@@ -1,0 +1,32 @@
+# Test-only configuration. This package is a library, not a deployable
+# Worker, so tests need an entry point that re-exports the Durable Object
+# class for wrangler to find.
+name = "atproto-pmr-cloudflare-tests"
+main = "test/worker.ts"
+compatibility_date = "2026-07-01"
+
+[durable_objects]
+bindings = [{ name = "pmrs", class_name = "PMRObject" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PMRObject"]
+
+# Illustrative values, matching wrangler.example.toml. These are
+# implementation-defined; tests read them from env rather than hardcoding,
+# so any operator's numbers work here.
+[vars]
+MAX_MESSAGES_PER_PAIR_SENDER = "25"
+POOL_CAP_BYTES = "4000000"
+POOL_DEPTH_PER_SENDER = "3"
+POOL_DEPTH_UNDER_PRESSURE = "1"
+
+[[kv_namespaces]]
+	binding = "pmrDirectory"
+	id = "test"
+[[kv_namespaces]]
+	binding = "addresses"
+	id = "test"
+[[kv_namespaces]]
+	binding = "messages"
+	id = "test"

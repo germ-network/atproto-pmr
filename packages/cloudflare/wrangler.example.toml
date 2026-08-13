@@ -1,0 +1,59 @@
+# Example configuration for a Worker consuming this package.
+#
+# This package is not itself a deployable Worker — it supplies the Durable
+# Object class and the storage adapters. Copy this into YOUR Worker and fill
+# in your own values.
+#
+# Deliberately absent: `account_id` (wrangler infers it from your login, and
+# a wrong one is expensive), and any `routes` block (routing is a deployment
+# decision, and a Worker runs on workers.dev without one).
+
+name = "my-atproto-pmr"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# Your entry point MUST re-export the Durable Object class, because wrangler
+# looks for it on `main`:
+#
+#     export { PMRObject } from "@germ-network/atproto-pmr-cloudflare"
+#
+# To supply your own synthetic behavior — which you should — subclass it and
+# export the subclass under the name used here instead.
+[durable_objects]
+bindings = [
+  { name = "pmrs", class_name = "PMRObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PMRObject"]
+
+# ─────────────────────────────────────────────────────────────────────────
+# All values below are IMPLEMENTATION-DEFINED. The specification fixes none
+# of them; these are illustrative round numbers, not a recommendation. See
+# `spec/wire-api.md`, "Limits are implementation-defined", for the reasoning
+# that does transfer.
+# ─────────────────────────────────────────────────────────────────────────
+[vars]
+# Per-sender capacity of a provisioned pair mailbox. The mailbox refuses at
+# this point rather than evicting.
+MAX_MESSAGES_PER_PAIR_SENDER = "25"
+
+# Recovery pool. Bounded by BYTES, never by sender count: width is the
+# property the pool exists to provide, so under pressure depth gives and
+# width holds.
+POOL_CAP_BYTES = "4000000"
+POOL_DEPTH_PER_SENDER = "3"
+POOL_DEPTH_UNDER_PRESSURE = "1"
+
+# KV namespace ids are placeholders. Create your own:
+#   npx wrangler kv namespace create <binding>
+[[kv_namespaces]]
+	binding = "pmrDirectory"
+	id = "REPLACE_WITH_YOUR_NAMESPACE_ID"
+[[kv_namespaces]]
+	binding = "addresses"
+	id = "REPLACE_WITH_YOUR_NAMESPACE_ID"
+[[kv_namespaces]]
+	binding = "messages"
+	id = "REPLACE_WITH_YOUR_NAMESPACE_ID"

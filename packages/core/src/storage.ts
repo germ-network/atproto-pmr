@@ -1,0 +1,282 @@
+/**
+ * The storage seam relay logic runs against — the contract from
+ * `spec/storage-consistency.md` expressed as types.
+ *
+ * Nothing here presupposes a backend. `@germ-network/atproto-pmr-cloudflare`
+ * is one implementation; a relational adapter is an equally first-class one.
+ * Where an operation carries a consistency requirement that a serialized
+ * execution model provides for free and a relational backend does not, the
+ * requirement is stated on the operation rather than left to be inferred.
+ */
+
+/**
+ * Whatever an adapter needs to reach one relay's store: an object
+ * identifier, a primary key, or the DID itself.
+ */
+export type Locator = string
+
+/**
+ * A pair mailbox's key *within* one relay's store. Routing has already
+ * resolved the recipient DID to this store, so this is a local index, not
+ * an address: no global uniqueness, no derivation on the wire.
+ *
+ * Adapters SHOULD form it by hashing the counterpart DID, keeping plaintext
+ * identifiers out of storage keys and access logs. That derivation is
+ * unilateral — it crosses no wire and needs no agreement with anyone.
+ */
+export type MailboxKey = string
+
+/** Identifier of a stored message; bodies live in a separate store. */
+export type MessageId = string
+
+/** The pair-put anti-replay nonce, taken from the signed payload. */
+export type Nonce = Uint8Array
+
+/**
+ * What the relay validated a pair put against. Stored *alongside* the
+ * entry, never inside the body: the body is self-authenticating and the
+ * device re-verifies it, so this is an index and a convenience, not
+ * evidence.
+ *
+ * An adapter that loses or corrupts hints degrades performance. One that
+ * lets a hint substitute for verification degrades security.
+ */
+export interface VerificationHint {
+    senderDID: string
+    /** RFC 9679 thumbprint of the anchor key the payload verified against. */
+    anchorKeyThumbprint: string
+}
+
+export interface MessageRef {
+    messageId: MessageId
+    byteLength: number
+    hint?: VerificationHint
+}
+
+export type AppendResult =
+    /**
+     * `persistBody` tells the caller — which sits outside this store and
+     * does not, and must not, know whether the sender is blocked — whether
+     * it may write this message's body.
+     *
+     * `true` for a genuinely accepted message; `false` when the append was
+     * absorbed by the synthetic mailbox, so "no bytes stored for a blocked
+     * sender" holds even though the caller cannot see which branch ran.
+     *
+     * Never wire-visible: read only by deferred, post-response code. The
+     * outcome itself stays identical either way, which is what the response
+     * contract requires.
+     */
+    | { outcome: "appended"; persistBody: boolean }
+    /**
+     * The nonce was already recorded against a prior accepted outcome for
+     * this mailbox — a replay of an already-delivered envelope. The caller
+     * answers exactly as it would for the original accepted put, and
+     * nothing is written again.
+     *
+     * Deliberately distinct from `refused`: a refused attempt does NOT
+     * record its nonce, so a legitimate retry of the identical signed
+     * envelope — the natural client behavior after `429` + `Retry-After` —
+     * is evaluated fresh once room exists rather than treated forever as a
+     * replay of an attempt that never succeeded.
+     */
+    | { outcome: "duplicate" }
+    /**
+     * At capacity. The real path refuses rather than accept-and-evict:
+     * drop-oldest would discard a message the sender was told had been
+     * accepted, and refusal makes the per-sender quota self-limiting.
+     *
+     * `retryAfter` is an absolute instant. It MUST come from the same
+     * mechanism the synthetic path uses — see
+     * `SyntheticBehavior.nextRetryInstant`.
+     */
+    | { outcome: "refused"; retryAfter: number }
+
+export type PoolAppendResult =
+    /**
+     * `persistBody` mirrors `AppendResult`'s field, with one more case:
+     * `false` when the sender is inside a discard window, since the caller
+     * must not write bytes for an entry that was never pooled.
+     *
+     * This outcome MUST be reached by the same number of round trips and
+     * comparable work whether the sender is discarded or genuinely pooled.
+     * A discard check that lets the *caller* skip this call makes discard
+     * status observable by round-trip count and timing alone.
+     */
+    | { outcome: "pooled"; persistBody: boolean }
+    /** Same reasoning as `AppendResult`'s `duplicate`. */
+    | { outcome: "duplicate" }
+    /**
+     * True exhaustion only: byte cap reached, depth already minimal, and
+     * this sender holds no entries yet. Existing senders keep their slots,
+     * preserving earlier arrivals rather than letting a late flood displace
+     * them. Invisible to the sender — the put still answers `202`.
+     */
+    | { outcome: "exhausted" }
+
+export interface RegistrationFields {
+    did: string
+    /**
+     * The declared anchor key as a `COSE_Key` blob — self-describing, never
+     * a fixed-width column, so a new algorithm arrives as a new identifier
+     * rather than a schema migration. Converted at ingest from the
+     * declaration's frozen encoding.
+     */
+    anchorKey: Uint8Array
+    /**
+     * The push grant this relay holds, where the deployment uses push
+     * delegation: a capability, not an identity. A relay MUST NOT store a
+     * push token.
+     */
+    pushGrant?: { id: string; key: Uint8Array; expiry: number }
+    lastActive: number
+}
+
+export interface ResolvedAddress {
+    locator: Locator
+    /**
+     * Surfaced rather than collapsed into `null`, so a caller can do the
+     * same work for a closed address as for a live one. Callers MUST treat
+     * this as "answer `202` and store nothing", never "return early".
+     */
+    closed: boolean
+}
+
+/** Global, small, read on every inbound request. */
+export interface Directory {
+    /** Hot path: routes every pair put and every owner request. */
+    resolve(did: string): Promise<Locator | null>
+
+    /**
+     * Grant puts name no DID, so the address resolves globally before any
+     * relay is known.
+     *
+     * CONSISTENCY CONTRACT (5): the same work for a live address, a closed
+     * one, and one that never existed. Returning early on a missing row
+     * leaks blocking through latency even though the bytes are identical.
+     */
+    resolveAddress(address: string): Promise<ResolvedAddress | null>
+
+    /** Idempotent on DID. */
+    create(did: string, registration: RegistrationFields): Promise<Locator>
+
+    /** Deregistration and dormancy eviction. */
+    delete(did: string): Promise<void>
+}
+
+/**
+ * Everything scoped to one served DID. Every operation is implicitly scoped
+ * to its relay; the scope is not a parameter on each call.
+ */
+export interface PMRStore {
+    load(): Promise<RegistrationFields | null>
+    update(fields: Partial<RegistrationFields>): Promise<void>
+
+    /**
+     * Appends to a provisioned pair mailbox, or advances the synthetic
+     * mailbox if the sender is blocked. **The caller cannot tell which
+     * happened, and neither can the sender.**
+     *
+     * CONSISTENCY CONTRACT (1): the capacity check and the write MUST be
+     * one atomic step, or two concurrent puts both observe room and both
+     * write.
+     *
+     * CONSISTENCY CONTRACT (7): the nonce seen-check and the append MUST be
+     * that same atomic step — not a separate `hasSeen`-then-`append` pair,
+     * which reopens the same race for replay instead of capacity. The check
+     * MUST apply identically on the blocked path: if a replay advances
+     * synthetic state where a real mailbox's replay would not, the
+     * difference in when the response flips to `429` is an oracle. And a
+     * `refused` outcome MUST NOT record the nonce.
+     */
+    append(
+        key: MailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number
+    ): Promise<AppendResult>
+
+    list(key: MailboxKey, limit: number): Promise<MessageRef[]>
+
+    /** CONSISTENCY CONTRACT (6): MUST succeed on an already-removed record. */
+    remove(key: MailboxKey, messageId: MessageId): Promise<void>
+
+    /** True for a provisioned mailbox *or* a blocked sender. */
+    hasMailbox(key: MailboxKey): Promise<boolean>
+
+    /**
+     * The recovery pool. Do NOT implement by reusing `append` with a
+     * different cap: the eviction direction is opposite, and conflating
+     * them is how a recovery attempt gets refused or a first-contact
+     * message silently dropped.
+     *
+     * A provisioned mailbox refuses and keeps the OLDEST — first contact is
+     * what it is for. The pool keeps the NEWEST, because the freshest
+     * attempt carries current state.
+     *
+     * CONSISTENCY CONTRACT (3): the byte accounting is read-modify-write
+     * and needs real atomicity under contention.
+     *
+     * CONSISTENCY CONTRACT (7) applies here too, and the discard check MUST
+     * run inside this call — see `PoolAppendResult`.
+     */
+    appendToPool(
+        key: MailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number
+    ): Promise<PoolAppendResult>
+
+    /** DIDs only, never bodies. */
+    poolSenders(): Promise<MailboxKey[]>
+
+    /**
+     * Blocking is reversible — the pair-mailbox counterpart of
+     * close/reopen on a grant address — and a blocked sender is never told.
+     * The behavior this switches on comes from `SyntheticBehavior`.
+     */
+    setBlocked(
+        key: MailboxKey,
+        blocked: boolean,
+        nowSeconds: number
+    ): Promise<void>
+
+    /**
+     * Suppress an unprovisioned sender until `until`, after which it lapses
+     * and the sender pools normally again. Time-bounded rather than
+     * standing: the device discards a DID it does not recognize *at that
+     * moment*, and the pool exists precisely for the case where the
+     * device's own knowledge is behind.
+     */
+    setDiscarded(key: MailboxKey, until: number): Promise<void>
+}
+
+/**
+ * Message bodies, kept separate from the queue so the queue stays small
+ * regardless of body size. An adapter MAY back both with one table.
+ */
+export interface BodyStore {
+    putBody(id: MessageId, bytes: Uint8Array, expiresAt: number): Promise<void>
+
+    /**
+     * CONSISTENCY CONTRACT (4): expiry is an observability rule. A record
+     * past `expiresAt` MUST NEVER be returned by any read, regardless of
+     * how reclamation works.
+     */
+    getBody(id: MessageId): Promise<Uint8Array | null>
+
+    deleteBody(id: MessageId): Promise<void>
+}
+
+/** Global rather than per-relay: presented before the relay is known. */
+export interface ChallengeStore {
+    mint(challenge: string, boundTo: string, expiresAt: number): Promise<void>
+
+    /**
+     * CONSISTENCY CONTRACT (2): a server challenge gives freshness and
+     * bounded replay, NOT use-once. Consumption is best-effort; the
+     * load-bearing requirement lands on the operations, which must be
+     * replay-tolerant within the TTL.
+     */
+    consume(challenge: string): Promise<string | null>
+}
