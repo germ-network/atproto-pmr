@@ -37,7 +37,7 @@ export type VerifyOutcome =
            * checked against the resolved key regardless. Useful to make a
            * rotation legible rather than an unexplained failure.
            */
-          keyid?: string
+          keyid: string
           created?: number
       }
     /**
@@ -113,9 +113,16 @@ export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
     // how to verify — trusting it would let a signer nominate a weaker
     // algorithm, or one whose verification we would perform against the
     // wrong key type.
+    // The profile says a conforming request MUST carry both, so absence is
+    // a refusal rather than a default. `alg` is still never *consulted* to
+    // choose the algorithm — it is checked for conformance and discarded;
+    // the algorithm is pinned to what the resolved key implies.
     const alg = entry.params.get("alg")
-    if (alg !== undefined && alg !== "ed25519") {
+    if (alg !== "ed25519") {
         return { valid: false, reason: "unexpected alg" }
+    }
+    if (typeof entry.params.get("keyid") !== "string") {
+        return { valid: false, reason: "missing keyid" }
     }
 
     const nonce = entry.params.get("nonce")
@@ -163,12 +170,12 @@ export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
     }
     if (!ok) return { valid: false, reason: "signature verification failed" }
 
-    const keyid = entry.params.get("keyid")
+    const keyid = entry.params.get("keyid") as string
     const created = entry.params.get("created")
     return {
         valid: true,
         nonce,
-        keyid: typeof keyid === "string" ? keyid : undefined,
+        keyid,
         created: typeof created === "number" ? created : undefined,
     }
 }

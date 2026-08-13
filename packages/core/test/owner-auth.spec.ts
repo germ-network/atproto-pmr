@@ -10,6 +10,7 @@ import { ed25519 } from "@noble/curves/ed25519.js"
 import { describe, expect, it } from "vitest"
 import { authenticateOwner } from "../src/owner/authenticate"
 import { encodeBinding } from "../src/challenge"
+import { encodeOkpEd25519Key } from "../src/cose/key"
 import { signRequest } from "../src/http-sig/sign"
 import type {
     ChallengeStore,
@@ -67,7 +68,10 @@ async function scenario(opts?: { registerAlice?: boolean }) {
     if (opts?.registerAlice !== false) {
         registrations.set(ALICE, {
             did: ALICE,
-            anchorKey: publicKey,
+            // Stored as a self-describing COSE_Key blob, never raw bytes —
+            // the storage contract requires it, and `anchorKeyBytes` parses
+            // rather than assuming a width.
+            anchorKey: encodeOkpEd25519Key({ x: publicKey }),
             lastActive: T0,
         })
     }
@@ -106,7 +110,9 @@ describe("owner authentication needs both halves", () => {
         const s = await scenario()
         s.registrations.set(MALLORY, {
             did: MALLORY,
-            anchorKey: ed25519.getPublicKey(ed25519.utils.randomSecretKey()),
+            anchorKey: encodeOkpEd25519Key({
+                x: ed25519.getPublicKey(ed25519.utils.randomSecretKey()),
+            }),
             lastActive: T0,
         })
         await s.challenges.mint(

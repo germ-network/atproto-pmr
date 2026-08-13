@@ -135,7 +135,7 @@ is an index, not a substitute for the sections it links.
 |---|---|---|
 | 1 | Requests are authenticated with RFC 9421 HTTP Message Signatures carrying a server-issued challenge in the `nonce` parameter; `content-digest` MUST be a covered component on any request with a body | [wire](wire-api.md#request-authentication) |
 | 2 | **A put to a grant mailbox answers `202` always** — unknown, closed, live, and bad-tag addresses are identical in content *and* in time, and every address-dependent step runs after the response | [wire](wire-api.md#the-closure-exception) |
-| 3 | A put to a pair mailbox answers `202`, or `429` with `Retry-After` when the sender's own reservation is full, and **nothing else** | [wire](wire-api.md#delivery--peer-facing) |
+| 3 | A put to a pair mailbox answers `202`, or `429` with `Retry-After` when the sender's own reservation is full, or `400` for a malformed request decided on the request bytes alone — and **nothing recipient-dependent** | [wire](wire-api.md#delivery--peer-facing) |
 | 4 | The pair-put verification algorithm runs all four steps, in order, none optional; `kid` is diagnostic and never authority | [wire](wire-api.md#the-verification-algorithm) |
 | 5 | The recipient DID is inside the signature, and a verifier MUST reject a put whose signed recipient DID is not this recipient | [wire](wire-api.md#why-the-recipient-did-must-be-signed) |
 | 6 | Pair puts carry an anti-replay nonce the recipient records per sender until a session supersedes it; content-addressed dedup is not a substitute | [wire](wire-api.md#anti-replay) |

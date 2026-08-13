@@ -140,7 +140,94 @@ function isRawDeclarationRecord(value: unknown): value is RawDeclarationRecord {
  * DID -> DID document -> PDS -> declaration, per atproto-pmr.md's own
  * algorithm. `fetchImpl` is injected so tests never make a real network
  * call — every call in this module's test suite is against a fixture.
+ *
+ * ## This is a server-side fetch of an attacker-chosen URL
+ *
+ * The PDS endpoint comes out of the *sender's own* DID document, and this
+ * runs on an unauthenticated pair put, before any response is sent. That
+ * is a server-side request forgery surface, and the fetch is bounded here
+ * rather than left to the host:
+ *
+ *   - **https only.** A DID document naming `file:`, `http:` or anything
+ *     else is refused rather than fetched.
+ *   - **A timeout**, so a PDS that accepts and never answers cannot pin a
+ *     request open.
+ *   - **A response cap**, so an endlessly-streaming body cannot exhaust
+ *     memory. `response.json()` on an unbounded body is the specific
+ *     mistake being avoided.
+ *
+ * What this deliberately does NOT do is filter private address ranges.
+ * That is a resolver-level concern, it is unenforceable from inside
+ * `fetch`, and DNS rebinding defeats a naive check anyway. A deployment on
+ * a runtime without egress restrictions SHOULD add one — the Workers
+ * runtime blocks private-IP fetches, which is why germ's own deployment is
+ * covered, but this package is platform-neutral and an adopter on plain
+ * Node is not.
  */
+/** Bounds on any fetch this module makes. Deliberately conservative. */
+const FETCH_TIMEOUT_MS = 5_000
+const MAX_RESPONSE_BYTES = 64 * 1024
+
+/**
+ * `fetch` with the bounds above, plus the https-only check.
+ *
+ * The body is read through a capped reader rather than `response.json()`,
+ * because `json()` on an attacker-controlled endpoint will happily buffer
+ * until it runs out of memory.
+ */
+async function guardedFetchJSON(
+    url: string,
+    fetchImpl: typeof fetch
+): Promise<unknown> {
+    let parsed: URL
+    try {
+        parsed = new URL(url)
+    } catch {
+        throw new Error("malformed endpoint URL")
+    }
+    if (parsed.protocol !== "https:") {
+        throw new Error(`refusing non-https endpoint: ${parsed.protocol}`)
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+    try {
+        const response = await fetchImpl(url, { signal: controller.signal })
+        if (!response.ok) {
+            throw new Error(`endpoint answered ${response.status}`)
+        }
+        const text = await readCapped(response, MAX_RESPONSE_BYTES)
+        return JSON.parse(text) as unknown
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+async function readCapped(response: Response, maxBytes: number): Promise<string> {
+    const body = response.body
+    if (body === null) return ""
+    const reader = body.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        total += value.byteLength
+        if (total > maxBytes) {
+            await reader.cancel()
+            throw new Error("response exceeds the maximum size")
+        }
+        chunks.push(value)
+    }
+    const joined = new Uint8Array(total)
+    let offset = 0
+    for (const c of chunks) {
+        joined.set(c, offset)
+        offset += c.byteLength
+    }
+    return new TextDecoder().decode(joined)
+}
+
 export async function resolveDeclaration(
     senderDID: string,
     fetchImpl: typeof fetch = fetch
@@ -158,14 +245,9 @@ export async function resolveDeclaration(
         url.searchParams.set("repo", senderDID)
         url.searchParams.set("collection", DECLARATION_COLLECTION_NSID)
         url.searchParams.set("rkey", "self")
-        const response = await fetchImpl(url.toString())
-        if (!response.ok) {
-            return {
-                found: false,
-                reason: `declaration fetch: PDS answered ${response.status}`,
-            }
+        const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
+            value?: unknown
         }
-        const body = (await response.json()) as { value?: unknown }
         record = body.value
     } catch (e) {
         return { found: false, reason: `declaration fetch failed: ${String(e)}` }
@@ -207,20 +289,13 @@ async function resolvePDSEndpoint(
 ): Promise<string> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
-        const response = await fetchImpl(`https://plc.directory/${did}`)
-        if (!response.ok) {
-            throw new Error(`PLC directory answered ${response.status}`)
-        }
-        doc = await response.json()
+        doc = await guardedFetchJSON(`https://plc.directory/${did}`, fetchImpl)
     } else if (did.startsWith("did:web:")) {
         const hostname = did.slice("did:web:".length).replace(/:/g, "/")
-        const response = await fetchImpl(
-            `https://${hostname}/.well-known/did.json`
+        doc = await guardedFetchJSON(
+            `https://${hostname}/.well-known/did.json`,
+            fetchImpl
         )
-        if (!response.ok) {
-            throw new Error(`did:web document answered ${response.status}`)
-        }
-        doc = await response.json()
     } else {
         throw new Error(`unsupported DID method: ${did}`)
     }

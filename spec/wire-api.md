@@ -312,10 +312,20 @@ For a pair put, the permitted responses are exhaustive:
 - **`429 Too Many Requests` with `Retry-After`** — when *the sender's own*
   reservation is full.
 
-Nothing else. A pair put MUST NOT disclose whether the recipient is
-active, whether the sender was blocked, whether the sender is provisioned,
-or whether the recipient exists in any state other than one that would
-produce these two answers.
+Nothing else that depends on the recipient. A pair put MUST NOT disclose
+whether the recipient is active, whether the sender was blocked, whether
+the sender is provisioned, or whether the recipient exists in any state
+other than one that would produce these two answers.
+
+One narrow exception, and the condition on it is what keeps it safe: a
+**structurally malformed** request — an undecodable envelope, a
+non-canonical signature, a payload over the published maximum — MAY be
+refused with `400`. Every such check MUST be evaluated **before any
+recipient- or sender-dependent lookup**, so its outcome is a function of
+the request bytes alone. A sender already knows whether their own request
+is well-formed and how large their own payload is, so this tells them
+nothing they did not supply. An implementation that cannot decide a `400`
+without consulting recipient state MUST answer `202` instead.
 
 **Fullness is disclosable because senders are authenticated and each
 sender's mailbox is reserved to them**: a full mailbox is a fact about the
@@ -740,7 +750,7 @@ Three populations, and what each may learn is a security property:
 | audience | answer |
 |---|---|
 | peer, grant put | `202` **always** — no other code, no timing difference |
-| peer, pair put | `202`, or `429` + `Retry-After` when their own reservation is full. Nothing else — not whether the recipient is active, not whether they were blocked |
+| peer, pair put | `202`, or `429` + `Retry-After` when their own reservation is full, or `400` for a structurally malformed request decided on the request bytes alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
 The dividing line is authorization and what per-sender reservation makes

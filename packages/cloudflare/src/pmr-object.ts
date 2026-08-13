@@ -348,6 +348,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         _nowSeconds: number
     ): Promise<MessageRef[]> {
+        // A blocked sender is never provisionable. `block` already purges
+        // the pool, so this is belt-and-braces against a future caller that
+        // reaches here with a stale key — provisioning a blocked sender
+        // would undo the block by creating them a live mailbox.
+        if ((await this.db.get(syntheticKey(key))) !== undefined) return []
+
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         if (pooled.length === 0) {
             // Provisioning an empty sender still creates the mailbox, so
@@ -409,6 +415,15 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // Dropping the queue is the point, not a side effect: no bytes are
         // kept for a blocked sender.
         await this.db.delete(mailboxKey(key))
+
+        // And the pool, for the same reason. A sender who was pooled and
+        // then blocked would otherwise still surface in the owner's pool
+        // listing, and adjudication could provision them — creating a live
+        // mailbox holding a blocked sender's messages. Releasing through
+        // the shared helper also returns their bytes to the pool budget.
+        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+        if (pooled.length > 0) await this.releasePool(key, pooled)
+        else await this.db.delete(poolDIDKey(key))
     }
 
     async unblock(key: MailboxKey): Promise<void> {

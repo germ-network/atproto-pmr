@@ -1,6 +1,7 @@
 import { redeemChallenge } from "../challenge.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
+import { parseOkpEd25519Key } from "../cose/key.js"
 import type { ChallengeStore, Locator, PMRStore } from "../storage.js"
 
 /**
@@ -133,16 +134,14 @@ export async function authenticateOwner(
 /**
  * The stored anchor key is a `COSE_Key` blob — self-describing, never a
  * fixed-width column, so a post-quantum algorithm arrives as a new
- * identifier rather than a schema migration.
+ * identifier rather than a schema migration. That is a MUST in the storage
+ * consistency contract, and storing raw key bytes would satisfy the
+ * verifier today while quietly making the next algorithm a migration.
  *
- * Today the only algorithm in use is Ed25519, and the raw 32-byte public
- * key is what the verifier wants. This unwraps the common case and throws
- * on anything else rather than guessing: silently handing the wrong bytes
- * to a verifier fails open only if the verifier is also wrong, and that is
- * not a coincidence worth relying on.
+ * `parseOkpEd25519Key` rejects any other `kty`/`crv` rather than guessing:
+ * handing the wrong bytes to a verifier fails closed only because the
+ * verifier is strict, and that is not a coincidence worth depending on.
  */
 function anchorKeyBytes(stored: Uint8Array): Uint8Array {
-    // A bare 32-byte value is the raw key, already unwrapped at ingest.
-    if (stored.byteLength === 32) return stored
-    throw new Error("unsupported anchor key encoding")
+    return parseOkpEd25519Key(stored).x
 }

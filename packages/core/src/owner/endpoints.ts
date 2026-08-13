@@ -1,10 +1,13 @@
 import { redeemChallenge } from "../challenge.js"
+import { encodeOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
 import { deriveMailboxKey } from "../message-id.js"
 import { readBodyCapped, toResponseBody } from "../util.js"
 import type { Directory, RegistrationFields } from "../storage.js"
+import { mintChallenge, type ChallengeConfig } from "../challenge.js"
+import { withNextChallenge } from "../challenge-endpoint.js"
 import {
     authenticateOwner,
     type OwnerAuthDeps,
@@ -38,6 +41,46 @@ export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
+    /**
+     * Supplied to amortize the mint: every authenticated response carries a
+     * fresh challenge, so a client pays the mint round trip only on its
+     * first request. Omit to disable — every call then costs a mint.
+     */
+    challengeConfig?: ChallengeConfig
+    randomBytes?: (n: number) => Uint8Array
+}
+
+/**
+ * Attach a fresh challenge to an authenticated response.
+ *
+ * Minted for the DID that just authenticated, so it is bound to them and
+ * useless to anyone who intercepts it. Failures are swallowed
+ * deliberately: the operation already succeeded, and turning a
+ * convenience into a 500 would be a worse answer than making the client
+ * pay for one more mint.
+ */
+async function amortize(
+    response: Response,
+    did: string,
+    deps: OwnerDeps
+): Promise<Response> {
+    if (deps.challengeConfig === undefined || deps.randomBytes === undefined) {
+        return response
+    }
+    try {
+        const minted = await mintChallenge(
+            { realm: "anchor", subject: did },
+            {
+                store: deps.challenges,
+                config: deps.challengeConfig,
+                nowSeconds: deps.nowSeconds,
+                randomBytes: deps.randomBytes,
+            }
+        )
+        return withNextChallenge(response, minted)
+    } catch {
+        return response
+    }
 }
 
 async function authed(
@@ -87,7 +130,11 @@ function cbor(entries: [string, CoseValue][], status = 200): Response {
 export async function handleRegistrationCreate(
     request: Request,
     deps: OwnerDeps & {
-        /** DID → declared anchor key. The registration's root of trust. */
+        /**
+         * DID → declared anchor key, as raw Ed25519 bytes. The
+         * registration's root of trust. Stored as a `COSE_Key` blob, never
+         * as the raw bytes — see `RegistrationFields.anchorKey`.
+         */
         resolveAnchorKey: (did: string) => Promise<Uint8Array | null>
         /** The DID being registered, taken from the redeemed challenge. */
         nowSeconds: number
@@ -138,7 +185,9 @@ export async function handleRegistrationCreate(
 
     const fields: RegistrationFields = {
         did,
-        anchorKey,
+        // Self-describing on the way in, so nothing downstream has to know
+        // which algorithm produced it.
+        anchorKey: encodeOkpEd25519Key({ x: anchorKey }),
         lastActive: deps.nowSeconds,
     }
     // A push grant may accompany the registration. It is a capability —
@@ -175,12 +224,16 @@ export async function handleRegistrationRead(
 
     const reg = await a.auth.store.load()
     if (reg === null) return new Response(null, { status: 404 })
-    return cbor([
+    return amortize(
+        cbor([
         ["did", reg.did],
         ["la", reg.lastActive],
         // The push grant's key is never echoed back; only whether one exists.
         ["pg", reg.pushGrant !== undefined],
-    ])
+        ]),
+        a.auth.did,
+        deps
+    )
 }
 
 /** `DELETE /pmr/v1/registration` — deregister. */
@@ -193,7 +246,8 @@ export async function handleRegistrationDelete(
 
     await deps.directory.delete(a.auth.did)
     // Idempotent: deleting an already-deleted registration succeeds, so a
-    // retry inside the challenge TTL is safe.
+    // retry inside the challenge TTL is safe. No next-challenge here — the
+    // registration this one would be bound to no longer exists.
     return new Response(null, { status: 204 })
 }
 
@@ -207,7 +261,7 @@ export async function handleBlocksList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
     const dids = await a.auth.store.listBlocked()
-    return cbor([["b", dids]])
+    return amortize(cbor([["b", dids]]), a.auth.did, deps)
 }
 
 /**
@@ -236,7 +290,7 @@ export async function handleBlockSet(
     }
     // Idempotent both ways — blocking an already-blocked sender, or
     // unblocking one who is not blocked, both succeed.
-    return new Response(null, { status: 204 })
+    return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
 }
 
 // MARK: - Pool
@@ -250,7 +304,8 @@ export async function handlePoolList(
     if (!a.ok) return a.response
 
     const senders = await a.auth.store.poolSenders()
-    return cbor([
+    return amortize(
+        cbor([
         [
             "p",
             senders.map(
@@ -260,7 +315,10 @@ export async function handlePoolList(
                 ])
             ),
         ],
-    ])
+        ]),
+        a.auth.did,
+        deps
+    )
 }
 
 /**
@@ -317,11 +375,15 @@ export async function handlePoolAdjudication(
         )
     }
 
-    return cbor([
-        ["pr", provision.length],
-        ["di", discard.length],
-        ["m", provisioned],
-    ])
+    return amortize(
+        cbor([
+            ["pr", provision.length],
+            ["di", discard.length],
+            ["m", provisioned],
+        ]),
+        a.auth.did,
+        deps
+    )
 }
 
 function stringList(v: CoseValue | undefined): string[] {

@@ -500,3 +500,52 @@ describe("removal is idempotent", () => {
         })
     })
 })
+
+describe("blocking a pooled sender closes both surfaces", () => {
+    it("purges their pool entries, so adjudication cannot resurrect them", async () => {
+        // Otherwise a sender pooled BEFORE being blocked still shows up in
+        // the owner's pool listing, and provisioning them would create a
+        // live mailbox holding a blocked sender's messages.
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool(
+                "mallory",
+                "did:plc:mallory",
+                ref("m1", 500),
+                freshNonce(),
+                T0
+            )
+            expect((await pmr.poolSenders()).map((s) => s.key)).toContain("mallory")
+
+            await pmr.block("mallory", "did:plc:mallory", T0)
+
+            expect(await pmr.poolSenders()).toEqual([])
+            // And provisioning is refused even if a stale key reaches it.
+            expect(await pmr.provisionFromPool("mallory", T0)).toEqual([])
+            expect(await pmr.list("mallory", 10)).toEqual([])
+        })
+    })
+
+    it("returns the purged bytes to the pool budget", async () => {
+        // A blocked sender's bytes must not permanently consume the cap —
+        // that would let repeated block cycles starve the pool's width.
+        const stub = freshStub()
+        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("a", "did:plc:a", ref("big", cap), freshNonce(), T0)
+            // Pool is now at capacity: a new sender is turned away.
+            expect(
+                (await pmr.appendToPool("b", "did:plc:b", ref("m"), freshNonce(), T0))
+                    .outcome
+            ).toBe("exhausted")
+
+            await pmr.block("a", "did:plc:a", T0)
+
+            // Budget released, so an unrelated sender fits again.
+            expect(
+                (await pmr.appendToPool("c", "did:plc:c", ref("m"), freshNonce(), T0))
+                    .outcome
+            ).toBe("pooled")
+        })
+    })
+})
