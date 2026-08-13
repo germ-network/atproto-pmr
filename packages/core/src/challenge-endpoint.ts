@@ -59,7 +59,7 @@ export async function handleChallengeMint(
         if (typeof realm !== "string" || typeof subject !== "string") {
             return new Response("Malformed challenge request", { status: 400 })
         }
-        if (realm !== "anchor" && realm !== "registration") {
+        if (realm !== "anchor" && realm !== "grantPut" && realm !== "registration") {
             return new Response("Unknown realm", { status: 400 })
         }
         if (subject.length === 0) {

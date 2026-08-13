@@ -101,19 +101,24 @@ implementation would have. Implementations SHOULD prefer it.
 
 ### Realms
 
-Two authorization realms exist, distinguished by **the key that signs**,
+Three authorization realms exist, distinguished by **the key that signs**,
 not by separate endpoint families:
 
 - the **anchor realm** — the declared anchor key, for DID-scoped
-  operations. This is the realm an Atproto PMR implements.
+  operations.
+- the **grantPut realm** — a grant's own `authKey`, scoping a
+  put-challenge to the single address that grant derives. Unlike the other
+  two realms it authenticates no identity at all, only possession of that
+  one capability — see
+  [Grant address and put-tag derivation](#grant-address-and-put-tag-derivation).
 - the **registration realm** — a registration key, used by the push
   service in the optional [push delegation](#push-delegation-optional)
   path.
 
-A challenge is minted bound to a realm and MUST NOT verify against the
-other. A self-hosted Atproto PMR implements exactly one realm — the anchor
-realm — because push reaches its users by delegation rather than by
-holding a push token.
+A challenge is minted bound to a realm and MUST NOT verify against
+another. An Atproto PMR implements the anchor and grantPut realms; it does
+not implement the registration realm, because push reaches its users by
+delegation rather than by holding a push token.
 
 ### Content types
 
@@ -296,6 +301,61 @@ client MUST re-derive and verify each issued address rather than accepting
 the server's word for it**, and MUST reject a grant whose address it
 cannot reproduce. The server proposes; the client verifies.
 
+### Grant address and put-tag derivation
+
+**Normative.** `key` — the 32-byte symmetric secret a grant issues — is
+the input to two domain-separated HMAC-SHA256 derivations, both run
+locally by whichever side needs them and never transmitted:
+
+```
+address = HMAC-SHA256(authKey, "germ-pmr:grant-addr:v1" || host)
+tag     = HMAC-SHA256(authKey, "germ-pmr:grant-put:v1" || addressString
+                                || nonce || bodyDigest)
+```
+
+`address` is what [Grants](#grants--the-core-capability) requires the
+client to re-derive and what routes a put globally, before any relay is
+known. `tag` is what a [grant put](#the-grant-put-payload) carries to
+prove possession of `authKey` without transmitting it on every request —
+the relay verifies by recomputing, never by comparing bearer secrets.
+
+The two labels are domain-separated from each other, from
+[the pair-put type marker](#the-pair-put-payload), and from
+[push delegation's HMAC](#push-delegation-optional): a value computed for
+one purpose MUST NOT be reinterpretable as valid for another, even under a
+key that happens to be reused across them. They are also deliberately
+**not** germ-service's legacy v2 address scheme (`germ-addr:v1` /
+`germ-put:v1`) — that scheme belongs to the anchor-key-indexed inbox this
+specification retires, and giving the new one its own labels means an
+`authKey` never accidentally validates against both.
+
+Byte representations are fixed so an independent implementation
+reproduces these exactly:
+
+| field | representation |
+|---|---|
+| `host` | UTF-8 bytes of the relay's own hostname, unencoded |
+| `addressString` | UTF-8 bytes of `address`'s **base64url string form**, unpadded (43 bytes for a 32-byte HMAC output) — not the raw bytes, and not the URL-percent-encoded path segment |
+| `nonce` | UTF-8 bytes of the redeemed put-challenge's **string form** — the same value the challenge store keys on ([Freshness and replay](#freshness-and-replay)), not a byte-decoding of it |
+| `bodyDigest` | the raw 32-byte SHA-256 digest of the exact message bytes carried in the put |
+
+`addressString` and `bodyDigest` are fixed-length; `nonce`'s length
+follows the deployment's own challenge byte length once base64url-encoded
+— constant within a deployment, not mandated across them. That is not a
+concatenation hazard: both sides always know each field's length
+independently rather than recovering it by splitting the HMAC input back
+apart, so a variable length here has nothing to make ambiguous.
+
+**Known-answer test vectors** for both derivations, computed
+independently of the reference implementation, are published alongside it
+at `packages/core/test/grant.spec.ts` in this repository.
+
+**Wire encoding of `address` itself**: the base64url string form,
+unpadded — the same string used to build `addressString` above. Base64url
+uses no characters requiring percent-encoding, so it is carried in the
+`{address}` path segment (`POST /pmr/v1/mailboxes/{address}/messages`)
+unmodified, and in `PATCH`/`DELETE /pmr/v1/grants/{address}` the same way.
+
 ### Delivery — peer-facing
 
 | method | path | responses |
@@ -364,6 +424,47 @@ state, so the tier reveals nothing a sender could not compute. A tier
 resting on an aggregation means trusting an appview for an authorization
 decision; see
 [`trust-model.md`](trust-model.md#the-clients-fetch-posture).
+
+### The grant-put payload
+
+**PROVISIONAL BODY SHAPE**, as with the challenge mint: concrete CBOR
+schemas are tracked separately. The shape below is the minimum that
+expresses the three fields a grant put needs, chosen so that settling the
+schema later is a decode change rather than a redesign:
+
+```
+{ "n": nonce, "t": tag, "m": message }
+```
+
+`nonce` is a challenge redeemed from the **grantPut realm**
+([Realms](#realms)), bound to this address (`s` = `address` at mint time
+— `POST /pmr/v1/challenges` with `{"r": "grantPut", "s": address}`), the
+same mechanism as any other realm. `tag` and `message`'s digest are
+computed as in
+[Grant address and put-tag derivation](#grant-address-and-put-tag-derivation).
+
+**Why no per-sender anti-replay nonce, unlike a pair put.** Grant
+addresses carry steady-state traffic on an already-established session
+([`trust-model.md`](trust-model.md#p6--anti-replay-on-pre-session-puts)),
+and forging or replaying a message into an established session is a
+session-layer property, not a relay one — the residual there is already
+"none." The put-challenge's job is narrower: proving freshness and
+possession of `authKey`, not sequencing application content. What a relay
+still owes against replay is what [Freshness and replay](#freshness-and-replay)
+already states for every challenge-reachable operation — **puts are
+content-addressed and deduplicated** — which is sufficient here because
+`message` is content-addressed exactly as a pair put's payload is.
+
+**The response contract is stricter than a pair put's, not just
+uniform.** A pair put resolves and verifies before answering, and
+achieves uniformity by answering `202` on every branch. A grant put has no
+self-referential disclosure to permit at all, so it goes further: **no
+address-dependent step runs before the response.** The only synchronous,
+pre-response work is rejecting a structurally malformed request — an
+undecodable body, a payload over the published maximum — decided from the
+request bytes alone, exactly as a pair put's `400` is. Address resolution,
+challenge redemption, tag verification, storage, and delivery all run
+strictly after the `202`.
 
 ### The pair-put payload
 
@@ -828,13 +929,6 @@ Whatever a deployment picks, the put still answers `202`.
   algorithm identifier followed by the digest bytes — but the identifier
   assignments are not published here. SHA-256 is the only algorithm
   currently in use.
-- **The grant address derivation.** That a client re-derives an issued
-  address from its own key material and rejects a mismatch is normative
-  ([Grants](#grants--the-core-capability)). The derivation itself — the
-  HMAC input layout, its domain-separation string, and the encoding of
-  the resulting address in a path segment — is not stated in this draft,
-  and two implementations cannot interoperate on grants until it is
-  published with test vectors.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
   CBOR schemas for registration, grant issuance, ack batches, pool

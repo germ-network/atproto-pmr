@@ -615,3 +615,123 @@ describe("blocking a pooled sender closes both surfaces", () => {
         })
     })
 })
+
+describe("grant mailboxes reuse the pair mailbox's append/list/remove", () => {
+    it("accepts, lists, and removes exactly as a pair mailbox does — the key is just an address instead of a DID", async () => {
+        const stub = freshStub()
+        const address = "grant-address-000000000000000000000000000"
+        await inPMR(stub, async (pmr) => {
+            const result = await pmr.append(
+                address,
+                ref("m1"),
+                freshNonce(),
+                T0
+            )
+            expect(result).toEqual({ outcome: "appended", persistBody: true })
+            expect((await pmr.list(address, 10)).map((r) => r.messageId)).toEqual([
+                "m1",
+            ])
+            await pmr.remove(address, "m1")
+            expect(await pmr.list(address, 10)).toEqual([])
+        })
+    })
+
+    it("a content-hash nonce makes replaying the identical message a no-op", async () => {
+        // This is the mechanism `handleGrantPut` relies on in place of a
+        // per-sender anti-replay nonce: the same bytes hashed the same way
+        // land the same "nonce", so a resend of an already-appended message
+        // is `duplicate`, not a second queue entry.
+        const stub = freshStub()
+        const address = "grant-address-111111111111111111111111111"
+        const contentHash = new Uint8Array(32).fill(9)
+        await inPMR(stub, async (pmr) => {
+            const first = await pmr.append(address, ref("m1"), contentHash, T0)
+            expect(first.outcome).toBe("appended")
+            const replay = await pmr.append(address, ref("m1"), contentHash, T0)
+            expect(replay.outcome).toBe("duplicate")
+            expect(await pmr.list(address, 10)).toHaveLength(1)
+        })
+    })
+})
+
+describe("PMRObject grant records", () => {
+    it("issues, lists, and reads back a grant — never the authKey", async () => {
+        const stub = freshStub()
+        const address = "grant-address-222222222222222222222222222"
+        await inPMR(stub, async (pmr) => {
+            await pmr.issueGrant(address, new Uint8Array(32).fill(1), T0 + 3600)
+
+            const grants = await pmr.listGrants()
+            expect(grants).toEqual([{ address, expiresAt: T0 + 3600, closed: false }])
+            // No `key`/`authKey` field anywhere in what's listed back.
+            expect(Object.keys(grants[0]).sort()).toEqual([
+                "address",
+                "closed",
+                "expiresAt",
+            ])
+
+            expect(await pmr.getGrant(address)).toEqual({
+                address,
+                expiresAt: T0 + 3600,
+                closed: false,
+            })
+        })
+    })
+
+    it("getGrant is null for an address this owner never issued", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            expect(await pmr.getGrant("never-issued")).toBeNull()
+        })
+    })
+
+    it("setGrantClosed is reversible and a no-op on an unknown address", async () => {
+        const stub = freshStub()
+        const address = "grant-address-333333333333333333333333333"
+        await inPMR(stub, async (pmr) => {
+            await pmr.issueGrant(address, new Uint8Array(32), T0 + 3600)
+
+            await pmr.setGrantClosed(address, true)
+            expect((await pmr.getGrant(address))!.closed).toBe(true)
+
+            await pmr.setGrantClosed(address, false)
+            expect((await pmr.getGrant(address))!.closed).toBe(false)
+
+            // Never issued: must not throw and must not create a row.
+            await pmr.setGrantClosed("never-issued", true)
+            expect(await pmr.getGrant("never-issued")).toBeNull()
+        })
+    })
+
+    it("invalidateGrant removes the record permanently", async () => {
+        const stub = freshStub()
+        const address = "grant-address-444444444444444444444444444"
+        await inPMR(stub, async (pmr) => {
+            await pmr.issueGrant(address, new Uint8Array(32), T0 + 3600)
+            await pmr.invalidateGrant(address)
+            expect(await pmr.getGrant(address)).toBeNull()
+            expect(await pmr.listGrants()).toEqual([])
+
+            // Idempotent.
+            await pmr.invalidateGrant(address)
+        })
+    })
+
+    it("lists multiple grants without leaking into the pool/synthetic families", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.issueGrant("addr-a", new Uint8Array(32), T0 + 100)
+            await pmr.issueGrant("addr-b", new Uint8Array(32), T0 + 200)
+            await pmr.block("did:plc:unrelated", T0)
+            await pmr.appendToPool(
+                "did:plc:unrelated-pool",
+                ref("m"),
+                freshNonce(),
+                T0
+            )
+
+            const addresses = (await pmr.listGrants()).map((g) => g.address).sort()
+            expect(addresses).toEqual(["addr-a", "addr-b"])
+        })
+    })
+})

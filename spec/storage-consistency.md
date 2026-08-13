@@ -53,7 +53,7 @@ exact signatures belong to an implementation.
 | operation | notes |
 |---|---|
 | `resolve(did) -> Locator?` | hot path; routes every pair put and every owner request |
-| `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. **Carries the uniform-cost requirement below** |
+| `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
 | `create(did, registration) -> Locator` | idempotent on DID |
 | `delete(did)` | deregistration and dormancy eviction |
 | `dueForWork(kind, before, limit) -> [Locator]` | drives declaration watch and sweeps where alarms do not exist — see [Scheduling](#scheduling) |

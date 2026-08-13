@@ -19,6 +19,10 @@ export interface PMRLimits {
     maxMessagesPerPairSender: number
     /** Challenge TTL, seconds. */
     challengeExpirySeconds: number
+    /** How long an issued grant lives before it must be reissued, seconds. */
+    grantExpirySeconds: number
+    /** Refuses a single `POST /pmr/v1/grants` request for more than this many. */
+    maxGrantsPerRequest: number
 }
 
 export interface PoolLimits {

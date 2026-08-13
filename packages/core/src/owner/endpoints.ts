@@ -1,9 +1,10 @@
 import { redeemChallenge } from "../challenge.js"
 import { encodeOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
+import { deriveGrantAddress } from "../grant.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
-import { readBodyCapped, toResponseBody } from "../util.js"
+import { binaryToBase64URL, readBodyCapped, toResponseBody } from "../util.js"
 import type { Directory, RegistrationFields } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
@@ -35,7 +36,6 @@ import {
 
 const OWNER_BODY_MAX_BYTES = 16 * 1024
 
-/** Grants are absent on purpose — see the note at the bottom of this file. */
 export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     /** How long a discard suppresses a sender, in seconds. */
@@ -416,14 +416,177 @@ function stringList(v: CoseValue | undefined): string[] {
     })
 }
 
+// MARK: - Grants
+
 /**
- * GRANTS ARE NOT HERE, AND THAT IS NOT AN OVERSIGHT.
+ * Deps specific to grant issuance, on top of `OwnerDeps`.
  *
- * Issuing a grant means returning an address the client re-derives and
- * verifies from its own key material — that re-derivation is the property
- * keeping a relay from choosing addresses. The derivation itself is not yet
- * published, so implementing issuance now would mean inventing it in code
- * and making the first implementation the de facto specification, which is
- * exactly what the spec's "do not guess it from a reference
- * implementation's behavior" warns against.
+ * Split out rather than folded into `OwnerDeps` because `randomBytes` there
+ * is optional (amortize degrades gracefully without it) while a missing
+ * source of randomness here is not something these handlers can degrade
+ * around — issuing a grant IS generating a fresh secret.
  */
+export interface GrantConfig {
+    /** Domain-separates address derivation — `wire-api.md`, "Grant address
+     *  and put-tag derivation". */
+    hostName: string
+    /** How long an issued grant lives before it must be reissued, seconds. */
+    grantExpirySeconds: number
+    /** Refuses a single request asking for more than this many at once. */
+    maxGrantsPerRequest: number
+    randomBytes: (n: number) => Uint8Array
+}
+
+/**
+ * `POST /pmr/v1/grants` — request N; returns `{key, address, expiry}`
+ * triples, the exact wire vocabulary `wire-api.md`'s endpoint table names.
+ *
+ * The address a client is handed here is the SAME thing it MUST re-derive
+ * and verify locally (`wire-api.md#grants--the-core-capability`) — this
+ * handler does not get to special-case its own output.
+ */
+export async function handleGrantsCreate(
+    request: Request,
+    deps: OwnerDeps & GrantConfig
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    let count: number
+    try {
+        const map = decodeCoseMap(a.body ?? new Uint8Array(0))
+        const n = map.get("count")
+        if (typeof n !== "number" || !Number.isInteger(n) || n < 1) {
+            return new Response("Malformed grant request", { status: 400 })
+        }
+        count = n
+    } catch (e) {
+        return new Response(`Malformed grant request: ${String(e)}`, {
+            status: 400,
+        })
+    }
+    if (count > deps.maxGrantsPerRequest) {
+        return new Response("Too many grants requested", { status: 400 })
+    }
+
+    const expiresAt = deps.nowSeconds + deps.grantExpirySeconds
+    const issued: CoseValue[] = []
+    for (let i = 0; i < count; i++) {
+        const authKey = deps.randomBytes(32)
+        const address = deriveGrantAddress(authKey, deps.hostName)
+        const addressString = binaryToBase64URL(address)
+
+        // Two writes, same shape as registration's directory.create +
+        // store.update: the global routing row a put resolves against, and
+        // the owner's own record — the one `PATCH`/`DELETE` checks against
+        // before trusting an address the request merely NAMES.
+        await deps.directory.createGrantAddress(
+            a.auth.locator,
+            addressString,
+            authKey,
+            expiresAt
+        )
+        await a.auth.store.issueGrant(addressString, authKey, expiresAt)
+
+        issued.push(
+            new Map<string, CoseValue>([
+                ["key", authKey],
+                ["address", addressString],
+                ["expiry", expiresAt],
+            ])
+        )
+    }
+
+    return amortize(cbor([["grants", issued]], 201), a.auth.did, deps)
+}
+
+/** `GET /pmr/v1/grants` — list live grants. Never re-serves `key`. */
+export async function handleGrantsList(
+    request: Request,
+    deps: OwnerDeps
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const grants = await a.auth.store.listGrants()
+    return amortize(
+        cbor([
+            [
+                "grants",
+                grants.map(
+                    (g) =>
+                        new Map<string, CoseValue>([
+                            ["address", g.address],
+                            ["expiry", g.expiresAt],
+                            ["closed", g.closed],
+                        ])
+                ),
+            ],
+        ]),
+        a.auth.did,
+        deps
+    )
+}
+
+/**
+ * `PATCH /pmr/v1/grants/{address}` — `{closed: true|false}`, reversible.
+ * State transitions are a `PATCH` on the resource rather than `…/close`
+ * and `…/reopen` action endpoints (`wire-api.md`).
+ */
+export async function handleGrantSet(
+    request: Request,
+    address: string,
+    deps: OwnerDeps
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    let closed: boolean
+    try {
+        const map = decodeCoseMap(a.body ?? new Uint8Array(0))
+        const c = map.get("closed")
+        if (typeof c !== "boolean") {
+            return new Response("Malformed grant update", { status: 400 })
+        }
+        closed = c
+    } catch (e) {
+        return new Response(`Malformed grant update: ${String(e)}`, {
+            status: 400,
+        })
+    }
+
+    // The owner names an address by VALUE. This is what confirms it is
+    // actually theirs before the global routing row is touched — a `PATCH`
+    // that trusted the path segment alone would let any owner close or
+    // reopen any other owner's grant by guessing or observing its address.
+    const existing = await a.auth.store.getGrant(address)
+    if (existing === null) {
+        return new Response("No such grant", { status: 404 })
+    }
+
+    await a.auth.store.setGrantClosed(address, closed)
+    await deps.directory.setGrantAddressClosed(address, closed)
+
+    return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
+}
+
+/** `DELETE /pmr/v1/grants/{address}` — invalidate permanently. */
+export async function handleGrantDelete(
+    request: Request,
+    address: string,
+    deps: OwnerDeps
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    // Same ownership check as `handleGrantSet`, and for the same reason.
+    const existing = await a.auth.store.getGrant(address)
+    if (existing === null) {
+        return new Response("No such grant", { status: 404 })
+    }
+
+    await a.auth.store.invalidateGrant(address)
+    await deps.directory.deleteGrantAddress(address)
+
+    return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
+}

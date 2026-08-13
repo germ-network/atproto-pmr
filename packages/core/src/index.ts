@@ -18,6 +18,7 @@ export type {
     BodyStore,
     ChallengeStore,
     Directory,
+    GrantSummary,
     Locator,
     MailboxKey,
     MessageId,
@@ -101,16 +102,24 @@ export {
 export {
     handleBlockSet,
     handleBlocksList,
+    handleGrantDelete,
+    handleGrantSet,
+    handleGrantsCreate,
+    handleGrantsList,
     handlePoolAdjudication,
     handlePoolList,
     handleRegistrationCreate,
     handleRegistrationDelete,
     handleRegistrationRead,
+    type GrantConfig,
     type OwnerDeps,
 } from "./owner/endpoints.js"
 
 // The pair-put endpoint.
 export { handlePairPut, type PairPutDeps } from "./pair-put"
+
+// The grant-put endpoint.
+export { handleGrantPut, type GrantPutDeps } from "./grant-put"
 
 // Sender authentication.
 export {
@@ -137,6 +146,13 @@ export {
 // Declaration resolution and content addressing.
 export { resolveDeclaration, type DeclarationResolution } from "./declaration"
 export { deriveMessageId } from "./message-id"
+
+// Grant address and put-tag derivation.
+export {
+    computeGrantPutTag,
+    deriveGrantAddress,
+    verifyGrantPutTag,
+} from "./grant"
 export {
     readBodyCapped,
     toResponseBody,

@@ -1,12 +1,29 @@
-import type {
-    Directory,
-    Locator,
-    PMRStore,
-    RegistrationFields,
-    ResolvedAddress,
+import {
+    base64URLToBinary,
+    binaryToBase64URL,
+    type Directory,
+    type Locator,
+    type PMRStore,
+    type RegistrationFields,
+    type ResolvedAddress,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
 import type { PMRObject } from "./pmr-object"
+
+/** Minimum TTL Cloudflare KV accepts, seconds. Below this it errors. */
+const MIN_KV_TTL_SECONDS = 60
+
+interface GrantAddressRow {
+    locator: string
+    /** Base64url — `KVNamespace` JSON values are not typed for raw bytes. */
+    authKey: string
+    closed?: boolean
+    expiresAt: number
+}
+
+function ttlFor(expiresAt: number): number {
+    return Math.max(MIN_KV_TTL_SECONDS, Math.floor(expiresAt - Date.now() / 1000))
+}
 
 /**
  * KV-backed directory. Global, small, read on every inbound request.
@@ -39,8 +56,54 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
     async resolveAddress(address: string): Promise<ResolvedAddress | null> {
         const raw = await this.env.addresses.get(address, "json")
         if (raw === null) return null
-        const row = raw as { locator: string; closed?: boolean }
-        return { locator: row.locator, closed: row.closed === true }
+        const row = raw as GrantAddressRow
+        return {
+            locator: row.locator,
+            closed: row.closed === true,
+            authKey: base64URLToBinary(row.authKey),
+        }
+    }
+
+    /**
+     * The global routing row a grant put resolves against. `expiresAt` is
+     * stored in the row AND drives the KV entry's own TTL: the TTL is what
+     * keeps an expired grant and one that never existed costing the same
+     * lookup once it lapses (CONSISTENCY CONTRACT (5), same as `closed`),
+     * and the stored copy is what lets `setGrantAddressClosed` re-apply the
+     * same TTL on an update rather than resetting or dropping it — Workers
+     * KV has no "read the current TTL back" call, only `expirationTtl` on
+     * write.
+     */
+    async createGrantAddress(
+        locator: Locator,
+        address: string,
+        authKey: Uint8Array,
+        expiresAt: number
+    ): Promise<void> {
+        const row: GrantAddressRow = {
+            locator,
+            authKey: binaryToBase64URL(authKey),
+            expiresAt,
+        }
+        await this.env.addresses.put(address, JSON.stringify(row), {
+            expirationTtl: ttlFor(expiresAt),
+        })
+    }
+
+    /** Rewrites the row with `closed` flipped, preserving its own TTL. */
+    async setGrantAddressClosed(address: string, closed: boolean): Promise<void> {
+        const raw = await this.env.addresses.get(address, "json")
+        if (raw === null) return
+        const row = raw as GrantAddressRow
+        await this.env.addresses.put(
+            address,
+            JSON.stringify({ ...row, closed } satisfies GrantAddressRow),
+            { expirationTtl: ttlFor(row.expiresAt) }
+        )
+    }
+
+    async deleteGrantAddress(address: string): Promise<void> {
+        await this.env.addresses.delete(address)
     }
 
     /** Idempotent on DID. */

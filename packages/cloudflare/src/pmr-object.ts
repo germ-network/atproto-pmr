@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers"
 import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
     type AppendResult,
+    type GrantSummary,
     type MailboxKey,
     type MessageId,
     type MessageRef,
@@ -43,6 +44,7 @@ const KEY_POOL_BYTES = "poolBytes"
  */
 const POOL_PREFIX = "pool:"
 const SYNTHETIC_PREFIX = "syn:"
+const GRANT_PREFIX = "grant:"
 
 const mailboxKey = (k: MailboxKey) => `mbox:${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
@@ -50,6 +52,13 @@ const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
+const grantKey = (address: string) => `${GRANT_PREFIX}${address}`
+
+interface GrantRow {
+    address: string
+    expiresAt: number
+    closed: boolean
+}
 
 /**
  * How many recently-accepted nonces a mailbox key remembers.
@@ -445,5 +454,46 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     async isDiscarded(key: MailboxKey, nowSeconds: number): Promise<boolean> {
         const until = await this.db.get<number>(discardKey(key))
         return until !== undefined && until > nowSeconds
+    }
+
+    // MARK: - Grants
+
+    /**
+     * The owner's own record of a grant they issued. `authKey` is
+     * deliberately not a parameter of what gets stored here — the
+     * Directory's routing row is the only place a put needs to find it,
+     * and this record exists to answer "is this address mine" and "what
+     * have I issued", neither of which needs the secret itself.
+     */
+    async issueGrant(
+        address: string,
+        _authKey: Uint8Array,
+        expiresAt: number
+    ): Promise<void> {
+        await this.db.put(grantKey(address), {
+            address,
+            expiresAt,
+            closed: false,
+        } satisfies GrantRow)
+    }
+
+    async listGrants(): Promise<GrantSummary[]> {
+        const entries = await this.db.list<GrantRow>({ prefix: GRANT_PREFIX })
+        return [...entries.values()]
+    }
+
+    async getGrant(address: string): Promise<GrantSummary | null> {
+        return (await this.db.get<GrantRow>(grantKey(address))) ?? null
+    }
+
+    /** A no-op if `address` was never issued by this owner. */
+    async setGrantClosed(address: string, closed: boolean): Promise<void> {
+        const row = await this.db.get<GrantRow>(grantKey(address))
+        if (row === undefined) return
+        await this.db.put(grantKey(address), { ...row, closed })
+    }
+
+    async invalidateGrant(address: string): Promise<void> {
+        await this.db.delete(grantKey(address))
     }
 }

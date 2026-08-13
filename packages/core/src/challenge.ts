@@ -20,15 +20,20 @@ import type { ChallengeStore } from "./storage.js"
  */
 
 /**
- * The two authorization realms, distinguished by **the key that signs**
+ * The three authorization realms, distinguished by **the key that signs**
  * rather than by separate endpoint families.
  *
- * An Atproto PMR implements exactly one — `anchor` — because push reaches
- * its users by delegation rather than by holding a push token. `registration`
- * exists so the type is complete and so a cross-realm challenge is
- * expressible (and therefore rejectable) rather than unrepresentable.
+ * An Atproto PMR implements `anchor` and `grantPut`. It does not implement
+ * `registration` — push reaches its users by delegation rather than by
+ * holding a push token — but the type stays complete so a cross-realm
+ * challenge is expressible (and therefore rejectable) rather than
+ * unrepresentable.
+ *
+ * `grantPut` is unlike the other two: it authenticates no identity, only
+ * possession of one grant's own `authKey` — `spec/wire-api.md`, "Grant
+ * address and put-tag derivation".
  */
-export type Realm = "anchor" | "registration"
+export type Realm = "anchor" | "grantPut" | "registration"
 
 /**
  * What a challenge authorizes. Bound **at mint**, which is what the client
@@ -84,7 +89,9 @@ export function decodeBinding(s: string): ChallengeBinding | null {
     const sep = s.indexOf(":")
     if (sep < 1) return null
     const realm = s.slice(0, sep)
-    if (realm !== "anchor" && realm !== "registration") return null
+    if (realm !== "anchor" && realm !== "grantPut" && realm !== "registration") {
+        return null
+    }
     return { realm, subject: s.slice(sep + 1) }
 }
 

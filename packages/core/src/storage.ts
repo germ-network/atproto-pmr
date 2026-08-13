@@ -153,6 +153,22 @@ export interface ResolvedAddress {
      * this as "answer `202` and store nothing", never "return early".
      */
     closed: boolean
+    /**
+     * The 32-byte symmetric key this grant was issued with — what a
+     * [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation)
+     * verifies against. Present even when `closed`, since a closed
+     * address's put still needs a comparably expensive verification step
+     * to run for the uniform-cost contract to hold; only a live, open,
+     * tag-verified put may actually store or deliver.
+     */
+    authKey: Uint8Array
+}
+
+/** One issued grant, as listed back to its owner. Never re-carries `key`. */
+export interface GrantSummary {
+    address: string
+    expiresAt: number
+    closed: boolean
 }
 
 /** Global, small, read on every inbound request. */
@@ -175,6 +191,33 @@ export interface Directory {
 
     /** Deregistration and dormancy eviction. */
     delete(did: string): Promise<void>
+
+    /**
+     * Writes the GLOBAL routing row a grant put resolves against. Always a
+     * fresh address the server just derived from a freshly generated
+     * `authKey`, so — unlike `setGrantAddressClosed`/`deleteGrantAddress`,
+     * below — this needs no ownership check first: nothing else could
+     * already be using it.
+     */
+    createGrantAddress(
+        locator: Locator,
+        address: string,
+        authKey: Uint8Array,
+        expiresAt: number
+    ): Promise<void>
+
+    /**
+     * Updates only the `closed` flag on the routing row.
+     *
+     * The CALLER is responsible for confirming the address belongs to the
+     * owner making the request — this method has no notion of ownership,
+     * only routing. See `PMRStore.setGrantClosed`, which is where that
+     * record — and therefore that check — actually lives.
+     */
+    setGrantAddressClosed(address: string, closed: boolean): Promise<void>
+
+    /** Removes the routing row entirely. Same ownership caveat as above. */
+    deleteGrantAddress(address: string): Promise<void>
 }
 
 /**
@@ -293,6 +336,37 @@ export interface PMRStore {
      * device's own knowledge is behind.
      */
     setDiscarded(key: MailboxKey, until: number): Promise<void>
+
+    /**
+     * The owner's own record of a grant they issued — `issue`, `close`,
+     * `reopen`, `invalidate` from `spec/storage-consistency.md` §Grants,
+     * split into the four operations below rather than one mutating call,
+     * matching the shape blocking and discard already use.
+     *
+     * This is the record `GET /pmr/v1/grants` lists from, and — just as
+     * important — what a `PATCH`/`DELETE` checks BEFORE touching the
+     * Directory's global routing row: an owner names an address by value,
+     * and this store is what confirms that address is actually theirs
+     * before anything routes on their say-so. `authKey` is not readable
+     * back through this interface; the owner already holds it from
+     * issuance, and re-serving a capability's key is a disclosure with no
+     * legitimate reader.
+     */
+    issueGrant(address: string, authKey: Uint8Array, expiresAt: number): Promise<void>
+
+    listGrants(): Promise<GrantSummary[]>
+
+    /** `null` if this address was never issued by this owner. */
+    getGrant(address: string): Promise<GrantSummary | null>
+
+    /**
+     * Reversible — the grant counterpart of block/unblock on a pair
+     * mailbox. A no-op if `address` is not this owner's.
+     */
+    setGrantClosed(address: string, closed: boolean): Promise<void>
+
+    /** Permanent, unlike `setGrantClosed`. A no-op if not this owner's. */
+    invalidateGrant(address: string): Promise<void>
 }
 
 /**
