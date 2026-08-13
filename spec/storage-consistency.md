@@ -56,7 +56,7 @@ exact signatures belong to an implementation.
 | `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
 | `create(did, registration) -> Locator` | idempotent on DID |
 | `delete(did)` | deregistration and dormancy eviction |
-| `dueForWork(kind, before, limit) -> [Locator]` | drives declaration watch and sweeps where alarms do not exist — see [Scheduling](#scheduling) |
+| `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not the declaration watch, which is push-driven — see [Scheduling](#scheduling) |
 
 ### Registration state
 
@@ -64,6 +64,16 @@ exact signatures belong to an implementation.
 the push grant this relay holds (if the deployment uses
 [push delegation](wire-api.md#push-delegation-optional)), policy
 configuration, a last-active timestamp, and record timestamps.
+
+Registration state is the same shape whatever the deployment serves — it
+is an identity and trusted-key record, not a mailbox one
+([`wire-api.md` §Registration](wire-api.md#registration)) — so a watch-only
+deployment stores registrations exactly as any other does. What it also
+holds is the **capability set this registration is served under**, and,
+where `grant` is served, that capability's
+[lifecycle state](wire-api.md#retirement): a drain ends per-registration,
+when that registration's last outstanding grant expires, so `draining`
+versus absent is not a deployment-wide fact and cannot be stored as one.
 
 The anchor key MUST be stored as a **self-describing `COSE_Key` blob, never
 a fixed-width column**, encoded per RFC 8949 §4.2.1, so that a new
@@ -224,18 +234,45 @@ implementation stay light: a relay that forwards what it fetched needs no
 CAR parser, no MST walk, and none of the libraries those imply. Parsing
 becomes defense in depth against a lying PDS, added deliberately.
 
+### Reclamation is a policy, not a job
+
+**Reclamation is the storage layer's business, driven by a policy this
+interface hands it — never work this interface schedules.** Every record
+that expires carries its own expiry: `putBody(id, bytes, expiresAt)`, a
+grant's expiry, a discard window. An adapter reclaims on that however suits
+its backend — a native TTL, a periodic sweep, or nothing at all.
+
+What makes delegating it safe is
+[contract item 4](#4-expiry-is-semantic-not-incidental): expiry is an
+observability rule enforced on *read*, so correctness never depends on when,
+or whether, reclamation runs.
+
 ### Scheduling
 
-`scheduleWork(at, kind)` / `cancelWork(kind)`. A backend with per-tenant
-alarms implements this directly; an adapter with no alarm equivalent
-implements it as cron plus the directory's `dueForWork` query. Both must
-exist in the interface, or an adopter on a relational backend has no way to
-run declaration watch.
+Given the above, less needs scheduling than it first appears — and an
+earlier draft of this section overstated it in both directions.
 
-What does not need scheduling: pool adjudication is triggered by threshold
-or by connect, the blocked-sender synthetic state is evaluated when a put
-arrives, and expiry is an observability rule rather than a sweep.
-Scheduling is for declaration watch and retention reclamation.
+**Not the declaration watch.** A watcher is push-driven off the atproto
+firehose, and that firehose lives in a separate always-on component outside
+the request-scoped runtime entirely
+([`wire-api.md` §Watch](wire-api.md#serving-watch-requires-a-component-the-other-capabilities-do-not)).
+It is not something this interface schedules, per DID or otherwise. A
+**watch-only deployment needs little of what follows.**
+
+**Not expiry**, per the section above. **Nor** pool adjudication, which is
+triggered by threshold or by connect; **nor** the blocked-sender synthetic
+state, which is evaluated when a put arrives and needs no sweep at all.
+
+What remains is work that must **enumerate** rather than wait on a timer —
+principally dormancy eviction, finding registrations quiet long enough to
+remove. `dueForWork(kind, before, limit)` covers that, and an adapter
+serving mailboxes needs it.
+
+`scheduleWork(at, kind)` / `cancelWork(kind)` are offered for a backend with
+per-tenant alarms, which can express the same thing without a scan. Neither
+form is mandated: nothing in the wire surface changes based on which an
+adapter picks, and an adapter whose backend reclaims on TTL and whose
+deployment does not evict for dormancy may need neither.
 
 ## The consistency contract
 

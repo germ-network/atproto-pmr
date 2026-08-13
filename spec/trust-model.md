@@ -239,7 +239,7 @@ self-hosted relay that is a strict improvement; against a hosted one it
 concentrates in one known party what was previously scattered. And **spot
 checks cost something**: a direct fetch tells the counterpart's PDS that
 you are checking, so verification traffic is itself a signal — hence
-sampled and rare, and hence multi-observer cross-checking, which costs
+sampled and rare, and hence multi-watcher cross-checking, which costs
 nothing at the counterpart's host, as the better default.
 
 **Policy note.** A mailbox policy resting on an aggregation (for example
@@ -277,23 +277,88 @@ client-side:
 - **Spot checks.** Key-bearing moments — first contact, an observed
   anchor-key change — may trigger an independent fetch. Sampled and rare,
   because a direct fetch is itself a signal to the counterpart's host.
-- **Multiple independent observers.** A device MAY register observation
-  with more than one relay and cross-check them; a split view is evidence
-  of misbehavior no single relay can suppress.
+- **Multiple independent watchers.** A device SHOULD register `watch` with
+  more than one relay and cross-check them; a split view is evidence of
+  misbehavior no single relay can suppress.
 
 That last one holds for **any** DID under watch, including the device's
 own: reading a declaration requires no authority over anyone, so a second,
 non-delegate relay can watch the same own-DID declaration and report back,
 catching a delegate that misrepresents what it sees. What does require the
 canonical-delegate relationship is unrelated to reading: it is being the
-relay a peer's mailbox put resolves to. Cross-checking observation and
-holding mailbox authority are independent, and only the second is
-restricted to one relay.
+relay a peer's mailbox put resolves to. Watching and holding mailbox
+authority are independent, and only the second is restricted to one relay.
 
-**Observation-only relays** follow directly: a deployment MAY serve
-observation alone, with no mailboxes and no delegation. An operator
-running one gives self-hosting users an independent verifier without
-becoming their mail host.
+**Watch-only relays** follow directly: a deployment MAY serve `watch`
+alone, with no mailboxes and no delegation. An operator running one gives
+self-hosting users an independent verifier without becoming their mail
+host.
+
+### Why more than one watcher is load-bearing
+
+Redundancy here is not a freshness nicety. It is the only defense against
+a failure the rest of this document's machinery cannot reach.
+
+Everything above reduces relay misbehavior to replay and withholding,
+because **forging a record requires the repo signing key**. But the PDS
+holds that key. Against a third-party relay CAR is a strong defense;
+against a user's own PDS it is no defense at all for that user's own
+records, because a malicious PDS signs a genuine commit containing an
+attacker's anchor key bound to that DID. It verifies. Nothing in the chain
+was violated — the repo really does say that, and the repo is what the PDS
+is authoritative for.
+
+Self-fetch does not close it either. A PDS can **equivocate by audience**:
+serve the honest record to the owner's device and the malicious one to
+peers. The owner sees all clear while peers establish sessions against the
+attacker's key. So what is needed is not a second look but *a look from
+where the peers stand* — an observer independent of the publisher, fetching
+as an ordinary peer would.
+
+One such observer detects uniform malice. **Disagreement between observers
+is what exposes audience-targeted equivocation**, which no single observer
+can see at all.
+
+The comparison key is the repo `rev`:
+
+| observation | reading |
+|---|---|
+| differing `rev` across watchers | ordinary skew — one is simply behind |
+| **same `rev`, different content** | alarm — someone is equivocating |
+| a `rev` that moved backwards | alarm — someone is replaying |
+
+This is detection, not prevention — the same posture as Certificate
+Transparency. A client's response to an alarm is
+[not yet specified](#not-yet-specified).
+
+### Choosing watchers is the client's job
+
+**A client MUST NOT rely on a watcher that hosts its own repo** for the
+own-DID surface. That deployment is precisely the party the redundancy
+exists to check, and its report of its own honesty is worth nothing.
+
+**A client MUST NOT accept a deployment's own claim of independence.** A
+deployment cannot attest to a relationship it is one half of, so whether a
+given deployment is an acceptable watcher *for a given DID* is decided
+client-side, from what the client already knows about where that DID's repo
+lives.
+
+Two things follow, and they matter for how deployments are configured:
+
+- The disqualification is **per-DID, not per-deployment**. A relay that
+  hosts one user's repo is a perfectly sound watcher for every other DID,
+  and for counterpart DIDs it is often the best-positioned watcher there
+  is. `watch` is not a capability some deployments are forbidden to serve.
+- Capabilities are therefore **freely combinable**. A deployment MAY
+  declare `watch` alongside any other capability; this specification places
+  no restriction on the combination, because the constraint it would be
+  trying to express is a property of the client's situation rather than of
+  the deployment.
+
+Comparing hosts rules out the accidental case — a client that ends up with
+its PDS as its only watcher — and not the adversarial one, where two
+nominally distinct deployments are the same party. That residual is
+accepted here.
 
 ## Trust asymmetries
 
@@ -383,9 +448,10 @@ relay cannot tell.
 
 - **Which flows get spot checks**, and how far behind a `rev` may be
   before a device refuses relayed state.
-- **Multi-observer mechanics** — how a device registers observation-only
-  relays, and what it does on a split view (warn, refuse, or prefer the
-  higher `rev`).
+- **Multi-watcher mechanics** — how a client learns its watcher set
+  (configured, defaulted, or discovered), how many watchers make the
+  redundancy real, whether a client with only one should be warned, and
+  what it does on a split view (warn, refuse, or prefer the higher `rev`).
 - **Quota and abuse limits as a denial-of-service surface against the
   owner.** The caps that bound an attacker also bound the owner.
 - **Nonce width and seen-set retention**, including what a device

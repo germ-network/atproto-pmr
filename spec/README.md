@@ -19,28 +19,50 @@ opaque bytes, and for nothing that determines a key.**
 An **Atproto PMR** is the variant bound to an atproto DID. The delegation
 is established by publishing a messaging identity key — the **anchor key**
 — in a declaration record in that DID's atproto repository. A relay holding
-a live delegation for a DID performs some or all of three functions:
+a live delegation for a DID serves some or all of four capabilities:
 
-1. **Operate incoming mailboxes** for that DID — DID-addressed *pair
-   mailboxes* for first contact and recovery, and opaque *grant-addressed
-   mailboxes* for steady-state traffic.
-2. **Relay messages outbound.** Not in this version; the device performs
-   its own puts.
-3. **Observe** atproto state on the user's behalf while their device is
-   offline, and report it in a form the device can authenticate for itself.
+| capability | what it is | how many a user may have |
+|---|---|---|
+| `pairMailbox` | the DID-addressed mailbox — first contact and recovery | **exactly one** |
+| `grant` | issuing and serving opaque grant-addressed mailboxes | **any number** |
+| `watch` | the declaration watch — reporting changes to a DID's declaration | **any number**, and more than one is the point |
+| `observation` | the rest of atproto state — profiles, the follow graph, appview reads | one, ideally at the PDS |
+
+Outbound relay is **not in this version**; the device performs its own
+puts. It is not a capability identifier, and nothing advertises it.
+
+A deployment declares its capabilities in its capability document
+(§[Capability document](wire-api.md#capability-document)), and MUST NOT
+serve the endpoints of a capability it does not declare.
 
 **Grant issuance is the core capability.** A relay is a grant issuer first:
 it vends opaque, unguessable mailbox addresses that name no sender. DID
 addressing is the entry path that runs ahead of them — first contact and
 re-contact arrive on the DID-addressed mailbox, the always-resolvable
 layer, and conversations then move onto grant addresses for steady state.
-DID addressing complements grants; it never replaces them, and a relay that
-implements function 1 MUST implement grant issuance.
+DID addressing complements grants; it never replaces them, and **a
+deployment serving `pairMailbox` MUST also serve `grant`**: a pair mailbox
+that cannot vend grants strands every conversation on the entry path
+forever.
 
-The functions are separable in one direction: a deployment MAY serve
-observation alone, with no mailboxes. A deployment that serves mailboxes
-declares which functions it offers in its capability document
-(§[Capability document](wire-api.md#capability-document)).
+The reverse does not hold, and that asymmetry is the useful one. **`grant`
+stands alone**, and so does `watch`. The three cardinalities above follow
+from how each is reached:
+
+- A **grant carries its own host**, and its address is derived under that
+  host (§[Grant address and put-tag derivation](wire-api.md#grant-address-and-put-tag-derivation)),
+  so a peer holding a grant needs nothing else to route to it. A user may
+  therefore hold grants from several relays at once, and a deployment may
+  serve nothing but grant mailboxes.
+- A **pair put is routed by resolving the recipient's DID**, and that
+  resolution yields one relay, so there is exactly one pair mailbox per
+  DID. It is also the only capability whose reachability depends on
+  something this specification does not define — see
+  [the discovery hop](#not-yet-specified).
+- A **watcher is chosen by the client**, not resolved, so a device may
+  register with several and cross-check them. That redundancy is
+  load-bearing rather than decorative: it is what detects a relay — or a
+  PDS — that equivocates ([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
 
 ## Where to start
 
@@ -146,6 +168,7 @@ is an index, not a substitute for the sections it links.
 | 11 | Relayed atproto repo records are exchanged as CAR — signed commit plus inclusion proof — never as JSON | [trust](trust-model.md#p2--relayed-repo-records-are-car) |
 | 12 | The seven items of the storage consistency contract hold, whatever the backend | [storage](storage-consistency.md#the-consistency-contract) |
 | 13 | The relay's verification verdict is delivered to the device as a hint and never as evidence; the device re-verifies | [trust](trust-model.md#p8--the-relays-verdict-is-a-hint) |
+| 14 | A deployment declares its capabilities in the capability document and does not serve the endpoints of one it has not declared; a deployment serving `pairMailbox` also serves `grant` | [wire](wire-api.md#capabilities-cardinality-and-lifecycle) |
 
 Items 2 and 9 are not self-certifying. Both are timing properties, and an
 implementation that satisfies them in code can lose them to an early
@@ -156,19 +179,19 @@ asserting them.
 
 Each document carries its own "Not yet specified" section:
 
-- [`wire-api.md`](wire-api.md#not-yet-specified) — observation stream
-  framing, owner-facing error bodies, quota disclosure headers, COSE header
-  labels, version negotiation, batch shapes, nonce mechanics, custom header
-  field naming, content-address algorithm identifiers, the grant address
-  derivation, and concrete body schemas. The last two block a second
-  implementation from interoperating today; the rest are edges where
-  divergence is survivable.
+- [`wire-api.md`](wire-api.md#not-yet-specified) — owner-facing error
+  bodies, quota disclosure headers, COSE header labels, version
+  negotiation, batch shapes, nonce mechanics, custom header field naming,
+  content-address algorithm identifiers, the change digest's shape, and
+  concrete body schemas. Body schemas block a second implementation from
+  interoperating today; the rest are edges where divergence is survivable.
 - [`storage-consistency.md`](storage-consistency.md#not-yet-specified) —
   the blob interface, the observation cache's place in the interface, the
   recovery pool's cross-sender cap, stored-shape versioning.
 - [`trust-model.md`](trust-model.md#not-yet-specified) — which flows get
-  spot checks, `rev` staleness tolerance, multi-observer mechanics, quota
-  exhaustion as a denial-of-service surface against the owner.
+  spot checks, `rev` staleness tolerance, how a client learns its watcher
+  set and what it does on a split view, quota exhaustion as a
+  denial-of-service surface against the owner.
 
 Expect a future version to settle these. An implementation that needs one
 today should treat its choice as local and be prepared to change it.
