@@ -39,8 +39,24 @@ export interface PoolLimits {
     discardWindowSeconds: number
 }
 
-/** Which of the three functions this deployment serves. */
-export type ServedFunction = "mailboxes" | "observation"
+/**
+ * The four capabilities a deployment may serve — `spec/wire-api.md`,
+ * "Capabilities, cardinality, and lifecycle". A deployment MUST NOT serve
+ * the endpoints of one it does not declare here.
+ */
+export type ServedFunction =
+    | "pairMailbox"
+    | "grant"
+    | "watch"
+    | "observation"
+
+/**
+ * `grant` is the only capability that drains, because it is the only one
+ * that has vended live commitments to third parties: peers hold addresses
+ * they will keep putting to. `draining` stops vending and keeps serving
+ * until the last outstanding grant expires.
+ */
+export type GrantLifecycle = "active" | "draining" | "absent"
 
 export interface PMRConfig {
     /**
@@ -51,6 +67,13 @@ export interface PMRConfig {
     limits: PMRLimits
     pool: PoolLimits
     functions: readonly ServedFunction[]
+    /**
+     * Deployment-wide policy. The state a given client observes may differ:
+     * a drain ends per-registration, when *that* registration's last grant
+     * expires, so two clients of a draining deployment can legitimately see
+     * `draining` and `absent` at the same moment.
+     */
+    grantLifecycle: GrantLifecycle
     /**
      * Bumped whenever a published limit changes, so a client can cache on
      * it. Date-stamped rather than counted, by convention.
@@ -71,6 +94,8 @@ export interface CapabilityDocument {
     versions: readonly string[]
     encodings: readonly string[]
     functions: readonly string[]
+    /** Omitted entirely when `grant` is not among `functions`. */
+    grantLifecycle?: GrantLifecycle
     limits: Record<string, number>
 }
 
@@ -88,6 +113,12 @@ export function buildCapabilityDocument(config: PMRConfig): CapabilityDocument {
         versions: SUPPORTED_API_VERSIONS,
         encodings: SUPPORTED_ENCODINGS,
         functions: config.functions,
+        // Meaningless without the capability it describes, so it is absent
+        // rather than reported as "absent" — a client reading a document
+        // with no `grant` in `functions` has already been told.
+        ...(config.functions.includes("grant")
+            ? { grantLifecycle: config.grantLifecycle }
+            : {}),
         limits: {
             messageMaxBytes: config.limits.messageMaxBytes,
             messageExpiry: config.limits.messageExpirySeconds,

@@ -39,4 +39,18 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     POOL_CAP_BYTES: string
     POOL_DEPTH_PER_SENDER: string
     POOL_DEPTH_UNDER_PRESSURE: string
+
+    /**
+     * Comma-separated capability identifiers this deployment serves, from
+     * `pairMailbox`, `grant`, `watch`, `observation`. Read here so the
+     * events socket can report them; a deployment MUST also refuse the
+     * endpoints of anything absent from this list.
+     */
+    CAPABILITIES: string
+
+    /**
+     * `active`, `draining`, or `absent` — deployment-wide policy for the
+     * `grant` capability. Ignored when `grant` is not in `CAPABILITIES`.
+     */
+    GRANT_LIFECYCLE: string
 }

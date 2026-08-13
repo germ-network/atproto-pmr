@@ -8,10 +8,12 @@ import {
     decodeAckFrame,
     decodeFrame,
     drainBacklog,
+    encodeCapabilitiesFrame,
+    encodeCaughtUpFrame,
     encodeDeliveryFrame,
-    encodeDrainedFrame,
     encodePoolFrame,
     handleAckFrame,
+    type EffectiveCapabilities,
     type EventsDeps,
 } from "../src/events"
 import type {
@@ -50,12 +52,30 @@ describe("frame encode/decode", () => {
         expect(decoded.body.get("kt")).toBe("abcd")
     })
 
-    it("the pool and drained frames carry empty bodies", () => {
+    it("the pool and caughtUp frames carry empty bodies", () => {
         expect(decodeFrame(encodePoolFrame())).toEqual({ type: "pool", body: new Map() })
-        expect(decodeFrame(encodeDrainedFrame())).toEqual({
-            type: "drained",
+        expect(decodeFrame(encodeCaughtUpFrame())).toEqual({
+            type: "caughtUp",
             body: new Map(),
         })
+    })
+
+    it("a capabilities frame round-trips all four states", () => {
+        const decoded = decodeFrame(
+            encodeCapabilitiesFrame({
+                pairMailbox: "absent",
+                grant: "draining",
+                watch: "active",
+                observation: "absent",
+            })
+        )
+        expect(decoded.type).toBe("capabilities")
+        // By key, not by entry order: deterministic CBOR sorts map keys, so
+        // the decoded order is the encoding's business rather than ours.
+        expect(decoded.body.get("pm")).toBe("absent")
+        expect(decoded.body.get("gr")).toBe("draining")
+        expect(decoded.body.get("wt")).toBe("active")
+        expect(decoded.body.get("ob")).toBe("absent")
     })
 
     it("is two concatenated top-level canonical CBOR values, not one wrapped structure", () => {
@@ -166,12 +186,26 @@ function world() {
     return { mailboxes, bodies, pool, removed, store, bodyStore }
 }
 
+const ALL_ACTIVE: EffectiveCapabilities = {
+    pairMailbox: "active",
+    grant: "active",
+    watch: "active",
+    observation: "active",
+}
+
 function deps(w: ReturnType<typeof world>): EventsDeps {
     return { store: w.store, bodies: w.bodyStore }
 }
 
+/** Frame types after the leading `#capabilities`, which every drain sends. */
+function typesAfterCapabilities(frames: Uint8Array[]): string[] {
+    const types = frames.map((f) => decodeFrame(f).type)
+    expect(types[0]).toBe("capabilities")
+    return types.slice(1)
+}
+
 describe("drainBacklog", () => {
-    it("delivers everything queued, across mailboxes, then drained — no pool", async () => {
+    it("delivers everything queued, across mailboxes, then caughtUp — no pool", async () => {
         const w = world()
         w.mailboxes.set("did:plc:alice", [ref("m1")])
         w.mailboxes.set("grant-addr", [ref("m2")])
@@ -179,32 +213,57 @@ describe("drainBacklog", () => {
         w.bodies.set("m2", new TextEncoder().encode("two"))
 
         const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), (f) => frames.push(f))
+        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))
 
         const decoded = frames.map(decodeFrame)
         expect(decoded.filter((d) => d.type === "delivery")).toHaveLength(2)
         expect(decoded.filter((d) => d.type === "pool")).toHaveLength(0)
-        expect(decoded[decoded.length - 1].type).toBe("drained")
+        expect(decoded[decoded.length - 1].type).toBe("caughtUp")
     })
 
-    it("sends the pool notice as the LAST frame before drained, only when the pool is non-empty", async () => {
+    it("sends the pool notice as the LAST frame before caughtUp, only when the pool is non-empty", async () => {
         const w = world()
         w.mailboxes.set("did:plc:alice", [ref("m1")])
         w.bodies.set("m1", new Uint8Array([1]))
         w.pool.push({ did: "did:plc:stranger", count: 1 })
 
         const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), (f) => frames.push(f))
-        const types = frames.map((f) => decodeFrame(f).type)
+        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))
 
-        expect(types).toEqual(["delivery", "pool", "drained"])
+        expect(typesAfterCapabilities(frames)).toEqual([
+            "delivery",
+            "pool",
+            "caughtUp",
+        ])
     })
 
-    it("always sends drained, even with nothing queued and no pool", async () => {
+    it("always sends caughtUp, even with nothing queued and no pool", async () => {
         const w = world()
         const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), (f) => frames.push(f))
-        expect(frames.map((f) => decodeFrame(f).type)).toEqual(["drained"])
+        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))
+        expect(typesAfterCapabilities(frames)).toEqual(["caughtUp"])
+    })
+
+    it("leads with capabilities, before any delivery", async () => {
+        // A client that does not yet know the deployment serves no pair
+        // mailboxes cannot tell "none queued" from "not offered".
+        const w = world()
+        w.mailboxes.set("did:plc:alice", [ref("m1")])
+        w.bodies.set("m1", new Uint8Array([1]))
+
+        const frames: Uint8Array[] = []
+        await drainBacklog(
+            deps(w),
+            { ...ALL_ACTIVE, pairMailbox: "absent", grant: "draining" },
+            (f) => frames.push(f)
+        )
+
+        const first = decodeFrame(frames[0])
+        expect(first.type).toBe("capabilities")
+        expect(first.body.get("pm")).toBe("absent")
+        expect(first.body.get("gr")).toBe("draining")
+        expect(first.body.get("wt")).toBe("active")
+        expect(first.body.get("ob")).toBe("active")
     })
 
     it("skips a ref whose body is missing rather than failing the whole drain", async () => {
@@ -213,7 +272,7 @@ describe("drainBacklog", () => {
         w.bodies.set("m2", new Uint8Array([2])) // m1's body is missing
 
         const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), (f) => frames.push(f))
+        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))
         const decoded = frames.map(decodeFrame)
         const delivered = decoded.filter((d) => d.type === "delivery")
         expect(delivered).toHaveLength(1)
@@ -227,7 +286,7 @@ describe("drainBacklog", () => {
             w.bodies.set(`msg${i}`, new Uint8Array([i]))
         }
         const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), (f) => frames.push(f), 2)
+        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f), 2)
         const delivered = frames.map(decodeFrame).filter((d) => d.type === "delivery")
         expect(delivered).toHaveLength(5)
     })

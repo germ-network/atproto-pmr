@@ -49,6 +49,7 @@ export {
     SUPPORTED_API_VERSIONS,
     SUPPORTED_ENCODINGS,
     type CapabilityDocument,
+    type GrantLifecycle,
     type PMRConfig,
     type PMRLimits,
     type PoolLimits,
@@ -128,12 +129,14 @@ export {
     decodeAckFrame,
     decodeFrame,
     drainBacklog,
+    encodeCapabilitiesFrame,
+    encodeCaughtUpFrame,
     encodeDeliveryFrame,
-    encodeDrainedFrame,
     encodePoolFrame,
     handleAckFrame,
     type AckPayload,
     type DecodedFrame,
+    type EffectiveCapabilities,
     type EventsDeps,
 } from "./events"
 

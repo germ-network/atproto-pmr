@@ -1,7 +1,7 @@
 /**
  * The events socket end to end: hibernation accept, backlog drain on
  * connect, ack over the socket, and the "pool notice is the last frame
- * before drained, only if non-empty" ordering property.
+ * before caughtUp, only if non-empty" ordering property.
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
@@ -24,7 +24,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
     return testEnv.pmrs.get(id)
 }
 
-/** Opens the socket and collects frames until (and including) `#drained`. */
+/** Opens the socket and collects frames until (and including) `#caughtUp`. */
 async function connectAndDrain(
     stub: DurableObjectStub<PMRObject>
 ): Promise<{ ws: WebSocket; frames: DecodedFrame[] }> {
@@ -50,11 +50,40 @@ async function connectAndDrain(
                     : new Uint8Array(data as ArrayBuffer)
             const frame = decodeFrame(bytes)
             frames.push(frame)
-            if (frame.type === "drained") resolve()
+            if (frame.type === "caughtUp") resolve()
         })
         ws.addEventListener("error", (e) => reject(e))
     })
     return { ws, frames }
+}
+
+/** Frame types after the leading `#capabilities`, which every drain sends. */
+function typesAfterCapabilities(frames: DecodedFrame[]): string[] {
+    expect(frames[0].type).toBe("capabilities")
+    return frames.slice(1).map((f) => f.type)
+}
+
+/**
+ * Connect and return just the leading `#capabilities` frame, optionally
+ * with env vars overridden on the live instance first.
+ *
+ * The override replaces the instance's `env` rather than mutating it —
+ * `env` is shared, and mutating it would leak into every later test. Same
+ * reach-in idiom as `withSyntheticBehavior`, and contained here for the
+ * same reason.
+ */
+async function drainOnce(
+    stub: DurableObjectStub<PMRObject>,
+    envOverride?: Record<string, string>
+): Promise<DecodedFrame> {
+    if (envOverride !== undefined) {
+        await inPMR(stub, (pmr) => {
+            const held = pmr as unknown as { env: PMREnv }
+            held.env = { ...held.env, ...envOverride }
+        })
+    }
+    const { frames } = await connectAndDrain(stub)
+    return frames[0]
 }
 
 function ackFrame(key: string, messageId: string): Uint8Array {
@@ -68,7 +97,7 @@ function ackFrame(key: string, messageId: string): Uint8Array {
 }
 
 describe("connect and drain", () => {
-    it("delivers everything queued across mailbox kinds, then drained, no pool", async () => {
+    it("delivers everything queued across mailbox kinds, then caughtUp, no pool", async () => {
         const stub = freshStub()
         await inPMR(stub, (pmr) =>
             pmr.append("did:plc:alice", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]), 0)
@@ -91,16 +120,16 @@ describe("connect and drain", () => {
             "world"
         )
         expect(frames.filter((f) => f.type === "pool")).toHaveLength(0)
-        expect(frames[frames.length - 1].type).toBe("drained")
+        expect(frames[frames.length - 1].type).toBe("caughtUp")
     })
 
-    it("sends drained immediately when there is nothing queued", async () => {
+    it("sends caughtUp immediately when there is nothing queued", async () => {
         const stub = freshStub()
         const { frames } = await connectAndDrain(stub)
-        expect(frames.map((f) => f.type)).toEqual(["drained"])
+        expect(typesAfterCapabilities(frames)).toEqual(["caughtUp"])
     })
 
-    it("the pool notice rides out as the LAST frame before drained", async () => {
+    it("the pool notice rides out as the LAST frame before caughtUp", async () => {
         const stub = freshStub()
         await inPMR(stub, (pmr) =>
             pmr.append("did:plc:alice", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]), 0)
@@ -111,7 +140,48 @@ describe("connect and drain", () => {
         )
 
         const { frames } = await connectAndDrain(stub)
-        expect(frames.map((f) => f.type)).toEqual(["delivery", "pool", "drained"])
+        expect(typesAfterCapabilities(frames)).toEqual(["delivery", "pool", "caughtUp"])
+    })
+})
+
+describe("the capabilities frame", () => {
+    it("reports what the deployment declares", async () => {
+        const stub = freshStub()
+        const { frames } = await connectAndDrain(stub)
+        const c = frames[0]
+        expect(c.type).toBe("capabilities")
+        // wrangler.test.toml declares all four, grant active.
+        expect(c.body.get("pm")).toBe("active")
+        expect(c.body.get("gr")).toBe("active")
+        expect(c.body.get("wt")).toBe("active")
+        expect(c.body.get("ob")).toBe("active")
+    })
+
+    it("reports a drain as absent once this registration holds no live grant", async () => {
+        // The per-registration refinement: deployment-wide policy says
+        // draining, but a drain ends per-user, so a client with nothing
+        // outstanding is told absent rather than left waiting on a state
+        // that will never change for them.
+        const stub = freshStub()
+
+        const before = await drainOnce(stub, { GRANT_LIFECYCLE: "draining" })
+        expect(before.body.get("gr")).toBe("absent")
+
+        const future = Math.floor(Date.now() / 1000) + 3600
+        await inPMR(stub, (pmr) =>
+            pmr.issueGrant("addr-live", new Uint8Array(32), future)
+        )
+        const after = await drainOnce(stub, { GRANT_LIFECYCLE: "draining" })
+        expect(after.body.get("gr")).toBe("draining")
+    })
+
+    it("an expired grant does not hold a drain open", async () => {
+        const stub = freshStub()
+        const past = Math.floor(Date.now() / 1000) - 1
+        await inPMR(stub, (pmr) =>
+            pmr.issueGrant("addr-expired", new Uint8Array(32), past)
+        )
+        expect((await drainOnce(stub, { GRANT_LIFECYCLE: "draining" })).body.get("gr")).toBe("absent")
     })
 })
 
@@ -141,7 +211,7 @@ describe("ack over the socket", () => {
 
         // The connection is still alive and usable afterward.
         const second = await connectAndDrain(stub)
-        expect(second.frames.map((f) => f.type)).toEqual(["drained"])
+        expect(typesAfterCapabilities(second.frames)).toEqual(["caughtUp"])
     })
 })
 
@@ -152,7 +222,7 @@ describe("malformed inbound frames", () => {
         ws.send(new Uint8Array([0xff, 0xff, 0xff, 0xff]))
 
         const second = await connectAndDrain(stub)
-        expect(second.frames.map((f) => f.type)).toEqual(["drained"])
+        expect(typesAfterCapabilities(second.frames)).toEqual(["caughtUp"])
     })
 
     it("a text frame is ignored rather than throwing", async () => {
@@ -161,7 +231,7 @@ describe("malformed inbound frames", () => {
         ws.send("not a binary frame")
 
         const second = await connectAndDrain(stub)
-        expect(second.frames.map((f) => f.type)).toEqual(["drained"])
+        expect(typesAfterCapabilities(second.frames)).toEqual(["caughtUp"])
     })
 })
 

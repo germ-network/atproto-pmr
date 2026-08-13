@@ -4,6 +4,8 @@ import {
     drainBacklog,
     handleAckFrame,
     type AppendResult,
+    type EffectiveCapabilities,
+    type GrantLifecycle,
     type GrantSummary,
     type MailboxKey,
     type MailboxSnapshot,
@@ -103,6 +105,41 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return parseInt(this.env.MAX_MESSAGES_PER_PAIR_SENDER)
     }
 
+    /**
+     * What this deployment serves **for this registration**.
+     *
+     * The deployment-wide part comes from config; the one per-registration
+     * refinement is the `grant` drain, which ends when *this* registration's
+     * last grant expires rather than on a deployment-wide schedule. A
+     * deployment can therefore be `draining` while a client that holds no
+     * live grants is correctly told `absent`.
+     */
+    private async effectiveCapabilities(): Promise<EffectiveCapabilities> {
+        const declared = new Set(
+            this.env.CAPABILITIES.split(",").map((s) => s.trim()).filter(Boolean)
+        )
+        const on = (c: string): "active" | "absent" =>
+            declared.has(c) ? "active" : "absent"
+
+        let grant: GrantLifecycle = declared.has("grant")
+            ? (this.env.GRANT_LIFECYCLE as GrantLifecycle)
+            : "absent"
+        if (grant === "draining") {
+            const nowSeconds = Math.floor(Date.now() / 1000)
+            const live = (await this.listGrants()).some(
+                (g) => g.expiresAt > nowSeconds
+            )
+            if (!live) grant = "absent"
+        }
+
+        return {
+            pairMailbox: on("pairMailbox"),
+            grant,
+            watch: on("watch"),
+            observation: on("observation"),
+        }
+    }
+
     // MARK: - The events socket
 
     /**
@@ -132,14 +169,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const [client, server] = Object.values(new WebSocketPair())
         this.ctx.acceptWebSocket(server)
 
+        const capabilities = await this.effectiveCapabilities()
+
         // Deferred past the 101 response, matching this codebase's
         // "respond first, defer the rest" discipline elsewhere: the client
         // is connected the instant the handshake completes, with backlog
         // frames streaming in shortly after, rather than waiting for the
         // whole backlog to be computed before the socket even opens.
         this.ctx.waitUntil(
-            drainBacklog({ store: this, bodies: kvBodyStore(this.env) }, (frame) =>
-                server.send(frame)
+            drainBacklog(
+                { store: this, bodies: kvBodyStore(this.env) },
+                capabilities,
+                (frame) => server.send(frame)
             )
         )
 
