@@ -476,17 +476,20 @@ export async function handleGrantsCreate(
         const address = deriveGrantAddress(authKey, deps.hostName)
         const addressString = binaryToBase64URL(address)
 
-        // Two writes, same shape as registration's directory.create +
-        // store.update: the global routing row a put resolves against, and
-        // the owner's own record — the one `PATCH`/`DELETE` checks against
-        // before trusting an address the request merely NAMES.
+        // Owner record first, then the routing row — the opposite of
+        // registration's directory.create + store.update. Order decides
+        // the partial-failure state: this way leaves a grant that is
+        // listed and deletable but routes nothing, where the reverse
+        // leaves one puts reach while `getGrant` returns null, so
+        // `PATCH`/`DELETE` answer 404 and it cannot be revoked before it
+        // expires.
+        await a.auth.store.issueGrant(addressString, authKey, expiresAt)
         await deps.directory.createGrantAddress(
             a.auth.locator,
             addressString,
             authKey,
             expiresAt
         )
-        await a.auth.store.issueGrant(addressString, authKey, expiresAt)
 
         issued.push(
             new Map<string, CoseValue>([

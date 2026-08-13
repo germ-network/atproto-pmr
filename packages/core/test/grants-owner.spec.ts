@@ -57,6 +57,9 @@ interface AddressRow {
     closed: boolean
 }
 
+/** Set by the write-order test to make the routing write fail. */
+let failRoutingWrite = false
+
 function world() {
     const registrations = new Map<string, RegistrationFields>()
     const addressRows = new Map<string, AddressRow>()
@@ -80,6 +83,7 @@ function world() {
             registrations.delete(did)
         },
         async createGrantAddress(locator, address, authKey, _expiresAt) {
+            if (failRoutingWrite) throw new Error("routing write failed")
             addressRows.set(address, { locator, authKey, closed: false })
         },
         async setGrantAddressClosed(address, closed) {
@@ -302,6 +306,61 @@ async function issueOneGrant(
     const grants = map.get("grants") as Map<string, CoseValue>[]
     return grants[0].get("address") as string
 }
+
+describe("issuance write order fails toward the inert half", () => {
+    it("a failed routing write leaves a grant that is revocable, not one that is live-but-unrevocable", async () => {
+        // The owner record MUST be written first. Reversed, a failure here
+        // would leave a routing row puts land on while `getGrant` returns
+        // null — so PATCH/DELETE answer 404 and the owner cannot revoke it
+        // until its own expiry lapses.
+        const w = world()
+        const did = "did:plc:owner0000000000000006"
+        const secretKey = await registeredOwner(w, did)
+
+        failRoutingWrite = true
+        try {
+            await expect(
+                handleGrantsCreate(
+                    signedRequest(
+                        GRANTS_URL,
+                        "POST",
+                        secretKey,
+                        await challengeFor(w, did),
+                        encodeCose(new Map<string, CoseValue>([["count", 1]]))
+                    ),
+                    deps(w)
+                )
+            ).rejects.toThrow("routing write failed")
+        } finally {
+            failRoutingWrite = false
+        }
+
+        // Nothing routes — a put cannot reach it.
+        expect(w.addressRows.size).toBe(0)
+
+        // But the owner can see it and delete it: the failure is inert.
+        const list = await handleGrantsList(
+            signedRequest(GRANTS_URL, "GET", secretKey, await challengeFor(w, did)),
+            deps(w)
+        )
+        const listed = decodeCoseMap(new Uint8Array(await list.arrayBuffer()))
+        const grants = listed.get("grants") as Map<string, CoseValue>[]
+        expect(grants).toHaveLength(1)
+        const orphan = grants[0].get("address") as string
+
+        const deleted = await handleGrantDelete(
+            signedRequest(
+                `${ORIGIN}/pmr/v1/grants/${orphan}`,
+                "DELETE",
+                secretKey,
+                await challengeFor(w, did)
+            ),
+            orphan,
+            deps(w)
+        )
+        expect(deleted.status).toBe(204)
+    })
+})
 
 describe("PATCH /pmr/v1/grants/{address} — close/reopen", () => {
     it("closes and reopens, reflected in both the owner's list and global resolution", async () => {
