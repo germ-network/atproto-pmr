@@ -1,5 +1,6 @@
 import type { ChallengeStore } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
+import type { PMRObject } from "./pmr-object"
 
 /**
  * KV-backed challenge store.
@@ -22,7 +23,9 @@ import type { PMREnv } from "./env"
  * consistency item 4: a record past `expiresAt` is never returned by a
  * read, because it is gone.
  */
-export function kvChallengeStore(env: PMREnv): ChallengeStore {
+export function kvChallengeStore<TPMR extends PMRObject>(
+    env: PMREnv<TPMR>
+): ChallengeStore {
     return {
         async mint(challenge, boundTo, expiresAt) {
             // KV's minimum is 60s; a shorter TTL would be silently rejected.
