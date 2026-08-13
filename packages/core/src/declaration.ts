@@ -192,7 +192,16 @@ async function guardedFetchJSON(
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
-        const response = await fetchImpl(url, { signal: controller.signal })
+        const response = await fetchImpl(url, {
+            signal: controller.signal,
+            // Redirects are REFUSED, not followed — `@atproto/identity` does
+            // the same, and without it the https check above is decorative:
+            // it validates the URL we chose, and a `302` would take us
+            // somewhere it never runs again. That is the whole SSRF hole
+            // reopened by a redirect an attacker's PDS controls.
+            redirect: "error",
+            headers: { accept: "application/did+ld+json,application/json" },
+        })
         if (!response.ok) {
             throw new Error(`endpoint answered ${response.status}`)
         }
@@ -280,8 +289,22 @@ export async function resolveDeclaration(
 
 /**
  * DID -> DID document -> PDS. Supports did:plc (via the PLC directory) and
- * did:web (document at the well-known path) — the two DID methods atproto
- * uses.
+ * did:web — the two DID methods atproto uses.
+ *
+ * ## Deliberately a narrow reimplementation of `@atproto/identity`
+ *
+ * Not an invention: the rules below were read off that package and are
+ * meant to match it exactly. It is reimplemented rather than imported
+ * because importing costs ~13 MB across 16 packages (zod alone is 5 MB)
+ * for what amounts to forty lines — and this package's whole claim is that
+ * it carries no platform assumptions and stays light enough for an adopter
+ * on any backend.
+ *
+ * **That trade only holds while this matches.** Every divergence found in
+ * review was a bug on our side, and one of them (following redirects) was
+ * a security hole. If this drifts, or if a later feature makes
+ * `@atproto/crypto` a dependency anyway — CAR verification for observation
+ * would — reconsider importing rather than widening this.
  */
 async function resolvePDSEndpoint(
     did: string,
@@ -289,41 +312,97 @@ async function resolvePDSEndpoint(
 ): Promise<string> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
-        doc = await guardedFetchJSON(`https://plc.directory/${did}`, fetchImpl)
-    } else if (did.startsWith("did:web:")) {
-        const hostname = did.slice("did:web:".length).replace(/:/g, "/")
         doc = await guardedFetchJSON(
-            `https://${hostname}/.well-known/did.json`,
+            `https://plc.directory/${encodeURIComponent(did)}`,
             fetchImpl
         )
+    } else if (did.startsWith("did:web:")) {
+        doc = await guardedFetchJSON(didWebDocumentURL(did), fetchImpl)
     } else {
         throw new Error(`unsupported DID method: ${did}`)
     }
 
-    const service = extractPDSService(doc)
+    // The document must claim the DID we asked for. Cheap, and it closes
+    // the case where a directory hands back someone else's document: the
+    // endpoint from it would then be used to fetch *this* DID's
+    // declaration, and therefore its anchor key, from a host of the
+    // wrong party's choosing.
+    if (
+        typeof doc !== "object" ||
+        doc === null ||
+        (doc as { id?: unknown }).id !== did
+    ) {
+        throw new Error("DID document does not match the requested DID")
+    }
+
+    const service = extractPDSService(doc as Record<string, unknown>)
     if (service === null) {
-        throw new Error("DID document has no AtprotoPersonalDataServer service")
+        throw new Error("DID document has no #atproto_pds service")
     }
     return service
 }
 
-function extractPDSService(doc: unknown): string | null {
-    if (typeof doc !== "object" || doc === null || !("service" in doc)) {
-        return null
+/**
+ * `did:web:example.com` -> `https://example.com/.well-known/did.json`.
+ *
+ * Two rules that are easy to get wrong, both taken from
+ * `@atproto/identity`:
+ *
+ *   - Each colon-separated part is **percent-decoded**, so
+ *     `did:web:example.com%3A3000` resolves to host `example.com:3000`
+ *     rather than a nonsense hostname containing a literal `%3A`.
+ *   - A **path-form** did:web (more than one part) is REFUSED. The did:web
+ *     method would put that document at `/user/alice/did.json`, not under
+ *     `/.well-known/`, and atproto does not support the form at all.
+ *     Guessing either way means fetching the wrong URL, so this refuses
+ *     rather than resolve a DID differently from the rest of the network.
+ */
+function didWebDocumentURL(did: string): string {
+    const parts = did.slice("did:web:".length).split(":").map(decodeURIComponent)
+    if (parts.length !== 1 || parts[0].length === 0) {
+        throw new Error(`unsupported did:web form: ${did}`)
     }
-    const services = (doc as { service?: unknown }).service
+    return `https://${parts[0]}/.well-known/did.json`
+}
+
+/**
+ * The PDS service entry, selected **by id first** — `#atproto_pds`, either
+ * bare or absolute (`did:plc:xyz#atproto_pds`) — and only then confirmed by
+ * type.
+ *
+ * Matching on type alone, as an earlier version did, is an interop bug with
+ * teeth: a document whose `#atproto_pds` entry and its
+ * `AtprotoPersonalDataServer`-typed entry disagree would resolve to a
+ * different host here than in every other atproto implementation. Since the
+ * declaration — and so the anchor key — is fetched from whatever this
+ * returns, disagreeing about the endpoint is disagreeing about identity.
+ */
+function extractPDSService(doc: Record<string, unknown>): string | null {
+    const services = doc.service
     if (!Array.isArray(services)) return null
+
+    const docId = typeof doc.id === "string" ? doc.id : ""
     for (const entry of services) {
-        if (
-            typeof entry === "object" &&
-            entry !== null &&
-            (entry as { type?: unknown }).type ===
-                "AtprotoPersonalDataServer" &&
-            typeof (entry as { serviceEndpoint?: unknown }).serviceEndpoint ===
-                "string"
-        ) {
-            return (entry as { serviceEndpoint: string }).serviceEndpoint
+        if (typeof entry !== "object" || entry === null) continue
+        const { id, type, serviceEndpoint } = entry as {
+            id?: unknown
+            type?: unknown
+            serviceEndpoint?: unknown
         }
+        if (typeof id !== "string") continue
+        if (id !== "#atproto_pds" && id !== `${docId}#atproto_pds`) continue
+        if (type !== "AtprotoPersonalDataServer") return null
+        if (typeof serviceEndpoint !== "string") return null
+        // The endpoint is attacker-supplied; `guardedFetchJSON` re-checks
+        // the scheme on the URL actually fetched, but rejecting a
+        // non-http(s) endpoint here keeps the failure legible.
+        if (
+            !serviceEndpoint.startsWith("https://") &&
+            !serviceEndpoint.startsWith("http://")
+        ) {
+            return null
+        }
+        return serviceEndpoint
     }
     return null
 }

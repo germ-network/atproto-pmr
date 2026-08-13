@@ -40,9 +40,14 @@ function jsonResponse(body: unknown, status = 200): Response {
     })
 }
 
-function plcDocument(pdsUrl: string): unknown {
+/**
+ * `id` is a parameter because a DID document must claim the DID it was
+ * fetched for — reusing one document across two DIDs is exactly what the
+ * id check refuses.
+ */
+function didDocument(pdsUrl: string, id: string = DID_PLC): unknown {
     return {
-        id: DID_PLC,
+        id,
         service: [
             {
                 id: "#atproto_pds",
@@ -75,11 +80,32 @@ function fixtureFetch(
     }) as typeof fetch
 }
 
+/**
+ * A fixture that records every request and the options it was given.
+ *
+ * Needed because several properties here are about what the resolver
+ * *does not do* — a URL it must never request, an option it must always
+ * pass — and asserting only on the returned value lets a test pass for
+ * the wrong reason.
+ */
+function recordingFetch(routes: Record<string, () => Response>) {
+    const calls: { url: string; init?: RequestInit }[] = []
+    const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString()
+        calls.push({ url, init })
+        for (const [prefix, respond] of Object.entries(routes)) {
+            if (url.startsWith(prefix)) return respond()
+        }
+        throw new Error(`recordingFetch: no route for ${url}`)
+    }) as typeof fetch
+    return { impl, calls }
+}
+
 describe("happy path: did:plc -> PLC directory -> PDS -> declaration", () => {
     it("resolves a well-formed Ed25519 currentKey", async () => {
         const keyBytes = new Uint8Array(32).map((_, i) => i)
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
                     // Algorithm 2 is Curve25519 signing (Ed25519). See
@@ -100,7 +126,7 @@ describe("happy path: did:web -> well-known document -> PDS -> declaration", () 
         const keyBytes = new Uint8Array(32).fill(0x42)
         const fetchImpl = fixtureFetch({
             "https://example.com/.well-known/did.json": () =>
-                jsonResponse(plcDocument(PDS_URL)),
+                jsonResponse(didDocument(PDS_URL, DID_WEB)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
         })
@@ -114,7 +140,7 @@ describe("the algorithm byte matters — Curve25519_Signing (2), never KeyAgreem
     it("rejects a KeyAgreement (X25519) key presented where a signing key belongs", async () => {
         const keyBytes = new Uint8Array(32).fill(0x11)
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
                     // byte 1 = Curve25519_KeyAgreement, a DIFFERENT key type
@@ -130,7 +156,7 @@ describe("the algorithm byte matters — Curve25519_Signing (2), never KeyAgreem
 
     it("rejects an unknown algorithm byte", async () => {
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
                     declarationRecord(algorithmPrefixedKey(99, new Uint8Array(32)))
@@ -144,7 +170,7 @@ describe("the algorithm byte matters — Curve25519_Signing (2), never KeyAgreem
 describe("malformed input", () => {
     it("rejects a currentKey of the wrong length", async () => {
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
                     declarationRecord(algorithmPrefixedKey(2, new Uint8Array(3))) // way too short
@@ -158,7 +184,7 @@ describe("malformed input", () => {
 
     it("reports absence, not throws, when currentKey is missing entirely", async () => {
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse({ value: { version: "1.1.0" } }),
         })
@@ -172,7 +198,7 @@ describe("malformed input", () => {
         // representation is {"$bytes": "<base64>"}. An implementation that
         // checked `instanceof Uint8Array` would reject every real response.
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(declarationRecord([2, 1, 2, 3])),
         })
@@ -205,7 +231,7 @@ describe("resolution failures are reported, not thrown", () => {
 
     it("PDS answers non-200 for the declaration fetch", async () => {
         const fetchImpl = fixtureFetch({
-            "https://plc.directory/": () => jsonResponse(plcDocument(PDS_URL)),
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse({}, 404),
         })
@@ -221,5 +247,157 @@ describe("resolution failures are reported, not thrown", () => {
             fixtureFetch({})
         )
         expect(result.found).toBe(false)
+    })
+})
+
+/**
+ * These pin the five places our resolver had drifted from
+ * `@atproto/identity`. Each one was a real bug, and one was a security
+ * hole — so they are here to stop the drift returning, not to describe
+ * behaviour that was always right.
+ */
+describe("PDS resolution matches @atproto/identity", () => {
+    it("refuses a DID document that claims a different DID", async () => {
+        // A directory handing back the wrong document would otherwise pick
+        // the host that serves this DID's declaration — and so its anchor
+        // key. The declaration route is wired here on purpose: without the
+        // id check, resolution SUCCEEDS, so a bare found:false would pass
+        // for the wrong reason.
+        const keyBytes = new Uint8Array(32).fill(0x44)
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse(didDocument(PDS_URL, "did:plc:somebodyelse00000000000")),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+    })
+
+    it("refuses a path-form did:web WITHOUT fetching anything", async () => {
+        // did:web puts that document at /user/alice/did.json, not under
+        // /.well-known/ — and atproto does not support the form at all.
+        // The property is that no request is made: an earlier version
+        // fetched a confidently wrong URL, which a found:false assertion
+        // alone would not have caught.
+        const { impl, calls } = recordingFetch({
+            "https://": () => jsonResponse(didDocument(PDS_URL)),
+        })
+        const result = await resolveDeclaration(
+            "did:web:example.com:user:alice",
+            impl
+        )
+        expect(result.found).toBe(false)
+        expect(calls).toEqual([])
+    })
+
+    it("percent-decodes a did:web host, so a port survives", async () => {
+        const keyBytes = new Uint8Array(32).fill(0x11)
+        const did = "did:web:example.com%3A3000"
+        const fetchImpl = fixtureFetch({
+            "https://example.com:3000/.well-known/did.json": () =>
+                jsonResponse(didDocument(PDS_URL, did)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+        })
+        const result = await resolveDeclaration(did, fetchImpl)
+        expect(result.found).toBe(true)
+    })
+
+    it("selects the service by #atproto_pds id, not by type alone", async () => {
+        // A document whose id and type entries disagree must resolve the
+        // same way here as everywhere else in the network.
+        const keyBytes = new Uint8Array(32).fill(0x22)
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse({
+                    id: DID_PLC,
+                    service: [
+                        {
+                            id: "#something_else",
+                            type: "AtprotoPersonalDataServer",
+                            serviceEndpoint: "https://impostor.example",
+                        },
+                        {
+                            id: "#atproto_pds",
+                            type: "AtprotoPersonalDataServer",
+                            serviceEndpoint: PDS_URL,
+                        },
+                    ],
+                }),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+            "https://impostor.example": () => {
+                throw new Error("resolved to the wrong service entry")
+            },
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(true)
+    })
+
+    it("accepts the absolute service id form", async () => {
+        const keyBytes = new Uint8Array(32).fill(0x33)
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse({
+                    id: DID_PLC,
+                    service: [
+                        {
+                            id: `${DID_PLC}#atproto_pds`,
+                            type: "AtprotoPersonalDataServer",
+                            serviceEndpoint: PDS_URL,
+                        },
+                    ],
+                }),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+        })
+        expect((await resolveDeclaration(DID_PLC, fetchImpl)).found).toBe(true)
+    })
+
+    it("refuses a #atproto_pds entry whose type is wrong", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse({
+                    id: DID_PLC,
+                    service: [
+                        {
+                            id: "#atproto_pds",
+                            type: "SomethingElse",
+                            serviceEndpoint: PDS_URL,
+                        },
+                    ],
+                }),
+        })
+        expect((await resolveDeclaration(DID_PLC, fetchImpl)).found).toBe(false)
+    })
+
+    it("refuses a non-http(s) service endpoint", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse(didDocument("file:///etc/passwd")),
+        })
+        expect((await resolveDeclaration(DID_PLC, fetchImpl)).found).toBe(false)
+    })
+
+    it("asks fetch to refuse redirects on every request", async () => {
+        // Whether a redirect is followed is the real fetch's behaviour, not
+        // something a fixture can exercise — so the property pinned here is
+        // that the option is actually passed. Without it the https check is
+        // decorative: it validates the URL we chose, and a 302 goes
+        // somewhere it never runs again.
+        const keyBytes = new Uint8Array(32).fill(0x55)
+        const { impl, calls } = recordingFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+        })
+        expect((await resolveDeclaration(DID_PLC, impl)).found).toBe(true)
+
+        // Both hops: the directory and the PDS.
+        expect(calls.length).toBe(2)
+        for (const call of calls) {
+            expect(call.init?.redirect).toBe("error")
+        }
     })
 })
