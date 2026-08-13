@@ -211,6 +211,32 @@ export async function handleRegistrationCreate(
     }
 
     const locator = await deps.directory.create(did, fields)
+
+    // `create` is idempotent on DID and returns the existing locator
+    // **without touching its fields**, so re-registering an existing DID
+    // would leave a stale anchor key in place. That matters because
+    // re-registration is the recovery path from a key rotation: every owner
+    // endpoint verifies against the STORED key, so an owner who rotated
+    // their declared key would otherwise be locked out of their own
+    // registration — including the ability to delete it — with mail still
+    // arriving.
+    //
+    // Writing through is safe precisely because of what was checked above:
+    // the signature verified against the key in the DID's CURRENT
+    // declaration, which only that DID's controller can change. An attacker
+    // cannot reach this line without already holding the key they would be
+    // installing.
+    //
+    // `pushGrant` is written only when the request carried one, so
+    // re-registering to refresh a key does not silently drop push delivery.
+    await deps.store(locator).update({
+        anchorKey: fields.anchorKey,
+        lastActive: fields.lastActive,
+        ...(fields.pushGrant !== undefined
+            ? { pushGrant: fields.pushGrant }
+            : {}),
+    })
+
     return cbor([["l", locator]], 201)
 }
 
