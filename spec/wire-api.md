@@ -732,6 +732,56 @@ a convenience, not evidence, and a device MUST re-verify the payload
 before acting on it; see
 [`trust-model.md`](trust-model.md#p8--the-relays-verdict-is-a-hint).
 
+### The events socket
+
+`GET /pmr/v1/events` upgrades to a WebSocket, authenticated the same way as
+any other owner request: an RFC 9421 signature over the upgrade request
+itself, verified once, at handshake. The connection IS the authenticated
+channel from then on — there is no per-frame re-authentication.
+
+**Frames are two concatenated top-level canonical CBOR values — a header
+immediately followed by a body, no length prefix** — reaching for atproto's
+`subscribeRepos` framing rather than inventing one: a PDS operator already
+implements it, and reusing it keeps canonicalization and framing pinned by
+someone else's spec rather than this document's own invention.
+
+```
+header = { "op": 1, "t": "#<type>" }
+body   = { ... type-specific fields ... }
+```
+
+| `t` | direction | body | notes |
+|---|---|---|---|
+| `#delivery` | server → client | `{k, id, m, sd?, kt?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`kt` (the verification hint) are present only for a pair-mailbox entry |
+| `#ack` | client → server | `{k, id}` | acknowledges one message. Idempotent — acking an already-removed message MUST succeed, matching the REST ack endpoint |
+| `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
+| `#drained` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
+| `#observation` | server → client | `{did, rev, record}` | an atproto record update for an observed DID, as CAR. Depends on [observation](#observation) existing on this deployment |
+
+**Ordering on connect: every queued message first, oldest mailbox first,
+then `#pool` if and only if the pool is non-empty, then `#drained`,
+always.** This is not an optimization — it costs no extra push, no extra
+round trip, and no extra wake, because the device is already attached and
+already draining — it is the property that lets a device treat "real mail"
+and "merely waiting to be judged" as answered in that priority order.
+
+**New messages MUST be pushed to an attached connection as they arrive**,
+not held for the next reconnect — this is what makes it a *live* channel
+rather than a fancier `GET /pmr/v1/messages`. A relay MAY choose to also
+buffer and coalesce delivery under load; it MUST NOT silently drop it,
+since an unacked message already persists in its mailbox until drained or
+retained-out, and a client that never receives the live push still
+recovers it on its next reconnect-drain.
+
+**This is deliberately not a durable, resumable event log with a sequence
+cursor**, unlike atproto's own ephemeral commit stream. A message here
+stays durable in its mailbox queue until acked, so reconnecting and
+draining again recovers everything a log-and-cursor would, without
+needing one — the mailbox queue already IS the resume mechanism. A relay
+MAY still include a per-connection sequence number in `#delivery`
+headers for gap/reorder detection within one live connection; it is not
+meaningful across reconnects and MUST NOT be treated as a cursor.
+
 ### Attachments
 
 | method | path | notes |
@@ -896,11 +946,6 @@ Whatever a deployment picks, the put still answers `202`.
 
 ## Not yet specified
 
-- **Observation stream framing.** atproto's `subscribeRepos` framing —
-  DAG-CBOR header/body frames over a WebSocket with a monotonic sequence
-  cursor — is the direction to reach for first; a PDS operator already
-  implements it. The frame vocabulary for delivery, acks, the
-  queue-drained signal, and the pool notice is not fixed.
 - **Owner-facing error bodies.** Two candidates:
   [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html)
   (`application/problem+json`) or XRPC's `{error, message}` shape.

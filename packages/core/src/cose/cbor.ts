@@ -15,7 +15,7 @@
  * against.
  */
 
-import { decode, encode, rfc8949EncodeOptions } from "cborg"
+import { decodeFirst, encode, rfc8949EncodeOptions } from "cborg"
 
 export type CoseValue =
     | number
@@ -85,8 +85,12 @@ function assertCoseGrammar(value: unknown): void {
 }
 
 /**
- * Decodes under the pinned options, narrows to the COSE grammar, then
- * requires the input to have been in canonical form.
+ * Decodes exactly one top-level value under the pinned options, narrows it
+ * to the COSE grammar, requires it to have been in canonical form, and
+ * returns whatever bytes follow it — which the caller decides whether to
+ * treat as an error (a single value expected) or as the next value in a
+ * sequence (concatenated top-level values, atproto's own framing
+ * convention for e.g. a header immediately followed by a body).
  *
  * The re-encode round trip is the actual determinism check, and it is
  * stronger than any decode flag: re-encoding under RFC 8949 §4.2.1 produces
@@ -96,18 +100,27 @@ function assertCoseGrammar(value: unknown): void {
  * decodes to an indistinguishable number, so no type check can see it), and
  * out-of-order map keys.
  */
-function decodeNarrow(bytes: Uint8Array): unknown {
-    const value = decode(bytes, DECODE_OPTIONS)
+function decodeOneCanonical(bytes: Uint8Array): [unknown, Uint8Array] {
+    const [value, remainder] = decodeFirst(bytes, DECODE_OPTIONS)
     assertCoseGrammar(value)
 
+    const consumed = bytes.length - remainder.length
     const canonical = encode(value, ENCODE_OPTIONS)
-    if (canonical.length !== bytes.length) {
+    if (canonical.length !== consumed) {
         throw new Error("COSE/CBOR: input is not canonically encoded")
     }
     for (let i = 0; i < canonical.length; i++) {
         if (canonical[i] !== bytes[i]) {
             throw new Error("COSE/CBOR: input is not canonically encoded")
         }
+    }
+    return [value, remainder]
+}
+
+function decodeNarrow(bytes: Uint8Array): unknown {
+    const [value, remainder] = decodeOneCanonical(bytes)
+    if (remainder.length > 0) {
+        throw new Error("COSE/CBOR: too many terminals, data makes no sense")
     }
     return value
 }
@@ -134,4 +147,22 @@ export function decodeCoseMap(
         throw new Error("COSE/CBOR: expected a top-level map")
     }
     return value as Map<number | string, CoseValue>
+}
+
+/**
+ * Decodes a sequence of concatenated top-level canonical values — no
+ * length prefixes, each value's own encoding is where the previous one
+ * ends. Used for the events socket's header-then-body frames
+ * (`spec/wire-api.md#the-events-socket`), mirroring atproto's
+ * `subscribeRepos` framing.
+ */
+export function decodeCoseSequence(bytes: Uint8Array): CoseValue[] {
+    const values: CoseValue[] = []
+    let remaining = bytes
+    while (remaining.length > 0) {
+        const [value, rest] = decodeOneCanonical(remaining)
+        values.push(value as CoseValue)
+        remaining = rest
+    }
+    return values
 }

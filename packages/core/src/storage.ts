@@ -120,6 +120,18 @@ export type PoolAppendResult =
      */
     | { outcome: "exhausted" }
 
+/** One mailbox and everything currently queued in it. */
+export interface MailboxSnapshot {
+    key: MailboxKey
+    messages: MessageRef[]
+}
+
+export interface OpenMailboxesPage {
+    entries: MailboxSnapshot[]
+    /** Opaque — pass back verbatim to continue. `null` past the last page. */
+    nextCursor: string | null
+}
+
 export interface PoolSender {
     /** The sender's DID, for the device to decide about. */
     did: string
@@ -259,6 +271,22 @@ export interface PMRStore {
 
     /** True for a provisioned mailbox *or* a blocked sender. */
     hasMailbox(key: MailboxKey): Promise<boolean>
+
+    /**
+     * Every mailbox with at least one pending message — pair or grant
+     * alike, since the key alone does not say which, and reconnect-drain
+     * (the events socket's primitive) treats them identically. Also the
+     * hook retention sweeps will use once scheduling exists
+     * (`spec/storage-consistency.md` §Scheduling).
+     *
+     * An empty, provisioned mailbox — awaiting its first message, or
+     * fully drained since — is NOT returned: there is nothing to drain.
+     * A page CAN legitimately come back with zero entries despite
+     * `nextCursor` being non-null, if everything on that page happened to
+     * be empty; callers MUST keep paging on `nextCursor` rather than
+     * treating an empty page as the end.
+     */
+    openMailboxes(cursor: string | null, limit: number): Promise<OpenMailboxesPage>
 
     /**
      * The recovery pool. Do NOT implement by reusing `append` with a

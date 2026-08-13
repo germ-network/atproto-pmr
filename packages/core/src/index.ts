@@ -21,9 +21,11 @@ export type {
     GrantSummary,
     Locator,
     MailboxKey,
+    MailboxSnapshot,
     MessageId,
     MessageRef,
     Nonce,
+    OpenMailboxesPage,
     PMRStore,
     PoolAppendResult,
     PoolSender,
@@ -121,6 +123,20 @@ export { handlePairPut, type PairPutDeps } from "./pair-put"
 // The grant-put endpoint.
 export { handleGrantPut, type GrantPutDeps } from "./grant-put"
 
+// The events socket's frame protocol and drain orchestration.
+export {
+    decodeAckFrame,
+    decodeFrame,
+    drainBacklog,
+    encodeDeliveryFrame,
+    encodeDrainedFrame,
+    encodePoolFrame,
+    handleAckFrame,
+    type AckPayload,
+    type DecodedFrame,
+    type EventsDeps,
+} from "./events"
+
 // Sender authentication.
 export {
     decodePairPutEnvelope,
@@ -139,6 +155,7 @@ export {
 export {
     decodeCoseArray,
     decodeCoseMap,
+    decodeCoseSequence,
     encodeCose,
     type CoseValue,
 } from "./cose/cbor"

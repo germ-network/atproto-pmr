@@ -1,12 +1,16 @@
 import { DurableObject } from "cloudflare:workers"
 import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
+    drainBacklog,
+    handleAckFrame,
     type AppendResult,
     type GrantSummary,
     type MailboxKey,
+    type MailboxSnapshot,
     type MessageId,
     type MessageRef,
     type Nonce,
+    type OpenMailboxesPage,
     type PMRStore,
     type PoolSender,
     type PoolAppendResult,
@@ -14,6 +18,7 @@ import {
     type SyntheticBehavior,
     type SyntheticState,
 } from "@germ-network/atproto-pmr-core"
+import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
 
 /**
@@ -45,8 +50,9 @@ const KEY_POOL_BYTES = "poolBytes"
 const POOL_PREFIX = "pool:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_PREFIX = "grant:"
+const MAILBOX_PREFIX = "mbox:"
 
-const mailboxKey = (k: MailboxKey) => `mbox:${k}`
+const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
 const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
@@ -95,6 +101,78 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     private capacity(): number {
         return parseInt(this.env.MAX_MESSAGES_PER_PAIR_SENDER)
+    }
+
+    // MARK: - The events socket
+
+    /**
+     * `GET /pmr/v1/events` reaches this DO already authenticated — the
+     * router verifies the RFC 9421 signature over the upgrade request
+     * before ever forwarding it here, the same as every other owner
+     * endpoint. This method does no authentication of its own; it only
+     * ever runs for an owner who has already proven possession of the
+     * anchor key.
+     *
+     * Hibernation, not germ-service's non-hibernating `webSocket.accept()`
+     * + `addEventListener` style: this connection is long-lived and mostly
+     * idle on mobile — exactly hibernation's case — and a non-hibernating
+     * DO stays resident and billed for the whole connection regardless.
+     * The cost is that per-connection state cannot live in an in-memory
+     * array; it has to survive eviction. Nothing here needs any: draining
+     * reads straight from durable storage, and an ack names its own
+     * mailbox key and messageId, so there is nothing to carry in a
+     * `serializeAttachment` payload either.
+     */
+    async fetch(request: Request): Promise<Response> {
+        if (request.headers.get("Upgrade") !== "websocket") {
+            return new Response("Expected a WebSocket upgrade", {
+                status: 426,
+            })
+        }
+        const [client, server] = Object.values(new WebSocketPair())
+        this.ctx.acceptWebSocket(server)
+
+        // Deferred past the 101 response, matching this codebase's
+        // "respond first, defer the rest" discipline elsewhere: the client
+        // is connected the instant the handshake completes, with backlog
+        // frames streaming in shortly after, rather than waiting for the
+        // whole backlog to be computed before the socket even opens.
+        this.ctx.waitUntil(
+            drainBacklog({ store: this, bodies: kvBodyStore(this.env) }, (frame) =>
+                server.send(frame)
+            )
+        )
+
+        return new Response(null, { status: 101, webSocket: client })
+    }
+
+    /**
+     * A hibernation-woken instance reaches this with no surviving
+     * in-memory context from `fetch` — everything it needs is in the
+     * frame itself, which is exactly why an ack names its own mailbox key
+     * and messageId rather than relying on anything remembered per
+     * connection.
+     *
+     * `webSocketClose`/`webSocketError` are deliberately not implemented:
+     * there is no in-memory session state to release, so there is nothing
+     * for either to do.
+     */
+    async webSocketMessage(
+        ws: WebSocket,
+        message: string | ArrayBuffer
+    ): Promise<void> {
+        if (typeof message === "string") return // frames are binary only
+        try {
+            await handleAckFrame(
+                { store: this, bodies: kvBodyStore(this.env) },
+                new Uint8Array(message)
+            )
+        } catch {
+            // Malformed inbound frame: dropped, not fatal. There is no
+            // owner-facing "you sent something bad" channel here, and
+            // tearing down a long-lived mobile connection over one bad
+            // frame is worse than silently ignoring it.
+        }
     }
 
     // MARK: - Registration state
@@ -254,6 +332,40 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     async hasMailbox(key: MailboxKey): Promise<boolean> {
         if ((await this.db.get(mailboxKey(key))) !== undefined) return true
         return (await this.db.get(syntheticKey(key))) !== undefined
+    }
+
+    /**
+     * Reconnect-drain's primitive. `startAfter` gives cursor semantics for
+     * free from the underlying storage — `nextCursor` is just the last raw
+     * key on this page, independent of how many entries survived the
+     * empty-queue filter, so a page that filters down to nothing still
+     * advances.
+     *
+     * Fetches `limit + 1` and trims: fetching exactly `limit` cannot tell
+     * "there are more" from "that was all of them", since both return a
+     * full page.
+     */
+    async openMailboxes(
+        cursor: string | null,
+        limit: number
+    ): Promise<OpenMailboxesPage> {
+        const raw = await this.db.list<MessageRef[]>({
+            prefix: MAILBOX_PREFIX,
+            startAfter: cursor ?? undefined,
+            limit: limit + 1,
+        })
+        const rows = [...raw].slice(0, limit)
+        const hasMore = raw.size > limit
+
+        const entries: MailboxSnapshot[] = []
+        for (const [k, messages] of rows) {
+            if (messages.length === 0) continue
+            entries.push({ key: k.slice(MAILBOX_PREFIX.length), messages })
+        }
+        return {
+            entries,
+            nextCursor: hasMore ? rows[rows.length - 1][0] : null,
+        }
     }
 
     // MARK: - The recovery pool

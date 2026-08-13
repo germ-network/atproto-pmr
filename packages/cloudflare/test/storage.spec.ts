@@ -735,3 +735,74 @@ describe("PMRObject grant records", () => {
         })
     })
 })
+
+describe("openMailboxes — reconnect-drain's primitive", () => {
+    it("returns pair and grant mailboxes alike, with their queued messages", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
+            await pmr.append("grant-address-xyz", ref("m2"), freshNonce(), T0)
+
+            const page = await pmr.openMailboxes(null, 100)
+            expect(page.nextCursor).toBeNull()
+            const byKey = new Map(page.entries.map((e) => [e.key, e.messages]))
+            expect(byKey.get("did:plc:alice")?.map((r) => r.messageId)).toEqual(["m1"])
+            expect(byKey.get("grant-address-xyz")?.map((r) => r.messageId)).toEqual([
+                "m2",
+            ])
+        })
+    })
+
+    it("omits a provisioned mailbox with nothing queued", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            // provisionFromPool's empty-sender case writes an empty queue.
+            await pmr.provisionFromPool("did:plc:empty", T0)
+            const page = await pmr.openMailboxes(null, 100)
+            expect(page.entries).toEqual([])
+        })
+    })
+
+    it("does not leak pool or synthetic-block state into the listing", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:pooled", ref("m"), freshNonce(), T0)
+            await pmr.block("did:plc:blocked", T0)
+            const page = await pmr.openMailboxes(null, 100)
+            expect(page.entries).toEqual([])
+        })
+    })
+
+    it("paginates via a cursor, and a page filtered to empty still advances", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            // "a" has content, "b" is empty (provisioned via the pool path),
+            // "c" has content — a filtered-empty middle page must not stall.
+            await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
+            await pmr.provisionFromPool("did:plc:b", T0)
+            await pmr.append("did:plc:c", ref("m2"), freshNonce(), T0)
+
+            const first = await pmr.openMailboxes(null, 1)
+            expect(first.entries.map((e) => e.key)).toEqual(["did:plc:a"])
+            expect(first.nextCursor).not.toBeNull()
+
+            const second = await pmr.openMailboxes(first.nextCursor, 1)
+            expect(second.entries).toEqual([]) // "b" filtered out
+            expect(second.nextCursor).not.toBeNull()
+
+            const third = await pmr.openMailboxes(second.nextCursor, 1)
+            expect(third.entries.map((e) => e.key)).toEqual(["did:plc:c"])
+            expect(third.nextCursor).toBeNull()
+        })
+    })
+
+    it("a DID containing ':' round-trips through the prefix strip", async () => {
+        const stub = freshStub()
+        const did = "did:web:relay.example:users:eve"
+        await inPMR(stub, async (pmr) => {
+            await pmr.append(did, ref("m1"), freshNonce(), T0)
+            const page = await pmr.openMailboxes(null, 100)
+            expect(page.entries).toEqual([{ key: did, messages: [ref("m1")] }])
+        })
+    })
+})
