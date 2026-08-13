@@ -1184,6 +1184,14 @@ collide in.
 document does. A client compares it to decide whether to re-read, and MUST
 NOT parse it.
 
+**It MUST be derived from the document's content**, not maintained by hand.
+Most of what this document publishes — a lifecycle, a size cap, an expiry —
+comes from deployment configuration an operator changes without touching
+code, and a hand-bumped token sits still across exactly those changes,
+leaving a client polling `state` blind to the transition it is polling for.
+A host MAY prefix a human-readable release stamp, since the value is opaque
+to clients either way.
+
 The document is served `public, max-age=3600`. JMAP RECOMMENDs `no-store`
 for its Session resource, but that one is per-user and authenticated; this
 one is public and identical for every caller.
@@ -1198,7 +1206,12 @@ never maintained beside them: a published limit and an enforced one that
 disagree are worse than an unpublished limit, and now that the document
 carries routing, a wrong prefix is a client that cannot reach the host at
 all. The grant `lifecycle` here and the events socket's own
-[`#capabilities` frame](#capabilities) MUST agree.
+[`#capabilities` frame](#capabilities) MUST derive from the same
+declaration — but they are not required to be *equal*, because the frame
+refines deployment policy per registration: a draining deployment
+correctly tells a registration holding no live grant `absent` while this
+document still says `draining` ([Retirement](#retirement)). This document
+publishes the policy; the frame publishes what it means for you.
 
 This is an *enabler* document, served by a host whose address you already
 have. It is distinct from any future *discovery* mechanism — "does a host

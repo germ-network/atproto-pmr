@@ -160,8 +160,11 @@ export interface PMRConfig {
      */
     grantLifecycle: GrantLifecycle
     /**
-     * Bumped whenever a published value changes, so a client can cache on
-     * it. Date-stamped rather than counted, by convention.
+     * Human-readable prefix of the document's `state`, date-stamped rather
+     * than counted by convention. Bumping it is optional — `state` also
+     * carries a hash of the document's content, so a config-only change
+     * moves it either way. This is for an operator reading a served
+     * document and wanting to know which release it came from.
      */
     configState: string
 }
@@ -187,6 +190,26 @@ export interface EnablerDocument {
     state: string
     encodings: readonly string[]
     capabilities: Capabilities
+}
+
+/**
+ * A cache token over the document's own content, not a digest: a collision
+ * costs one client one missed refresh, so 32 bits is enough and the cost of
+ * being wrong is bounded.
+ *
+ * Content-derived because most of what this document publishes comes from
+ * deployment configuration — a lifecycle, a size cap — which an operator
+ * changes without touching source. A hand-bumped constant would leave
+ * `state` unchanged across exactly those deploys, and a client polling it
+ * would miss the transition it polls for.
+ */
+function contentState(stamp: string, body: Omit<EnablerDocument, "state">): string {
+    let hash = 0x811c9dc5
+    for (const ch of JSON.stringify(body)) {
+        hash ^= ch.charCodeAt(0)
+        hash = Math.imul(hash, 0x01000193) >>> 0
+    }
+    return `${stamp}.${hash.toString(16).padStart(8, "0")}`
 }
 
 /**
@@ -226,11 +249,8 @@ export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
             pathPrefix: serves.watch.pathPrefix,
         }
     }
-    return {
-        state: config.configState,
-        encodings: SUPPORTED_ENCODINGS,
-        capabilities,
-    }
+    const body = { encodings: SUPPORTED_ENCODINGS, capabilities }
+    return { state: contentState(config.configState, body), ...body }
 }
 
 /**

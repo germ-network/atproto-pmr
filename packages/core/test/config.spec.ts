@@ -152,6 +152,36 @@ describe("buildEnablerDocument", () => {
         expect(caps.grant!.maxPerRequest).toBe(c.limits.maxGrantsPerRequest)
     })
 
+    it("moves state when a config-only change moves the document", () => {
+        // The failure this pins: lifecycle, size caps, and expiries all come
+        // from deployment config an operator edits without touching source.
+        // A hand-bumped state would sit still across exactly those deploys,
+        // and a client polling it would miss the transition it polls for.
+        const base = buildEnablerDocument(config()).state
+        const drained = buildEnablerDocument(
+            config({ grantLifecycle: "draining" })
+        ).state
+        const smaller = buildEnablerDocument(
+            config({ limits: { ...config().limits, messageMaxBytes: 9_000 } })
+        ).state
+        expect(drained).not.toBe(base)
+        expect(smaller).not.toBe(base)
+        expect(drained).not.toBe(smaller)
+    })
+
+    it("holds state still when nothing changed", () => {
+        expect(buildEnablerDocument(config()).state).toBe(
+            buildEnablerDocument(config()).state
+        )
+    })
+
+    it("keeps the operator's stamp readable at the front of state", () => {
+        // So a served document still says which release it came from.
+        expect(buildEnablerDocument(config()).state).toMatch(
+            /^2026-08-13\.1\.[0-9a-f]{8}$/
+        )
+    })
+
     it("publishes nothing about pool sizing or blocked-sender behavior", () => {
         // The first is implementation-defined; the second is unpublished on
         // purpose, since a published simulation is a fingerprint.
