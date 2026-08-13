@@ -51,6 +51,24 @@ export {
     type ServedFunction,
 } from "./config"
 
+// RFC 9421 HTTP Message Signatures.
+export {
+    buildSignatureBase,
+    contentDigestMatches,
+    verifyRequestSignature,
+    BODY_COMPONENT,
+    DEFAULT_LABEL,
+    REQUIRED_COMPONENTS,
+    type VerifyInput,
+    type VerifyOutcome as RequestVerifyOutcome,
+} from "./http-sig/verify.js"
+export { signRequest, type SignOptions } from "./http-sig/sign.js"
+export {
+    parseSignature,
+    parseSignatureInput,
+    type InnerList,
+} from "./http-sig/structured-fields.js"
+
 // Server-issued challenges.
 export {
     consumeChallenge,
