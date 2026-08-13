@@ -25,6 +25,7 @@ export type {
     Nonce,
     PMRStore,
     PoolAppendResult,
+    PoolSender,
     RegistrationFields,
     ResolvedAddress,
     VerificationHint,
@@ -76,6 +77,7 @@ export {
     encodeBinding,
     mintChallenge,
     nextChallengeHeaderValue,
+    redeemChallenge,
     NEXT_CHALLENGE_HEADER,
     type ChallengeBinding,
     type ChallengeConfig,
@@ -89,6 +91,23 @@ export {
     withNextChallenge,
     type ChallengeEndpointDeps,
 } from "./challenge-endpoint.js"
+
+// The owner-facing surface.
+export {
+    authenticateOwner,
+    type OwnerAuthDeps,
+    type OwnerAuthOutcome,
+} from "./owner/authenticate.js"
+export {
+    handleBlockSet,
+    handleBlocksList,
+    handlePoolAdjudication,
+    handlePoolList,
+    handleRegistrationCreate,
+    handleRegistrationDelete,
+    handleRegistrationRead,
+    type OwnerDeps,
+} from "./owner/endpoints.js"
 
 // The pair-put endpoint.
 export { handlePairPut, type PairPutDeps } from "./pair-put"

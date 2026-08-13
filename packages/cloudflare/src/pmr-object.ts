@@ -7,6 +7,7 @@ import {
     type MessageRef,
     type Nonce,
     type PMRStore,
+    type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
     type SyntheticBehavior,
@@ -37,6 +38,8 @@ const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `pool:${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
+const blockedDIDKey = (k: MailboxKey) => `blockedDID:${k}`
+const poolDIDKey = (k: MailboxKey) => `poolDID:${k}`
 
 /**
  * How many recently-accepted nonces a mailbox key remembers.
@@ -260,6 +263,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      */
     async appendToPool(
         key: MailboxKey,
+        senderDID: string,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number
@@ -302,29 +306,98 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
 
         await this.db.put(poolKey(key), existing)
+        await this.db.put(poolDIDKey(key), senderDID)
         await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
         await this.recordNonce(key, nonce, seen)
         return { outcome: "pooled", persistBody: true }
     }
 
-    /** DIDs only, never bodies. */
-    async poolSenders(): Promise<MailboxKey[]> {
+    /**
+     * DIDs only, never bodies.
+     *
+     * The DID is recorded explicitly at append time rather than read back
+     * out of a `MessageRef`'s optional hint: the mailbox key is a hash and
+     * cannot be reversed, and adjudication has to name a sender the device
+     * can actually decide about. Depending on an optional field here would
+     * mean an entry whose DID went missing sits unadjudicable until
+     * retention expiry.
+     */
+    async poolSenders(): Promise<PoolSender[]> {
         const entries = await this.db.list<MessageRef[]>({ prefix: "pool:" })
-        return [...entries.keys()].map((k) => k.slice("pool:".length))
+        const dids = await this.db.list<string>({ prefix: "poolDID:" })
+        const out: PoolSender[] = []
+        for (const [k, refs] of entries) {
+            const key = k.slice("pool:".length)
+            const did = dids.get(poolDIDKey(key))
+            if (did === undefined) continue
+            out.push({ key, did, count: refs.length })
+        }
+        return out
+    }
+
+    /**
+     * Move a pooled sender's entries into a real pair mailbox.
+     *
+     * Capacity is applied on the way in, so provisioning a sender who
+     * flooded the pool cannot overfill their new mailbox — and the entries
+     * kept are the OLDEST, matching what a provisioned mailbox does under
+     * pressure. The pool's own newest-wins policy governed which attempts
+     * survived to be provisioned; it does not follow them across.
+     */
+    async provisionFromPool(
+        key: MailboxKey,
+        _nowSeconds: number
+    ): Promise<MessageRef[]> {
+        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+        if (pooled.length === 0) {
+            // Provisioning an empty sender still creates the mailbox, so
+            // their next put lands normally rather than pooling again.
+            const existing = await this.db.get<MessageRef[]>(mailboxKey(key))
+            if (existing === undefined) await this.db.put(mailboxKey(key), [])
+            return []
+        }
+
+        const queue = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
+        const room = Math.max(0, this.capacity() - queue.length)
+        const moved = pooled.slice(0, room)
+
+        await this.db.put(mailboxKey(key), [...queue, ...moved])
+        await this.releasePool(key, pooled)
+        return moved
+    }
+
+    /** Drop the pooled entries and suppress the sender until `until`. */
+    async discardFromPool(key: MailboxKey, until: number): Promise<void> {
+        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+        await this.releasePool(key, pooled)
+        await this.db.put(discardKey(key), until)
+    }
+
+    /** Remove a sender's pool entries and return their bytes to the budget. */
+    private async releasePool(
+        key: MailboxKey,
+        pooled: MessageRef[]
+    ): Promise<void> {
+        const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
+        const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
+        await this.db.delete(poolKey(key))
+        await this.db.delete(poolDIDKey(key))
+        await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
     }
 
     // MARK: - Blocking and discard
 
-    async setBlocked(
+    async block(
         key: MailboxKey,
-        blocked: boolean,
+        senderDID: string,
         _nowSeconds: number
     ): Promise<void> {
-        if (!blocked) {
-            await this.db.delete(syntheticKey(key))
-            return
-        }
         if ((await this.db.get(syntheticKey(key))) !== undefined) return
+
+        // The DID is stored alongside the block so the owner-facing listing
+        // can name who is blocked; the key itself stays hashed, which is
+        // what keeps plaintext identifiers out of keys and access logs.
+        await this.db.put(blockedDIDKey(key), senderDID)
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
         // calling `advance` — that would count a fill at block time, so the
@@ -336,6 +409,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // Dropping the queue is the point, not a side effect: no bytes are
         // kept for a blocked sender.
         await this.db.delete(mailboxKey(key))
+    }
+
+    async unblock(key: MailboxKey): Promise<void> {
+        await this.db.delete(syntheticKey(key))
+        await this.db.delete(blockedDIDKey(key))
+    }
+
+    async listBlocked(): Promise<string[]> {
+        const entries = await this.db.list<string>({ prefix: "blockedDID:" })
+        return [...entries.values()]
     }
 
     async setDiscarded(key: MailboxKey, until: number): Promise<void> {

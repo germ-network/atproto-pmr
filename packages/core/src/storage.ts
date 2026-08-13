@@ -114,6 +114,15 @@ export type PoolAppendResult =
      */
     | { outcome: "exhausted" }
 
+export interface PoolSender {
+    /** The local mailbox key, for adjudication calls. */
+    key: MailboxKey
+    /** The sender's DID, for the device to decide about. */
+    did: string
+    /** How many entries are waiting. Never their contents. */
+    count: number
+}
+
 export interface RegistrationFields {
     did: string
     /**
@@ -222,24 +231,62 @@ export interface PMRStore {
      */
     appendToPool(
         key: MailboxKey,
+        senderDID: string,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number
     ): Promise<PoolAppendResult>
 
-    /** DIDs only, never bodies. */
-    poolSenders(): Promise<MailboxKey[]>
+    /**
+     * Who is waiting in the pool — **DIDs only, never bodies.**
+     *
+     * Returns the DID as well as the local key, because the owner-facing
+     * listing must name senders the device can actually adjudicate, and a
+     * hashed key is not something a person can decide about. The DID is
+     * recoverable because every pooled entry carries the verification hint
+     * the relay validated it against.
+     *
+     * This is not a new disclosure: the trust model already states that a
+     * relay learns the sender DID on a pair-mailbox put — that is the
+     * direct cost of requiring authenticated puts. Hashing is for storage
+     * keys and access logs, never confidentiality from the relay itself.
+     */
+    poolSenders(): Promise<PoolSender[]>
+
+    /**
+     * Adjudication, the device's verdict on a pooled sender.
+     *
+     * Provisioning moves the pooled entries into a real pair mailbox, so
+     * the sender's future puts land normally and the waiting messages are
+     * delivered rather than discarded. Returns what moved, so the caller
+     * can deliver it.
+     */
+    provisionFromPool(key: MailboxKey, nowSeconds: number): Promise<MessageRef[]>
+
+    /**
+     * Discard drops the pooled entries and suppresses the sender until
+     * `until`. Time-bounded rather than standing — see `setDiscarded`.
+     */
+    discardFromPool(key: MailboxKey, until: number): Promise<void>
 
     /**
      * Blocking is reversible — the pair-mailbox counterpart of
      * close/reopen on a grant address — and a blocked sender is never told.
      * The behavior this switches on comes from `SyntheticBehavior`.
      */
-    setBlocked(
+    block(
         key: MailboxKey,
-        blocked: boolean,
+        senderDID: string,
         nowSeconds: number
     ): Promise<void>
+
+    unblock(key: MailboxKey): Promise<void>
+
+    /**
+     * Blocked sender DIDs, for the owner-facing listing. Stored alongside
+     * the block record so the key itself can stay hashed.
+     */
+    listBlocked(): Promise<string[]>
 
     /**
      * Suppress an unprovisioned sender until `until`, after which it lapses

@@ -179,6 +179,7 @@ export async function handlePairPut(
     // does, or the count itself becomes an oracle.
     const pooled = await store.appendToPool(
         mailboxKey,
+        envelope.payload.senderDID,
         ref,
         envelope.payload.nonce,
         nowSeconds

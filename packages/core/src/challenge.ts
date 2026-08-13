@@ -179,3 +179,37 @@ export function nextChallengeHeaderValue(minted: MintedChallenge): string {
     const padded = standard + "=".repeat((4 - (standard.length % 4)) % 4)
     return `:${padded}:; expires=@${minted.expiresAt}`
 }
+
+/**
+ * Redeem a challenge knowing only the **realm**, and learn the subject
+ * from the binding.
+ *
+ * This exists because the two callers know different things.
+ * `consumeChallenge` is for an operation whose subject the request already
+ * names — a put to a known address — where checking the binding against
+ * that subject is the point.
+ *
+ * An owner-facing request names no subject: the endpoints are singular
+ * ("the authenticated identity determines whose registration is
+ * addressed"), so the DID has to come from the binding itself. That is
+ * safe only because the binding alone proves nothing. It says which key to
+ * check; the signature over the request is what proves possession of it.
+ * A stolen challenge names its rightful owner and is useless without their
+ * key.
+ *
+ * Do not use this where the subject is knowable from the request —
+ * checking a binding you could have verified is strictly stronger.
+ */
+export async function redeemChallenge(
+    challenge: string,
+    realm: Realm,
+    store: ChallengeStore
+): Promise<ConsumeOutcome> {
+    const boundTo = await store.consume(challenge)
+    if (boundTo === null) return { valid: false }
+
+    const binding = decodeBinding(boundTo)
+    if (binding === null) return { valid: false }
+    if (binding.realm !== realm) return { valid: false }
+    return { valid: true, binding }
+}
