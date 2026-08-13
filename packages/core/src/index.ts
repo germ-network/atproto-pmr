@@ -51,6 +51,27 @@ export {
     type ServedFunction,
 } from "./config"
 
+// Server-issued challenges.
+export {
+    consumeChallenge,
+    decodeBinding,
+    encodeBinding,
+    mintChallenge,
+    nextChallengeHeaderValue,
+    NEXT_CHALLENGE_HEADER,
+    type ChallengeBinding,
+    type ChallengeConfig,
+    type ConsumeOutcome,
+    type MintDeps,
+    type MintedChallenge,
+    type Realm,
+} from "./challenge.js"
+export {
+    handleChallengeMint,
+    withNextChallenge,
+    type ChallengeEndpointDeps,
+} from "./challenge-endpoint.js"
+
 // The pair-put endpoint.
 export { handlePairPut, type PairPutDeps } from "./pair-put"
 
@@ -79,4 +100,9 @@ export {
 // Declaration resolution and content addressing.
 export { resolveDeclaration, type DeclarationResolution } from "./declaration"
 export { deriveMailboxKey, deriveMessageId } from "./message-id"
-export { readBodyCapped, base64URLToBinary, binaryToBase64URL } from "./util"
+export {
+    readBodyCapped,
+    toResponseBody,
+    base64URLToBinary,
+    binaryToBase64URL,
+} from "./util"

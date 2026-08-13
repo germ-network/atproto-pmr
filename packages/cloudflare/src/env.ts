@@ -24,6 +24,11 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     addresses: KVNamespace
     /** Message bodies, kept out of the queue. */
     messages: KVNamespace
+    /**
+     * Server-issued challenges. Global rather than per-relay: a challenge
+     * is presented before the relay is known.
+     */
+    challenges: KVNamespace
 
     pmrs: DurableObjectNamespace<TPMR>
 

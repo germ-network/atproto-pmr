@@ -30,3 +30,6 @@ POOL_DEPTH_UNDER_PRESSURE = "1"
 [[kv_namespaces]]
 	binding = "messages"
 	id = "test"
+[[kv_namespaces]]
+	binding = "challenges"
+	id = "test"

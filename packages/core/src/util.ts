@@ -77,3 +77,17 @@ export async function readBodyCapped(
     }
     return out
 }
+
+/**
+ * Copy bytes into a standalone `ArrayBuffer` for use as a response body.
+ *
+ * A `Uint8Array` may be a view onto a larger buffer, so handing its
+ * `.buffer` to `Response` would send the whole backing store — silently, and
+ * only when the view happens to be a subarray. Copying is one allocation on
+ * payloads that are already bounded, and removes the class of bug.
+ */
+export function toResponseBody(bytes: Uint8Array): ArrayBuffer {
+    const out = new ArrayBuffer(bytes.byteLength)
+    new Uint8Array(out).set(bytes)
+    return out
+}
