@@ -67,6 +67,81 @@ export function parseGrantLifecycle(raw: string): GrantLifecycle {
     return raw as GrantLifecycle
 }
 
+/**
+ * Which capability families a deployment serves.
+ *
+ * Short tokens rather than JMAP's vendor URLs. JMAP needs globally unique
+ * URIs because capabilities from many vendors land in one namespace; this
+ * document is already scoped by its own well-known path, so there is no
+ * shared registry to collide in. Unprefixed tokens are reserved to the
+ * specification; an extension uses a URL on a domain it owns
+ * (`spec/wire-api.md`, "The enabler document").
+ *
+ * `core` is always served — registrations, challenges, the events socket —
+ * and exists as an entry so that surface has somewhere to declare its own
+ * prefix and versions. Without it, `POST /pmr/v1/challenges` would be the
+ * one path a client could not discover.
+ */
+export type CapabilityName = "core" | "didMailbox" | "grant" | "watch"
+
+/** What every capability entry carries, whatever else it adds. */
+export interface CapabilityBase {
+    /**
+     * API versions this deployment speaks for this capability, newest last.
+     * A departure from JMAP, where the capability URI *is* the version and a
+     * breaking change means a new URI. Explicit here because the version
+     * already appears in the path, so a second encoding of it would be a
+     * second thing to keep in step.
+     */
+    versions: readonly string[]
+    /**
+     * Where this capability's endpoints live, without a trailing slash —
+     * the paths in `spec/wire-api.md` are relative to it.
+     *
+     * Also a departure: JMAP routes every capability through one shared
+     * `apiUrl`, which suits a single-endpoint RPC protocol and not a REST
+     * one. Two capabilities MAY name the same prefix, and `didMailbox` and
+     * `grant` do — they share the inbox path and differ only in the key
+     * they accept.
+     */
+    pathPrefix: string
+}
+
+export interface CoreCapability extends CapabilityBase {
+    challengeExpiry: number
+}
+
+/** Common to both mailbox kinds, published per kind rather than once. */
+export interface MailboxCapability extends CapabilityBase {
+    messageMaxBytes: number
+    messageExpiry: number
+}
+
+export interface GrantCapability extends MailboxCapability {
+    lifecycle: GrantLifecycle
+    maxPerRequest: number
+}
+
+/**
+ * A capability a deployment does not serve is **absent**, never present
+ * with a false-ish value: a client tests for the key.
+ */
+export interface Capabilities {
+    core: CoreCapability
+    didMailbox?: MailboxCapability
+    grant?: GrantCapability
+    watch?: CapabilityBase
+}
+
+/** Which capabilities a deployment serves, and where it serves them. */
+export interface ServedCapabilities {
+    pathPrefix: string
+    versions: readonly string[]
+    didMailbox: boolean
+    grant: boolean
+    watch?: { pathPrefix: string; versions: readonly string[] }
+}
+
 export interface PMRConfig {
     /**
      * The host this relay serves. A protocol input, not routing: grant
@@ -75,6 +150,8 @@ export interface PMRConfig {
     hostName: string
     limits: PMRLimits
     pool: PoolLimits
+    /** What this deployment serves, and under which prefix. */
+    serves: ServedCapabilities
     /**
      * Deployment-wide policy. The state a given client observes may differ:
      * a drain ends per-registration, when *that* registration's last grant
@@ -83,7 +160,7 @@ export interface PMRConfig {
      */
     grantLifecycle: GrantLifecycle
     /**
-     * Bumped whenever a published limit changes, so a client can cache on
+     * Bumped whenever a published value changes, so a client can cache on
      * it. Date-stamped rather than counted, by convention.
      */
     configState: string
@@ -92,44 +169,81 @@ export interface PMRConfig {
 export const SUPPORTED_API_VERSIONS = ["1"] as const
 
 /**
- * Bodies are deterministic CBOR; the capability document is the one JSON
+ * Bodies are deterministic CBOR; the enabler document is the one JSON
  * resource (`spec/wire-api.md`, "Content types").
  */
 export const SUPPORTED_ENCODINGS = ["application/cbor"] as const
 
-export interface CapabilityDocument {
+/**
+ * `GET /.well-known/private-messaging-enabler.json` — what a host serving
+ * private messaging says it can do, and where.
+ *
+ * Modelled on JMAP's Session resource (RFC 8620 §2): capabilities are an
+ * object keyed by name, each value carrying that capability's own
+ * configuration, so a new capability adds a key rather than a parallel
+ * array someone has to keep aligned.
+ */
+export interface EnablerDocument {
     state: string
-    versions: readonly string[]
     encodings: readonly string[]
-    grantLifecycle: GrantLifecycle
-    limits: Record<string, number>
+    capabilities: Capabilities
 }
 
 /**
  * Generated from the enforcing config rather than written alongside it, so
- * a published limit and the value actually enforced cannot drift.
+ * a published value and the one actually enforced cannot drift.
  *
  * Deliberately publishes nothing about pool sizing or the blocked-sender
  * behavior: the first is implementation-defined and the second is
  * unpublished on purpose, since a published simulation is a fingerprint.
  */
-export function buildCapabilityDocument(config: PMRConfig): CapabilityDocument {
+export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
+    const { serves, limits } = config
+    const mailbox = {
+        versions: serves.versions,
+        pathPrefix: serves.pathPrefix,
+        messageMaxBytes: limits.messageMaxBytes,
+        messageExpiry: limits.messageExpirySeconds,
+    }
+    const capabilities: Capabilities = {
+        core: {
+            versions: serves.versions,
+            pathPrefix: serves.pathPrefix,
+            challengeExpiry: limits.challengeExpirySeconds,
+        },
+    }
+    if (serves.didMailbox) capabilities.didMailbox = mailbox
+    if (serves.grant) {
+        capabilities.grant = {
+            ...mailbox,
+            lifecycle: config.grantLifecycle,
+            maxPerRequest: limits.maxGrantsPerRequest,
+        }
+    }
+    if (serves.watch !== undefined) {
+        capabilities.watch = {
+            versions: serves.watch.versions,
+            pathPrefix: serves.watch.pathPrefix,
+        }
+    }
     return {
         state: config.configState,
-        versions: SUPPORTED_API_VERSIONS,
         encodings: SUPPORTED_ENCODINGS,
-        grantLifecycle: config.grantLifecycle,
-        limits: {
-            messageMaxBytes: config.limits.messageMaxBytes,
-            messageExpiry: config.limits.messageExpirySeconds,
-            challengeExpiry: config.limits.challengeExpirySeconds,
-        },
+        capabilities,
     }
 }
 
-/** Public and cacheable. */
-export function serveCapabilityDocument(config: PMRConfig): Response {
-    return new Response(JSON.stringify(buildCapabilityDocument(config)), {
+/**
+ * Public and cacheable. The document carries routing now, so a deployment
+ * that moves a prefix must expect clients to hold the old one for up to
+ * this long — the same discipline a DNS TTL asks for.
+ *
+ * JMAP RECOMMENDs no-store for its Session resource, but that document is
+ * per-user and authenticated; this one is public and identical for every
+ * caller, and `state` gives a client a cheap way to notice a change.
+ */
+export function serveEnablerDocument(config: PMRConfig): Response {
+    return new Response(JSON.stringify(buildEnablerDocument(config)), {
         headers: {
             "content-type": "application/json",
             "cache-control": "public, max-age=3600",

@@ -54,18 +54,25 @@ export {
     type SyntheticState,
 } from "./synthetic"
 
-// Deployment parameters and the capability document generated from them.
+// Deployment parameters and the enabler document generated from them.
 export {
-    buildCapabilityDocument,
+    buildEnablerDocument,
     parseGrantLifecycle,
-    serveCapabilityDocument,
+    serveEnablerDocument,
     SUPPORTED_API_VERSIONS,
     SUPPORTED_ENCODINGS,
-    type CapabilityDocument,
+    type Capabilities,
+    type CapabilityBase,
+    type CapabilityName,
+    type CoreCapability,
+    type EnablerDocument,
+    type GrantCapability,
     type GrantLifecycle,
+    type MailboxCapability,
     type PMRConfig,
     type PMRLimits,
     type PoolLimits,
+    type ServedCapabilities,
 } from "./config"
 
 // RFC 9421 HTTP Message Signatures.

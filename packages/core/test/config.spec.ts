@@ -1,14 +1,15 @@
 /**
- * Grant-lifecycle parsing and the capability document.
+ * The enabler document: what a host serving private messaging says it can
+ * do, and where.
  *
- * The parser exists so a deployment declares its grant state exactly once.
- * Two independent declarations can disagree, and the one a client happens
- * to read then decides what it believes — which is the drift the capability
- * document is generated (rather than written) to prevent.
+ * Generated from the enforcing config rather than written beside it. A
+ * published value and an enforced one that disagree are worse than an
+ * unpublished value, and now that the document carries path prefixes, a
+ * wrong one is a client that cannot route at all.
  */
 import { describe, expect, it } from "vitest"
 import {
-    buildCapabilityDocument,
+    buildEnablerDocument,
     parseGrantLifecycle,
     type PMRConfig,
 } from "../src/config"
@@ -16,6 +17,12 @@ import {
 function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
     return {
         hostName: "relay.example",
+        serves: {
+            pathPrefix: "/pmr/v1",
+            versions: ["1"],
+            didMailbox: true,
+            grant: true,
+        },
         grantLifecycle: "active",
         configState: "2026-08-13.1",
         limits: {
@@ -51,37 +58,104 @@ describe("parseGrantLifecycle", () => {
     })
 })
 
-describe("buildCapabilityDocument", () => {
-    it("publishes the grant lifecycle, always", () => {
-        // Unconditional now that operating mailboxes is not a declared
-        // capability: there is no configuration in which a relay serves no
-        // grants, only one in which it has stopped vending new ones.
-        for (const grantLifecycle of ["active", "draining", "absent"] as const) {
-            expect(
-                buildCapabilityDocument(config({ grantLifecycle }))
-                    .grantLifecycle
-            ).toBe(grantLifecycle)
+describe("buildEnablerDocument", () => {
+    it("always carries core, so the always-served surface is discoverable", () => {
+        // Registrations, challenges, and the events socket are served
+        // whatever else is. Without this entry, POST /pmr/v1/challenges
+        // would be the one path a client could not find.
+        const core = buildEnablerDocument(config()).capabilities.core
+        expect(core.pathPrefix).toBe("/pmr/v1")
+        expect(core.versions).toEqual(["1"])
+        expect(core.challengeExpiry).toBe(600)
+    })
+
+    it("gives every capability its own versions and prefix", () => {
+        const caps = buildEnablerDocument(config()).capabilities
+        for (const entry of [caps.core, caps.didMailbox!, caps.grant!]) {
+            expect(entry.versions).toEqual(["1"])
+            expect(entry.pathPrefix).toBe("/pmr/v1")
         }
     })
 
-    it("publishes no capability list", () => {
-        // A relay operates both mailbox kinds or is not a relay, so there
-        // is nothing for a client to switch on and nothing to drift.
-        expect("functions" in buildCapabilityDocument(config())).toBe(false)
+    it("lets the two mailbox kinds share one prefix", () => {
+        // They differ in the key they accept, not in where they live, and
+        // saying so is informative rather than redundant.
+        const caps = buildEnablerDocument(config()).capabilities
+        expect(caps.didMailbox!.pathPrefix).toBe(caps.grant!.pathPrefix)
+    })
+
+    it("OMITS a capability that is not served, rather than flagging it", () => {
+        // A client tests for the key. A present-but-disabled entry would
+        // make "serves grants" a two-step question and invite the reading
+        // where a missing field means yes.
+        const doc = buildEnablerDocument(
+            config({
+                serves: {
+                    pathPrefix: "/pmr/v1",
+                    versions: ["1"],
+                    didMailbox: false,
+                    grant: true,
+                },
+            })
+        )
+        expect("didMailbox" in doc.capabilities).toBe(false)
+        expect(doc.capabilities.grant).toBeDefined()
+    })
+
+    it("serves grants alone — the case the split exists to allow", () => {
+        // A free atproto PDS vending grant mailboxes and no DID mailbox.
+        const doc = buildEnablerDocument(
+            config({
+                serves: {
+                    pathPrefix: "/pmr/v1",
+                    versions: ["1"],
+                    didMailbox: false,
+                    grant: true,
+                },
+            })
+        )
+        expect(Object.keys(doc.capabilities).sort()).toEqual(["core", "grant"])
+    })
+
+    it("nests the grant lifecycle under grant, where it applies", () => {
+        const doc = buildEnablerDocument(config({ grantLifecycle: "draining" }))
+        expect(doc.capabilities.grant!.lifecycle).toBe("draining")
+        expect("lifecycle" in doc.capabilities.core).toBe(false)
+    })
+
+    it("carries a watch capability at its own prefix when declared", () => {
+        // The watcher can live somewhere else entirely — it is a separate
+        // component, and this is how a client is told where.
+        const doc = buildEnablerDocument(
+            config({
+                serves: {
+                    pathPrefix: "/pmr/v1",
+                    versions: ["1"],
+                    didMailbox: true,
+                    grant: true,
+                    watch: { pathPrefix: "/watch/v1", versions: ["1"] },
+                },
+            })
+        )
+        expect(doc.capabilities.watch!.pathPrefix).toBe("/watch/v1")
+    })
+
+    it("omits watch by default", () => {
+        expect("watch" in buildEnablerDocument(config()).capabilities).toBe(false)
     })
 
     it("publishes limits the put path actually enforces, not a copy", () => {
         const c = config()
-        const doc = buildCapabilityDocument(c)
-        expect(doc.limits.messageMaxBytes).toBe(c.limits.messageMaxBytes)
-        expect(doc.limits.challengeExpiry).toBe(c.limits.challengeExpirySeconds)
+        const caps = buildEnablerDocument(c).capabilities
+        expect(caps.didMailbox!.messageMaxBytes).toBe(c.limits.messageMaxBytes)
+        expect(caps.core.challengeExpiry).toBe(c.limits.challengeExpirySeconds)
+        expect(caps.grant!.maxPerRequest).toBe(c.limits.maxGrantsPerRequest)
     })
 
     it("publishes nothing about pool sizing or blocked-sender behavior", () => {
         // The first is implementation-defined; the second is unpublished on
         // purpose, since a published simulation is a fingerprint.
-        const doc = buildCapabilityDocument(config())
-        const serialized = JSON.stringify(doc)
+        const serialized = JSON.stringify(buildEnablerDocument(config()))
         expect(serialized).not.toContain("pool")
         expect(serialized).not.toContain("synthetic")
     })

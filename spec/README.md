@@ -51,7 +51,14 @@ Grants are also the only thing a relay vends to third parties, and so the
 only thing whose retirement a peer can observe: a relay winds grant
 issuance down through `draining` before it stops
 (§[Retirement](wire-api.md#retirement)), which is the one lifecycle state
-its capability document publishes.
+its [enabler document](wire-api.md#the-enabler-document) publishes.
+
+**A host says what it can do in its enabler document**,
+`GET /.well-known/private-messaging-enabler.json`
+(§[The enabler document](wire-api.md#the-enabler-document)) — which
+capabilities it serves, at which versions, and under which path prefix. A
+client reads it before constructing any URL; the paths in this
+specification are relative to the prefix declared there.
 
 Outbound relay is **not in this version**; the device performs its own
 puts.
@@ -175,6 +182,7 @@ is an index, not a substitute for the sections it links.
 | 12 | The seven items of the storage consistency contract hold, whatever the backend | [storage](storage-consistency.md#the-consistency-contract) |
 | 13 | The relay's verification verdict is delivered to the device as a hint and never as evidence; the device re-verifies | [trust](trust-model.md#p8--the-relays-verdict-is-a-hint) |
 | 14 | Both mailbox kinds are served on one inbox path, distinguished by key prefix, with a DID carried verbatim and only a grant address prefixed | [wire](wire-api.md#delivery--peer-facing) |
+| 15 | The enabler document is generated from enforced values, omits capabilities not served rather than flagging them, and its declared prefixes are where the endpoints actually answer | [wire](wire-api.md#the-enabler-document) |
 
 Items 2 and 9 are not self-certifying. Both are timing properties, and an
 implementation that satisfies them in code can lose them to an early

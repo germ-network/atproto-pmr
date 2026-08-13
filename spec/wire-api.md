@@ -14,7 +14,7 @@ existing client's envelope.
 ### Versioned base path
 
 All endpoints live under `/pmr/v1/…`, plus the unversioned
-`/.well-known/pmr-config.json`, which advertises supported versions.
+`/.well-known/private-messaging-enabler.json`, which advertises supported versions.
 
 ### Request authentication
 
@@ -126,7 +126,7 @@ delegation rather than by holding a push token.
 |---|---|
 | `application/cbor` | the default for request and response bodies |
 | `application/vnd.ipld.car` | relayed atproto repo records |
-| `application/json` | the capability document only |
+| `application/json` | the enabler document only |
 
 `Accept` selects where a resource has more than one representation.
 
@@ -836,7 +836,7 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 | method | path | notes |
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
-| `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the capability document's limit |
+| `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the enabler document's limit |
 | `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
@@ -904,7 +904,7 @@ transition without reconnecting.
 relay observes. A grant lapsing passively wakes nothing; a deployment-wide
 policy change usually drops connections anyway, and clients learn on
 reconnect. **A client MUST NOT treat the absence of a frame as evidence
-that nothing changed** — the frame is a prompt, and the capability document
+that nothing changed** — the frame is a prompt, and the enabler document
 plus the next connect are the ground truth.
 
 It reports the state **effective for this registration**, not deployment
@@ -1072,29 +1072,137 @@ grant dies with logout, deregistration, or its own expiry, and can be
 revoked individually without disturbing the registration, the mailbox
 grants, or any other delegation.
 
-### Capability document
+### The enabler document
 
-`GET /.well-known/pmr-config.json` — public and cacheable. It advertises
-limits, supported versions and encodings, and the **grant lifecycle
-state**. A server MAY also send it preemptively, for example alongside a
-challenge mint.
+`GET /.well-known/private-messaging-enabler.json` — public and cacheable.
+A host that serves it is a **private messaging enabler**; this resource is
+its **enabler document**, and it says what the host can do and where.
 
-**It carries no capability list.** A relay operates both mailbox kinds or
-is not a relay, so there is nothing to declare and nothing for a client to
-switch on. The one thing that varies is `grantLifecycle` — `active`,
-`draining`, or `absent` (§[Retirement](#retirement)) — which a relay
-**MUST** publish, because a peer holding a grant address has no other way
-to learn that issuance is winding down.
+It is modelled on **JMAP's Session resource**
+([RFC 8620 §2](https://www.rfc-editor.org/rfc/rfc8620.html#section-2)):
+capabilities are an **object keyed by name**, each value carrying that
+capability's own configuration. A new capability adds a key; it does not
+add a parallel array someone has to keep aligned with another one.
 
-The document is **generated from the values a relay actually enforces**,
+```json
+{
+  "state": "2026-08-13.1",
+  "encodings": ["application/cbor"],
+  "capabilities": {
+    "core": {
+      "versions": ["1"],
+      "pathPrefix": "/pmr/v1",
+      "challengeExpiry": 600
+    },
+    "didMailbox": {
+      "versions": ["1"],
+      "pathPrefix": "/pmr/v1",
+      "messageMaxBytes": 10000,
+      "messageExpiry": 2592000
+    },
+    "grant": {
+      "versions": ["1"],
+      "pathPrefix": "/pmr/v1",
+      "messageMaxBytes": 10000,
+      "messageExpiry": 2592000,
+      "lifecycle": "active",
+      "maxPerRequest": 20
+    }
+  }
+}
+```
+
+#### The capabilities
+
+| name | what it covers |
+|---|---|
+| `core` | registrations, challenges, the events socket — **always present** |
+| `didMailbox` | DID-addressed mail: `did:`-keyed puts, the recovery pool, `PUT`/`DELETE` on blocks |
+| `grant` | grant issuance and grant-addressed mail: the grants endpoints and `grant:`-keyed puts |
+| `watch` | the [declaration watch](#watch--a-separate-component-not-a-relay-surface), where the host also runs one |
+
+**A capability a host does not serve is absent from the object**, never
+present with a disabling flag. A client tests for the key. An entry that
+existed but meant "no" would make every capability a two-step question and
+invite the reading where a missing field means yes.
+
+`core` exists as an entry so that the always-served surface has somewhere
+to declare its prefix and versions. Without it, `POST /pmr/v1/challenges`
+would be the one path a client could not discover.
+
+Every entry carries at least:
+
+| field | meaning |
+|---|---|
+| `versions` | API versions the host speaks for this capability, newest last |
+| `pathPrefix` | where the capability's endpoints live, no trailing slash; every path in this document is relative to it |
+
+**Two capabilities MAY name the same `pathPrefix`, and the mailbox pair
+normally does.** `didMailbox` and `grant` share
+[one inbox path](#delivery--peer-facing) and differ only in the key they
+accept, so a host serving both publishes the same prefix twice. That is
+informative, not redundant: it tells a client the two are co-located.
+
+A host serving `grant` and not `didMailbox` is the case this split exists
+to allow — it vends grant mailboxes, and rejects `did:`-keyed puts as
+naming a mailbox kind it does not operate.
+
+#### Two deliberate divergences from JMAP
+
+**Per-capability path prefixes, where JMAP has one shared `apiUrl`.** JMAP
+routes every capability through a single endpoint and has the client name
+the capabilities it is using per request. That suits a single-endpoint RPC
+protocol; this is a REST-shaped surface, so each family declares where it
+lives. It also lets a `watch` capability point somewhere else entirely,
+which matters because the watcher is a separate component and need not be
+co-hosted.
+
+**Explicit `versions`, where a JMAP capability URI *is* its version.** In
+JMAP a breaking change means a new capability URI. Here the version already
+appears in the path, so encoding it a second time in the name would be a
+second thing to keep in step.
+
+#### Names, and extending them
+
+Capability names are **short tokens**, not the URLs
+[RFC 8620 §2](https://www.rfc-editor.org/rfc/rfc8620.html#section-2)
+requires of JMAP vendor extensions. JMAP needs globally unique URIs because
+capabilities from many vendors land in one shared namespace; this document
+is already scoped by its own well-known path, and there is no registry to
+collide in.
+
+- **Unprefixed tokens are reserved to this specification.** An
+  implementation MUST NOT invent one.
+- **An extension MUST use a URL on a domain it owns** — JMAP's rule, kept
+  where it earns its keep — and that URL SHOULD resolve to documentation
+  for what the extension does.
+- A client **MUST ignore** a capability name it does not recognize.
+
+#### Caching, and what `state` is for
+
+`state` is an opaque string that changes whenever anything else in the
+document does. A client compares it to decide whether to re-read, and MUST
+NOT parse it.
+
+The document is served `public, max-age=3600`. JMAP RECOMMENDs `no-store`
+for its Session resource, but that one is per-user and authenticated; this
+one is public and identical for every caller.
+
+**A host that moves a `pathPrefix` must expect clients to route to the old
+one for up to the max-age** — the same discipline a DNS TTL asks for. A
+host planning to move one SHOULD serve both prefixes across at least one
+max-age window.
+
+The document is **generated from the values a host actually enforces**,
 never maintained beside them: a published limit and an enforced one that
-disagree are worse than an unpublished limit, and the same applies to the
-lifecycle state the events socket reports on
-[its own `#capabilities` frame](#capabilities). The two MUST agree.
+disagree are worse than an unpublished limit, and now that the document
+carries routing, a wrong prefix is a client that cannot reach the host at
+all. The grant `lifecycle` here and the events socket's own
+[`#capabilities` frame](#capabilities) MUST agree.
 
-This is a *capability* document, served by a relay whose address you
-already have. It is distinct from any future *discovery* mechanism — "does
-a relay exist for this PDS, and where" — which is out of scope here.
+This is an *enabler* document, served by a host whose address you already
+have. It is distinct from any future *discovery* mechanism — "does a host
+exist for this PDS, and where" — which is out of scope here.
 
 ## Freshness and replay
 
@@ -1142,7 +1250,7 @@ The owner-facing error **body** format is
 Message and attachment size caps, attachment budgets, retention windows,
 recovery-pool sizing, discard-window length, challenge TTL, and dormancy
 policy are implementation-defined. The operator picks them and advertises
-the peer-visible ones in the capability document. No constants appear in
+the peer-visible ones in the enabler document. No constants appear in
 this specification; none of them is something a peer or another relay
 must agree on.
 
@@ -1188,7 +1296,7 @@ Whatever a deployment picks, the put still answers `202`.
   about a seen-set it no longer holds.
 - **COSE header labels** — registered versus private-use, for the sender
   DID, recipient DID, type marker, and nonce headers.
-- **Version negotiation.** The capability document advertises versions;
+- **Version negotiation.** The enabler document advertises versions;
   the rule for a client older or newer than its relay is undefined.
 - **Batch shapes.** Acks batch today; whether grants, blocks, and
   watch or observation subscriptions need batch forms or tolerate N
@@ -1206,7 +1314,7 @@ Whatever a deployment picks, the put still answers `202`.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
   CBOR schemas for registration, grant issuance, ack batches, pool
-  adjudication, and the capability document are not fixed here. The
+  adjudication, and the enabler document are not fixed here. The
   encoding rules that govern them — deterministic CBOR, `COSE_Key`, tag-1
   integer timestamps — are.
 
