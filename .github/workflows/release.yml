@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.ref == 'refs/heads/main' && github.repository_owner == 'germ-network' }}
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          run_install: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ".node-version"
+          check-latest: true
+          cache: pnpm
+
+      # NOTE: `publish:` is deliberately absent. With it set, this action
+      # attempts an npm publish on every push to main whenever there are no
+      # pending changesets — and since this job grants `id-token: write`,
+      # npm trusted publishing would succeed with no NPM_TOKEN configured.
+      # These packages are distributed as git dependencies today, not npm.
+      #
+      # This step now only opens a "Prepare next release" PR when changesets
+      # are present, and tags a GitHub release when that PR merges.
+      #
+      # To enable npm publishing later: add `publish: pnpm release`, add a
+      # `release` script (`changeset publish`) to the root package.json,
+      # drop `"private": true` from the two packages, and set `access` to
+      # "public" in .changeset/config.json.
+      - name: Create Pull Request for next release
+        id: changesets
+        uses: changesets/action@v1
+
+        with:
+          title: Prepare next release
+          createGithubReleases: true
+          version: pnpm version-package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
