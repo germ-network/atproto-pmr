@@ -58,6 +58,70 @@ export type ServedFunction =
  */
 export type GrantLifecycle = "active" | "draining" | "absent"
 
+const SERVED_FUNCTIONS: readonly ServedFunction[] = [
+    "pairMailbox",
+    "grant",
+    "watch",
+    "observation",
+]
+
+const GRANT_LIFECYCLES: readonly GrantLifecycle[] = [
+    "active",
+    "draining",
+    "absent",
+]
+
+/**
+ * Parse a comma-separated capability list, rejecting anything unrecognized.
+ *
+ * **Rejecting rather than ignoring is the point.** A silently-dropped
+ * unknown value — `"grants"` for `"grant"` — yields a deployment that
+ * serves grant mailboxes while telling every client it does not, which is
+ * precisely the drift the capability document exists to prevent. Failing
+ * the config is loud, immediate, and fixable; the alternative is a
+ * deployment that lies quietly.
+ *
+ * Parse ONCE and derive everything from the result. Two independent
+ * declarations of what a deployment serves can disagree, and the one a
+ * client reads is then a coin flip.
+ */
+export function parseServedFunctions(raw: string): ServedFunction[] {
+    const parts = raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0)
+
+    const unknown = parts.filter(
+        (p) => !SERVED_FUNCTIONS.includes(p as ServedFunction)
+    )
+    if (unknown.length > 0) {
+        throw new Error(
+            `Unknown capability ${unknown.map((u) => `"${u}"`).join(", ")}; ` +
+                `expected some of ${SERVED_FUNCTIONS.join(", ")}`
+        )
+    }
+
+    const parsed = parts as ServedFunction[]
+    if (parsed.includes("pairMailbox") && !parsed.includes("grant")) {
+        throw new Error(
+            "A deployment serving pairMailbox MUST also serve grant: a pair " +
+                "mailbox that cannot vend grants strands every conversation " +
+                "on the entry path"
+        )
+    }
+    return parsed
+}
+
+export function parseGrantLifecycle(raw: string): GrantLifecycle {
+    if (!GRANT_LIFECYCLES.includes(raw as GrantLifecycle)) {
+        throw new Error(
+            `Unknown grant lifecycle "${raw}"; ` +
+                `expected one of ${GRANT_LIFECYCLES.join(", ")}`
+        )
+    }
+    return raw as GrantLifecycle
+}
+
 export interface PMRConfig {
     /**
      * The host this relay serves. A protocol input, not routing: grant

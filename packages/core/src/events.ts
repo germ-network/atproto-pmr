@@ -123,6 +123,37 @@ export function encodeCapabilitiesFrame(c: EffectiveCapabilities): Uint8Array {
 }
 
 /**
+ * The client half. A relay never decodes this — it is exported so a client
+ * implementer is not left hand-rolling the abbreviated keys against a raw
+ * map, which is how two implementations end up disagreeing about a field
+ * name nobody wrote down.
+ */
+export function decodeCapabilitiesFrame(
+    bytes: Uint8Array
+): EffectiveCapabilities {
+    const frame = decodeFrame(bytes)
+    if (frame.type !== "capabilities") {
+        throw new Error(
+            `events: expected a capabilities frame, got "${frame.type}"`
+        )
+    }
+    const read = <T extends string>(key: string, allowed: readonly T[]): T => {
+        const v = frame.body.get(key)
+        if (typeof v !== "string" || !allowed.includes(v as T)) {
+            throw new Error(`events: malformed capabilities frame at "${key}"`)
+        }
+        return v as T
+    }
+    const present = ["active", "absent"] as const
+    return {
+        pairMailbox: read("pm", present),
+        grant: read("gr", ["active", "draining", "absent"] as const),
+        watch: read("wt", present),
+        observation: read("ob", present),
+    }
+}
+
+/**
  * Unconditional "your connect-time backlog is finished" — sent whether or
  * not `#pool` was.
  *

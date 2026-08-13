@@ -183,6 +183,43 @@ describe("the capabilities frame", () => {
         )
         expect((await drainOnce(stub, { GRANT_LIFECYCLE: "draining" })).body.get("gr")).toBe("absent")
     })
+
+    it("re-sends unsolicited when invalidating the last grant ends a drain", async () => {
+        // The one transition this object can cause rather than merely
+        // observe, so it is the one it announces without a reconnect.
+        const stub = freshStub()
+        const future = Math.floor(Date.now() / 1000) + 3600
+        await inPMR(stub, (pmr) =>
+            pmr.issueGrant("addr-live", new Uint8Array(32), future)
+        )
+        expect(
+            (await drainOnce(stub, { GRANT_LIFECYCLE: "draining" })).body.get("gr")
+        ).toBe("draining")
+
+        // Stay attached and watch for a frame arriving with no request.
+        const response = await stub.fetch("https://relay.example/pmr/v1/events", {
+            headers: { Upgrade: "websocket" },
+        })
+        const ws = response.webSocket
+        if (ws === null) throw new Error("expected a WebSocket")
+        ws.binaryType = "arraybuffer"
+        ws.accept()
+
+        const unsolicited = new Promise<DecodedFrame>((resolve) => {
+            let connectBurstOver = false
+            ws.addEventListener("message", (event) => {
+                const f = decodeFrame(new Uint8Array(event.data as ArrayBuffer))
+                if (f.type === "caughtUp") {
+                    connectBurstOver = true
+                    return
+                }
+                if (connectBurstOver && f.type === "capabilities") resolve(f)
+            })
+        })
+
+        await inPMR(stub, (pmr) => pmr.invalidateGrant("addr-live"))
+        expect((await unsolicited).body.get("gr")).toBe("absent")
+    })
 })
 
 describe("ack over the socket", () => {

@@ -887,8 +887,16 @@ it.
   "ob": "active" | "absent" }
 ```
 
-Sent first on connect, and again unsolicited whenever the state changes, so
-a long-lived connection learns of a transition without reconnecting.
+A relay **MUST** send it first on connect, and **SHOULD** send it again
+unsolicited when the state changes, so a long-lived connection learns of a
+transition without reconnecting.
+
+`SHOULD` rather than `MUST` because not every transition is something a
+relay observes. A grant lapsing passively wakes nothing; a deployment-wide
+policy change usually drops connections anyway, and clients learn on
+reconnect. **A client MUST NOT treat the absence of a frame as evidence
+that nothing changed** — the frame is a prompt, and the capability document
+plus the next connect are the ground truth.
 
 It reports the state **effective for this registration**, not deployment
 policy in the abstract. The distinction matters during a `grant` drain:

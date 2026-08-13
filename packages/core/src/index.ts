@@ -45,6 +45,8 @@ export {
 // Deployment parameters and the capability document generated from them.
 export {
     buildCapabilityDocument,
+    parseGrantLifecycle,
+    parseServedFunctions,
     serveCapabilityDocument,
     SUPPORTED_API_VERSIONS,
     SUPPORTED_ENCODINGS,
@@ -127,6 +129,7 @@ export { handleGrantPut, type GrantPutDeps } from "./grant-put"
 // The events socket's frame protocol and drain orchestration.
 export {
     decodeAckFrame,
+    decodeCapabilitiesFrame,
     decodeFrame,
     drainBacklog,
     encodeCapabilitiesFrame,

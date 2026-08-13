@@ -2,7 +2,10 @@ import { DurableObject } from "cloudflare:workers"
 import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
     drainBacklog,
+    encodeCapabilitiesFrame,
     handleAckFrame,
+    parseGrantLifecycle,
+    parseServedFunctions,
     type AppendResult,
     type EffectiveCapabilities,
     type GrantLifecycle,
@@ -17,6 +20,7 @@ import {
     type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
+    type ServedFunction,
     type SyntheticBehavior,
     type SyntheticState,
 } from "@germ-network/atproto-pmr-core"
@@ -115,14 +119,15 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * live grants is correctly told `absent`.
      */
     private async effectiveCapabilities(): Promise<EffectiveCapabilities> {
-        const declared = new Set(
-            this.env.CAPABILITIES.split(",").map((s) => s.trim()).filter(Boolean)
-        )
-        const on = (c: string): "active" | "absent" =>
+        // Parsed rather than read loosely: an unrecognized identifier is a
+        // misconfiguration that would otherwise yield a deployment serving
+        // something it tells every client it does not.
+        const declared = new Set(parseServedFunctions(this.env.CAPABILITIES))
+        const on = (c: ServedFunction): "active" | "absent" =>
             declared.has(c) ? "active" : "absent"
 
         let grant: GrantLifecycle = declared.has("grant")
-            ? (this.env.GRANT_LIFECYCLE as GrantLifecycle)
+            ? parseGrantLifecycle(this.env.GRANT_LIFECYCLE)
             : "absent"
         if (grant === "draining") {
             const nowSeconds = Math.floor(Date.now() / 1000)
@@ -138,6 +143,29 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             watch: on("watch"),
             observation: on("observation"),
         }
+    }
+
+    /**
+     * Push a fresh `#capabilities` frame to every attached connection.
+     *
+     * Called where this object can *cause* a transition. Only one exists:
+     * invalidating the last live grant during a drain ends that drain for
+     * this registration. Two other transitions are deliberately not
+     * covered, and neither needs to be:
+     *
+     * - **Deployment policy changing** (`GRANT_LIFECYCLE` edited) requires
+     *   a redeploy, which drops every socket; clients reconnect and are
+     *   told on connect.
+     * - **A grant lapsing passively** wakes nothing here, so it is observed
+     *   on the client's next connect. This is why the specification says a
+     *   relay SHOULD re-send on change rather than MUST, and why a client
+     *   must not treat the absence of a frame as proof nothing moved.
+     */
+    private async broadcastCapabilities(): Promise<void> {
+        const sockets = this.ctx.getWebSockets()
+        if (sockets.length === 0) return
+        const frame = encodeCapabilitiesFrame(await this.effectiveCapabilities())
+        for (const ws of sockets) ws.send(frame)
     }
 
     // MARK: - The events socket
@@ -648,5 +676,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async invalidateGrant(address: string): Promise<void> {
         await this.db.delete(grantKey(address))
+        // May have been the last live grant of a drain, which ends it for
+        // this registration — the one capability transition this object
+        // can cause rather than merely observe.
+        await this.broadcastCapabilities()
     }
 }
