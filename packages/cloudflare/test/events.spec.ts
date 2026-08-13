@@ -126,11 +126,12 @@ describe("ack over the socket", () => {
         const { ws } = await connectAndDrain(stub)
         ws.send(ackFrame("did:plc:alice", "m1"))
 
-        // The ack is handled inline in webSocketMessage — no waitUntil to
-        // race, so it has landed by the time send() returns to us. Confirm
-        // by draining a SECOND connection and seeing nothing left.
-        const second = await connectAndDrain(stub)
-        expect(second.frames.map((f) => f.type)).toEqual(["drained"])
+        // `send` only puts bytes on the wire; the DO's webSocketMessage
+        // handler runs on the other side of it, so nothing orders this
+        // against the ack landing. Poll the outcome rather than assume.
+        await expect
+            .poll(() => inPMR(stub, (pmr) => pmr.list("did:plc:alice", 10)))
+            .toEqual([])
     })
 
     it("acking an unknown message is a no-op, not a crash", async () => {
