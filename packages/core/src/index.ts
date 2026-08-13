@@ -136,7 +136,7 @@ export {
 
 // Declaration resolution and content addressing.
 export { resolveDeclaration, type DeclarationResolution } from "./declaration"
-export { deriveMailboxKey, deriveMessageId } from "./message-id"
+export { deriveMessageId } from "./message-id"
 export {
     readBodyCapped,
     toResponseBody,

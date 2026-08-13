@@ -3,7 +3,6 @@ import { encodeOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
-import { deriveMailboxKey } from "../message-id.js"
 import { readBodyCapped, toResponseBody } from "../util.js"
 import type { Directory, RegistrationFields } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
@@ -308,11 +307,10 @@ export async function handleBlockSet(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    const key = deriveMailboxKey(senderDID)
     if (blocked) {
-        await a.auth.store.block(key, senderDID, deps.nowSeconds)
+        await a.auth.store.block(senderDID, deps.nowSeconds)
     } else {
-        await a.auth.store.unblock(key)
+        await a.auth.store.unblock(senderDID)
     }
     // Idempotent both ways — blocking an already-blocked sender, or
     // unblocking one who is not blocked, both succeed.
@@ -385,10 +383,7 @@ export async function handlePoolAdjudication(
 
     let provisioned = 0
     for (const did of provision) {
-        const moved = await a.auth.store.provisionFromPool(
-            deriveMailboxKey(did),
-            deps.nowSeconds
-        )
+        const moved = await a.auth.store.provisionFromPool(did, deps.nowSeconds)
         provisioned += moved.length
     }
     for (const did of discard) {
@@ -396,7 +391,7 @@ export async function handlePoolAdjudication(
         // not recognize *at that moment*, and the pool exists for exactly
         // the case where its own knowledge is behind.
         await a.auth.store.discardFromPool(
-            deriveMailboxKey(did),
+            did,
             deps.nowSeconds + deps.discardWindowSeconds
         )
     }

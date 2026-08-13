@@ -137,12 +137,6 @@ re-verifies it, so the hint is an index and a convenience, not evidence. An
 adapter that loses or corrupts hints degrades performance; one that lets a
 hint substitute for verification degrades security.
 
-An adapter **SHOULD hash counterpart DIDs when forming local keys and log
-lines**, so plaintext identifiers stay out of storage keys, access logs,
-and monitoring. That derivation is unilateral: it crosses no wire, needs no
-agreement with any other implementation, and therefore carries none of the
-silent-mail-loss risk a shared derivation would.
-
 #### Two suppression records, not interchangeable
 
 Both are per-sender suppression, and confusing them produces a wrong answer

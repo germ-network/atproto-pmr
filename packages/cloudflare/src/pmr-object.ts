@@ -32,14 +32,24 @@ import type { PMREnv } from "./env"
 const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 
+/**
+ * The key families. A `MailboxKey` is the counterpart DID, so a prefixed
+ * listing is also the DID listing — there is no side table mapping keys
+ * back, and no way for one to disagree with the family it describes.
+ *
+ * DIDs contain `:` themselves, which is harmless: every read slices a fixed
+ * prefix length rather than splitting, so `pool:did:plc:alice` recovers
+ * `did:plc:alice` exactly.
+ */
+const POOL_PREFIX = "pool:"
+const SYNTHETIC_PREFIX = "syn:"
+
 const mailboxKey = (k: MailboxKey) => `mbox:${k}`
-const syntheticKey = (k: MailboxKey) => `syn:${k}`
+const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
 const discardKey = (k: MailboxKey) => `discard:${k}`
-const poolKey = (k: MailboxKey) => `pool:${k}`
+const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
-const blockedDIDKey = (k: MailboxKey) => `blockedDID:${k}`
-const poolDIDKey = (k: MailboxKey) => `poolDID:${k}`
 
 /**
  * How many recently-accepted nonces a mailbox key remembers.
@@ -263,7 +273,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      */
     async appendToPool(
         key: MailboxKey,
-        senderDID: string,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number
@@ -306,7 +315,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
 
         await this.db.put(poolKey(key), existing)
-        await this.db.put(poolDIDKey(key), senderDID)
         await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
         await this.recordNonce(key, nonce, seen)
         return { outcome: "pooled", persistBody: true }
@@ -315,24 +323,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     /**
      * DIDs only, never bodies.
      *
-     * The DID is recorded explicitly at append time rather than read back
-     * out of a `MessageRef`'s optional hint: the mailbox key is a hash and
-     * cannot be reversed, and adjudication has to name a sender the device
-     * can actually decide about. Depending on an optional field here would
-     * mean an entry whose DID went missing sits unadjudicable until
-     * retention expiry.
+     * A projection of the pool's own keys — not a join. Because the key is
+     * the DID, there is no entry whose DID can go missing and leave the
+     * sender unadjudicable until retention expiry.
      */
     async poolSenders(): Promise<PoolSender[]> {
-        const entries = await this.db.list<MessageRef[]>({ prefix: "pool:" })
-        const dids = await this.db.list<string>({ prefix: "poolDID:" })
-        const out: PoolSender[] = []
-        for (const [k, refs] of entries) {
-            const key = k.slice("pool:".length)
-            const did = dids.get(poolDIDKey(key))
-            if (did === undefined) continue
-            out.push({ key, did, count: refs.length })
-        }
-        return out
+        const entries = await this.db.list<MessageRef[]>({ prefix: POOL_PREFIX })
+        return [...entries].map(([k, refs]) => ({
+            did: k.slice(POOL_PREFIX.length),
+            count: refs.length,
+        }))
     }
 
     /**
@@ -387,23 +387,13 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
         const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
         await this.db.delete(poolKey(key))
-        await this.db.delete(poolDIDKey(key))
         await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
     }
 
     // MARK: - Blocking and discard
 
-    async block(
-        key: MailboxKey,
-        senderDID: string,
-        _nowSeconds: number
-    ): Promise<void> {
+    async block(key: MailboxKey, _nowSeconds: number): Promise<void> {
         if ((await this.db.get(syntheticKey(key))) !== undefined) return
-
-        // The DID is stored alongside the block so the owner-facing listing
-        // can name who is blocked; the key itself stays hashed, which is
-        // what keeps plaintext identifiers out of keys and access logs.
-        await this.db.put(blockedDIDKey(key), senderDID)
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
         // calling `advance` — that would count a fill at block time, so the
@@ -423,17 +413,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // the shared helper also returns their bytes to the pool budget.
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         if (pooled.length > 0) await this.releasePool(key, pooled)
-        else await this.db.delete(poolDIDKey(key))
     }
 
     async unblock(key: MailboxKey): Promise<void> {
         await this.db.delete(syntheticKey(key))
-        await this.db.delete(blockedDIDKey(key))
     }
 
+    /** The block markers' own keys — the DIDs. No second table to drift. */
     async listBlocked(): Promise<string[]> {
-        const entries = await this.db.list<string>({ prefix: "blockedDID:" })
-        return [...entries.values()]
+        const entries = await this.db.list<SyntheticState>({
+            prefix: SYNTHETIC_PREFIX,
+        })
+        return [...entries.keys()].map((k) => k.slice(SYNTHETIC_PREFIX.length))
     }
 
     async setDiscarded(key: MailboxKey, until: number): Promise<void> {

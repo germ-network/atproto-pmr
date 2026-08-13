@@ -208,12 +208,6 @@ all: routing resolves the recipient DID to their relay, and the mailbox is
 a local index inside that relay's store, so there is nothing on the wire
 for a derivation to obscure.
 
-What remains available is **log hygiene, done locally**: an implementation
-SHOULD hash counterpart DIDs when forming storage keys and log lines, so
-plaintext identifiers stay out of access logs and monitoring. That is
-unilateral — it crosses no wire, needs no agreed spec or version, and
-cannot silently lose mail the way a shared derivation could.
-
 ## The client's fetch posture
 
 **The relay is the primary fetch path for atproto authenticated data;

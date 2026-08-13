@@ -16,13 +16,19 @@
 export type Locator = string
 
 /**
- * A pair mailbox's key *within* one relay's store. Routing has already
- * resolved the recipient DID to this store, so this is a local index, not
- * an address: no global uniqueness, no derivation on the wire.
+ * A pair mailbox's key *within* one relay's store: **the counterpart DID.**
+ * Routing has already resolved the recipient DID to this store, so this is a
+ * local index, not an address — no global uniqueness, no derivation on the
+ * wire. The alias exists to mark that distinction, not to hide a derivation.
  *
- * Adapters SHOULD form it by hashing the counterpart DID, keeping plaintext
- * identifiers out of storage keys and access logs. That derivation is
- * unilateral — it crosses no wire and needs no agreement with anyone.
+ * This deliberately replaced a hashed key. The hash was there for log
+ * hygiene, and in this design it bought none: an unsalted digest over a
+ * public, enumerable identifier resists nothing, and a per-record salt is
+ * impossible for a key that must be computed *before* the record is read.
+ * Meanwhile the relay stores the plaintext DID adjacent regardless — in
+ * `VerificationHint`, and in the owner-facing listings that have to name a
+ * sender the device can decide about — and takes it in request paths that
+ * land in access logs. Two side tables existed purely to map the hash back.
  */
 export type MailboxKey = string
 
@@ -115,8 +121,6 @@ export type PoolAppendResult =
     | { outcome: "exhausted" }
 
 export interface PoolSender {
-    /** The local mailbox key, for adjudication calls. */
-    key: MailboxKey
     /** The sender's DID, for the device to decide about. */
     did: string
     /** How many entries are waiting. Never their contents. */
@@ -231,7 +235,6 @@ export interface PMRStore {
      */
     appendToPool(
         key: MailboxKey,
-        senderDID: string,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number
@@ -240,16 +243,14 @@ export interface PMRStore {
     /**
      * Who is waiting in the pool — **DIDs only, never bodies.**
      *
-     * Returns the DID as well as the local key, because the owner-facing
-     * listing must name senders the device can actually adjudicate, and a
-     * hashed key is not something a person can decide about. The DID is
-     * recoverable because every pooled entry carries the verification hint
-     * the relay validated it against.
+     * The owner-facing listing must name senders the device can actually
+     * adjudicate, which is why the key is the DID: the listing is a
+     * projection of the pool's own keys rather than a join against a table
+     * that maps them back.
      *
      * This is not a new disclosure: the trust model already states that a
      * relay learns the sender DID on a pair-mailbox put — that is the
-     * direct cost of requiring authenticated puts. Hashing is for storage
-     * keys and access logs, never confidentiality from the relay itself.
+     * direct cost of requiring authenticated puts.
      */
     poolSenders(): Promise<PoolSender[]>
 
@@ -274,17 +275,13 @@ export interface PMRStore {
      * close/reopen on a grant address — and a blocked sender is never told.
      * The behavior this switches on comes from `SyntheticBehavior`.
      */
-    block(
-        key: MailboxKey,
-        senderDID: string,
-        nowSeconds: number
-    ): Promise<void>
+    block(key: MailboxKey, nowSeconds: number): Promise<void>
 
     unblock(key: MailboxKey): Promise<void>
 
     /**
-     * Blocked sender DIDs, for the owner-facing listing. Stored alongside
-     * the block record so the key itself can stay hashed.
+     * Blocked sender DIDs, for the owner-facing listing — the block
+     * records' own keys, not a second table that can disagree with them.
      */
     listBlocked(): Promise<string[]>
 

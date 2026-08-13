@@ -49,10 +49,10 @@ describe("a provisioned pair mailbox refuses when full", () => {
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
             for (let i = 0; i < capacity; i++) {
-                const result = await pmr.append("alice", ref(`m${i}`), freshNonce(), T0)
+                const result = await pmr.append("did:plc:alice", ref(`m${i}`), freshNonce(), T0)
                 expect(result.outcome).toBe("appended")
             }
-            const overflow = await pmr.append("alice", ref("overflow"), freshNonce(), T0)
+            const overflow = await pmr.append("did:plc:alice", ref("overflow"), freshNonce(), T0)
             expect(overflow.outcome).toBe("refused")
         })
     })
@@ -65,11 +65,11 @@ describe("a provisioned pair mailbox refuses when full", () => {
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("alice", ref(`m${i}`), freshNonce(), T0)
+                await pmr.append("did:plc:alice", ref(`m${i}`), freshNonce(), T0)
             }
-            await pmr.append("alice", ref("overflow"), freshNonce(), T0)
+            await pmr.append("did:plc:alice", ref("overflow"), freshNonce(), T0)
 
-            const queue = await pmr.list("alice", 1000)
+            const queue = await pmr.list("did:plc:alice", 1000)
             expect(queue).toHaveLength(capacity)
             expect(queue[0].messageId).toBe("m0")
             expect(queue.map((r) => r.messageId)).not.toContain("overflow")
@@ -103,10 +103,10 @@ describe("a provisioned pair mailbox refuses when full", () => {
 
             // Real mailbox, filled to capacity, then refused.
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("alice", ref(`m${i}`), freshNonce(), T0)
+                await pmr.append("did:plc:alice", ref(`m${i}`), freshNonce(), T0)
             }
             const realRefusal = await pmr.append(
-                "alice",
+                "did:plc:alice",
                 ref("overflow"),
                 freshNonce(),
                 T0
@@ -115,12 +115,12 @@ describe("a provisioned pair mailbox refuses when full", () => {
             expect(realRefusal.retryAfter).toBe(SENTINEL)
 
             // Blocked sender, filled to capacity, then refused.
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("mallory", ref("x"), freshNonce(), T0)
+                await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             }
             const blockedRefusal = await pmr.append(
-                "mallory",
+                "did:plc:mallory",
                 ref("x"),
                 freshNonce(),
                 T0
@@ -142,13 +142,13 @@ describe("a provisioned pair mailbox refuses when full", () => {
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("alice", ref(`m${i}`), freshNonce(), T0)
+                await pmr.append("did:plc:alice", ref(`m${i}`), freshNonce(), T0)
             }
-            const first = await pmr.append("alice", ref("x"), freshNonce(), T0)
+            const first = await pmr.append("did:plc:alice", ref("x"), freshNonce(), T0)
             if (first.outcome !== "refused") throw new Error("expected full")
 
             for (let i = 0; i < 5; i++) {
-                const later = await pmr.append("alice", ref("x"), freshNonce(), T0 + i)
+                const later = await pmr.append("did:plc:alice", ref("x"), freshNonce(), T0 + i)
                 if (later.outcome !== "refused") throw new Error("expected full")
                 expect(later.retryAfter).toBe(first.retryAfter)
             }
@@ -160,21 +160,21 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
     it("stores no bytes and keeps no queue", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.append("mallory", ref("real"), freshNonce(), T0)
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.append("did:plc:mallory", ref("real"), freshNonce(), T0)
+            await pmr.block("did:plc:mallory", T0)
 
-            await pmr.append("mallory", ref("m1"), freshNonce(), T0)
-            await pmr.append("mallory", ref("m2"), freshNonce(), T0)
+            await pmr.append("did:plc:mallory", ref("m1"), freshNonce(), T0)
+            await pmr.append("did:plc:mallory", ref("m2"), freshNonce(), T0)
 
-            expect(await pmr.list("mallory", 1000)).toEqual([])
+            expect(await pmr.list("did:plc:mallory", 1000)).toEqual([])
         })
     })
 
     it("answers in the same shape a real mailbox does", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
-            const result = await pmr.append("mallory", ref("m1"), freshNonce(), T0)
+            await pmr.block("did:plc:mallory", T0)
+            const result = await pmr.append("did:plc:mallory", ref("m1"), freshNonce(), T0)
             // The DISPATCH OUTCOME — what's wire-visible via the caller's
             // response — is identical to a real mailbox's. `persistBody` is
             // internal bookkeeping never sent to any peer (see
@@ -191,7 +191,7 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
     it("a REAL mailbox's accepted append sets persistBody: true", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            const result = await pmr.append("alice", ref("m1"), freshNonce(), T0)
+            const result = await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
             expect(result.outcome).toBe("appended")
             if (result.outcome !== "appended") throw new Error("unreachable")
             expect(result.persistBody).toBe(true)
@@ -202,12 +202,12 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
-                const r = await pmr.append("mallory", ref("x"), freshNonce(), T0)
+                const r = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
                 expect(r.outcome).toBe("appended")
             }
-            const refused = await pmr.append("mallory", ref("x"), freshNonce(), T0)
+            const refused = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             expect(refused.outcome).toBe("refused")
             if (refused.outcome !== "refused") throw new Error("unreachable")
             expect(refused.retryAfter).toBeGreaterThan(T0)
@@ -218,14 +218,14 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("mallory", ref("x"), freshNonce(), T0)
+                await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             }
-            const refused = await pmr.append("mallory", ref("x"), freshNonce(), T0)
+            const refused = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             if (refused.outcome !== "refused") throw new Error("expected full")
 
-            const afterDrain = await pmr.append("mallory", ref("x"), freshNonce(), refused.retryAfter)
+            const afterDrain = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), refused.retryAfter)
             expect(afterDrain.outcome).toBe("appended")
         })
     })
@@ -236,18 +236,18 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("mallory", ref("x"), freshNonce(), T0)
+                await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             }
-            const first = await pmr.append("mallory", ref("x"), freshNonce(), T0)
+            const first = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0)
             if (first.outcome !== "refused") throw new Error("expected full")
 
             // A sender that keeps pushing must not move the deadline.
             for (let i = 0; i < 5; i++) {
-                await pmr.append("mallory", ref("x"), freshNonce(), T0 + i)
+                await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0 + i)
             }
-            const later = await pmr.append("mallory", ref("x"), freshNonce(), T0 + 10)
+            const later = await pmr.append("did:plc:mallory", ref("x"), freshNonce(), T0 + 10)
             if (later.outcome !== "refused") throw new Error("expected full")
             expect(later.retryAfter).toBe(first.retryAfter)
         })
@@ -256,11 +256,47 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
     it("is reversible — unblocking restores an ordinary mailbox", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
-            await pmr.unblock("mallory")
-            await pmr.append("mallory", ref("m1"), freshNonce(), T0)
-            const queue = await pmr.list("mallory", 1000)
+            await pmr.block("did:plc:mallory", T0)
+            await pmr.unblock("did:plc:mallory")
+            await pmr.append("did:plc:mallory", ref("m1"), freshNonce(), T0)
+            const queue = await pmr.list("did:plc:mallory", 1000)
             expect(queue.map((r) => r.messageId)).toEqual(["m1"])
+        })
+    })
+
+    it("lists the blocked DIDs from the block records themselves", async () => {
+        // The listing is a projection of the block markers' own keys, so it
+        // cannot disagree with who is actually blocked — which a side table
+        // mapping keys back to DIDs could. Colons in the DID are the case
+        // worth pinning: the prefix is stripped by length, never split on.
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.block("did:plc:mallory", T0)
+            await pmr.block("did:web:relay.example:users:eve", T0)
+            expect((await pmr.listBlocked()).sort()).toEqual([
+                "did:plc:mallory",
+                "did:web:relay.example:users:eve",
+            ])
+
+            await pmr.unblock("did:plc:mallory")
+            expect(await pmr.listBlocked()).toEqual([
+                "did:web:relay.example:users:eve",
+            ])
+        })
+    })
+
+    it("does not list a sender who merely has a mailbox or pool entry", async () => {
+        // `syn:` is the blocked family; nothing else may leak into it.
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool(
+                "did:plc:stranger",
+                ref("m2"),
+                freshNonce(),
+                T0
+            )
+            expect(await pmr.listBlocked()).toEqual([])
         })
     })
 })
@@ -270,19 +306,19 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const first = await pmr.append("alice", ref("m1"), nonce, T0)
+            const first = await pmr.append("did:plc:alice", ref("m1"), nonce, T0)
             expect(first.outcome).toBe("appended")
 
             // SAME nonce — a captured envelope resubmitted.
             const replay = await pmr.append(
-                "alice",
+                "did:plc:alice",
                 ref("m1-replay-attempt"),
                 nonce,
                 T0
             )
             expect(replay.outcome).toBe("duplicate")
 
-            const queue = await pmr.list("alice", 10)
+            const queue = await pmr.list("did:plc:alice", 10)
             expect(queue).toHaveLength(1)
             expect(queue[0].messageId).toBe("m1")
         })
@@ -296,18 +332,18 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const first = await pmr.append("alice", ref("m1"), nonce, T0)
+            const first = await pmr.append("did:plc:alice", ref("m1"), nonce, T0)
             expect(first.outcome).toBe("appended")
 
             // Replay the SAME envelope far more times than capacity.
             for (let i = 0; i < capacity * 3; i++) {
-                const replay = await pmr.append("alice", ref("m1"), nonce, T0)
+                const replay = await pmr.append("did:plc:alice", ref("m1"), nonce, T0)
                 expect(replay.outcome).toBe("duplicate")
             }
 
             // The mailbox never filled from replay — fresh senders still fit.
             for (let i = 0; i < capacity - 1; i++) {
-                const r = await pmr.append("alice", ref(`fresh${i}`), freshNonce(), T0)
+                const r = await pmr.append("did:plc:alice", ref(`fresh${i}`), freshNonce(), T0)
                 expect(r.outcome).toBe("appended")
             }
         })
@@ -321,19 +357,19 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
             const nonce = freshNonce()
-            const first = await pmr.append("mallory", ref("m1"), nonce, T0)
+            const first = await pmr.append("did:plc:mallory", ref("m1"), nonce, T0)
             expect(first.outcome).toBe("appended")
 
             for (let i = 0; i < capacity * 3; i++) {
-                const replay = await pmr.append("mallory", ref("m1"), nonce, T0)
+                const replay = await pmr.append("did:plc:mallory", ref("m1"), nonce, T0)
                 expect(replay.outcome).toBe("duplicate")
             }
 
             // Still has real headroom left — replay consumed none of it.
             for (let i = 0; i < capacity - 1; i++) {
-                const r = await pmr.append("mallory", ref(`fresh${i}`), freshNonce(), T0)
+                const r = await pmr.append("did:plc:mallory", ref(`fresh${i}`), freshNonce(), T0)
                 expect(r.outcome).toBe("appended")
             }
         })
@@ -348,16 +384,16 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
         await inPMR(stub, async (pmr) => {
             for (let i = 0; i < capacity; i++) {
-                await pmr.append("alice", ref(`m${i}`), freshNonce(), T0)
+                await pmr.append("did:plc:alice", ref(`m${i}`), freshNonce(), T0)
             }
 
             const retryNonce = freshNonce()
-            const refused = await pmr.append("alice", ref("retryme"), retryNonce, T0)
+            const refused = await pmr.append("did:plc:alice", ref("retryme"), retryNonce, T0)
             expect(refused.outcome).toBe("refused")
 
             // Drain one slot, then retry the SAME envelope/nonce.
-            await pmr.remove("alice", "m0")
-            const retried = await pmr.append("alice", ref("retryme"), retryNonce, T0)
+            await pmr.remove("did:plc:alice", "m0")
+            const retried = await pmr.append("did:plc:alice", ref("retryme"), retryNonce, T0)
             expect(retried.outcome).toBe("appended")
         })
     })
@@ -366,10 +402,10 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const first = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), nonce, T0)
+            const first = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
             expect(first.outcome).toBe("pooled")
 
-            const replay = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), nonce, T0)
+            const replay = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
             expect(replay.outcome).toBe("duplicate")
         })
     })
@@ -381,11 +417,11 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const pooled = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), nonce, T0)
+            const pooled = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
             expect(pooled.outcome).toBe("pooled")
 
             // Same sender is now provisioned; the SAME envelope replays.
-            const replay = await pmr.append("stranger", ref("m1"), nonce, T0)
+            const replay = await pmr.append("did:plc:stranger", ref("m1"), nonce, T0)
             expect(replay.outcome).toBe("duplicate")
         })
     })
@@ -400,14 +436,14 @@ describe("the recovery pool inverts the provisioned mailbox's policy", () => {
         const depth = parseInt(testEnv.POOL_DEPTH_PER_SENDER)
         await inPMR(stub, async (pmr) => {
             for (let i = 0; i < depth + 3; i++) {
-                const r = await pmr.appendToPool("stranger", "did:plc:stranger", ref(`m${i}`), freshNonce(), T0)
+                const r = await pmr.appendToPool("did:plc:stranger", ref(`m${i}`), freshNonce(), T0)
                 expect(r.outcome).toBe("pooled")
             }
             const senders = await pmr.poolSenders()
-            expect(senders.map((s) => s.key)).toContain("stranger")
-            // Adjudication must name a sender the device can decide about,
-            // not just a key it cannot reverse.
+            expect(senders.map((s) => s.did)).toContain("did:plc:stranger")
+            // Adjudication must name a sender the device can decide about.
             expect(senders[0].did).toBe("did:plc:stranger")
+            expect(senders[0].count).toBe(depth)
         })
     })
 
@@ -415,8 +451,8 @@ describe("the recovery pool inverts the provisioned mailbox's policy", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const big = parseInt(testEnv.POOL_CAP_BYTES)
-            await pmr.appendToPool("recovering", "did:plc:recovering", ref("first", big), freshNonce(), T0)
-            const second = await pmr.appendToPool("recovering", "did:plc:recovering", ref("second"), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:recovering", ref("first", big), freshNonce(), T0)
+            const second = await pmr.appendToPool("did:plc:recovering", ref("second"), freshNonce(), T0)
             expect(second.outcome).toBe("pooled")
         })
     })
@@ -425,8 +461,8 @@ describe("the recovery pool inverts the provisioned mailbox's policy", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const big = parseInt(testEnv.POOL_CAP_BYTES)
-            await pmr.appendToPool("early", "did:plc:early", ref("fills-the-pool", big), freshNonce(), T0)
-            const late = await pmr.appendToPool("late", "did:plc:late", ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:early", ref("fills-the-pool", big), freshNonce(), T0)
+            const late = await pmr.appendToPool("did:plc:late", ref("m1"), freshNonce(), T0)
             expect(late.outcome).toBe("exhausted")
         })
     })
@@ -434,10 +470,41 @@ describe("the recovery pool inverts the provisioned mailbox's policy", () => {
     it("lists senders without exposing bodies", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("a", "did:plc:a", ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool("b", "did:plc:b", ref("m2"), freshNonce(), T0)
-            const senders = (await pmr.poolSenders()).map((s) => s.key)
-            expect(senders.sort()).toEqual(["a", "b"])
+            await pmr.appendToPool("did:plc:a", ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:b", ref("m2"), freshNonce(), T0)
+            const senders = (await pmr.poolSenders()).map((s) => s.did)
+            expect(senders.sort()).toEqual(["did:plc:a", "did:plc:b"])
+        })
+    })
+
+    it("recovers each sender's DID exactly, colons and all", async () => {
+        // The listing reads the pool's own keys rather than joining against
+        // a table that records the DID separately, so there is no entry
+        // whose DID can go missing and leave the sender unadjudicable. A
+        // `did:web` with path segments is the shape that would break a
+        // prefix stripped by splitting on `:` instead of by length.
+        const stub = freshStub()
+        const did = "did:web:relay.example:users:eve"
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool(did, ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool(did, ref("m2"), freshNonce(), T0)
+            expect(await pmr.poolSenders()).toEqual([{ did, count: 2 }])
+
+            // And the recovered DID round-trips as a key: adjudicating with
+            // exactly what the listing returned finds the entries.
+            const moved = await pmr.provisionFromPool(did, T0)
+            expect(moved.map((r) => r.messageId)).toEqual(["m1", "m2"])
+        })
+    })
+
+    it("does not mistake the pool byte counter for a pooled sender", async () => {
+        // `poolBytes` sits one character from the `pool:` family.
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:a", ref("m1"), freshNonce(), T0)
+            expect(await pmr.poolSenders()).toEqual([
+                { did: "did:plc:a", count: 1 },
+            ])
         })
     })
 })
@@ -450,9 +517,9 @@ describe("discard is time-bounded, not standing", () => {
         // exactly the case where its knowledge is behind.
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("stranger", T0 + 100)
-            expect(await pmr.isDiscarded("stranger", T0)).toBe(true)
-            expect(await pmr.isDiscarded("stranger", T0 + 101)).toBe(false)
+            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
+            expect(await pmr.isDiscarded("did:plc:stranger", T0)).toBe(true)
+            expect(await pmr.isDiscarded("did:plc:stranger", T0 + 101)).toBe(false)
         })
     })
 
@@ -462,28 +529,28 @@ describe("discard is time-bounded, not standing", () => {
         // branches on before deciding whether to call this at all.
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("stranger", T0 + 100)
-            const result = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), freshNonce(), T0)
+            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
+            const result = await pmr.appendToPool("did:plc:stranger", ref("m1"), freshNonce(), T0)
             expect(result).toEqual({ outcome: "pooled", persistBody: false })
             // Never actually entered — poolSenders() must not list it.
-            expect((await pmr.poolSenders()).map((s) => s.key)).not.toContain("stranger")
+            expect((await pmr.poolSenders()).map((s) => s.did)).not.toContain("did:plc:stranger")
         })
     })
 
     it("a fresh envelope succeeds once the discard window lapses, same nonce or not", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("stranger", T0 + 100)
+            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
             const nonce = freshNonce()
-            const discarded = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), nonce, T0)
+            const discarded = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
             if (discarded.outcome !== "pooled") throw new Error("unreachable")
             expect(discarded.persistBody).toBe(false)
 
             // Discard didn't consume the nonce either, matching `refused`'s
             // reasoning: a retry once the window lapses is evaluated fresh.
-            const afterLapse = await pmr.appendToPool("stranger", "did:plc:stranger", ref("m1"), nonce, T0 + 101)
+            const afterLapse = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0 + 101)
             expect(afterLapse).toEqual({ outcome: "pooled", persistBody: true })
-            expect((await pmr.poolSenders()).map((s) => s.key)).toContain("stranger")
+            expect((await pmr.poolSenders()).map((s) => s.did)).toContain("did:plc:stranger")
         })
     })
 })
@@ -492,11 +559,11 @@ describe("removal is idempotent", () => {
     it("succeeds on an already-removed record", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.append("alice", ref("m1"), freshNonce(), T0)
-            await pmr.remove("alice", "m1")
-            await pmr.remove("alice", "m1")
+            await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
+            await pmr.remove("did:plc:alice", "m1")
+            await pmr.remove("did:plc:alice", "m1")
             await pmr.remove("nobody", "m1")
-            expect(await pmr.list("alice", 10)).toEqual([])
+            expect(await pmr.list("did:plc:alice", 10)).toEqual([])
         })
     })
 })
@@ -509,20 +576,19 @@ describe("blocking a pooled sender closes both surfaces", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.appendToPool(
-                "mallory",
                 "did:plc:mallory",
                 ref("m1", 500),
                 freshNonce(),
                 T0
             )
-            expect((await pmr.poolSenders()).map((s) => s.key)).toContain("mallory")
+            expect((await pmr.poolSenders()).map((s) => s.did)).toContain("did:plc:mallory")
 
-            await pmr.block("mallory", "did:plc:mallory", T0)
+            await pmr.block("did:plc:mallory", T0)
 
             expect(await pmr.poolSenders()).toEqual([])
             // And provisioning is refused even if a stale key reaches it.
-            expect(await pmr.provisionFromPool("mallory", T0)).toEqual([])
-            expect(await pmr.list("mallory", 10)).toEqual([])
+            expect(await pmr.provisionFromPool("did:plc:mallory", T0)).toEqual([])
+            expect(await pmr.list("did:plc:mallory", 10)).toEqual([])
         })
     })
 
@@ -532,18 +598,18 @@ describe("blocking a pooled sender closes both surfaces", () => {
         const stub = freshStub()
         const cap = parseInt(testEnv.POOL_CAP_BYTES)
         await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("a", "did:plc:a", ref("big", cap), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:a", ref("big", cap), freshNonce(), T0)
             // Pool is now at capacity: a new sender is turned away.
             expect(
-                (await pmr.appendToPool("b", "did:plc:b", ref("m"), freshNonce(), T0))
+                (await pmr.appendToPool("did:plc:b", ref("m"), freshNonce(), T0))
                     .outcome
             ).toBe("exhausted")
 
-            await pmr.block("a", "did:plc:a", T0)
+            await pmr.block("did:plc:a", T0)
 
             // Budget released, so an unrelated sender fits again.
             expect(
-                (await pmr.appendToPool("c", "did:plc:c", ref("m"), freshNonce(), T0))
+                (await pmr.appendToPool("did:plc:c", ref("m"), freshNonce(), T0))
                     .outcome
             ).toBe("pooled")
         })

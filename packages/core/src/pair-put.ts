@@ -1,7 +1,7 @@
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { thumbprintOkpEd25519 } from "./cose/key.js"
 import { DeclarationResolution } from "./declaration.js"
-import { deriveMailboxKey, deriveMessageId } from "./message-id.js"
+import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import { BodyStore, Directory, Locator, PMRStore } from "./storage.js"
 import { readBodyCapped } from "./util.js"
@@ -125,7 +125,9 @@ export async function handlePairPut(
     }
     const store = deps.store(locator)
 
-    const mailboxKey = deriveMailboxKey(envelope.payload.senderDID)
+    // The mailbox key is the sender's DID, taken from the SIGNED headers —
+    // the same value verification just ran against, never a routing hint.
+    const mailboxKey = envelope.payload.senderDID
     const messageId = deriveMessageId(envelope.payload.payload)
     const ref = {
         messageId,
@@ -179,7 +181,6 @@ export async function handlePairPut(
     // does, or the count itself becomes an oracle.
     const pooled = await store.appendToPool(
         mailboxKey,
-        envelope.payload.senderDID,
         ref,
         envelope.payload.nonce,
         nowSeconds
