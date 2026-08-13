@@ -103,7 +103,7 @@ describe("connect and drain", () => {
             pmr.append("did:plc:alice", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]), 0)
         )
         await inPMR(stub, (pmr) =>
-            pmr.append("grant-addr-1", { messageId: "m2", byteLength: 5 }, new Uint8Array([2]), 0)
+            pmr.append("grant:addr-1", { messageId: "m2", byteLength: 5 }, new Uint8Array([2]), 0)
         )
         await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
         await testEnv.messages.put("m2", new TextEncoder().encode("world"))
@@ -145,16 +145,16 @@ describe("connect and drain", () => {
 })
 
 describe("the capabilities frame", () => {
-    it("reports what the deployment declares", async () => {
+    it("reports the deployment's grant lifecycle, and nothing else", async () => {
         const stub = freshStub()
         const { frames } = await connectAndDrain(stub)
         const c = frames[0]
         expect(c.type).toBe("capabilities")
-        // wrangler.test.toml declares all four, grant active.
-        expect(c.body.get("pm")).toBe("active")
+        // wrangler.test.toml sets GRANT_LIFECYCLE = "active".
         expect(c.body.get("gr")).toBe("active")
-        expect(c.body.get("wt")).toBe("active")
-        expect(c.body.get("ob")).toBe("active")
+        // Mailbox operation is not declared, so nothing reports on it: a
+        // relay serves both kinds or is not a relay.
+        expect([...c.body.keys()]).toEqual(["gr"])
     })
 
     it("reports a drain as absent once this registration holds no live grant", async () => {

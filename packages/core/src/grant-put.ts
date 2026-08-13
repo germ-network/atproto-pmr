@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { consumeChallenge } from "./challenge.js"
 import { decodeCoseMap } from "./cose/cbor.js"
 import { verifyGrantPutTag } from "./grant.js"
+import { grantMailboxKey } from "./mailbox-key.js"
 import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import { BodyStore, ChallengeStore, Directory, Locator, PMRStore } from "./storage.js"
@@ -22,7 +23,7 @@ export interface GrantPutDeps {
 }
 
 /**
- * `POST /pmr/v1/mailboxes/{address}/messages` — `spec/wire-api.md`, "The
+ * `POST /pmr/v1/inbox/grant:{address}/messages` — `spec/wire-api.md`, "The
  * grant-put payload" and "the closure exception".
  *
  * RESPONSE CONTRACT: `202`, always, for a well-formed request — no other
@@ -121,7 +122,12 @@ async function deliver(
     // grant put does not need one. `bodyDigest` already exists and is
     // exactly a content address for `message`, so it doubles as the
     // "nonce" `append` records rather than introducing a second mechanism.
-    const result = await store.append(address, ref, bodyDigest, nowSeconds)
+    const result = await store.append(
+        grantMailboxKey(address),
+        ref,
+        bodyDigest,
+        nowSeconds
+    )
     if (result.outcome === "appended" && result.persistBody) {
         await deps.bodies.putBody(
             messageId,

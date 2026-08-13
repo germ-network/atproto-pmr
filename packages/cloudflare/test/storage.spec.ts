@@ -741,13 +741,13 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
-            await pmr.append("grant-address-xyz", ref("m2"), freshNonce(), T0)
+            await pmr.append("grant:address-xyz", ref("m2"), freshNonce(), T0)
 
             const page = await pmr.openMailboxes(null, 100)
             expect(page.nextCursor).toBeNull()
             const byKey = new Map(page.entries.map((e) => [e.key, e.messages]))
             expect(byKey.get("did:plc:alice")?.map((r) => r.messageId)).toEqual(["m1"])
-            expect(byKey.get("grant-address-xyz")?.map((r) => r.messageId)).toEqual([
+            expect(byKey.get("grant:address-xyz")?.map((r) => r.messageId)).toEqual([
                 "m2",
             ])
         })

@@ -60,22 +60,12 @@ describe("frame encode/decode", () => {
         })
     })
 
-    it("a capabilities frame round-trips all four states", () => {
-        const decoded = decodeFrame(
-            encodeCapabilitiesFrame({
-                pairMailbox: "absent",
-                grant: "draining",
-                watch: "active",
-                observation: "absent",
-            })
-        )
-        expect(decoded.type).toBe("capabilities")
-        // By key, not by entry order: deterministic CBOR sorts map keys, so
-        // the decoded order is the encoding's business rather than ours.
-        expect(decoded.body.get("pm")).toBe("absent")
-        expect(decoded.body.get("gr")).toBe("draining")
-        expect(decoded.body.get("wt")).toBe("active")
-        expect(decoded.body.get("ob")).toBe("absent")
+    it("a capabilities frame round-trips each grant state", () => {
+        for (const grant of ["active", "draining", "absent"] as const) {
+            const decoded = decodeFrame(encodeCapabilitiesFrame({ grant }))
+            expect(decoded.type).toBe("capabilities")
+            expect(decoded.body.get("gr")).toBe(grant)
+        }
     })
 
     it("is two concatenated top-level canonical CBOR values, not one wrapped structure", () => {
@@ -186,12 +176,7 @@ function world() {
     return { mailboxes, bodies, pool, removed, store, bodyStore }
 }
 
-const ALL_ACTIVE: EffectiveCapabilities = {
-    pairMailbox: "active",
-    grant: "active",
-    watch: "active",
-    observation: "active",
-}
+const ALL_ACTIVE: EffectiveCapabilities = { grant: "active" }
 
 function deps(w: ReturnType<typeof world>): EventsDeps {
     return { store: w.store, bodies: w.bodyStore }
@@ -208,7 +193,7 @@ describe("drainBacklog", () => {
     it("delivers everything queued, across mailboxes, then caughtUp — no pool", async () => {
         const w = world()
         w.mailboxes.set("did:plc:alice", [ref("m1")])
-        w.mailboxes.set("grant-addr", [ref("m2")])
+        w.mailboxes.set("grant:addr", [ref("m2")])
         w.bodies.set("m1", new TextEncoder().encode("one"))
         w.bodies.set("m2", new TextEncoder().encode("two"))
 
@@ -245,25 +230,20 @@ describe("drainBacklog", () => {
     })
 
     it("leads with capabilities, before any delivery", async () => {
-        // A client that does not yet know the deployment serves no pair
-        // mailboxes cannot tell "none queued" from "not offered".
+        // A client that does not yet know grants are draining cannot tell
+        // "nothing queued" from "these addresses are winding down".
         const w = world()
         w.mailboxes.set("did:plc:alice", [ref("m1")])
         w.bodies.set("m1", new Uint8Array([1]))
 
         const frames: Uint8Array[] = []
-        await drainBacklog(
-            deps(w),
-            { ...ALL_ACTIVE, pairMailbox: "absent", grant: "draining" },
-            (f) => frames.push(f)
+        await drainBacklog(deps(w), { grant: "draining" }, (f) =>
+            frames.push(f)
         )
 
         const first = decodeFrame(frames[0])
         expect(first.type).toBe("capabilities")
-        expect(first.body.get("pm")).toBe("absent")
         expect(first.body.get("gr")).toBe("draining")
-        expect(first.body.get("wt")).toBe("active")
-        expect(first.body.get("ob")).toBe("active")
     })
 
     it("skips a ref whose body is missing rather than failing the whole drain", async () => {

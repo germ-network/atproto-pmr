@@ -254,70 +254,58 @@ property.
 Pair mailboxes differ, because authentication plus per-sender reservation
 makes fullness self-referential — see below.
 
-## Capabilities, cardinality, and lifecycle
+## Mailboxes, cardinality, and lifecycle
 
-The four capabilities are introduced in
-[`README.md`](README.md#what-an-atproto-pmr-is). This section is the
-normative detail: which endpoints belong to each, how each is reached, and
-how each is retired.
-
-### Which endpoints belong to which
-
-This table is also the enforcement table for
-[the capability document](#capability-document).
-
-| capability | endpoints |
-|---|---|
-| `pairMailbox` | `POST /pmr/v1/inboxes/{did}/messages`; the recovery pool (`GET /pmr/v1/pool`, `POST /pmr/v1/pool/adjudication`); `PUT`/`DELETE /pmr/v1/blocks/{did}` |
-| `grant` | `POST`/`GET /pmr/v1/grants`, `PATCH`/`DELETE /pmr/v1/grants/{address}`; `POST /pmr/v1/mailboxes/{address}/messages` |
-| `watch` | the declaration-watch surfaces (§[Watch](#watch)) |
-| `observation` | atproto reads beyond the declaration (§[Observation](#observation)) |
-| *every deployment* | registrations, challenges, the capability document, and the events socket |
-
-A **user-level block spans two capabilities**, which is the same split
-[Blocked senders](#blocked-senders) already describes: the DID half is
-`pairMailbox`'s, the address-closing half is `grant`'s. A deployment
-serving only `grant` can therefore close addresses but cannot block a DID,
-because it has no pair mailbox to block one on.
+A PMR operates mailboxes — both kinds, always
+([`README.md`](README.md#what-an-atproto-pmr-is)). There is no capability
+list and nothing to declare: a relay serves them or it is not a relay. What
+*does* vary, and what this section is the normative detail for, is how each
+kind is reached, how many of each a user has, and how grant issuance is
+retired.
 
 ### How each is reached, and therefore how many there are
 
-| capability | reached by | count |
+| mailbox kind | reached by | count |
 |---|---|---|
-| `pairMailbox` | resolving the recipient's DID through the canonical chain | exactly one |
-| `grant` | the host carried in the grant itself | any number |
-| `watch` | client configuration | any number |
-| `observation` | client configuration | one in practice |
+| pair | resolving the recipient's DID through the canonical chain | exactly one |
+| grant | the host carried in the grant itself | any number |
 
-The routing difference is the whole reason `pairMailbox` and `grant` are
-separate capabilities rather than one. A grant carries its own host and its
-address is derived under that host
+The routing difference is why the cardinalities differ. A grant carries its
+own host and its address is derived under that host
 (§[Grant address and put-tag derivation](#grant-address-and-put-tag-derivation)),
-so a peer holding a grant reaches it without consulting anything else — a
-user may hold grants from several relays at once, and a deployment may vend
-grant mailboxes while serving no DID-addressed mailbox at all. A pair put
-has no such carrier: the sender resolves the recipient's DID, and that
-resolution names one relay.
+so a peer holding a grant reaches it without consulting anything else, and a
+user may hold grants from several relays at once. A pair put has no such
+carrier: the sender resolves the recipient's DID, and that resolution names
+one relay.
 
-That also makes `pairMailbox` **the only capability whose reachability
+That also makes the pair mailbox **the one thing here whose reachability
 depends on something this specification does not define.** The last hop of
 DID → DID document → PDS → PMR is
 [out of scope](README.md#not-yet-specified), and until it points at a
-deployment, declaring `pairMailbox` changes nothing a sender can observe.
+deployment, that deployment's pair mailboxes receive nothing — while its
+grant mailboxes work from the moment it vends one.
+
+A **user-level block spans both kinds**, which is the split
+[Blocked senders](#blocked-senders) already describes: a sender DID is
+blocked on the pair mailbox, and a grant address is suppressed by closing
+it. The two are not interchangeable, because a relay cannot map an address
+back to a person.
 
 ### Retirement
 
-| capability | states |
-|---|---|
-| `grant` | `active` → `draining` → absent |
-| `pairMailbox`, `watch`, `observation` | `active` / absent |
+Grants are the only thing a relay vends to third parties, so grant issuance
+is the only thing whose retirement a peer can observe — and the only thing
+with a lifecycle to publish:
 
-**Only `grant` drains, and the reason is what each capability owes third
-parties.** A vended grant address is a live commitment: peers hold it and
-will keep putting to it, on a schedule the relay does not control.
-Withdrawing it outright would silently strand mail those peers were told
-was deliverable — the failure [the refusal rule](#delivery--peer-facing)
-exists to prevent. So the capability stops vending and keeps serving:
+| | states |
+|---|---|
+| grant issuance | `active` → `draining` → `absent` |
+
+**A vended grant address is a live commitment**: peers hold it and will keep
+putting to it, on a schedule the relay does not control. Withdrawing it
+outright would silently strand mail those peers were told was deliverable —
+the failure [the refusal rule](#delivery--peer-facing) exists to prevent. So
+issuance stops and service continues:
 
 - **`draining`**: a relay **MUST NOT** issue new grants — `POST
   /pmr/v1/grants` answers `409` — **MUST** continue accepting puts to
@@ -329,22 +317,14 @@ let the outstanding TTLs run**. Blanket-closing its addresses is worse than
 doing nothing: a closed address a peer still holds is a dropped path, where
 an expiring one is a path that peer was always going to have to replace.
 
-Nothing else needs a drain. `pairMailbox` vends nothing — it stops
-receiving when the canonical chain stops pointing at the deployment, though
-mail already queued **MUST** remain deliverable to its owner. `watch` and
-`observation` issue nothing to third parties at all, so they toggle: 
-dropping one revokes a delegation and forgets a subscription, and no peer
-is left holding something that stops working.
+The drain state a client observes is **per registration**, not deployment
+wide: it ends when *that* registration's last grant expires, so two clients
+of one draining deployment can correctly see `draining` and `absent` at the
+same moment.
 
-**Adding a capability is not the mirror image of retiring one.** A
-deployment that begins serving `grant` is reachable as soon as it vends its
-first grant, because the grant carries the host. A deployment that begins
-serving `pairMailbox` is reachable only once the canonical chain points at
-it, which is external to this specification and to the deployment's own
-control. A client learns the deployment's side of that through
-[the capability document](#capability-document) and
-[the `#capabilities` frame](#the-events-socket); it learns the resolution
-side by resolving.
+Pair mailboxes have no drain, because they vend nothing. A relay stops
+receiving on them when the canonical chain stops pointing at it, and mail
+already queued **MUST** remain deliverable to its owner.
 
 ## Resources
 
@@ -365,21 +345,16 @@ An Atproto PMR **MUST NOT** accept or store a platform push token. Push, if
 the deployment needs delegation at all, is authorized by a capability — see
 [Push delegation](#push-delegation-optional).
 
-**Registration is capability-independent.** It is an identity, consent, and
-trusted-key record — proof the DID's controller chose this deployment, plus
-the key every later owner request verifies against — and it is not a
-mailbox concept. **Every deployment accepts registrations, whatever it
-serves**, and a client registers the same way with a watch-only deployment
-as with any other. What differs is only which fields carry weight:
+**Registration is an identity record, not a mailbox one.** It is proof the
+DID's controller chose this deployment, plus the key every later owner
+request verifies against. A DID and its declared anchor key are required; a
+push grant is optional, and needed only where the deployment reaches the
+device by pushing.
 
-| field | `pairMailbox` / `grant` | `watch` / `observation` |
-|---|---|---|
-| DID + declared anchor key | required | required |
-| push grant | optional | **required** — these capabilities reach the device by pushing |
-
-An implementation **MUST NOT** define a second identity mechanism for
-watch-only clients. The `anchor` realm and this endpoint already establish
-everything such a deployment needs, and a parallel mechanism would be a
+A component that is not a relay but needs the same record — a declaration
+watcher, say (§[Watch](#watch--a-separate-component-not-a-relay-surface)) — **MUST NOT** define a second identity
+mechanism. The `anchor` realm and this endpoint already establish
+everything such a component needs, and a parallel mechanism would be a
 second place for the trusted key to be wrong.
 
 A registration lives while the anchor key stays in the DID's declaration.
@@ -462,15 +437,47 @@ at `packages/core/test/grant.spec.ts` in this repository.
 **Wire encoding of `address` itself**: the base64url string form,
 unpadded — the same string used to build `addressString` above. Base64url
 uses no characters requiring percent-encoding, so it is carried in the
-`{address}` path segment (`POST /pmr/v1/mailboxes/{address}/messages`)
+`{key}` path segment (`POST /pmr/v1/inbox/grant:{address}/messages`)
 unmodified, and in `PATCH`/`DELETE /pmr/v1/grants/{address}` the same way.
 
 ### Delivery — peer-facing
 
+Both mailbox kinds are served on **one path**, distinguished by the key's
+prefix:
+
 | method | path | responses |
 |---|---|---|
-| `POST` | `/pmr/v1/mailboxes/{address}/messages` | **`202` always** — see [the closure exception](#the-closure-exception) |
-| `POST` | `/pmr/v1/inboxes/{did}/messages` | pair mailbox; sender identified by the payload signature |
+| `POST` | `/pmr/v1/inbox/{key}/messages` | see below, per kind |
+
+`{key}` is:
+
+| kind | key | example |
+|---|---|---|
+| pair | **the recipient's DID, verbatim** | `did:plc:alice` |
+| grant | `grant:` + the base64url address | `grant:6cXk…` |
+
+**Only the grant arm carries an added prefix, and that asymmetry is
+deliberate.** A DID already begins with `did:` — that is what the DID scheme
+is — so prefixing one would produce `did:did:plc:alice`, and stripping one
+would hand routing an identifier that resolves to nobody. A grant address is
+opaque base64url with no self-describing prefix of its own, so it is given
+one. A relay MUST carry a DID key through unmodified and MUST strip only
+`grant:`.
+
+`did:grant:…` is not ambiguous: it begins with `did:`, so it is a DID whose
+method is named `grant`, and it routes as a pair key. A relay MUST test the
+`did:` prefix first.
+
+A key matching neither prefix is **malformed**, and a relay SHOULD answer
+`400`. This is decidable from the request path alone, before any lookup, so
+it discloses nothing about what does or does not exist — the same condition
+that makes the `400` below safe.
+
+The two kinds share a path and nothing else: their authentication and their
+permitted responses stay exactly as specified below and in
+[the closure exception](#the-closure-exception). A **grant put MUST answer
+`202` always**. A **pair put** may additionally answer `429`, for the
+reasons that follow.
 
 For a pair put, the permitted responses are exhaustive:
 
@@ -830,7 +837,7 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
 | `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the capability document's limit |
-| `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, watch and observation updates, and the pool notice as the last frame before the queue is declared caught up |
+| `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
@@ -881,11 +888,13 @@ it.
 #### `#capabilities`
 
 ```
-{ "pm": "active" | "absent",
-  "gr": "active" | "draining" | "absent",
-  "wt": "active" | "absent",
-  "ob": "active" | "absent" }
+{ "gr": "active" | "draining" | "absent" }
 ```
+
+One field, and still a map: operating mailboxes is not something a relay
+declares, so grant issuance is all that varies today — but a bare enum
+would make adding a second field a breaking frame change. A client MUST
+ignore fields it does not recognize.
 
 A relay **MUST** send it first on connect, and **SHOULD** send it again
 unsolicited when the state changes, so a long-lived connection learns of a
@@ -899,20 +908,22 @@ that nothing changed** — the frame is a prompt, and the capability document
 plus the next connect are the ground truth.
 
 It reports the state **effective for this registration**, not deployment
-policy in the abstract. The distinction matters during a `grant` drain:
-the drain ends per-user, when *that* user's last outstanding grant expires,
-so two clients of the same deployment can legitimately see `draining` and
-`absent` at the same moment.
+policy in the abstract. The distinction matters during a drain: the drain
+ends per-user, when *that* user's last outstanding grant expires, so two
+clients of the same deployment can legitimately see `draining` and `absent`
+at the same moment.
 
 What a client should expect from each state:
 
 | state | expect |
 |---|---|
-| `gr` `active` or `draining` | `#delivery` for grant addresses; on `draining`, `POST /pmr/v1/grants` answers `409` |
-| `pm` `active` | `#delivery` for pair mailboxes, and `#pool` |
-| `pm` and `gr` both `absent` | no `#delivery` at all — the socket carries watch and observation traffic only |
-| `wt` `active` | `#declaration` |
-| `ob` `active` | `#observation` |
+| `active` | `#delivery` for grant addresses; `POST /pmr/v1/grants` issues normally |
+| `draining` | `#delivery` for grant addresses still; `POST /pmr/v1/grants` answers `409` |
+| `absent` | no new grants, and nothing further for grant addresses |
+
+`#delivery` for pair mailboxes, and `#pool`, are unconditional — a relay
+operates pair mailboxes in every state above, so there is nothing to
+report and nothing for a client to switch on.
 
 **`#caughtUp` and `gr: "draining"` are unrelated despite the similar
 words.** `#caughtUp` says the connect-time backlog is finished, and arrives
@@ -950,7 +961,7 @@ meaningful across reconnects and MUST NOT be treated as a cursor.
 Ranged reads are REQUIRED: a client resuming an interrupted transfer picks
 up at a segment boundary.
 
-### Records are CAR, for both watch and observation
+### Records are CAR, wherever they are relayed
 
 **Repo records MUST be exchanged as CAR** — the signed commit plus the
 inclusion proof — never as JSON. Aggregations (follow counts, feeds, a
@@ -961,113 +972,45 @@ discards the provenance that makes a record authoritative, and without it
 an attacker can mint a well-formed declaration binding their own key to a
 victim's DID.
 
-A relay serving either capability is a CAR pass-through: it fetches the
+Anything forwarding repo records is a CAR pass-through: it fetches the
 record, stores the bytes and the `rev`, and forwards them, needing no CAR
 parser and no MST walk. Verifying what it forwards is defense in depth
-against a lying PDS, not a prerequisite.
+against a lying PDS, not a prerequisite. This applies to a relay resolving
+a counterpart declaration to check a pair-put signature, and to a
+declaration watcher (§[Watch](#watch--a-separate-component-not-a-relay-surface))
+alike.
 
-### Watch
+### Watch — a separate component, not a relay surface
 
-The declaration watch reports changes to a DID's **declaration record**,
-and nothing else. It is a separate capability from `observation` because
-its failure mode is different in kind: a lying observer costs a user their
-identity, where a lying observer of the rest of atproto costs them a stale
-profile. That is also why a client uses more than one — see
+The declaration watch reports changes to a DID's **declaration record**. It
+is **not part of a PMR**, and this document does not specify it.
+
+That is a deliberate split rather than an omission. Its failure mode is
+different in kind from anything a mailbox does — a lying declaration
+watcher costs a user their identity — and the defense is redundancy across
+watchers a client picks *itself*, including the requirement that a watcher
+be independent of the DID's own PDS. None of that composes with a relay
+that is resolved rather than chosen. See
 [`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car) for the
 independence rule, which is a client-side decision this document cannot
-make for it.
+make.
 
-**A watcher pushes; it is not polled.** To report a change it consumes the
-firehose filtered to the declaration collection, so it observes every
-declaration change whether or not anyone asked. The question is therefore
-not what it *can* see but what it reports, and to whom — which is what the
-three surfaces below partition.
+**A PMR is encouraged to operate a watcher alongside itself**, because the
+work overlaps almost exactly: a relay already resolves and verifies a
+counterpart's declaration to check a pair-put signature, which is most of
+what watching that DID requires. Doing both is an operator's choice and
+changes nothing about the relay surface — there is no capability to
+declare, and a client discovers its watchers by configuration, not by
+resolving this relay.
 
-#### Serving `watch` requires a component the other capabilities do not
+A watcher **pushes**: to report a change it consumes the firehose filtered
+to the declaration collection, which is an always-on component a
+request-scoped serverless deployment cannot host. That constraint is the
+practical reason the two separate cleanly.
 
-The firehose is a long-lived streaming connection, and it **cannot be
-served from a request-scoped runtime.** A serverless environment invoked
-per request — which the rest of this API sits comfortably within — has
-nowhere to hold a stream open between invocations. A deployment serving
-`watch` therefore runs a **separate always-on component**, alongside
-whatever serves its HTTP surface, that consumes the firehose and hands
-changes to the deployment's storage and delivery path.
-
-How that component reaches that path is the deployment's own business and
-out of scope here. Its existence is not, because it changes how the
-capability is sized:
-
-- **The firehose is a sunk cost, not a per-user one.** One consumer sees
-  every declaration change in the network whether or not anybody asked
-  about it. Adding a watched DID costs a stored row, not a connection, so
-  the cost of serving `watch` is close to flat in the number of DIDs
-  watched. That is what makes running several independent watchers
-  practical — the redundancy
-  [`trust-model.md`](trust-model.md#why-more-than-one-watcher-is-load-bearing)
-  requires would be unaffordable if each watcher's cost scaled with its
-  subscriber list.
-- **Monitoring and reporting are separate questions.** A watcher already
-  sees everything, so an interest set is a *reporting* policy, not a
-  monitoring instruction. That is why the three surfaces below partition by
-  what naming an interest discloses rather than by what the watcher is able
-  to observe.
-
-| method | path | notes |
-|---|---|---|
-| `GET` | `/pmr/v1/watch` | list the DIDs this client has asked to be told about |
-| `PUT` | `/pmr/v1/watch/{did}` | add one |
-| `DELETE` | `/pmr/v1/watch/{did}` | remove one |
-| `GET` | `/pmr/v1/watch/{did}/record` | the current declaration as CAR, with its `rev` — a direct read, for a client that wants one now rather than at the next change |
-
-The owner's own DID is watched implicitly by virtue of the registration and
-need not be added.
-
-#### What a watcher sends, and on which channel
-
-**On the events socket, a watcher sends the record itself** — a
-[`#declaration` frame](#the-events-socket) carrying the changed
-declaration as CAR with its `rev`. Sending only a notification would be
-the wrong economy twice over. The client cannot act on a bare "something
-changed": a declaration is key-bearing, so it MUST verify the CAR against
-the DID document's signing key before believing any of it, and a
-notification only forces a fetch it could have been spared. Worse, the
-cross-watcher comparison that makes redundancy worth anything
-([`trust-model.md`](trust-model.md#why-more-than-one-watcher-is-load-bearing))
-is a comparison of *content at a `rev`* — a client holding only revs from
-each watcher can see them agree and still be equivocated at.
-
-**A push notification is a wake, not a record.** Where a deployment reaches
-a sleeping device through [push delegation](#push-delegation-optional), the
-notification MUST NOT be relied on to carry the CAR: push payloads are
-small and hard-capped by the platform, and a declaration's commit and
-inclusion proof have no guaranteed bound. This is the same shape the
-[recovery pool](#the-recovery-pool) already uses — the wake says *look*,
-and the device fetches when it connects, which it must do to verify anyway.
-
-A woken device catches up either by connecting to the socket, or by reading
-`GET /pmr/v1/watch/{did}/record` from **each** of its watchers — which is
-what that endpoint is for, and the only way to obtain the several copies a
-comparison needs.
-
-Three surfaces, partitioned by whether the interest is already public:
-
-| surface | covers | what naming it discloses |
-|---|---|---|
-| own-DID | the registered DID's own declaration | nothing — a watcher must know the DID it serves you under |
-| public interest | DIDs the client asks about above | nothing *new*, where the interest is already a public record such as a follow |
-| change digest | every declaration that changed in a window | nothing — identical bytes for every client |
-
-The digest exists for one population: **DIDs a device cares about that
-carry no public signal** — a pair-mailbox counterpart known only to the
-device, or a permitted-but-unannounced peer. Naming those to a watcher
-would disclose exactly what is otherwise private, so the watcher instead
-publishes what changed and learns nothing about who cares; the device tests
-its private set locally and fetches only the hits.
-
-The digest is therefore **unauthenticated and identity-free by
-construction**: it takes no registration, and every client receives the
-same bytes. Its concrete shape — window, encoding, and path — is
-[not yet specified](#not-yet-specified).
+Its own surface — the push channels, the interest set, and the
+unauthenticated change digest — is
+[not yet specified](#not-yet-specified) here.
 
 ### Observation
 
@@ -1082,10 +1025,12 @@ Everything beyond the declaration: profiles, the follow graph, appview
 reads. Updates stream over [`/pmr/v1/events`](#the-events-socket) as
 `#observation` frames.
 
-Unlike `watch`, this capability wants breadth and permissioned access
-rather than independence, so it is served once and sits well at a
-deployment with the user's data — including their PDS. A deployment MAY
-serve it alongside any other capability.
+Unlike the declaration watch, observation wants breadth and permissioned
+access rather than independence, so it is served once and sits well at a
+deployment holding the user's data — including their PDS.
+
+**Deferred.** The endpoints above are a sketch, not a specified surface;
+nothing here is normative yet.
 
 ### Push delegation (optional)
 
@@ -1130,33 +1075,22 @@ grants, or any other delegation.
 ### Capability document
 
 `GET /.well-known/pmr-config.json` — public and cacheable. It advertises
-limits, supported versions and encodings, and **which capabilities this
-deployment serves**. A server MAY also send it preemptively, for example
-alongside a challenge mint.
+limits, supported versions and encodings, and the **grant lifecycle
+state**. A server MAY also send it preemptively, for example alongside a
+challenge mint.
 
-The capability identifiers are exactly these four strings, carried as an
-array:
+**It carries no capability list.** A relay operates both mailbox kinds or
+is not a relay, so there is nothing to declare and nothing for a client to
+switch on. The one thing that varies is `grantLifecycle` — `active`,
+`draining`, or `absent` (§[Retirement](#retirement)) — which a relay
+**MUST** publish, because a peer holding a grant address has no other way
+to learn that issuance is winding down.
 
-| identifier | surface |
-|---|---|
-| `pairMailbox` | the DID-addressed mailbox |
-| `grant` | issuing and serving grant-addressed mailboxes |
-| `watch` | the declaration watch |
-| `observation` | the rest of atproto state |
-
-A deployment **MUST** declare every capability it serves and **MUST NOT**
-serve the endpoints of one it has not declared; a request to an undeclared
-capability's endpoint **SHOULD** answer `501`. A client encountering a
-document without a capability it needs **MUST** treat that capability as
-unoffered rather than probing for it.
-
-**This does not weaken the closure contract.** The check is
-capability-level and decided from the request path alone, before any
-address- or DID-dependent lookup, so it cannot become an oracle about a
-recipient. A deployment that declares `grant` answers grant puts exactly as
-[the closure exception](#the-closure-exception) requires — a `501` is
-possible only from a deployment that serves no grant mailboxes for anyone,
-which is a fact about the deployment and not about any address.
+The document is **generated from the values a relay actually enforces**,
+never maintained beside them: a published limit and an enforced one that
+disagree are worse than an unpublished limit, and the same applies to the
+lifecycle state the events socket reports on
+[its own `#capabilities` frame](#capabilities). The two MUST agree.
 
 This is a *capability* document, served by a relay whose address you
 already have. It is distinct from any future *discovery* mechanism — "does

@@ -35,21 +35,14 @@ new_sqlite_classes = ["PMRObject"]
 # that does transfer.
 # ─────────────────────────────────────────────────────────────────────────
 [vars]
-# Which of the four capabilities this deployment serves, comma-separated:
-# pairMailbox, grant, watch, observation. A deployment MUST NOT serve the
-# endpoints of one it does not declare here, and `pairMailbox` requires
-# `grant` (see spec/wire-api.md, "Capabilities, cardinality, and lifecycle").
-#
-# Two combinations worth knowing: `grant` alone is a perfectly good
-# deployment — a grant carries its own host, so peers reach it without any
-# DID resolution — and `watch` alone is the independent-observer case, which
-# also needs an always-on firehose component this Worker cannot host.
-CAPABILITIES = "pairMailbox,grant,watch,observation"
-
 # active | draining | absent. `draining` stops vending new grants while
-# still accepting puts to already-vended addresses, which is how the grant
-# capability is retired without stranding mail peers hold addresses for.
-# Ignored unless `grant` is in CAPABILITIES.
+# still accepting puts to already-vended addresses, which is how grant
+# issuance is retired without stranding mail peers hold addresses for.
+#
+# There is no companion setting for the mailboxes themselves: a relay
+# operates both kinds or is not a relay (see spec/wire-api.md). Grants are
+# the one thing vended to third parties, so they are the one thing whose
+# retirement a peer can observe.
 GRANT_LIFECYCLE = "active"
 
 # Per-sender capacity of a provisioned pair mailbox. The mailbox refuses at

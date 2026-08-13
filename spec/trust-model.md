@@ -277,9 +277,9 @@ client-side:
 - **Spot checks.** Key-bearing moments — first contact, an observed
   anchor-key change — may trigger an independent fetch. Sampled and rare,
   because a direct fetch is itself a signal to the counterpart's host.
-- **Multiple independent watchers.** A device SHOULD register `watch` with
-  more than one relay and cross-check them; a split view is evidence of
-  misbehavior no single relay can suppress.
+- **Multiple independent watchers.** A device SHOULD register with more
+  than one declaration watcher and cross-check them; a split view is
+  evidence of misbehavior no single one can suppress.
 
 That last one holds for **any** DID under watch, including the device's
 own: reading a declaration requires no authority over anyone, so a second,
@@ -289,10 +289,12 @@ canonical-delegate relationship is unrelated to reading: it is being the
 relay a peer's mailbox put resolves to. Watching and holding mailbox
 authority are independent, and only the second is restricted to one relay.
 
-**Watch-only relays** follow directly: a deployment MAY serve `watch`
-alone, with no mailboxes and no delegation. An operator running one gives
-self-hosting users an independent verifier without becoming their mail
-host.
+**A standalone watcher** follows directly: the declaration watch is a
+separate component from a relay
+([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)),
+and may be operated with no mailboxes and no delegation at all. An operator
+running one gives self-hosting users an independent verifier without
+becoming their mail host.
 
 ### Why more than one watcher is load-bearing
 
@@ -348,12 +350,13 @@ Two things follow, and they matter for how deployments are configured:
 - The disqualification is **per-DID, not per-deployment**. A relay that
   hosts one user's repo is a perfectly sound watcher for every other DID,
   and for counterpart DIDs it is often the best-positioned watcher there
-  is. `watch` is not a capability some deployments are forbidden to serve.
-- Capabilities are therefore **freely combinable**. A deployment MAY
-  declare `watch` alongside any other capability; this specification places
-  no restriction on the combination, because the constraint it would be
-  trying to express is a property of the client's situation rather than of
-  the deployment.
+  is. Watching is not something some operators are forbidden to do.
+- Watching and relaying are therefore **freely combinable**, and a PMR is
+  in fact encouraged to do both — it already resolves counterpart
+  declarations to verify pair puts. This specification places no
+  restriction on the combination, because the constraint it would be trying
+  to express is a property of the client's situation rather than of the
+  deployment.
 
 Comparing hosts rules out the accidental case — a client that ends up with
 its PDS as its only watcher — and not the adversarial one, where two

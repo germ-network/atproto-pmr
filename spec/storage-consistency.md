@@ -65,15 +65,13 @@ the push grant this relay holds (if the deployment uses
 [push delegation](wire-api.md#push-delegation-optional)), policy
 configuration, a last-active timestamp, and record timestamps.
 
-Registration state is the same shape whatever the deployment serves — it
-is an identity and trusted-key record, not a mailbox one
-([`wire-api.md` §Registration](wire-api.md#registration)) — so a watch-only
-deployment stores registrations exactly as any other does. What it also
-holds is the **capability set this registration is served under**, and,
-where `grant` is served, that capability's
-[lifecycle state](wire-api.md#retirement): a drain ends per-registration,
-when that registration's last outstanding grant expires, so `draining`
-versus absent is not a deployment-wide fact and cannot be stored as one.
+Registration state is an identity and trusted-key record, not a mailbox one
+([`wire-api.md` §Registration](wire-api.md#registration)). There is no
+capability set to store alongside it — a relay operates both mailbox kinds
+or is not a relay. What it does hold is enough to answer the
+[grant lifecycle](wire-api.md#retirement) *for this registration*: a drain
+ends when that registration's last outstanding grant expires, so `draining`
+versus `absent` is not a deployment-wide fact and cannot be stored as one.
 
 The anchor key MUST be stored as a **self-describing `COSE_Key` blob, never
 a fixed-width column**, encoded per RFC 8949 §4.2.1, so that a new
@@ -89,22 +87,36 @@ token.
 
 ### Declaration watch
 
-`readWatchState()` / `writeWatchState(...)` over: the last observed
+The watcher is a **separate component**, not a relay surface
+([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)),
+and its storage is not specified here.
+
+A relay still keeps a little watch-shaped state for its **own** registered
+DIDs, because it pauses when a declared key disappears
+(§[Registration state](#registration-state)): the last observed
 declaration revision, the last check time, the currently trusted anchor
-key, and the paused flag set when the declared key disappears. Scheduling
-is separate.
+key, and the paused flag. That is a relay concern and stays here; serving
+watch *to others* is not.
 
 ### Mailboxes
 
 Three shapes, distinguished by what routes to them:
 
-- **Pair mailboxes** — keyed by counterpart DID, *within* this relay's
-  store. Routing already resolved the recipient DID to this store, so the
-  key is a local index: it needs no global uniqueness and no derivation on
-  the wire.
-- **Grant mailboxes** — keyed by the derived opaque address, which is
-  itself the routing key and therefore MUST resolve globally, before any
-  relay is known.
+- **Pair mailboxes** — keyed by the counterpart DID **verbatim**, *within*
+  this relay's store. Routing already resolved the recipient DID to this
+  store, so the key is a local index: it needs no global uniqueness and no
+  derivation on the wire.
+- **Grant mailboxes** — keyed by `grant:` + the derived opaque address,
+  which is itself the routing key and therefore MUST resolve globally,
+  before any relay is known.
+
+Both kinds share one key space, and a key says which kind it is: a DID
+already begins with `did:`, so only the grant arm carries an added prefix
+([`wire-api.md` §Delivery — peer-facing](wire-api.md#delivery--peer-facing)).
+An adapter MUST NOT strip or add a prefix on the pair arm. Note the
+consequence for any internal key namespacing: a record family named
+`grant:` is now ambiguous with the mailbox-kind prefix, and wants a
+distinct name.
 - **The recovery pool** — for senders with no provisioned mailbox. Shallow
   per sender, wide in sender count, and **newest-wins on overflow** rather
   than refusing.
@@ -255,9 +267,8 @@ earlier draft of this section overstated it in both directions.
 **Not the declaration watch.** A watcher is push-driven off the atproto
 firehose, and that firehose lives in a separate always-on component outside
 the request-scoped runtime entirely
-([`wire-api.md` §Watch](wire-api.md#serving-watch-requires-a-component-the-other-capabilities-do-not)).
-It is not something this interface schedules, per DID or otherwise. A
-**watch-only deployment needs little of what follows.**
+([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)).
+It is not something this interface schedules, per DID or otherwise.
 
 **Not expiry**, per the section above. **Nor** pool adjudication, which is
 triggered by threshold or by connect; **nor** the blocked-sender synthetic

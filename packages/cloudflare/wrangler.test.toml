@@ -20,7 +20,6 @@ MAX_MESSAGES_PER_PAIR_SENDER = "25"
 POOL_CAP_BYTES = "4000000"
 POOL_DEPTH_PER_SENDER = "3"
 POOL_DEPTH_UNDER_PRESSURE = "1"
-CAPABILITIES = "pairMailbox,grant,watch,observation"
 GRANT_LIFECYCLE = "active"
 
 [[kv_namespaces]]

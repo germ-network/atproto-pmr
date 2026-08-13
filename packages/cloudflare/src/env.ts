@@ -41,16 +41,10 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     POOL_DEPTH_UNDER_PRESSURE: string
 
     /**
-     * Comma-separated capability identifiers this deployment serves, from
-     * `pairMailbox`, `grant`, `watch`, `observation`. Read here so the
-     * events socket can report them; a deployment MUST also refuse the
-     * endpoints of anything absent from this list.
-     */
-    CAPABILITIES: string
-
-    /**
-     * `active`, `draining`, or `absent` — deployment-wide policy for the
-     * `grant` capability. Ignored when `grant` is not in `CAPABILITIES`.
+     * `active`, `draining`, or `absent` — deployment-wide policy for grant
+     * issuance. Operating mailboxes is not configurable: a relay serves
+     * both kinds or is not a relay. This is the one thing that winds down,
+     * because it is the one thing vended to third parties.
      */
     GRANT_LIFECYCLE: string
 }

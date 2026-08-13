@@ -5,7 +5,6 @@ import {
     encodeCapabilitiesFrame,
     handleAckFrame,
     parseGrantLifecycle,
-    parseServedFunctions,
     type AppendResult,
     type EffectiveCapabilities,
     type GrantLifecycle,
@@ -20,7 +19,6 @@ import {
     type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
-    type ServedFunction,
     type SyntheticBehavior,
     type SyntheticState,
 } from "@germ-network/atproto-pmr-core"
@@ -45,17 +43,24 @@ const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 
 /**
- * The key families. A `MailboxKey` is the counterpart DID, so a prefixed
- * listing is also the DID listing — there is no side table mapping keys
- * back, and no way for one to disagree with the family it describes.
+ * The key families — which *kind of record* this is, an axis orthogonal to
+ * the `MailboxKey` it is about. A prefixed listing is therefore also the
+ * key listing, with no side table to disagree with the family it describes.
  *
- * DIDs contain `:` themselves, which is harmless: every read slices a fixed
- * prefix length rather than splitting, so `pool:did:plc:alice` recovers
- * `did:plc:alice` exactly.
+ * Keys contain `:` themselves — a DID always, and a grant key by its own
+ * prefix — which is harmless: every read slices a fixed prefix length
+ * rather than splitting, so `pool:did:plc:alice` recovers `did:plc:alice`
+ * and `mbox:grant:abc` recovers `grant:abc`, both exactly.
+ *
+ * `GRANT_ROW_PREFIX` is NOT the wire-level `grant:` mailbox-kind prefix,
+ * despite the near-collision: this one names an owner's record OF a grant
+ * they issued, keyed by bare address, while that one makes a routing key
+ * out of an address. A grant's queue lives under `mbox:grant:<address>`
+ * and its metadata under `grantrow:<address>`.
  */
 const POOL_PREFIX = "pool:"
 const SYNTHETIC_PREFIX = "syn:"
-const GRANT_PREFIX = "grant:"
+const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
@@ -64,7 +69,7 @@ const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
-const grantKey = (address: string) => `${GRANT_PREFIX}${address}`
+const grantRowKey = (address: string) => `${GRANT_ROW_PREFIX}${address}`
 
 interface GrantRow {
     address: string
@@ -113,22 +118,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * What this deployment serves **for this registration**.
      *
      * The deployment-wide part comes from config; the one per-registration
-     * refinement is the `grant` drain, which ends when *this* registration's
+     * refinement is the grant drain, which ends when *this* registration's
      * last grant expires rather than on a deployment-wide schedule. A
      * deployment can therefore be `draining` while a client that holds no
      * live grants is correctly told `absent`.
      */
     private async effectiveCapabilities(): Promise<EffectiveCapabilities> {
-        // Parsed rather than read loosely: an unrecognized identifier is a
-        // misconfiguration that would otherwise yield a deployment serving
-        // something it tells every client it does not.
-        const declared = new Set(parseServedFunctions(this.env.CAPABILITIES))
-        const on = (c: ServedFunction): "active" | "absent" =>
-            declared.has(c) ? "active" : "absent"
-
-        let grant: GrantLifecycle = declared.has("grant")
-            ? parseGrantLifecycle(this.env.GRANT_LIFECYCLE)
-            : "absent"
+        // Parsed rather than read loosely: an unrecognized value is a
+        // misconfiguration, and a relay that puts one on the wire tells
+        // every client something it cannot act on.
+        let grant: GrantLifecycle = parseGrantLifecycle(
+            this.env.GRANT_LIFECYCLE
+        )
         if (grant === "draining") {
             const nowSeconds = Math.floor(Date.now() / 1000)
             const live = (await this.listGrants()).some(
@@ -137,12 +138,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             if (!live) grant = "absent"
         }
 
-        return {
-            pairMailbox: on("pairMailbox"),
-            grant,
-            watch: on("watch"),
-            observation: on("observation"),
-        }
+        return { grant }
     }
 
     /**
@@ -429,7 +425,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const entries: MailboxSnapshot[] = []
         for (const [k, messages] of rows) {
             if (messages.length === 0) continue
-            entries.push({ key: k.slice(MAILBOX_PREFIX.length), messages })
+            // `mailboxKey()` is the only writer of this family, and it takes
+            // a `MailboxKey`, so slicing its prefix back off recovers one.
+            entries.push({
+                key: k.slice(MAILBOX_PREFIX.length) as MailboxKey,
+                messages,
+            })
         }
         return {
             entries,
@@ -651,7 +652,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         _authKey: Uint8Array,
         expiresAt: number
     ): Promise<void> {
-        await this.db.put(grantKey(address), {
+        await this.db.put(grantRowKey(address), {
             address,
             expiresAt,
             closed: false,
@@ -659,23 +660,23 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     async listGrants(): Promise<GrantSummary[]> {
-        const entries = await this.db.list<GrantRow>({ prefix: GRANT_PREFIX })
+        const entries = await this.db.list<GrantRow>({ prefix: GRANT_ROW_PREFIX })
         return [...entries.values()]
     }
 
     async getGrant(address: string): Promise<GrantSummary | null> {
-        return (await this.db.get<GrantRow>(grantKey(address))) ?? null
+        return (await this.db.get<GrantRow>(grantRowKey(address))) ?? null
     }
 
     /** A no-op if `address` was never issued by this owner. */
     async setGrantClosed(address: string, closed: boolean): Promise<void> {
-        const row = await this.db.get<GrantRow>(grantKey(address))
+        const row = await this.db.get<GrantRow>(grantRowKey(address))
         if (row === undefined) return
-        await this.db.put(grantKey(address), { ...row, closed })
+        await this.db.put(grantRowKey(address), { ...row, closed })
     }
 
     async invalidateGrant(address: string): Promise<void> {
-        await this.db.delete(grantKey(address))
+        await this.db.delete(grantRowKey(address))
         // May have been the last live grant of a drain, which ends it for
         // this registration — the one capability transition this object
         // can cause rather than merely observe.

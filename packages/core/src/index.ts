@@ -18,6 +18,7 @@ export type {
     BodyStore,
     ChallengeStore,
     Directory,
+    GrantMailboxKey,
     GrantSummary,
     Locator,
     MailboxKey,
@@ -26,6 +27,7 @@ export type {
     MessageRef,
     Nonce,
     OpenMailboxesPage,
+    PairMailboxKey,
     PMRStore,
     PoolAppendResult,
     PoolSender,
@@ -33,6 +35,16 @@ export type {
     ResolvedAddress,
     VerificationHint,
 } from "./storage"
+
+// The one inbox path's key prefixes.
+export {
+    asMailboxKey,
+    asPairMailboxKey,
+    grantMailboxKey,
+    isPairMailboxKey,
+    parseMailboxKey,
+    type ParsedMailboxKey,
+} from "./mailbox-key"
 
 // The blocked-sender seam. Supply your own; do not publish it.
 export {
@@ -46,7 +58,6 @@ export {
 export {
     buildCapabilityDocument,
     parseGrantLifecycle,
-    parseServedFunctions,
     serveCapabilityDocument,
     SUPPORTED_API_VERSIONS,
     SUPPORTED_ENCODINGS,
@@ -55,7 +66,6 @@ export {
     type PMRConfig,
     type PMRLimits,
     type PoolLimits,
-    type ServedFunction,
 } from "./config"
 
 // RFC 9421 HTTP Message Signatures.

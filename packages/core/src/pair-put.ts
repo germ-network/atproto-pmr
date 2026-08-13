@@ -1,9 +1,16 @@
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { thumbprintOkpEd25519 } from "./cose/key.js"
 import { DeclarationResolution } from "./declaration.js"
+import { asPairMailboxKey } from "./mailbox-key.js"
 import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
-import { BodyStore, Directory, Locator, PMRStore } from "./storage.js"
+import {
+    BodyStore,
+    Directory,
+    Locator,
+    PairMailboxKey,
+    PMRStore,
+} from "./storage.js"
 import { readBodyCapped } from "./util.js"
 
 /**
@@ -38,7 +45,7 @@ export interface PairPutDeps {
 }
 
 /**
- * `POST /pmr/v1/inboxes/{did}/messages` — `spec/wire-api.md`, "Delivery —
+ * `POST /pmr/v1/inbox/{did}/messages` — `spec/wire-api.md`, "Delivery —
  * peer-facing" and "The pair-put payload".
  *
  * RESPONSE CONTRACT, read literally from the specification's error table:
@@ -67,6 +74,11 @@ export async function handlePairPut(
     // --- Address-independent and synchronous. Malformed input is real
     // client error and safe to report distinctly. ---
     let envelope: ReturnType<typeof decodePairPutEnvelope>
+    // The mailbox key is the sender's DID, from the SIGNED headers — the
+    // same value verification runs against, never a routing hint. Narrowed
+    // here, in request-bytes-only territory, because a non-DID sender is a
+    // malformed envelope and nothing below may answer anything but 202/429.
+    let senderKey: PairMailboxKey
     try {
         const bodyBytes = await readBodyCapped(
             request,
@@ -78,6 +90,7 @@ export async function handlePairPut(
                 status: 400,
             })
         }
+        senderKey = asPairMailboxKey(envelope.payload.senderDID)
     } catch (e) {
         return new Response(`Malformed pair-put envelope: ${String(e)}`, {
             status: 400,
@@ -125,9 +138,7 @@ export async function handlePairPut(
     }
     const store = deps.store(locator)
 
-    // The mailbox key is the sender's DID, taken from the SIGNED headers —
-    // the same value verification just ran against, never a routing hint.
-    const mailboxKey = envelope.payload.senderDID
+    const mailboxKey = senderKey
     const messageId = deriveMessageId(envelope.payload.payload)
     const ref = {
         messageId,

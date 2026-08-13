@@ -1,7 +1,7 @@
 /**
- * Capability parsing and the capability document.
+ * Grant-lifecycle parsing and the capability document.
  *
- * The parsers exist so a deployment declares what it serves exactly once.
+ * The parser exists so a deployment declares its grant state exactly once.
  * Two independent declarations can disagree, and the one a client happens
  * to read then decides what it believes — which is the drift the capability
  * document is generated (rather than written) to prevent.
@@ -10,14 +10,12 @@ import { describe, expect, it } from "vitest"
 import {
     buildCapabilityDocument,
     parseGrantLifecycle,
-    parseServedFunctions,
     type PMRConfig,
 } from "../src/config"
 
 function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
     return {
         hostName: "relay.example",
-        functions: ["pairMailbox", "grant", "watch", "observation"],
         grantLifecycle: "active",
         configState: "2026-08-13.1",
         limits: {
@@ -39,41 +37,6 @@ function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
     }
 }
 
-describe("parseServedFunctions", () => {
-    it("parses the four identifiers, trimming whitespace", () => {
-        expect(parseServedFunctions("pairMailbox, grant , watch,observation")).toEqual(
-            ["pairMailbox", "grant", "watch", "observation"]
-        )
-    })
-
-    it("accepts a watch-only deployment", () => {
-        expect(parseServedFunctions("watch")).toEqual(["watch"])
-    })
-
-    it("accepts grant standing alone — the case the split exists to allow", () => {
-        expect(parseServedFunctions("grant")).toEqual(["grant"])
-    })
-
-    it("accepts an empty declaration", () => {
-        // Serves nothing but the always-present surface. Odd, not invalid.
-        expect(parseServedFunctions("")).toEqual([])
-    })
-
-    it("REJECTS an unrecognized identifier rather than dropping it", () => {
-        // Silently ignoring "grants" would leave a deployment serving grant
-        // mailboxes while telling every client it does not.
-        expect(() => parseServedFunctions("pairMailbox,grants")).toThrow(
-            /Unknown capability "grants"/
-        )
-    })
-
-    it("rejects pairMailbox without grant", () => {
-        expect(() => parseServedFunctions("pairMailbox")).toThrow(
-            /MUST also serve grant/
-        )
-    })
-})
-
 describe("parseGrantLifecycle", () => {
     it("parses the three states", () => {
         expect(parseGrantLifecycle("active")).toBe("active")
@@ -89,29 +52,22 @@ describe("parseGrantLifecycle", () => {
 })
 
 describe("buildCapabilityDocument", () => {
-    it("publishes the declared capabilities verbatim", () => {
-        expect(buildCapabilityDocument(config()).functions).toEqual([
-            "pairMailbox",
-            "grant",
-            "watch",
-            "observation",
-        ])
+    it("publishes the grant lifecycle, always", () => {
+        // Unconditional now that operating mailboxes is not a declared
+        // capability: there is no configuration in which a relay serves no
+        // grants, only one in which it has stopped vending new ones.
+        for (const grantLifecycle of ["active", "draining", "absent"] as const) {
+            expect(
+                buildCapabilityDocument(config({ grantLifecycle }))
+                    .grantLifecycle
+            ).toBe(grantLifecycle)
+        }
     })
 
-    it("publishes the grant lifecycle when grants are served", () => {
-        expect(
-            buildCapabilityDocument(config({ grantLifecycle: "draining" }))
-                .grantLifecycle
-        ).toBe("draining")
-    })
-
-    it("omits the grant lifecycle when grants are not served", () => {
-        // Meaningless without the capability it describes — absent rather
-        // than reported as "absent", which a client could misread as a
-        // drain that has finished.
-        const doc = buildCapabilityDocument(config({ functions: ["watch"] }))
-        expect(doc.grantLifecycle).toBeUndefined()
-        expect("grantLifecycle" in doc).toBe(false)
+    it("publishes no capability list", () => {
+        // A relay operates both mailbox kinds or is not a relay, so there
+        // is nothing for a client to switch on and nothing to drift.
+        expect("functions" in buildCapabilityDocument(config())).toBe(false)
     })
 
     it("publishes limits the put path actually enforces, not a copy", () => {

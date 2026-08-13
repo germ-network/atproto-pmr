@@ -1,5 +1,6 @@
 import { decodeCoseSequence, encodeCose, type CoseValue } from "./cose/cbor.js"
 import type { GrantLifecycle } from "./config.js"
+import { asMailboxKey } from "./mailbox-key.js"
 import type { BodyStore, MessageRef, PMRStore } from "./storage.js"
 
 /**
@@ -99,26 +100,23 @@ export function encodePoolFrame(): Uint8Array {
 /**
  * What this deployment currently serves **for this registration**.
  *
- * Per-registration rather than deployment-wide because a `grant` drain
- * ends when *that* registration's last grant expires, so two clients of
- * the same deployment can legitimately see different states at once.
+ * Per-registration rather than deployment-wide because a grant drain ends
+ * when *that* registration's last grant expires, so two clients of the same
+ * deployment can legitimately see different states at once.
+ *
+ * One field, and still a struct: mailbox operation is not a capability a
+ * relay declares (it serves both kinds or is not a relay), so the grant
+ * lifecycle is all that varies today — but a bare enum on the wire would
+ * make adding a second field a breaking frame change.
  */
 export interface EffectiveCapabilities {
-    pairMailbox: "active" | "absent"
     grant: GrantLifecycle
-    watch: "active" | "absent"
-    observation: "active" | "absent"
 }
 
 export function encodeCapabilitiesFrame(c: EffectiveCapabilities): Uint8Array {
     return encodeFrame(
         "capabilities",
-        new Map<string, CoseValue>([
-            ["pm", c.pairMailbox],
-            ["gr", c.grant],
-            ["wt", c.watch],
-            ["ob", c.observation],
-        ])
+        new Map<string, CoseValue>([["gr", c.grant]])
     )
 }
 
@@ -144,12 +142,8 @@ export function decodeCapabilitiesFrame(
         }
         return v as T
     }
-    const present = ["active", "absent"] as const
     return {
-        pairMailbox: read("pm", present),
         grant: read("gr", ["active", "draining", "absent"] as const),
-        watch: read("wt", present),
-        observation: read("ob", present),
     }
 }
 
@@ -157,11 +151,11 @@ export function decodeCapabilitiesFrame(
  * Unconditional "your connect-time backlog is finished" — sent whether or
  * not `#pool` was.
  *
- * NOT to be confused with the `grant` capability's `draining` state, which
+ * NOT to be confused with the grant lifecycle's `draining` state, which
  * says the deployment has stopped vending grants
  * (`spec/wire-api.md`, "Retirement"). Both words appear on this socket and
- * they mean unrelated things; this one is about a queue, that one about a
- * capability being retired.
+ * they mean unrelated things; this one is about a queue, that one about
+ * grant issuance winding down.
  */
 export function encodeCaughtUpFrame(): Uint8Array {
     return encodeFrame("caughtUp", new Map())
@@ -201,8 +195,9 @@ const DEFAULT_DRAIN_PAGE_SIZE = 50
  * pool is empty.
  *
  * `#capabilities` leads because it frames how to read everything after it:
- * a client that does not yet know the deployment serves no pair mailboxes
- * cannot tell "none queued" from "not offered".
+ * a client that does not yet know grants are draining cannot tell "nothing
+ * queued for my grant addresses" from "those addresses are winding down and
+ * I should be reissuing".
  *
  * `capabilities` is a parameter rather than part of `EventsDeps` because
  * the other consumer of those deps — the ack path — has no use for it, and
@@ -243,11 +238,15 @@ export async function drainBacklog(
     send(encodeCaughtUpFrame())
 }
 
-/** Acks are idempotent — `remove` already succeeds on an unknown record. */
+/**
+ * Acks are idempotent — `remove` already succeeds on an unknown record, and
+ * a key naming neither mailbox kind names nothing this store could hold, so
+ * it is the same no-op rather than a distinct error.
+ */
 export async function handleAckFrame(
     deps: EventsDeps,
     frameBytes: Uint8Array
 ): Promise<void> {
     const ack = decodeAckFrame(frameBytes)
-    await deps.store.remove(ack.key, ack.messageId)
+    await deps.store.remove(asMailboxKey(ack.key), ack.messageId)
 }

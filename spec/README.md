@@ -18,51 +18,57 @@ opaque bytes, and for nothing that determines a key.**
 
 An **Atproto PMR** is the variant bound to an atproto DID. The delegation
 is established by publishing a messaging identity key — the **anchor key**
-— in a declaration record in that DID's atproto repository. A relay holding
-a live delegation for a DID serves some or all of four capabilities:
+— in a declaration record in that DID's atproto repository.
 
-| capability | what it is | how many a user may have |
+**A PMR operates mailboxes.** That is the whole of it, and there is nothing
+to declare: a relay serves both kinds of mailbox or it is not a relay.
+
+| mailbox kind | key | how many a user may have |
 |---|---|---|
-| `pairMailbox` | the DID-addressed mailbox — first contact and recovery | **exactly one** |
-| `grant` | issuing and serving opaque grant-addressed mailboxes | **any number** |
-| `watch` | the declaration watch — reporting changes to a DID's declaration | **any number**, and more than one is the point |
-| `observation` | the rest of atproto state — profiles, the follow graph, appview reads | one, ideally at the PDS |
+| pair | the counterpart DID, verbatim | **exactly one relay's worth** |
+| grant | `grant:` + an opaque derived address | **any number, across any number of relays** |
 
-Outbound relay is **not in this version**; the device performs its own
-puts. It is not a capability identifier, and nothing advertises it.
-
-A deployment declares its capabilities in its capability document
-(§[Capability document](wire-api.md#capability-document)), and MUST NOT
-serve the endpoints of a capability it does not declare.
-
-**Grant issuance is the core capability.** A relay is a grant issuer first:
-it vends opaque, unguessable mailbox addresses that name no sender. DID
-addressing is the entry path that runs ahead of them — first contact and
-re-contact arrive on the DID-addressed mailbox, the always-resolvable
-layer, and conversations then move onto grant addresses for steady state.
-DID addressing complements grants; it never replaces them, and **a
-deployment serving `pairMailbox` MUST also serve `grant`**: a pair mailbox
-that cannot vend grants strands every conversation on the entry path
-forever.
-
-The reverse does not hold, and that asymmetry is the useful one. **`grant`
-stands alone**, and so does `watch`. The three cardinalities above follow
-from how each is reached:
+Both arrive on one path, `POST /pmr/v1/inbox/{key}/messages`, told apart by
+the key's prefix (§[Delivery — peer-facing](wire-api.md#delivery--peer-facing)).
+The cardinalities differ because the routing does:
 
 - A **grant carries its own host**, and its address is derived under that
   host (§[Grant address and put-tag derivation](wire-api.md#grant-address-and-put-tag-derivation)),
   so a peer holding a grant needs nothing else to route to it. A user may
-  therefore hold grants from several relays at once, and a deployment may
-  serve nothing but grant mailboxes.
+  therefore hold grants from several relays at once.
 - A **pair put is routed by resolving the recipient's DID**, and that
   resolution yields one relay, so there is exactly one pair mailbox per
-  DID. It is also the only capability whose reachability depends on
-  something this specification does not define — see
+  DID. Its reachability is the one thing here that depends on something
+  this specification does not define — see
   [the discovery hop](#not-yet-specified).
-- A **watcher is chosen by the client**, not resolved, so a device may
-  register with several and cross-check them. That redundancy is
-  load-bearing rather than decorative: it is what detects a relay — or a
-  PDS — that equivocates ([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
+
+**Grant issuance is the core of it.** A relay is a grant issuer first: it
+vends opaque, unguessable mailbox addresses that name no sender. DID
+addressing is the entry path that runs ahead of them — first contact and
+re-contact arrive on the DID-addressed mailbox, the always-resolvable
+layer, and conversations then move onto grant addresses for steady state.
+Grants are also the only thing a relay vends to third parties, and so the
+only thing whose retirement a peer can observe: a relay winds grant
+issuance down through `draining` before it stops
+(§[Retirement](wire-api.md#retirement)), which is the one lifecycle state
+its capability document publishes.
+
+Outbound relay is **not in this version**; the device performs its own
+puts.
+
+**Two related components are deliberately not part of a PMR.** The
+**declaration watch** — reporting changes to a DID's declaration — is a
+separate, independently operable component that a PMR is *encouraged* to
+run alongside itself, because it is nearly free where a relay already
+resolves and verifies counterpart declarations to check pair-put
+signatures. It is not a capability of the relay, and a client chooses its
+watchers rather than resolving them: a device registers with several and
+cross-checks, which is load-bearing rather than decorative, being what
+detects a relay — or a PDS — that equivocates
+([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
+**Observation** — the rest of atproto state, profiles and the follow graph
+— is deferred. Neither has a specified surface here yet; see
+[Not yet specified](#not-yet-specified).
 
 ## Where to start
 
@@ -168,7 +174,7 @@ is an index, not a substitute for the sections it links.
 | 11 | Relayed atproto repo records are exchanged as CAR — signed commit plus inclusion proof — never as JSON | [trust](trust-model.md#p2--relayed-repo-records-are-car) |
 | 12 | The seven items of the storage consistency contract hold, whatever the backend | [storage](storage-consistency.md#the-consistency-contract) |
 | 13 | The relay's verification verdict is delivered to the device as a hint and never as evidence; the device re-verifies | [trust](trust-model.md#p8--the-relays-verdict-is-a-hint) |
-| 14 | A deployment declares its capabilities in the capability document and does not serve the endpoints of one it has not declared; a deployment serving `pairMailbox` also serves `grant` | [wire](wire-api.md#capabilities-cardinality-and-lifecycle) |
+| 14 | Both mailbox kinds are served on one inbox path, distinguished by key prefix, with a DID carried verbatim and only a grant address prefixed | [wire](wire-api.md#delivery--peer-facing) |
 
 Items 2 and 9 are not self-certifying. Both are timing properties, and an
 implementation that satisfies them in code can lose them to an early

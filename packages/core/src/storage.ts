@@ -16,13 +16,17 @@
 export type Locator = string
 
 /**
- * A pair mailbox's key *within* one relay's store: **the counterpart DID.**
- * Routing has already resolved the recipient DID to this store, so this is a
- * local index, not an address — no global uniqueness, no derivation on the
- * wire. The alias exists to mark that distinction, not to hide a derivation.
+ * A mailbox's key *within* one relay's store, both kinds sharing one space:
+ * **the counterpart DID verbatim** for a pair mailbox, `grant:<address>`
+ * for a grant mailbox. Only one arm carries an added prefix — see
+ * `mailbox-key.ts` for why.
  *
- * This deliberately replaced a hashed key. The hash was there for log
- * hygiene, and in this design it bought none: an unsalted digest over a
+ * Routing has already resolved the recipient to this store, so this is a
+ * local index, not an address — no global uniqueness, no derivation on the
+ * wire.
+ *
+ * The pair arm deliberately replaced a hashed key. The hash was there for
+ * log hygiene, and in this design it bought none: an unsalted digest over a
  * public, enumerable identifier resists nothing, and a per-record salt is
  * impossible for a key that must be computed *before* the record is read.
  * Meanwhile the relay stores the plaintext DID adjacent regardless — in
@@ -30,7 +34,22 @@ export type Locator = string
  * sender the device can decide about — and takes it in request paths that
  * land in access logs. Two side tables existed purely to map the hash back.
  */
-export type MailboxKey = string
+export type MailboxKey = PairMailboxKey | GrantMailboxKey
+
+/**
+ * A pair mailbox: the counterpart DID, verbatim.
+ *
+ * Named separately because several operations are pair-only by
+ * construction, and saying so in the type is free. Blocking is the clearest
+ * case: an owner blocks a *sender DID*, and suppresses a grant address by
+ * closing the grant instead — the asymmetry `spec/wire-api.md`'s closure
+ * exception spells out. The recovery pool is likewise DID-shaped; a grant
+ * address never pools, because holding one already means being provisioned.
+ */
+export type PairMailboxKey = `did:${string}`
+
+/** A grant mailbox: the derived address, prefixed. */
+export type GrantMailboxKey = `grant:${string}`
 
 /** Identifier of a stored message; bodies live in a separate store. */
 export type MessageId = string
@@ -305,7 +324,7 @@ export interface PMRStore {
      * run inside this call — see `PoolAppendResult`.
      */
     appendToPool(
-        key: MailboxKey,
+        key: PairMailboxKey,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number
@@ -333,22 +352,22 @@ export interface PMRStore {
      * delivered rather than discarded. Returns what moved, so the caller
      * can deliver it.
      */
-    provisionFromPool(key: MailboxKey, nowSeconds: number): Promise<MessageRef[]>
+    provisionFromPool(key: PairMailboxKey, nowSeconds: number): Promise<MessageRef[]>
 
     /**
      * Discard drops the pooled entries and suppresses the sender until
      * `until`. Time-bounded rather than standing — see `setDiscarded`.
      */
-    discardFromPool(key: MailboxKey, until: number): Promise<void>
+    discardFromPool(key: PairMailboxKey, until: number): Promise<void>
 
     /**
      * Blocking is reversible — the pair-mailbox counterpart of
      * close/reopen on a grant address — and a blocked sender is never told.
      * The behavior this switches on comes from `SyntheticBehavior`.
      */
-    block(key: MailboxKey, nowSeconds: number): Promise<void>
+    block(key: PairMailboxKey, nowSeconds: number): Promise<void>
 
-    unblock(key: MailboxKey): Promise<void>
+    unblock(key: PairMailboxKey): Promise<void>
 
     /**
      * Blocked sender DIDs, for the owner-facing listing — the block
@@ -363,7 +382,7 @@ export interface PMRStore {
      * moment*, and the pool exists precisely for the case where the
      * device's own knowledge is behind.
      */
-    setDiscarded(key: MailboxKey, until: number): Promise<void>
+    setDiscarded(key: PairMailboxKey, until: number): Promise<void>
 
     /**
      * The owner's own record of a grant they issued — `issue`, `close`,

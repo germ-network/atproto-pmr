@@ -4,8 +4,13 @@ import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { deriveGrantAddress } from "../grant.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
+import { asPairMailboxKey, isPairMailboxKey } from "../mailbox-key.js"
 import { binaryToBase64URL, readBodyCapped, toResponseBody } from "../util.js"
-import type { Directory, RegistrationFields } from "../storage.js"
+import type {
+    Directory,
+    PairMailboxKey,
+    RegistrationFields,
+} from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
@@ -307,6 +312,9 @@ export async function handleBlockSet(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
+    if (!isPairMailboxKey(senderDID)) {
+        return new Response("Not a DID", { status: 400 })
+    }
     if (blocked) {
         await a.auth.store.block(senderDID, deps.nowSeconds)
     } else {
@@ -364,12 +372,12 @@ export async function handlePoolAdjudication(
     if (!a.ok) return a.response
     if (a.body === null) return new Response("Missing body", { status: 400 })
 
-    let provision: string[] = []
-    let discard: string[] = []
+    let provision: PairMailboxKey[] = []
+    let discard: PairMailboxKey[] = []
     try {
         const map = decodeCoseMap(a.body)
-        provision = stringList(map.get("prov"))
-        discard = stringList(map.get("disc"))
+        provision = stringList(map.get("prov")).map(asPairMailboxKey)
+        discard = stringList(map.get("disc")).map(asPairMailboxKey)
     } catch {
         return new Response("Malformed body", { status: 400 })
     }
