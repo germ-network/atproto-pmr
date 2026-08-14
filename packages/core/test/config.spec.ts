@@ -123,8 +123,8 @@ describe("buildEnablerDocument", () => {
         expect("lifecycle" in doc.capabilities.core).toBe(false)
     })
 
-    it("carries a watch capability at its own prefix when declared", () => {
-        // The watcher can live somewhere else entirely — it is a separate
+    it("carries a monitor capability at its own prefix when declared", () => {
+        // The monitor can live somewhere else entirely — it is a separate
         // component, and this is how a client is told where.
         const doc = buildEnablerDocument(
             config({
@@ -133,15 +133,15 @@ describe("buildEnablerDocument", () => {
                     versions: ["1"],
                     didMailbox: true,
                     grant: true,
-                    watch: { pathPrefix: "/watch/v1", versions: ["1"] },
+                    monitor: { pathPrefix: "/monitor/v1", versions: ["1"] },
                 },
             })
         )
-        expect(doc.capabilities.watch!.pathPrefix).toBe("/watch/v1")
+        expect(doc.capabilities.monitor!.pathPrefix).toBe("/monitor/v1")
     })
 
-    it("omits watch by default", () => {
-        expect("watch" in buildEnablerDocument(config()).capabilities).toBe(false)
+    it("omits monitor by default", () => {
+        expect("monitor" in buildEnablerDocument(config()).capabilities).toBe(false)
     })
 
     it("publishes limits the put path actually enforces, not a copy", () => {

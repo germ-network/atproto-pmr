@@ -82,7 +82,7 @@ export function parseGrantLifecycle(raw: string): GrantLifecycle {
  * prefix and versions. Without it, `POST /pmr/v1/challenges` would be the
  * one path a client could not discover.
  */
-export type CapabilityName = "core" | "didMailbox" | "grant" | "watch"
+export type CapabilityName = "core" | "didMailbox" | "grant" | "monitor"
 
 /** What every capability entry carries, whatever else it adds. */
 export interface CapabilityBase {
@@ -130,7 +130,7 @@ export interface Capabilities {
     core: CoreCapability
     didMailbox?: MailboxCapability
     grant?: GrantCapability
-    watch?: CapabilityBase
+    monitor?: CapabilityBase
 }
 
 /** Which capabilities a deployment serves, and where it serves them. */
@@ -139,7 +139,7 @@ export interface ServedCapabilities {
     versions: readonly string[]
     didMailbox: boolean
     grant: boolean
-    watch?: { pathPrefix: string; versions: readonly string[] }
+    monitor?: { pathPrefix: string; versions: readonly string[] }
 }
 
 export interface PMRConfig {
@@ -243,10 +243,10 @@ export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
             maxPerRequest: limits.maxGrantsPerRequest,
         }
     }
-    if (serves.watch !== undefined) {
-        capabilities.watch = {
-            versions: serves.watch.versions,
-            pathPrefix: serves.watch.pathPrefix,
+    if (serves.monitor !== undefined) {
+        capabilities.monitor = {
+            versions: serves.monitor.versions,
+            pathPrefix: serves.monitor.pathPrefix,
         }
     }
     const body = { encodings: SUPPORTED_ENCODINGS, capabilities }

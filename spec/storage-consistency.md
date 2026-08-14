@@ -56,7 +56,7 @@ exact signatures belong to an implementation.
 | `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
 | `create(did, registration) -> Locator` | idempotent on DID |
 | `delete(did)` | deregistration and dormancy eviction |
-| `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not the declaration watch, which is push-driven — see [Scheduling](#scheduling) |
+| `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not key monitoring, which is push-driven — see [Scheduling](#scheduling) |
 
 ### Registration state
 
@@ -85,18 +85,18 @@ The push grant, where present, is a **capability, not an identity**: an
 identifier, a symmetric key, and an expiry. A relay MUST NOT store a push
 token.
 
-### Declaration watch
+### Key monitoring
 
-The watcher is a **separate component**, not a relay surface
-([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)),
+The monitor is a **separate component**, not a relay surface
+([`wire-api.md` §Monitoring](wire-api.md#monitoring--a-separate-component-not-a-relay-surface)),
 and its storage is not specified here.
 
-A relay still keeps a little watch-shaped state for its **own** registered
+A relay still keeps a little monitor-shaped state for its **own** registered
 DIDs, because it pauses when a declared key disappears
 (§[Registration state](#registration-state)): the last observed
 declaration revision, the last check time, the currently trusted anchor
 key, and the paused flag. That is a relay concern and stays here; serving
-watch *to others* is not.
+monitoring *to others* is not.
 
 ### Mailboxes
 
@@ -264,10 +264,10 @@ or whether, reclamation runs.
 Given the above, less needs scheduling than it first appears — and an
 earlier draft of this section overstated it in both directions.
 
-**Not the declaration watch.** A watcher is push-driven off the atproto
+**Not key monitoring.** A monitor is push-driven off the atproto
 firehose, and that firehose lives in a separate always-on component outside
 the request-scoped runtime entirely
-([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)).
+([`wire-api.md` §Monitoring](wire-api.md#monitoring--a-separate-component-not-a-relay-surface)).
 It is not something this interface schedules, per DID or otherwise.
 
 **Not expiry**, per the section above. **Nor** pool adjudication, which is

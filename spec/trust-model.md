@@ -239,7 +239,7 @@ self-hosted relay that is a strict improvement; against a hosted one it
 concentrates in one known party what was previously scattered. And **spot
 checks cost something**: a direct fetch tells the counterpart's PDS that
 you are checking, so verification traffic is itself a signal — hence
-sampled and rare, and hence multi-watcher cross-checking, which costs
+sampled and rare, and hence multi-monitor cross-checking, which costs
 nothing at the counterpart's host, as the better default.
 
 **Policy note.** A mailbox policy resting on an aggregation (for example
@@ -277,26 +277,26 @@ client-side:
 - **Spot checks.** Key-bearing moments — first contact, an observed
   anchor-key change — may trigger an independent fetch. Sampled and rare,
   because a direct fetch is itself a signal to the counterpart's host.
-- **Multiple independent watchers.** A device SHOULD register with more
-  than one declaration watcher and cross-check them; a split view is
+- **Multiple independent monitors.** A device SHOULD register with more
+  than one monitor and cross-check them; a split view is
   evidence of misbehavior no single one can suppress.
 
-That last one holds for **any** DID under watch, including the device's
+That last one holds for **any** DID under monitoring, including the device's
 own: reading a declaration requires no authority over anyone, so a second,
-non-delegate relay can watch the same own-DID declaration and report back,
+non-delegate relay can monitor the same own-DID declaration and report back,
 catching a delegate that misrepresents what it sees. What does require the
 canonical-delegate relationship is unrelated to reading: it is being the
-relay a peer's mailbox put resolves to. Watching and holding mailbox
+relay a peer's mailbox put resolves to. Monitoring and holding mailbox
 authority are independent, and only the second is restricted to one relay.
 
-**A standalone watcher** follows directly: the declaration watch is a
-separate component from a relay
-([`wire-api.md` §Watch](wire-api.md#watch--a-separate-component-not-a-relay-surface)),
-and may be operated with no mailboxes and no delegation at all. An operator
+**A standalone monitor** follows directly: the key monitor is a separate
+component from a relay, with its own specification
+([`key-transparency.md`](key-transparency.md)), and may be operated with
+no mailboxes and no delegation at all. An operator
 running one gives self-hosting users an independent verifier without
 becoming their mail host.
 
-### Why more than one watcher is load-bearing
+### Why more than one monitor is load-bearing
 
 Redundancy here is not a freshness nicety. It is the only defense against
 a failure the rest of this document's machinery cannot reach.
@@ -325,7 +325,7 @@ The comparison key is the repo `rev`:
 
 | observation | reading |
 |---|---|
-| differing `rev` across watchers | ordinary skew — one is simply behind |
+| differing `rev` across monitors | ordinary skew — one is simply behind |
 | **same `rev`, different content** | alarm — someone is equivocating |
 | a `rev` that moved backwards | alarm — someone is replaying |
 
@@ -333,25 +333,25 @@ This is detection, not prevention — the same posture as Certificate
 Transparency. A client's response to an alarm is
 [not yet specified](#not-yet-specified).
 
-### Choosing watchers is the client's job
+### Choosing monitors is the client's job
 
-**A client MUST NOT rely on a watcher that hosts its own repo** for the
+**A client MUST NOT rely on a monitor that hosts its own repo** for the
 own-DID surface. That deployment is precisely the party the redundancy
 exists to check, and its report of its own honesty is worth nothing.
 
 **A client MUST NOT accept a deployment's own claim of independence.** A
 deployment cannot attest to a relationship it is one half of, so whether a
-given deployment is an acceptable watcher *for a given DID* is decided
+given deployment is an acceptable monitor *for a given DID* is decided
 client-side, from what the client already knows about where that DID's repo
 lives.
 
 Two things follow, and they matter for how deployments are configured:
 
 - The disqualification is **per-DID, not per-deployment**. A relay that
-  hosts one user's repo is a perfectly sound watcher for every other DID,
-  and for counterpart DIDs it is often the best-positioned watcher there
-  is. Watching is not something some operators are forbidden to do.
-- Watching and relaying are therefore **freely combinable**, and a PMR is
+  hosts one user's repo is a perfectly sound monitor for every other DID,
+  and for counterpart DIDs it is often the best-positioned monitor there
+  is. Monitoring is not something some operators are forbidden to do.
+- Monitoring and relaying are therefore **freely combinable**, and a PMR is
   in fact encouraged to do both — it already resolves counterpart
   declarations to verify pair puts. This specification places no
   restriction on the combination, because the constraint it would be trying
@@ -359,7 +359,7 @@ Two things follow, and they matter for how deployments are configured:
   deployment.
 
 Comparing hosts rules out the accidental case — a client that ends up with
-its PDS as its only watcher — and not the adversarial one, where two
+its PDS as its only monitor — and not the adversarial one, where two
 nominally distinct deployments are the same party. That residual is
 accepted here.
 
@@ -451,10 +451,11 @@ relay cannot tell.
 
 - **Which flows get spot checks**, and how far behind a `rev` may be
   before a device refuses relayed state.
-- **Multi-watcher mechanics** — how a client learns its watcher set
-  (configured, defaulted, or discovered), how many watchers make the
-  redundancy real, whether a client with only one should be warned, and
-  what it does on a split view (warn, refuse, or prefer the higher `rev`).
+- **Multi-monitor mechanics** have moved to
+  [`key-transparency.md`](key-transparency.md#not-yet-specified) with the
+  rest of the monitor's surface: the monitor-set choice, the plurality
+  threshold, the no-independent-view warning, and the response to a split
+  view.
 - **Quota and abuse limits as a denial-of-service surface against the
   owner.** The caps that bound an attacker also bound the owner.
 - **Nonce width and seen-set retention**, including what a device

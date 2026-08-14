@@ -105,7 +105,7 @@ export async function authenticateOwner(
 
     // (3) Resolve that DID's registration. The anchor key comes from
     // storage, populated at registration from the DID's declaration and
-    // kept current by the declaration watch — never from the message.
+    // kept current by the key monitor — never from the message.
     const locator = await deps.resolveLocator(did)
     if (locator === null) {
         return { authenticated: false, reason: "no registration" }

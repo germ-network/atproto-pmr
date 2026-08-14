@@ -64,17 +64,18 @@ Outbound relay is **not in this version**; the device performs its own
 puts.
 
 **Two related components are deliberately not part of a PMR.** The
-**declaration watch** — reporting changes to a DID's declaration — is a
-separate, independently operable component that a PMR is *encouraged* to
-run alongside itself, because it is nearly free where a relay already
-resolves and verifies counterpart declarations to check pair-put
-signatures. It is not a capability of the relay, and a client chooses its
-watchers rather than resolving them: a device registers with several and
-cross-checks, which is load-bearing rather than decorative, being what
-detects a relay — or a PDS — that equivocates
+**key monitor** — [key transparency](key-transparency.md) for the
+messaging keys this whole system rests on — is a separate, independently
+operable component that a PMR is *encouraged* to run alongside itself,
+because it is nearly free where a relay already resolves and verifies
+counterpart declarations to check pair-put signatures. It is not a
+one of the relay's mailbox capabilities, and a client chooses its monitors rather than
+resolving them: a device registers with several and cross-checks, which is
+load-bearing rather than decorative, being what detects a PDS that
+equivocates about a user's keys
 ([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
 **Observation** — the rest of atproto state, profiles and the follow graph
-— is deferred. Neither has a specified surface here yet; see
+— is deferred, with no specified surface yet; see
 [Not yet specified](#not-yet-specified).
 
 ## Where to start
@@ -133,6 +134,7 @@ fingerprint an attacker can test a relay against. See
 | [`wire-api.md`](wire-api.md) | the **normative wire surface** — request authentication, key material, the endpoint inventory, the pair-put payload and its verification algorithm, error semantics, the closure exception |
 | [`storage-consistency.md`](storage-consistency.md) | the **storage consistency contract** an implementation must satisfy, stated backend-neutrally, plus the operation inventory the relay's logic runs against |
 | [`trust-model.md`](trust-model.md) | the **security properties** an implementation must preserve, what a relay necessarily learns, and what a malicious one can do |
+| [`key-transparency.md`](key-transparency.md) | the **key monitor** — key transparency for atproto messaging: the CT-shaped trust structure, the monitor's surfaces (own-DID push, domain deltas, the change digest, the community-view fetch), and the append-only-ledger enhancement |
 
 ## Dependencies on a non-atproto record format
 
@@ -203,9 +205,12 @@ Each document carries its own "Not yet specified" section:
   the blob interface, the observation cache's place in the interface, the
   recovery pool's cross-sender cap, stored-shape versioning.
 - [`trust-model.md`](trust-model.md#not-yet-specified) — which flows get
-  spot checks, `rev` staleness tolerance, how a client learns its watcher
-  set and what it does on a split view, quota exhaustion as a
+  spot checks, `rev` staleness tolerance, quota exhaustion as a
   denial-of-service surface against the owner.
+- [`key-transparency.md`](key-transparency.md#not-yet-specified) — the
+  monitor-set choice and its defaults, the plurality threshold and the
+  no-independent-view warning, offline digest catch-up, what a client
+  does on detection, registration lifecycle, concrete body schemas.
 
 Expect a future version to settle these. An implementation that needs one
 today should treat its choice as local and be prepared to change it.

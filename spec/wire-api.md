@@ -351,17 +351,17 @@ request verifies against. A DID and its declared anchor key are required; a
 push grant is optional, and needed only where the deployment reaches the
 device by pushing.
 
-A component that is not a relay but needs the same record — a declaration
-watcher, say (§[Watch](#watch--a-separate-component-not-a-relay-surface)) — **MUST NOT** define a second identity
+A component that is not a relay but needs the same record — a key
+monitor, say (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface)) — **MUST NOT** define a second identity
 mechanism. The `anchor` realm and this endpoint already establish
 everything such a component needs, and a parallel mechanism would be a
 second place for the trusted key to be wrong.
 
 A registration lives while the anchor key stays in the DID's declaration.
-An implementation SHOULD watch that declaration, and when the declared key
+An implementation SHOULD monitor that declaration, and when the declared key
 disappears it SHOULD **pause** rather than tear down: stop accepting
 incoming DID-addressed mail and stop acting on behalf of the DID, continue
-accepting grant-addressed mail, and continue watching that one DID's
+accepting grant-addressed mail, and continue monitoring that one DID's
 declaration to see whether the key returns.
 
 Per-DID state MUST be keyed by **DID**, never by anchor key, so that key
@@ -868,13 +868,11 @@ body   = { ... type-specific fields ... }
 
 | `t` | direction | body | notes |
 |---|---|---|---|
-| `#capabilities` | server → client | `{pm, gr, wt, ob}` | what this deployment currently serves *for this registration* — see below |
+| `#capabilities` | server → client | `{gr}` | the grant lifecycle effective *for this registration* — see below |
 | `#delivery` | server → client | `{k, id, m, sd?, kt?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`kt` (the verification hint) are present only for a pair-mailbox entry |
 | `#ack` | client → server | `{k, id}` | acknowledges one message. Idempotent — acking an already-removed message MUST succeed, matching the REST ack endpoint |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
-| `#declaration` | server → client | `{did, rev, record}` | a watched DID's declaration changed; the record as CAR. Requires `watch` |
-| `#observation` | server → client | `{did, rev, record}` | any other atproto record update for an observed DID, as CAR. Requires `observation` |
 
 **Ordering on connect: `#capabilities` first, then every queued message,
 oldest mailbox first, then `#pool` if and only if the pool is non-empty,
@@ -976,41 +974,40 @@ Anything forwarding repo records is a CAR pass-through: it fetches the
 record, stores the bytes and the `rev`, and forwards them, needing no CAR
 parser and no MST walk. Verifying what it forwards is defense in depth
 against a lying PDS, not a prerequisite. This applies to a relay resolving
-a counterpart declaration to check a pair-put signature, and to a
-declaration watcher (§[Watch](#watch--a-separate-component-not-a-relay-surface))
+a counterpart declaration to check a pair-put signature, and to a key
+monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface))
 alike.
 
-### Watch — a separate component, not a relay surface
+### Monitoring — a separate component, not a relay surface
 
-The declaration watch reports changes to a DID's **declaration record**. It
-is **not part of a PMR**, and this document does not specify it.
+A **key monitor** reports changes to the record in which a DID publishes a
+messaging key — the declaration record here. It is **not part of a PMR**,
+and this document does not specify it;
+[`key-transparency.md`](key-transparency.md) does.
 
-That is a deliberate split rather than an omission. Its failure mode is
-different in kind from anything a mailbox does — a lying declaration
-watcher costs a user their identity — and the defense is redundancy across
-watchers a client picks *itself*, including the requirement that a watcher
-be independent of the DID's own PDS. None of that composes with a relay
-that is resolved rather than chosen. See
+The split is deliberate. A monitor's failure mode differs in kind from
+anything a mailbox does — a lying monitor costs a user their identity — and
+the defense is redundancy across monitors a client picks itself, including
+the requirement that a monitor be independent of the DID's own PDS. None of
+that composes with a relay that is resolved rather than chosen. See
 [`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car) for the
-independence rule, which is a client-side decision this document cannot
-make.
+independence rule, a client-side decision this document cannot make.
 
-**A PMR is encouraged to operate a watcher alongside itself**, because the
-work overlaps almost exactly: a relay already resolves and verifies a
-counterpart's declaration to check a pair-put signature, which is most of
-what watching that DID requires. Doing both is an operator's choice and
-changes nothing about the relay surface — there is no capability to
-declare, and a client discovers its watchers by configuration, not by
-resolving this relay.
+A PMR is encouraged to run a monitor alongside itself, because the work
+overlaps: a relay already resolves and verifies a counterpart's declaration
+to check a pair-put signature, which is most of monitoring that DID. A host
+that runs one declares the `monitor` capability in its enabler document,
+naming where it lives; a client still chooses its monitor set by
+configuration rather than resolving it from the monitored DID.
 
-A watcher **pushes**: to report a change it consumes the firehose filtered
-to the declaration collection, which is an always-on component a
-request-scoped serverless deployment cannot host. That constraint is the
-practical reason the two separate cleanly.
+A monitor **pushes**: to report a change it consumes the firehose filtered
+to the declaration collection, an always-on component a request-scoped
+serverless deployment cannot host. That constraint is the practical reason
+the two separate cleanly.
 
-Its own surface — the push channels, the interest set, and the
-unauthenticated change digest — is
-[not yet specified](#not-yet-specified) here.
+Its surface — registration and the own-DID push, domain deltas, the
+unauthenticated change digest, and the community-view record fetch — is
+specified in [`key-transparency.md`](key-transparency.md).
 
 ### Observation
 
@@ -1022,10 +1019,10 @@ unauthenticated change digest — is
 | `GET` | `/pmr/v1/observations/{did}/record` | latest record as CAR, with its `rev` |
 
 Everything beyond the declaration: profiles, the follow graph, appview
-reads. Updates stream over [`/pmr/v1/events`](#the-events-socket) as
-`#observation` frames.
+reads. How updates reach a client — a frame on the events socket, or a
+surface of its own — is part of this deferred design, not defined here.
 
-Unlike the declaration watch, observation wants breadth and permissioned
+Unlike key monitoring, observation wants breadth and permissioned
 access rather than independence, so it is served once and sits well at a
 deployment holding the user's data — including their PDS.
 
@@ -1119,7 +1116,7 @@ add a parallel array someone has to keep aligned with another one.
 | `core` | registrations, challenges, the events socket — **always present** |
 | `didMailbox` | DID-addressed mail: `did:`-keyed puts, the recovery pool, `PUT`/`DELETE` on blocks |
 | `grant` | grant issuance and grant-addressed mail: the grants endpoints and `grant:`-keyed puts |
-| `watch` | the [declaration watch](#watch--a-separate-component-not-a-relay-surface), where the host also runs one |
+| `monitor` | the [key monitor](key-transparency.md), where the host also runs one |
 
 **A capability a host does not serve is absent from the object**, never
 present with a disabling flag. A client tests for the key. An entry that
@@ -1153,8 +1150,8 @@ naming a mailbox kind it does not operate.
 routes every capability through a single endpoint and has the client name
 the capabilities it is using per request. That suits a single-endpoint RPC
 protocol; this is a REST-shaped surface, so each family declares where it
-lives. It also lets a `watch` capability point somewhere else entirely,
-which matters because the watcher is a separate component and need not be
+lives. It also lets a `monitor` capability point somewhere else entirely,
+which matters because the monitor is a separate component and need not be
 co-hosted.
 
 **Explicit `versions`, where a JMAP capability URI *is* its version.** In
@@ -1312,11 +1309,13 @@ Whatever a deployment picks, the put still answers `202`.
 - **Version negotiation.** The enabler document advertises versions;
   the rule for a client older or newer than its relay is undefined.
 - **Batch shapes.** Acks batch today; whether grants, blocks, and
-  watch or observation subscriptions need batch forms or tolerate N
+  observation subscriptions need batch forms or tolerate N
   requests is open.
-- **The change digest's shape.** That a watcher publishes one, that it is
-  unauthenticated and identical for every client, and what it is for are
-  settled above. Its window, encoding, and path are not.
+- **The change digest's shape** is settled in
+  [`key-transparency.md`](key-transparency.md#the-change-digest) — Bloom
+  filters over per-window change sets, client-held cursors. Its remaining
+  edges (window width, serialization, prefix-sharding at scale) live in
+  that document's own list.
 - **Custom header field naming.** The reference implementation uses the
   field name `Germ-Next-Challenge`, shown above. Whether the published
   format keeps a vendor prefix is unsettled.
