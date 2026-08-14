@@ -1,0 +1,41 @@
+# Illustrative configuration for a key monitor. Nothing here is specified:
+# the collection, the stream, and the cadences are all an operator's.
+
+name = "example-key-monitor"
+main = "src/worker.ts"
+compatibility_date = "2026-07-01"
+
+# THE INGEST OBJECT IS A SINGLETON. Address it by a fixed name — one
+# stream, one cursor, one rev index for the whole coverage. Addressing it
+# per user would open one socket per user and interleave writers.
+[durable_objects]
+bindings = [{ name = "ingest", class_name = "MonitorIngest" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MonitorIngest"]
+
+[vars]
+# The collection carrying the published key.
+MONITOR_COLLECTION = "com.germnetwork.declaration"
+
+# A monitor is not bound to any one provider. Point this at a self-hosted
+# instance to take a third party out of the noticing path; the trust model
+# never depended on this feed being honest, only on it being timely.
+JETSTREAM_URL = "https://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents"
+
+# An outbound socket does not hibernate, so this object is evicted on the
+# platform's schedule whatever this value is. The alarm is what reconnects
+# from the stored cursor; eviction is expected, not exceptional.
+WATCHDOG_INTERVAL_MS = "120000"
+
+# Owed fetches settled per wake. A failed fetch stays owed with backoff:
+# the stream will not redeliver it.
+SETTLE_BATCH = "32"
+
+# The snapshot and sealed digest windows. Read by plain Workers on the
+# public paths — the community view should scale like the public data it
+# is, rather than funnel through the ingest object.
+[[kv_namespaces]]
+	binding = "records"
+	id = "PROVISION_BEFORE_DEPLOY"

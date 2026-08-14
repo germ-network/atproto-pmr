@@ -61,6 +61,24 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(vite@8.2.1(esbuild@0.28.1))
 
+  packages/monitor-cloudflare:
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: ^0.18.7
+        version: 0.18.8(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10(vite@8.2.1(esbuild@0.28.1)))
+      '@germ-network/atproto-pmr-monitor':
+        specifier: workspace:*
+        version: link:../monitor
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(vite@8.2.1(esbuild@0.28.1))
+      wrangler:
+        specifier: ^4.11.1
+        version: 4.122.0
+
 packages:
 
   '@babel/runtime@7.29.7':

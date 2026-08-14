@@ -1,0 +1,34 @@
+{
+	"name": "@germ-network/atproto-pmr-monitor-cloudflare",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Durable Object and KV implementation of the key monitor's ingest and storage seams",
+	"license": "MIT",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"types": "./src/index.ts",
+	"files": [
+		"src",
+		"wrangler.example.toml"
+	],
+	"engines": {
+		"node": ">=24"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.18.7",
+		"@germ-network/atproto-pmr-monitor": "workspace:*",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.10",
+		"wrangler": "^4.11.1"
+	},
+	"scripts": {
+		"pretypecheck": "wrangler types -c wrangler.test.toml",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run"
+	},
+	"peerDependencies": {
+		"@germ-network/atproto-pmr-monitor": "*"
+	}
+}

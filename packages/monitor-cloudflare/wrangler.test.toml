@@ -1,0 +1,25 @@
+# Test-only configuration. This package is a library, not a deployable
+# Worker, so tests need an entry point that re-exports the Durable Object
+# class for wrangler to find.
+name = "atproto-pmr-monitor-cloudflare-tests"
+main = "test/worker.ts"
+compatibility_date = "2026-07-01"
+
+[durable_objects]
+bindings = [{ name = "ingest", class_name = "MonitorIngest" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MonitorIngest"]
+
+# Illustrative values, matching wrangler.example.toml. All are
+# implementation-defined; tests read them from env rather than hardcoding.
+[vars]
+MONITOR_COLLECTION = "com.example.declaration"
+JETSTREAM_URL = "https://jetstream.invalid/subscribe"
+WATCHDOG_INTERVAL_MS = "120000"
+SETTLE_BATCH = "32"
+
+[[kv_namespaces]]
+	binding = "records"
+	id = "test"
