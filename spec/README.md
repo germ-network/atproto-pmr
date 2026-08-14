@@ -161,7 +161,10 @@ push service that can. In the reference deployment that service is operated
 by Germ. It is a deployment-specific delivery path, not a requirement: a
 self-hoster on a platform without that constraint delivers push directly
 and implements none of it. See
-[`wire-api.md` §Push delegation](wire-api.md#push-delegation-optional).
+[`wire-api.md` §Push delivery](wire-api.md#push-delivery--web-push-optional)
+— which is **Web Push** (RFC 8030/8292 plus a symmetric, post-quantum
+payload seal), so any deployment or push service speaks a standard
+surface rather than one invented here.
 
 ## Conformance summary
 

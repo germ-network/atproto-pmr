@@ -61,8 +61,9 @@ exact signatures belong to an implementation.
 ### Registration state
 
 `load()` / `update(fields)` over: the served DID, the trusted anchor key,
-the push grant this relay holds (if the deployment uses
-[push delegation](wire-api.md#push-delegation-optional)), policy
+the Web Push subscription and content key this relay holds (if the
+deployment uses
+[push delivery](wire-api.md#push-delivery--web-push-optional)), policy
 configuration, a last-active timestamp, and record timestamps.
 
 Registration state is an identity and trusted-key record, not a mailbox one
@@ -81,9 +82,10 @@ converted at ingest (see
 [`wire-api.md` §Key material](wire-api.md#key-material)), so nothing
 downstream of registration handles two formats.
 
-The push grant, where present, is a **capability, not an identity**: an
-identifier, a symmetric key, and an expiry. A relay MUST NOT store a push
-token.
+The push subscription, where present, is a **capability, not an
+identity**: an endpoint URL and a symmetric content key. A relay MUST NOT
+store a push token — the endpoint keeps the token behind it by
+construction (RFC 8030).
 
 ### Key monitoring
 
@@ -318,8 +320,11 @@ sequenced. Right-size the TTL to that tolerance rather than assuming the
 challenge enforces uniqueness.
 
 One operation has no natural dedup and therefore needs its own
-containment: [push-delegation submit](wire-api.md#push-delegation-optional),
-because a delivered notification is a user-visible side effect.
+containment: causing a
+[push delivery](wire-api.md#push-delivery--web-push-optional), because a
+delivered notification is a user-visible side effect (RFC 8030's `Topic`
+header is the standard collapse mechanism where the push service honors
+it).
 
 ### 3. Atomic counters
 
@@ -392,7 +397,7 @@ any of it to satisfy the contract:
 - **Policy decisions.** The relay's core decides policy; storage only holds
   the configuration it decides from.
 - **Push delivery**, which for a self-hosted relay runs through
-  [delegation](wire-api.md#push-delegation-optional) anyway.
+  [Web Push](wire-api.md#push-delivery--web-push-optional) anyway.
 
 ## Not yet specified
 

@@ -137,9 +137,10 @@ copy slip past dedup.
 
 ### P7 — No push custody where a relay delegates
 
-**Where a relay uses push delegation, it MUST NOT be given a platform push
-token — it holds a capability instead.** Delegation itself is optional (see
-[wire-api.md §Push delegation](wire-api.md#push-delegation-optional)): a
+**Where a relay delegates push, it MUST NOT be given a platform push
+token — it holds a Web Push subscription instead.** Delegation itself is
+optional (see
+[wire-api.md §Push delivery](wire-api.md#push-delivery--web-push-optional)): a
 self-hoster who delivers push directly, on a platform where they hold
 their own credentials, uses none of this machinery and is not bound by it.
 This is a goal the delegation path is built to achieve, not a blanket rule

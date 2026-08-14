@@ -52,8 +52,8 @@ carrying a server challenge is conformant use.
   the message.
 - MUST set `keyid` to the
   [RFC 9679](https://www.rfc-editor.org/rfc/rfc9679.html) COSE Key
-  Thumbprint of the key that signs — the registration key or the declared
-  anchor key, according to realm.
+  Thumbprint of the key that signs — the declared anchor key or a
+  grant's `authKey`, according to realm.
 - SHOULD include `created`, per the RFC's recommendation. Freshness rests
   on the challenge, not on the client's clock.
 
@@ -101,24 +101,22 @@ implementation would have. Implementations SHOULD prefer it.
 
 ### Realms
 
-Three authorization realms exist, distinguished by **the key that signs**,
+Two authorization realms exist, distinguished by **the key that signs**,
 not by separate endpoint families:
 
 - the **anchor realm** — the declared anchor key, for DID-scoped
   operations.
 - the **grantPut realm** — a grant's own `authKey`, scoping a
-  put-challenge to the single address that grant derives. Unlike the other
-  two realms it authenticates no identity at all, only possession of that
-  one capability — see
+  put-challenge to the single address that grant derives. Unlike the
+  anchor realm it authenticates no identity at all, only possession of
+  that one capability — see
   [Grant address and put-tag derivation](#grant-address-and-put-tag-derivation).
-- the **registration realm** — a registration key, used by the push
-  service in the optional [push delegation](#push-delegation-optional)
-  path.
 
 A challenge is minted bound to a realm and MUST NOT verify against
-another. An Atproto PMR implements the anchor and grantPut realms; it does
-not implement the registration realm, because push reaches its users by
-delegation rather than by holding a push token.
+another. Push delivery authenticates outside the realm system entirely —
+[Web Push VAPID](#push-delivery--web-push-optional) — because it is the
+one path where the counterparty is not an implementation of this
+specification.
 
 ### Content types
 
@@ -336,19 +334,19 @@ need no identifier in the path.
 
 | method | path | notes |
 |---|---|---|
-| `POST` | `/pmr/v1/registrations` | create: DID + declared anchor key (`COSE_Key`) + optionally a push grant. **Never a push token** |
+| `POST` | `/pmr/v1/registrations` | create: DID + declared anchor key (`COSE_Key`) + optionally a [Web Push subscription and content key](#push-delivery--web-push-optional). **Never a push token** |
 | `GET` | `/pmr/v1/registration` | read own |
 | `PATCH` | `/pmr/v1/registration` | mutable registration fields |
 | `DELETE` | `/pmr/v1/registration` | deregister |
 
-An Atproto PMR **MUST NOT** accept or store a platform push token. Push, if
-the deployment needs delegation at all, is authorized by a capability — see
-[Push delegation](#push-delegation-optional).
+An Atproto PMR **MUST NOT** accept or store a platform push token. Push,
+if the deployment cannot deliver directly, rides a Web Push subscription —
+see [Push delivery](#push-delivery--web-push-optional).
 
 **Registration is an identity record, not a mailbox one.** It is proof the
 DID's controller chose this deployment, plus the key every later owner
 request verifies against. A DID and its declared anchor key are required; a
-push grant is optional, and needed only where the deployment reaches the
+push subscription is optional, and needed only where the deployment reaches the
 device by pushing.
 
 A component that is not a relay but needs the same record — a key
@@ -403,9 +401,8 @@ known. `tag` is what a [grant put](#the-grant-put-payload) carries to
 prove possession of `authKey` without transmitting it on every request —
 the relay verifies by recomputing, never by comparing bearer secrets.
 
-The two labels are domain-separated from each other, from
-[the pair-put type marker](#the-pair-put-payload), and from
-[push delegation's HMAC](#push-delegation-optional): a value computed for
+The two labels are domain-separated from each other and from
+[the pair-put type marker](#the-pair-put-payload): a value computed for
 one purpose MUST NOT be reinterpretable as valid for another, even under a
 key that happens to be reused across them. They are also deliberately
 **not** germ-service's legacy v2 address scheme (`germ-addr:v1` /
@@ -1032,45 +1029,78 @@ deployment holding the user's data — including their PDS.
 **Deferred.** The endpoints above are a sketch, not a specified surface;
 nothing here is normative yet.
 
-### Push delegation (optional)
+### Push delivery — Web Push (optional)
 
 This section is deployment-specific and OPTIONAL. A relay whose platform
 lets it deliver push directly implements none of it.
 
 The problem it solves: mobile push entitlements are not transferable
-between operators, so a self-hosted relay on such a platform cannot talk
-to the platform's push service itself. The delegation shape:
+between operators, so a self-hosted relay cannot talk to the platform's
+push service itself. The mechanism is **Web Push** — not this
+specification's invention:
+[RFC 8030](https://www.rfc-editor.org/rfc/rfc8030.html) delivery to a
+capability-URL push resource, with
+[RFC 8292](https://www.rfc-editor.org/rfc/rfc8292.html) VAPID
+authentication. A relay delivers with any off-the-shelf Web Push library;
+a push service exposes the same small surface browser push services and
+UnifiedPush distributors already expose.
 
-- The client mints a **push grant** at the push service, authorized by
-  that service's **registration realm**. Minting is the consent step:
-  only the registration's owner can authorize delivery to it, closing the
-  hijack — there is no way to mint a delegation pointed at someone else's
-  device.
-- The client **carries the grant to the relay** as part of its
-  registration here, authorized by the anchor key. Server-to-server
-  provisioning never happens; the credential travels client-carried, each
-  hop authorized by the key that owns that hop.
-- The relay **presents the grant** to cause a push. The grant is a
-  symmetric key plus an identifier — a capability, not an identity — and
-  authorization is an HMAC over the request under the grant key, not a
-  bearer field: the same RFC 9421 profile used elsewhere, with an
-  `hmac-sha256` algorithm.
+The delegation shape, in Web Push's terms:
 
-Two custody rules are normative for any deployment that uses this path:
+- The client **creates a subscription at its push service**, bound at
+  creation to the relay's VAPID public key (published in the relay's
+  [enabler document](#the-enabler-document) capability entry as
+  `vapidKey`). Creation is the consent step: only the registration's
+  owner can point a subscription at its own device, and the VAPID
+  binding means a leaked endpoint still accepts delivery only from the
+  key it was minted for. How a push service creates subscriptions is its
+  own affair and out of this specification's scope.
+- The client **carries the subscription to the relay** in its
+  registration here, authorized by the anchor key, together with a
+  **device-provisioned content key** (below). Server-to-server
+  provisioning never happens; the credentials travel client-carried,
+  each hop authorized by the key that owns that hop.
+- The relay **delivers** by `POST` to the subscription's endpoint per
+  RFC 8030 — `TTL`, and optionally `Urgency` and `Topic`, apply — with a
+  VAPID JWT proving it is the bound deliverer.
 
-- The relay **MUST NOT hold a push token.** The grant points at a
-  *registration*, so a token that rotates is a registration-side update
-  and live grants keep resolving.
-- The push payload **MUST be sealed** under a content key shared between
-  the device and this relay, so the push service relays ciphertext it
-  cannot read. The grant authorizes *delivery*; the content key protects
-  *content*; neither substitutes for the other.
+Two custody properties are normative, now by citation rather than
+invention:
 
-The payload carries the originating relay's host, so the device's
-notification extension can select the right decryption context. A push
-grant dies with logout, deregistration, or its own expiry, and can be
-revoked individually without disturbing the registration, the mailbox
-grants, or any other delegation.
+- The relay **never holds a push token** — RFC 8030's architecture: the
+  endpoint is a capability URL at the push service, the token stays
+  behind it, and a rotated token is the push service's business while
+  live subscriptions keep resolving.
+- The push payload **MUST be sealed** under a content key the device
+  provisions to this relay at registration and rotates by registration
+  update. The wire format is the symmetric Web Push message
+  (`application/webpush-message`,
+  [draft-thomson-webpush-sym](https://datatracker.ietf.org/doc/html/draft-thomson-webpush-sym-00);
+  the structure is restated here normatively so the draft's expiry
+  cannot strand an implementation): `key_id ‖ nonce ‖ AEAD ciphertext`,
+  AEAD **AES-256-GCM**, nonce **random 96-bit** — random is mandatory,
+  not a counter, because counter state lost by a serverless deliverer
+  means nonce reuse, and the random collision bound (2²⁸ messages per
+  key) exceeds any plausible per-registration push volume. Symmetric
+  AEAD is also the post-quantum posture: no confidentiality on this path
+  rests on classical asymmetric cryptography. Where a user agent
+  enforces [RFC 8291](https://www.rfc-editor.org/rfc/rfc8291.html)
+  (today's browsers), that encryption is applied as an **outer wrap**
+  around the sealed message; breaking its P-256 layer yields only inner
+  ciphertext.
+
+VAPID's ES256 is classical, and that is acceptable *for what it
+protects*: delivery authorization, not content. A forgery is push spam
+against an endpoint the attacker must separately possess — the same
+stakes as a leaked capability URL, already bounded by the push service's
+rate limits.
+
+The sealed payload carries the originating relay's host, so the device's
+notification extension can select the right decryption context. The
+lifecycle is RFC 8030's: a relay MUST discard a subscription answered
+with `404` or `410`, and the device kills one by unsubscribing at its
+push service — individually, without disturbing the registration, the
+mailbox grants, or any other subscription.
 
 ### The enabler document
 
@@ -1345,4 +1375,9 @@ message signing (`COSE_Sign1`,
 pagination (`?cursor=`, the atproto convention), repo records (CAR),
 deterministic encoding (RFC 8949 §4.2.1), header syntax
 ([RFC 9651](https://www.rfc-editor.org/rfc/rfc9651.html) Structured
-Fields), and time (CBOR tag 1 / Structured Fields Date, integer seconds).
+Fields), push delivery (Web Push —
+[RFC 8030](https://www.rfc-editor.org/rfc/rfc8030.html) delivery,
+[RFC 8292](https://www.rfc-editor.org/rfc/rfc8292.html) VAPID, the
+symmetric message format of
+[draft-thomson-webpush-sym](https://datatracker.ietf.org/doc/html/draft-thomson-webpush-sym-00)),
+and time (CBOR tag 1 / Structured Fields Date, integer seconds).

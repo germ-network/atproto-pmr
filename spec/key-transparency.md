@@ -141,12 +141,15 @@ notification before swapping keys: the swap notifies the push destination
 bound to the old key. Registration is publish-then-register — a record must
 exist to authenticate against.
 
-Push delivery reuses the
-[push delegation shape](wire-api.md#push-delegation-optional) unchanged,
-including both custody rules: the monitor holds a push grant, never a push
-token, and the payload is sealed under a device-shared content key. The
-push carries the changed DID and the monitor's observed `rev`; the device
-responds by fetching and verifying, not by trusting the push content.
+Push delivery is [Web Push](wire-api.md#push-delivery--web-push-optional),
+with both custody properties intact: the monitor holds a subscription,
+never a push token, and the payload is sealed under a device-provisioned
+symmetric content key the push service cannot read. A **browser** client
+can register with a monitor using the literal Push API — its subscription
+comes from its browser's own push service, with no additional
+infrastructure anywhere in the path. The push carries the changed DID and
+the monitor's observed `rev`; the device responds by fetching and
+verifying, not by trusting the push content.
 
 Deregistration revokes the delegation and forgets the subscription. Nothing
 a monitor holds is issued to third parties, so dropping one leaves no peer
