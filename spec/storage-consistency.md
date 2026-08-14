@@ -265,8 +265,8 @@ Given the above, less needs scheduling than it first appears — and an
 earlier draft of this section overstated it in both directions.
 
 **Not key monitoring.** A monitor is push-driven off the atproto
-firehose, and that firehose lives in a separate always-on component outside
-the request-scoped runtime entirely
+firehose, a standing subscription that lives outside this interface
+entirely
 ([`wire-api.md` §Monitoring](wire-api.md#monitoring--a-separate-component-not-a-relay-surface)).
 It is not something this interface schedules, per DID or otherwise.
 

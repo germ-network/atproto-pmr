@@ -1001,9 +1001,12 @@ naming where it lives; a client still chooses its monitor set by
 configuration rather than resolving it from the monitored DID.
 
 A monitor **pushes**: to report a change it consumes the firehose filtered
-to the declaration collection, an always-on component a request-scoped
-serverless deployment cannot host. That constraint is the practical reason
-the two separate cleanly.
+to the declaration collection. That consumer is a standing subscription
+rather than a request handler — though with a cursor-resumable,
+server-filtered stream it need not be literally always-on; a periodically
+woken consumer achieves the same coverage at a latency floor of its wake
+cadence. Either way it is a different workload from answering requests,
+which is the practical reason the two separate cleanly.
 
 Its surface — registration and the own-DID push, domain deltas, the
 unauthenticated change digest, and the community-view record fetch — is

@@ -87,10 +87,14 @@ as untrusted as any relay, cannot forge, and neither can a set of them.
 A key monitor:
 
 - **consumes the firehose**, filtered to the collection that carries the
-  key — the declaration collection in this deployment. This is an always-on
-  component; a request-scoped serverless deployment cannot host the
-  consumer, which is why the monitor and a relay separate cleanly even when
-  one operator runs both.
+  key — the declaration collection in this deployment. The consumer is a
+  standing subscription, not a request handler — though where the stream
+  is cursor-resumable and server-filtered, it need not be literally
+  always-on: a periodically woken consumer achieves the same coverage,
+  and always-on becomes a latency choice. Coverage MUST NOT depend on an
+  uninterrupted connection — a monitor MUST resume from its cursor (or
+  replay) across any gap. This workload difference is why the monitor
+  and a relay separate cleanly even when one operator runs both.
 - holds a **stateful snapshot** of its coverage:
   `did → (rev, record CAR, observedAt)`.
 - declares its **coverage**: the population of records it observes,
