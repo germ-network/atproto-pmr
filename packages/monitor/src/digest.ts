@@ -22,6 +22,7 @@ import {
     encodeCose,
     type CoseValue,
 } from "@germ-network/atproto-pmr-core"
+import type { MonitorIndex, SnapshotStore } from "./storage"
 
 /**
  * A sealed window, self-describing so a client needs no out-of-band
@@ -221,4 +222,57 @@ function asNumber(value: CoseValue | undefined, field: string): number {
         throw new Error(`digest: ${field} must be a number`)
     }
     return value
+}
+
+/** What sealing needs: the writer, the serving store, and the geometry. */
+export interface SealDeps {
+    index: MonitorIndex
+    snapshot: SnapshotStore
+    /** Window width. Published with every filter, so it may change. */
+    widthMs: number
+    nowMs(): number
+}
+
+/**
+ * Seal every window that has closed since the last pass.
+ *
+ * Only *closed* windows are ever sealed, and therefore only closed windows
+ * are ever served: the current one is still accumulating, so publishing it
+ * would return different bytes to two callers a second apart — breaking
+ * both cacheability and the identical-bytes-for-every-caller property the
+ * privacy argument rests on. The cost is a latency floor: a change is
+ * invisible to the digest for up to one window width.
+ *
+ * `sealedThrough` advances to the last closed window whether or not
+ * anything was in it, which is what lets a reader tell "nothing changed"
+ * from "not published yet" without materialising empty filters.
+ */
+export async function sealDueWindows(deps: SealDeps, limit = 16): Promise<number[]> {
+    const current = windowOf(deps.nowMs(), deps.widthMs)
+    const due = await deps.index.closedWindowsWithMembers(current, limit)
+
+    const sealed: number[] = []
+    for (const w of due) {
+        const members = await deps.index.windowMembers(w)
+        const filter = sealWindow(w, deps.widthMs, members)
+        // Bytes durable before the membership is dropped: the reverse
+        // order loses the window entirely if the write fails, and a window
+        // cannot be rebuilt — the events that fed it are long past.
+        await deps.snapshot.putSealedWindow(String(w), encodeDigestWindows([filter]))
+        await deps.index.dropWindow(w)
+        sealed.push(w)
+    }
+
+    // Only claim up to what was actually processed: if the limit truncated
+    // the batch, windows beyond it still hold members and must not be
+    // reported as sealed-and-empty.
+    const claimable =
+        due.length === limit && due.length > 0
+            ? Math.max(...due)
+            : current - 1
+    const previous = await deps.index.readSealedThrough()
+    if (previous === null || claimable > previous) {
+        await deps.index.setSealedThrough(claimable)
+    }
+    return sealed
 }

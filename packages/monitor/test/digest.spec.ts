@@ -18,10 +18,12 @@ import {
     decodeDigestWindows,
     encodeDigestWindows,
     mightHaveChanged,
+    sealDueWindows,
     sealWindow,
     sizeFor,
     windowOf,
     type DigestWindow,
+    type SealDeps,
 } from "../src/digest"
 
 const WIDTH = 600_000 // ten minutes
@@ -203,5 +205,100 @@ describe("known answers — this is the wire format", () => {
             hashes: 16,
             set: [1, 3, 9, 11, 13, 25, 29, 31, 37, 39, 47, 49, 51, 53, 55, 59],
         })
+    })
+})
+
+describe("sealing", () => {
+    /** Minimal index: only what sealing touches. */
+    function sealHarness(seed: Record<number, string[]> = {}) {
+        const members = new Map<number, Set<string>>(
+            Object.entries(seed).map(([w, d]) => [Number(w), new Set(d)])
+        )
+        const windows = new Map<string, Uint8Array>()
+        let sealedThrough: number | null = null
+        const deps = {
+            index: {
+                closedWindowsWithMembers: async (cur: number, limit: number) =>
+                    [...members.keys()].filter((w) => w < cur).sort((a, b) => a - b).slice(0, limit),
+                windowMembers: async (w: number) => [...(members.get(w) ?? [])].sort(),
+                dropWindow: async (w: number) => void members.delete(w),
+                readSealedThrough: async () => sealedThrough,
+                setSealedThrough: async (w: number) => void (sealedThrough = w),
+            },
+            snapshot: {
+                putSealedWindow: async (id: string, f: Uint8Array) => void windows.set(id, f),
+                getSealedWindow: async (id: string) => windows.get(id) ?? null,
+            },
+            widthMs: WIDTH,
+            nowMs: () => 10 * WIDTH + 1, // current window is 10
+        } as unknown as SealDeps
+        return { deps, members, windows, sealedThrough: () => sealedThrough }
+    }
+
+    it("seals closed windows and leaves the current one accumulating", async () => {
+        // The open window must never be published: it would return
+        // different bytes to two callers a second apart, which breaks both
+        // caching and the identical-bytes property.
+        const h = sealHarness({ 8: ["did:plc:a"], 10: ["did:plc:current"] })
+        const sealed = await sealDueWindows(h.deps)
+        expect(sealed).toEqual([8])
+        expect(h.windows.has("8")).toBe(true)
+        expect(h.windows.has("10")).toBe(false)
+        expect(h.members.has(10)).toBe(true)
+    })
+
+    it("a sealed window still answers for its members", async () => {
+        const h = sealHarness({ 8: ["did:plc:a", "did:plc:b"] })
+        await sealDueWindows(h.deps)
+        const [w] = decodeDigestWindows(h.windows.get("8")!)
+        expect(mightHaveChanged(w, "did:plc:a")).toBe(true)
+        expect(mightHaveChanged(w, "did:plc:b")).toBe(true)
+        expect(mightHaveChanged(w, "did:plc:never")).toBe(false)
+    })
+
+    it("advances sealedThrough past EMPTY windows", async () => {
+        // Nothing observed is a real answer, and a reader needs it to tell
+        // "nothing changed" from "not published yet" without the monitor
+        // materialising a filter for every quiet interval.
+        const h = sealHarness({})
+        await sealDueWindows(h.deps)
+        expect(h.sealedThrough()).toBe(9)
+        expect(h.windows.size).toBe(0)
+    })
+
+    it("drops membership only after the filter is durable", async () => {
+        // A window cannot be rebuilt — the events that fed it are past —
+        // so losing it to a failed write would be permanent.
+        const h = sealHarness({ 8: ["did:plc:a"] })
+        const failing = {
+            ...h.deps,
+            snapshot: {
+                ...h.deps.snapshot,
+                putSealedWindow: async () => {
+                    throw new Error("KV down")
+                },
+            },
+        } as unknown as SealDeps
+        await expect(sealDueWindows(failing)).rejects.toThrow(/KV down/)
+        expect(h.members.has(8)).toBe(true)
+    })
+
+    it("does not claim windows the batch limit left behind", async () => {
+        // Reporting sealed-through past an unsealed window would make it
+        // read as definitively empty — a silent all-clear.
+        const h = sealHarness({ 2: ["did:plc:a"], 3: ["did:plc:b"], 4: ["did:plc:c"] })
+        const sealed = await sealDueWindows(h.deps, 2)
+        expect(sealed).toEqual([2, 3])
+        expect(h.sealedThrough()).toBe(3)
+        expect(h.members.has(4)).toBe(true)
+    })
+
+    it("never moves sealedThrough backwards", async () => {
+        const h = sealHarness({})
+        await sealDueWindows(h.deps)
+        expect(h.sealedThrough()).toBe(9)
+        const earlier = { ...h.deps, nowMs: () => 5 * WIDTH } as unknown as SealDeps
+        await sealDueWindows(earlier)
+        expect(h.sealedThrough()).toBe(9)
     })
 })

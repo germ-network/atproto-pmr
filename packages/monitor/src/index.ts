@@ -46,10 +46,12 @@ export {
     decodeDigestWindows,
     encodeDigestWindows,
     mightHaveChanged,
+    sealDueWindows,
     sealWindow,
     sizeFor,
     windowOf,
     type DigestWindow,
+    type SealDeps,
 } from "./digest"
 
 // The authoritative read.

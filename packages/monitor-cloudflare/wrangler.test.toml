@@ -19,6 +19,7 @@ MONITOR_COLLECTION = "com.example.declaration"
 JETSTREAM_URL = "https://jetstream.invalid/subscribe"
 WATCHDOG_INTERVAL_MS = "120000"
 SETTLE_BATCH = "32"
+DIGEST_WINDOW_MS = "600000"
 
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"

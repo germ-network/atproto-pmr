@@ -39,6 +39,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
     const records = new Map<string, { rev: string; car: Uint8Array; observedAtMs: number }>()
     const windows = new Map<string, Uint8Array>()
+    const members = new Map<number, Set<string>>()
+    let sealedThrough: number | null = null
 
     const index: MonitorIndex = {
         readCursor: async () => null,
@@ -47,8 +49,12 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
             return { outcome: "accepted" }
         },
-        complete: async (did, rev) => {
+        complete: async (did, rev, observedAtMs) => {
             revs.set(did, rev)
+            const w = Math.floor(observedAtMs / 600_000)
+            const set = members.get(w) ?? new Set<string>()
+            set.add(did)
+            members.set(w, set)
             pending.delete(did)
         },
         duePending: async (nowMs) =>
@@ -63,6 +69,12 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
         clearPending: async (did) => void pending.delete(did),
         changedSince: async () => ({ dids: [], nextCursor: "0" }),
+        closedWindowsWithMembers: async (current, limit) =>
+            [...members.keys()].filter((w) => w < current).sort((a, b) => a - b).slice(0, limit),
+        windowMembers: async (w) => [...(members.get(w) ?? [])].sort(),
+        dropWindow: async (w) => void members.delete(w),
+        readSealedThrough: async () => sealedThrough,
+        setSealedThrough: async (w) => void (sealedThrough = w),
     }
 
     const snapshot: SnapshotStore = {
@@ -79,7 +91,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         nowMs: () => 1_000_000,
         ...overrides,
     }
-    return { deps, revs, pending, records }
+    return { deps, revs, pending, records, members, windows, sealedThrough: () => sealedThrough }
 }
 
 describe("intake", () => {

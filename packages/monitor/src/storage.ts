@@ -125,6 +125,39 @@ export interface MonitorIndex {
     revOf(did: string): Promise<string | null>
 
     /**
+     * Windows that have closed and hold members, oldest first.
+     *
+     * A window is indexed by **observation time** — when this monitor
+     * confirmed the change — not by when the change happened. The retry
+     * path forces it: a DID whose PDS was down settles hours late, and a
+     * sealed Bloom filter cannot be amended, so indexing by event time
+     * would drop that change into a window already published and make it
+     * permanently invisible. The cost is a fact clients depend on: a
+     * digest window says when this monitor *saw* a change, so window
+     * numbers are monitor-local and only `rev` is comparable across
+     * monitors.
+     */
+    closedWindowsWithMembers(currentWindow: number, limit: number): Promise<number[]>
+
+    /** The DIDs recorded in one window. */
+    windowMembers(window: number): Promise<string[]>
+
+    /** Drop a window's membership once its filter is durable. */
+    dropWindow(window: number): Promise<void>
+
+    /**
+     * The highest window sealed so far — the boundary between "definitely
+     * nothing changed" and "not published yet".
+     *
+     * Advances past empty windows too. A quiet interval and an interval
+     * this monitor was down are the same thing under observation-time
+     * indexing: nothing was observed, so nothing is reported, and the
+     * backlog lands in whichever window it is finally confirmed in.
+     */
+    readSealedThrough(): Promise<number | null>
+    setSealedThrough(window: number): Promise<void>
+
+    /**
      * Which of `dids` changed since `cursor`. The reason the index exists
      * rather than living wholly in the snapshot: a key-value serving store
      * can neither answer this nor promise read-your-writes.

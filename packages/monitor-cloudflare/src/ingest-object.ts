@@ -2,7 +2,9 @@ import { DurableObject } from "cloudflare:workers"
 import {
     decodeEvent,
     intake,
+    sealDueWindows,
     settleDue,
+    windowOf,
     type Cursor,
     type DeltaCursor,
     type FetchedRecord,
@@ -58,6 +60,11 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
                 CREATE TABLE IF NOT EXISTS meta (
                     k TEXT PRIMARY KEY,
                     v TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS window_members (
+                    window INTEGER NOT NULL,
+                    did TEXT NOT NULL,
+                    PRIMARY KEY (window, did)
                 );
             `)
         })
@@ -127,7 +134,15 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
     }
 
-    /** Index the rev and clear the obligation — after the bytes are durable. */
+    /**
+     * Index the rev, add the DID to the open digest window, and clear the
+     * obligation — after the bytes are durable, and in one batch so the
+     * object's serialized execution makes it atomic.
+     *
+     * The window is chosen by **observation time**, `observedAtMs`, not by
+     * when the change happened: a sealed filter cannot be amended, and the
+     * retry path settles arbitrarily late.
+     */
     async complete(did: string, rev: string, observedAtMs: number): Promise<void> {
         this.db.sql.exec(
             "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
@@ -136,7 +151,64 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             rev,
             observedAtMs
         )
+        this.db.sql.exec(
+            "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                "ON CONFLICT(window, did) DO NOTHING",
+            windowOf(observedAtMs, this.digestWidthMs()),
+            did
+        )
         this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    }
+
+    private digestWidthMs(): number {
+        const parsed = Number.parseInt(this.env.DIGEST_WINDOW_MS, 10)
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 600_000
+    }
+
+    async closedWindowsWithMembers(
+        currentWindow: number,
+        limit: number
+    ): Promise<number[]> {
+        return this.db.sql
+            .exec<{ window: number }>(
+                "SELECT DISTINCT window FROM window_members WHERE window < ? " +
+                    "ORDER BY window LIMIT ?",
+                currentWindow,
+                limit
+            )
+            .toArray()
+            .map((r) => r.window)
+    }
+
+    async windowMembers(window: number): Promise<string[]> {
+        return this.db.sql
+            .exec<{ did: string }>(
+                "SELECT did FROM window_members WHERE window = ? ORDER BY did",
+                window
+            )
+            .toArray()
+            .map((r) => r.did)
+    }
+
+    async dropWindow(window: number): Promise<void> {
+        this.db.sql.exec("DELETE FROM window_members WHERE window = ?", window)
+    }
+
+    async readSealedThrough(): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'sealed_through'")
+            .toArray()[0]
+        if (row === undefined) return null
+        const parsed = Number(row.v)
+        return Number.isFinite(parsed) ? parsed : null
+    }
+
+    async setSealedThrough(window: number): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('sealed_through', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            String(window)
+        )
     }
 
     async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
@@ -313,6 +385,14 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         } finally {
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            // Sealed after settling, so anything confirmed on this wake
+            // lands in a window before that window is closed out.
+            await sealDueWindows({
+                index: this,
+                snapshot: kvSnapshotStore(this.env),
+                widthMs: this.digestWidthMs(),
+                nowMs: () => Date.now(),
+            })
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
             if (Number.isFinite(interval) && interval > 0) {
                 await this.db.setAlarm(Date.now() + interval)

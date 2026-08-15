@@ -32,6 +32,7 @@ WATCHDOG_INTERVAL_MS = "120000"
 # Owed fetches settled per wake. A failed fetch stays owed with backoff:
 # the stream will not redeliver it.
 SETTLE_BATCH = "32"
+DIGEST_WINDOW_MS = "600000"
 
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"

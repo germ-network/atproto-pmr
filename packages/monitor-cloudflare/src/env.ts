@@ -50,6 +50,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     SETTLE_BATCH: string
 
     /**
+     * Digest window width in milliseconds. Published with every filter, so
+     * it can change without coordinating a flag day — but a change is
+     * visible to clients mid-flight, since window numbers are derived from
+     * it.
+     */
+    DIGEST_WINDOW_MS: string
+
+    /**
      * How long a sealed digest window stays fetchable. Records never
      * expire; windows do — past this a client falls back to the direct
      * re-verification it would do with no digest at all.

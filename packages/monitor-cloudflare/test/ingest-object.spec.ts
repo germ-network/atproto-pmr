@@ -8,7 +8,13 @@
  */
 import { env, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { settleDue, type FetchedRecord } from "@germ-network/atproto-pmr-monitor"
+import {
+    decodeDigestWindows,
+    mightHaveChanged,
+    sealDueWindows,
+    settleDue,
+    type FetchedRecord,
+} from "@germ-network/atproto-pmr-monitor"
 import { kvSnapshotStore } from "../src/snapshot-store"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -23,6 +29,14 @@ function freshStub(): DurableObjectStub<MonitorIngest> {
 }
 
 /** Reach in to drive the ingest object with a stubbed authoritative fetch. */
+/** Enter the object with its own type, mirroring inPMR upstream. */
+function inMonitorObj<R>(
+    stub: DurableObjectStub<MonitorIngest>,
+    fn: (obj: MonitorIngest) => R | Promise<R>
+): Promise<R> {
+    return runInDurableObject(stub, (instance) => fn(instance as MonitorIngest))
+}
+
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
     fetchRecord: (did: string) => Promise<FetchedRecord>
@@ -222,6 +236,64 @@ describe("the way in", () => {
         })
         expect(after.owed).toEqual([])
         expect(after.rev).toBeNull()
+    })
+})
+
+describe("digest windows", () => {
+    it("records a completed fetch in the window it was OBSERVED in", async () => {
+        // Observation time, not event time: a sealed filter cannot be
+        // amended, and the retry path settles arbitrarily late.
+        const stub = freshStub()
+        const observedAtMs = 12 * 600_000 + 5_000
+        const members = await inMonitorObj(stub, async (obj) => {
+            await obj.complete(DID, "3m1", observedAtMs)
+            return obj.windowMembers(12)
+        })
+        expect(members).toEqual([DID])
+    })
+
+    it("seals closed windows on the alarm, leaving the open one alone", async () => {
+        const stub = freshStub()
+        const now = Date.now()
+        const currentWindow = Math.floor(now / 600_000)
+        const sealed = await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:old", "3m1", (currentWindow - 2) * 600_000)
+            await obj.complete("did:plc:now", "3m2", now)
+            return sealDueWindows({
+                index: obj,
+                snapshot: kvSnapshotStore(testEnv),
+                widthMs: 600_000,
+                nowMs: () => now,
+            })
+        })
+        expect(sealed).toEqual([currentWindow - 2])
+
+        const bytes = await kvSnapshotStore(testEnv).getSealedWindow(String(currentWindow - 2))
+        const [w] = decodeDigestWindows(bytes!)
+        expect(mightHaveChanged(w, "did:plc:old")).toBe(true)
+        expect(mightHaveChanged(w, "did:plc:now")).toBe(false)
+
+        // The current window is still accumulating.
+        const stillOpen = await inMonitorObj(stub, (obj) => obj.windowMembers(currentWindow))
+        expect(stillOpen).toEqual(["did:plc:now"])
+    })
+
+    it("tracks sealedThrough, the boundary between empty and unpublished", async () => {
+        const stub = freshStub()
+        const now = Date.now()
+        const before = await inMonitorObj(stub, (obj) => obj.readSealedThrough())
+        expect(before).toBeNull()
+        await inMonitorObj(stub, (obj) =>
+            sealDueWindows({
+                index: obj,
+                snapshot: kvSnapshotStore(testEnv),
+                widthMs: 600_000,
+                nowMs: () => now,
+            })
+        )
+        expect(await inMonitorObj(stub, (obj) => obj.readSealedThrough())).toBe(
+            Math.floor(now / 600_000) - 1
+        )
     })
 })
 
