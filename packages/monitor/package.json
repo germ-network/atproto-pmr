@@ -17,10 +17,14 @@
 	},
 	"devDependencies": {
 		"typescript": "^5.9.3",
-		"vitest": "^4.1.10"
+		"vitest": "^4.1.10",
+		"@germ-network/atproto-pmr-core": "workspace:*"
 	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"test": "vitest run"
+	},
+	"peerDependencies": {
+		"@germ-network/atproto-pmr-core": "*"
 	}
 }

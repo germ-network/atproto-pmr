@@ -40,6 +40,9 @@ export {
     type SnapshotStore,
 } from "./storage"
 
+// The authoritative read.
+export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"
+
 // Ingest orchestration.
 export {
     intake,

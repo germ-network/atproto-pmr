@@ -185,6 +185,13 @@ export {
 
 // Declaration resolution and content addressing.
 export { resolveDeclaration, type DeclarationResolution } from "./declaration"
+// Shared with the key monitor: the SSRF guards are the security boundary
+// for every consumer, so they are reused rather than reimplemented.
+export {
+    guardedFetchBytes,
+    guardedFetchJSON,
+    resolvePDSEndpoint,
+} from "./atproto-fetch"
 export { deriveMessageId } from "./message-id"
 
 // Grant address and put-tag derivation.
