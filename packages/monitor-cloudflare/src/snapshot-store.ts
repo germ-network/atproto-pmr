@@ -1,5 +1,6 @@
 import type { SnapshotEntry, SnapshotStore } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
+import type { MonitorIngest } from "./ingest-object"
 
 /**
  * The serving half of the seam, on KV.
@@ -21,7 +22,16 @@ interface StoredMeta {
     observedAtMs: number
 }
 
-export function kvSnapshotStore(env: MonitorEnv): SnapshotStore {
+/**
+ * Generic over the Durable Object class for the same reason `PMREnv` is: a
+ * deployment subclasses `MonitorIngest` to supply the authoritative fetch,
+ * and `protected fetchRecord` makes the subclass non-assignable to the
+ * base. Without the parameter every adopter who followed that advice would
+ * hit a type error here.
+ */
+export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
+    env: MonitorEnv<TIngest>
+): SnapshotStore {
     return {
         async getRecord(did: string): Promise<SnapshotEntry | null> {
             const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
