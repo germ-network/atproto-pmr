@@ -88,13 +88,53 @@ describe("the index", () => {
     })
 
     it("answers changedSince, which is why the index is not merely KV", async () => {
+        // REALISTIC MAGNITUDES, deliberately. An earlier version of this
+        // test used 1000/5000 with a cursor of 2000 — self-consistent
+        // numbers that passed while the production comparison was a stream
+        // cursor in MICROSECONDS against an observation time in
+        // MILLISECONDS, which is always false. Fixtures drawn from outside
+        // the real domain cannot catch a unit mismatch.
         const stub = freshStub()
-        const changed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete("did:plc:old", "3m1", 1_000)
-            await obj.complete("did:plc:new", "3m2", 5_000)
-            return obj.changedSince(["did:plc:old", "did:plc:new", "did:plc:absent"], "2000")
+        const now = Date.now()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete("did:plc:old", "3m1", now - 60_000)
+            await obj.complete("did:plc:new", "3m2", now - 1_000)
+            return obj.changedSince(
+                ["did:plc:old", "did:plc:new", "did:plc:absent"],
+                String(now - 30_000)
+            )
         })
-        expect(changed).toEqual(["did:plc:new"])
+        expect(result.dids).toEqual(["did:plc:new"])
+    })
+
+    it("hands back a delta cursor usable as the next request's `since`", async () => {
+        // The round trip is the property: a cursor the monitor issued must
+        // exclude what it already reported. A stream cursor here would be
+        // 1000x out and silently report nothing, forever.
+        const stub = freshStub()
+        const now = Date.now()
+        const second = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", now - 1_000)
+            const first = await obj.changedSince([DID], null)
+            expect(first.dids).toEqual([DID])
+            return obj.changedSince([DID], first.nextCursor)
+        })
+        expect(second.dids).toEqual([])
+    })
+
+    it("does not confuse the stream cursor with a delta cursor", async () => {
+        // Feed it a REAL Jetstream cursor (microseconds) as if someone
+        // wired the two together again: it must not silently answer
+        // "nothing changed" for a DID observed a second ago.
+        const stub = freshStub()
+        const now = Date.now()
+        const streamCursor = String(now * 1000)
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", now - 1_000)
+            return obj.changedSince([DID], String(now - 30_000))
+        })
+        expect(result.dids).toEqual([DID])
+        expect(Number(streamCursor)).toBeGreaterThan(Number(result.nextCursor))
     })
 })
 
@@ -143,6 +183,45 @@ describe("settling what is owed", () => {
             obj.duePending(Date.now(), 10)
         )
         expect(dueNow).toEqual([])
+    })
+})
+
+describe("the way in", () => {
+    it("start() arms the alarm, so a deployed object is not inert", async () => {
+        // There was no entry point at all: connect armed the alarm and
+        // only the alarm called connect. A fresh object never started.
+        const stub = freshStub()
+        const before = await runInDurableObject(stub, (_o, state) => state.storage.getAlarm())
+        expect(before).toBeNull()
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            // connect() reaches the network; arming is the part under test.
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const after = await runInDurableObject(stub, (_o, state) => state.storage.getAlarm())
+        expect(after).not.toBeNull()
+    })
+
+    it("owes a re-read on demand, past the dedupe check", async () => {
+        const stub = freshStub()
+        const owed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now())
+            // intake would call this a duplicate; a rotation still needs it.
+            await obj.owe(DID, "3m1")
+            return obj.duePending(Date.now(), 10)
+        })
+        expect(owed.map((p) => p.did)).toEqual([DID])
+    })
+
+    it("clearPending discharges without indexing", async () => {
+        const stub = freshStub()
+        const after = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "100")
+            await obj.clearPending(DID)
+            return { owed: await obj.duePending(Date.now(), 10), rev: await obj.revOf(DID) }
+        })
+        expect(after.owed).toEqual([])
+        expect(after.rev).toBeNull()
     })
 })
 

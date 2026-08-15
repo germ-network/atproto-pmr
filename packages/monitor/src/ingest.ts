@@ -75,10 +75,15 @@ export async function intake(
 ): Promise<IntakeDecision> {
     if (event.kind !== "commit") {
         // Identity/account/sync ignore the collection filter and arrive for
-        // every DID. Only those already in the snapshot matter, and for
-        // them a re-key changes what their record verifies against.
+        // every DID. Only those already in the snapshot matter — and for
+        // them this is not merely informational: a DID-document rotation
+        // changes what the record verifies against, so the record must be
+        // read again even though it did not change. `owe` rather than
+        // `intake` because the dedupe check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
-        return known === null ? "ignored" : "reverify"
+        if (known === null) return "ignored"
+        await deps.index.owe(event.did, known)
+        return "reverify"
     }
 
     const commit: CommitEvent = event
@@ -92,24 +97,39 @@ export async function intake(
 }
 
 /**
+ * A terminal outcome for one owed fetch.
+ *
+ * `rejected` is not an error: the look happened and the answer was an
+ * alarm. It is separated from `stored` because the obligation is
+ * discharged either way — retrying a regression would hammer the PDS of
+ * the very DID under attack, forever, with the same answer.
+ */
+export type SettleOutcome = "stored" | "rejected"
+
+/**
  * Steps 2 and 3, off the read loop. Safe to call for a DID owed more than
  * once — the fetch is by DID, not by event, so a burst of revs for one DID
  * collapses into a single authoritative read.
+ *
+ * Throws only on *transient* failure (the PDS is unreachable), which is
+ * what tells the caller to retry with backoff.
  */
-export async function settle(deps: IngestDeps, did: string): Promise<void> {
+export async function settle(deps: IngestDeps, did: string): Promise<SettleOutcome> {
     const record = await deps.fetchRecord(did)
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
-        // A record that fails verification is not evidence of anything the
-        // monitor may serve: leave the obligation owed and say nothing.
-        return
+        // Not evidence of anything the monitor may serve. Terminal, not
+        // transient: the same bytes will fail again next time.
+        await deps.index.clearPending(did)
+        return "rejected"
     }
 
     const indexed = await deps.index.revOf(did)
     const movement = compareRev(indexed, record.rev)
     if (movement === "regressed" && indexed !== null) {
         await deps.onRegression?.(did, indexed, record.rev)
-        return
+        await deps.index.clearPending(did)
+        return "rejected"
     }
 
     const observedAtMs = deps.nowMs()
@@ -121,6 +141,7 @@ export async function settle(deps: IngestDeps, did: string): Promise<void> {
     await deps.index.complete(did, record.rev, observedAtMs)
 
     if (movement === "advanced") await deps.onChange?.(did, record.rev)
+    return "stored"
 }
 
 /** Drain what is owed. Called by the same clock that watches the socket. */
@@ -134,8 +155,7 @@ export async function settleDue(
     let settled = 0
     for (const p of due) {
         try {
-            await settle(deps, p.did)
-            settled += 1
+            if ((await settle(deps, p.did)) === "stored") settled += 1
         } catch {
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only

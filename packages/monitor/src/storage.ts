@@ -16,8 +16,25 @@
  * is a serving copy, not a truth.
  */
 
-/** An opaque resume position. Never parsed by a monitor. */
+/**
+ * A position in the upstream stream, in whatever units the stream uses
+ * (Jetstream: microseconds). Opaque: a monitor stores and replays it, and
+ * never compares it to anything of its own.
+ */
 export type Cursor = string
+
+/**
+ * A position in **this monitor's own observation clock**, milliseconds.
+ *
+ * Deliberately a different type from `Cursor`, because they were briefly
+ * the same one and the bug that produced is instructive: a stream cursor
+ * in microseconds compared against an observation time in milliseconds is
+ * off by a factor of a thousand, so the comparison silently answers
+ * "nothing changed" forever rather than failing. A client's delta cursor
+ * is issued by the monitor, from `nextCursor`, and is never the stream
+ * position.
+ */
+export type DeltaCursor = string
 
 /** What the monitor serves for one DID: the verified bytes and their rev. */
 export interface SnapshotEntry {
@@ -74,6 +91,26 @@ export interface MonitorIndex {
     intake(event: { did: string; rev: string }, cursor: Cursor): Promise<IntakeOutcome>
 
     /**
+     * Record an obligation regardless of what the index already knows.
+     *
+     * Distinct from `intake` because two cases need a fetch the dedupe
+     * check would suppress: a DID-document rotation, where the record is
+     * unchanged but what it verifies against is not, and any operator-
+     * driven re-check.
+     */
+    owe(did: string, rev: string): Promise<void>
+
+    /**
+     * Discharge an obligation **without** indexing anything.
+     *
+     * For outcomes that are terminal but unstorable — a regression, a
+     * record that failed verification. The look happened and the answer
+     * was an alarm; leaving the row would retry the same answer in a hot
+     * loop against the very DID under attack.
+     */
+    clearPending(did: string): Promise<void>
+
+    /**
      * Apply a completed fetch: index the rev, add the DID to the open
      * window, clear the pending row — **atomically**, and only after the
      * bytes are durable in the `SnapshotStore`.
@@ -92,7 +129,10 @@ export interface MonitorIndex {
      * rather than living wholly in the snapshot: a key-value serving store
      * can neither answer this nor promise read-your-writes.
      */
-    changedSince(dids: readonly string[], cursor: Cursor | null): Promise<string[]>
+    changedSince(
+        dids: readonly string[],
+        since: DeltaCursor | null
+    ): Promise<{ dids: string[]; nextCursor: DeltaCursor }>
 }
 
 /**

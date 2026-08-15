@@ -60,7 +60,9 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             if (p !== undefined) pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
         },
         revOf: async (did) => revs.get(did) ?? null,
-        changedSince: async () => [],
+        owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
+        clearPending: async (did) => void pending.delete(did),
+        changedSince: async () => ({ dids: [], nextCursor: "0" }),
     }
 
     const snapshot: SnapshotStore = {
@@ -116,8 +118,14 @@ describe("intake", () => {
         const h = harness()
         const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
         expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(h.pending.size).toBe(0)
+
         h.revs.set(DID, "3m1")
         expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        // And it must actually SCHEDULE the re-read it names: a rotation
+        // leaves the record unchanged while changing what verifies it, so
+        // the dedupe check would otherwise suppress the one fetch needed.
+        expect(h.pending.has(DID)).toBe(true)
     })
 })
 
@@ -164,17 +172,24 @@ describe("settle", () => {
             fetchRecord: async () => ({ rev: "3m1", car: new Uint8Array([9]) }),
         })
         h.revs.set(DID, "3m9")
-        await settle(h.deps, DID)
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        expect(await settle(h.deps, DID)).toBe("rejected")
         expect(onRegression).toHaveBeenCalledWith(DID, "3m9", "3m1")
         expect(h.records.has(DID)).toBe(false)
         expect(h.revs.get(DID)).toBe("3m9")
+        // Terminal, so the obligation is discharged. Leaving it would
+        // retry the same alarming answer on every wake, forever, against
+        // the very DID under attack.
+        expect(h.pending.has(DID)).toBe(false)
     })
 
     it("stores nothing when verification fails", async () => {
         const h = harness({ verify: async () => false })
-        await settle(h.deps, DID)
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        expect(await settle(h.deps, DID)).toBe("rejected")
         expect(h.records.size).toBe(0)
         expect(h.revs.size).toBe(0)
+        expect(h.pending.has(DID)).toBe(false)
     })
 })
 
@@ -193,6 +208,18 @@ describe("settleDue", () => {
         const owed = h.pending.get(DID)
         expect(owed?.attempts).toBe(1)
         expect(owed?.notBeforeMs).toBeGreaterThan(h.deps.nowMs())
+    })
+
+    it("counts only what was stored, never a rejection", async () => {
+        // A rejection is not a failure, but it is not progress either;
+        // reporting it as settled hid a permanent retry loop.
+        const h = harness({
+            verify: async () => false,
+            fetchRecord: async () => ({ rev: "3m1", car: new Uint8Array([1]) }),
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        expect(await settleDue(h.deps)).toBe(0)
+        expect(h.pending.size).toBe(0)
     })
 
     it("clears the obligation once the fetch succeeds", async () => {

@@ -53,10 +53,14 @@ export function kvSnapshotStore(env: MonitorEnv): SnapshotStore {
         },
 
         async putSealedWindow(windowId: string, filter: Uint8Array): Promise<void> {
-            // Windows DO expire: past the published retention a client
-            // falls back to direct re-verification, which is the cost it
-            // would pay without a digest at all.
-            await env.records.put(WINDOW_PREFIX + windowId, filter)
+            // Windows DO expire, unlike records: past the published
+            // retention a client falls back to direct re-verification,
+            // which is the cost it would pay with no digest at all. The
+            // comment used to say this while the code kept them forever.
+            const ttl = Number.parseInt(env.WINDOW_RETENTION_SECONDS, 10)
+            await env.records.put(WINDOW_PREFIX + windowId, filter, {
+                expirationTtl: Number.isFinite(ttl) ? Math.max(60, ttl) : undefined,
+            })
         },
     }
 }

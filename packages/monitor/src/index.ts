@@ -32,6 +32,7 @@ export {
 export {
     compareRev,
     type Cursor,
+    type DeltaCursor,
     type IntakeOutcome,
     type MonitorIndex,
     type PendingFetch,
@@ -52,4 +53,5 @@ export {
     type IngestConfig,
     type IngestDeps,
     type IntakeDecision,
+    type SettleOutcome,
 } from "./ingest"

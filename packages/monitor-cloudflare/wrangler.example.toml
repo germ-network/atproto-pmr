@@ -33,6 +33,9 @@ WATCHDOG_INTERVAL_MS = "120000"
 # the stream will not redeliver it.
 SETTLE_BATCH = "32"
 
+# Records never expire; digest windows do.
+WINDOW_RETENTION_SECONDS = "604800"
+
 # The snapshot and sealed digest windows. Read by plain Workers on the
 # public paths — the community view should scale like the public data it
 # is, rather than funnel through the ingest object.

@@ -20,6 +20,9 @@ JETSTREAM_URL = "https://jetstream.invalid/subscribe"
 WATCHDOG_INTERVAL_MS = "120000"
 SETTLE_BATCH = "32"
 
+# Records never expire; digest windows do.
+WINDOW_RETENTION_SECONDS = "604800"
+
 [[kv_namespaces]]
 	binding = "records"
 	id = "test"

@@ -48,4 +48,11 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /** How many owed fetches to settle per wake. */
     SETTLE_BATCH: string
+
+    /**
+     * How long a sealed digest window stays fetchable. Records never
+     * expire; windows do — past this a client falls back to the direct
+     * re-verification it would do with no digest at all.
+     */
+    WINDOW_RETENTION_SECONDS: string
 }

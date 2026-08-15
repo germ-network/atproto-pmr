@@ -4,6 +4,7 @@ import {
     intake,
     settleDue,
     type Cursor,
+    type DeltaCursor,
     type FetchedRecord,
     type IngestDeps,
     type IntakeOutcome,
@@ -111,6 +112,21 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         return { outcome: "accepted" }
     }
 
+    /** Owe a fetch the dedupe check would otherwise suppress. */
+    async owe(did: string, rev: string): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev",
+            did,
+            rev
+        )
+    }
+
+    /** Discharge an obligation without indexing: a terminal, unstorable answer. */
+    async clearPending(did: string): Promise<void> {
+        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    }
+
     /** Index the rev and clear the obligation — after the bytes are durable. */
     async complete(did: string, rev: string, observedAtMs: number): Promise<void> {
         this.db.sql.exec(
@@ -155,12 +171,22 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         return row?.rev ?? null
     }
 
-    async changedSince(dids: readonly string[], cursor: Cursor | null): Promise<string[]> {
-        if (dids.length === 0) return []
-        const since = cursor === null ? 0 : Number(cursor)
-        const bound = Number.isFinite(since) ? since : 0
+    /**
+     * Compared in **this monitor's observation clock**, never against the
+     * stream cursor: those are different quantities in different units,
+     * and comparing them answers "nothing changed" forever rather than
+     * failing. The cursor handed back is drawn from the same clock.
+     */
+    async changedSince(
+        dids: readonly string[],
+        since: DeltaCursor | null
+    ): Promise<{ dids: string[]; nextCursor: DeltaCursor }> {
+        const now = Date.now()
+        if (dids.length === 0) return { dids: [], nextCursor: String(now) }
+        const parsed = since === null ? 0 : Number(since)
+        const bound = Number.isFinite(parsed) ? parsed : 0
         const holes = dids.map(() => "?").join(",")
-        return this.db.sql
+        const changed = this.db.sql
             .exec<{ did: string }>(
                 `SELECT did FROM revs WHERE observed_at > ? AND did IN (${holes})`,
                 bound,
@@ -168,6 +194,7 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             )
             .toArray()
             .map((r) => r.did)
+        return { dids: changed, nextCursor: String(now) }
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -204,6 +231,20 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         }
     }
 
+    /**
+     * The way in. Idempotent, and the only thing that needs calling from
+     * outside: a scheduled Worker pokes it, and everything after is the
+     * object's own alarm chain.
+     *
+     * Without this the object had no entry point at all — `connect` armed
+     * the alarm and only the alarm called `connect`, so a freshly deployed
+     * monitor would have sat inert forever.
+     */
+    async start(): Promise<void> {
+        await this.armWatchdog()
+        if (this.socket === null) await this.connect()
+    }
+
     /** Open the stream at the stored cursor, or at the tip on first run. */
     async connect(): Promise<void> {
         if (this.socket !== null) return
@@ -237,17 +278,23 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     private async onFrame(raw: string): Promise<void> {
         const event = decodeEvent(raw)
         if (event === null) return
-        const cursor = event.timeMs === null ? null : String(Math.round(event.timeMs * 1000))
-        if (cursor === null) return
+        // A frame without a parseable time still carries a DID worth
+        // looking at; only the cursor is unknown, so hold the last one
+        // rather than discard the event. Replaying a little on resume is
+        // the cheap failure; dropping a key change is not.
+        const cursor =
+            event.timeMs === null
+                ? await this.readCursor()
+                : String(Math.round(event.timeMs * 1000))
         await intake(
             this.deps(),
             { collection: this.env.MONITOR_COLLECTION },
             event,
-            cursor
+            cursor ?? ""
         )
     }
 
-    private async armWatchdog(): Promise<void> {
+    protected async armWatchdog(): Promise<void> {
         const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
         if (!Number.isFinite(interval) || interval <= 0) return
         if ((await this.db.getAlarm()) === null) {
