@@ -41,6 +41,17 @@ export {
     type SnapshotStore,
 } from "./storage"
 
+// The change digest.
+export {
+    decodeDigestWindows,
+    encodeDigestWindows,
+    mightHaveChanged,
+    sealWindow,
+    sizeFor,
+    windowOf,
+    type DigestWindow,
+} from "./digest"
+
 // The authoritative read.
 export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"
 
