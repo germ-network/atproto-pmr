@@ -293,6 +293,29 @@ published yet" stay distinguishable. A monitor need not store such windows;
 `sealedThrough` is what licenses synthesising them on read, since it
 asserts that everything at or below it has been sealed.
 
+**A request carrying no cursor is a bootstrap, not an error.** A client
+with no baseline has nothing to diff — it verifies records directly at
+first contact — so a monitor SHOULD answer with an empty page whose
+`nextCursor` names the current window, telling the client where to begin.
+
+#### Caching
+
+Cacheability is a correctness property here, not only an efficiency one: a
+page held past its validity reports coverage the monitor never gave, and on
+this surface stale coverage reads as "nothing changed".
+
+The distinction is whether a page reaches the tip:
+
+- A page whose `nextCursor` is **at or below `sealedThrough`** is fully
+  determined — every window in it is sealed and the range cannot grow — and
+  MAY be cached indefinitely.
+- A page that runs to the tip **gains windows as they seal**, and MUST NOT
+  be cached beyond one window width.
+
+This is also why the truncation signal is `nextCursor` against
+`sealedThrough` rather than a flag: the same comparison that tells a client
+whether to keep paging tells a cache whether the answer can be kept.
+
 ### The record fetch
 
 `GET /records/{did}` — unauthenticated. Returns the monitor's held record
