@@ -32,7 +32,15 @@ WATCHDOG_INTERVAL_MS = "120000"
 # Owed fetches settled per wake. A failed fetch stays owed with backoff:
 # the stream will not redeliver it.
 SETTLE_BATCH = "32"
+# Changing this requires clearing sealed windows + sealedThrough: an
+# absent window below sealedThrough means "empty", and that promise does
+# not survive a granularity change.
 DIGEST_WINDOW_MS = "600000"
+# Tune from observed response sizes; a byte budget rather than a window
+# count so it does not go stale as the population grows.
+DIGEST_BYTE_BUDGET = "65536"
+# Free to retune: every window carries the parameters it was sealed under.
+DIGEST_FALSE_POSITIVE_RATE = "0.01"
 
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"

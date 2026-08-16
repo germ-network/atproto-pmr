@@ -19,6 +19,7 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import {
     decodeCoseArray,
+    decodeCoseMap,
     encodeCose,
     type CoseValue,
 } from "@germ-network/atproto-pmr-core"
@@ -41,9 +42,28 @@ export interface DigestWindow {
     filter: Uint8Array
 }
 
-/** The window an instant falls in. Integer division, so it is stable. */
+/**
+ * The window an instant falls in, identified by its **start instant** in
+ * epoch milliseconds — not by an index.
+ *
+ * An index (`floor(ms / width)`) is ambiguous the moment the width is
+ * tuned: index `5` means minutes 50–60 at a ten-minute width and 25–30 at
+ * a five-minute one, so windows sealed under different widths collide on
+ * the same storage key with different meanings, and a client asking for
+ * "window 5" gets an answer to a question it did not ask. A start instant
+ * names a point in time under any width, so changing the width alters
+ * granularity going forward and leaves every sealed window addressable.
+ *
+ * A client still computes the window it wants from a timestamp, and reads
+ * `widthMs` off any window it already holds.
+ */
 export function windowOf(epochMs: number, widthMs: number): number {
-    return Math.floor(epochMs / widthMs)
+    return Math.floor(epochMs / widthMs) * widthMs
+}
+
+/** The window after this one, under the same width. */
+export function nextWindow(window: number, widthMs: number): number {
+    return window + widthMs
 }
 
 /**
@@ -167,33 +187,83 @@ export function mightHaveChanged(w: DigestWindow, did: string): boolean {
 }
 
 /**
- * The wire form: deterministic CBOR, matching every other body in this
- * protocol (`spec/wire-api.md`, "Deterministic CBOR"). An array, because
- * catch-up spans `[cursor, now]` as a *sequence* of per-window filters
- * rather than their union — a union's false-positive rate degrades as
- * windows merge, and the sequence stays exact for the price of a few bytes
- * at this population.
+ * What a digest request answers with.
  *
- * Short keys because this body is fetched often and is pure overhead
- * otherwise: `w` window, `d` width, `b` bits, `k` hashes, `f` filter.
+ * An envelope rather than a bare array, because three facts have to travel
+ * with the windows and none of them is derivable from the windows alone:
+ *
+ * - `oldest` — the earliest window still retained. A client whose cursor
+ *   predates it has lost coverage and MUST fall back to re-verifying its
+ *   interest set directly. Without this, "past retention" and "nothing
+ *   changed" are the same empty answer, and the failure is silent in
+ *   exactly the case where coverage was lost.
+ * - `sealedThrough` — the newest published window. Compare `nextCursor`
+ *   against it to know whether to keep paging; a separate "truncated"
+ *   flag would be a second source of the same truth, free to disagree.
+ * - `nextCursor` — where to resume.
  */
-export function encodeDigestWindows(windows: readonly DigestWindow[]): Uint8Array {
+export interface DigestPage {
+    windows: DigestWindow[]
+    oldest: number
+    sealedThrough: number
+    nextCursor: number
+}
+
+/**
+ * The wire form: deterministic CBOR, matching every other body in this
+ * protocol (`spec/wire-api.md`, "Deterministic CBOR"). The windows are a
+ * *sequence* rather than a union — a union's false-positive rate degrades
+ * as windows merge, and the sequence stays exact for a few bytes at this
+ * population.
+ *
+ * Short keys because this body is fetched often and is otherwise pure
+ * overhead: `w` window, `d` width, `b` bits, `k` hashes, `f` filter; and
+ * on the envelope `s` windows, `o` oldest, `t` sealedThrough, `n` next.
+ */
+export function encodeDigestPage(page: DigestPage): Uint8Array {
     return encodeCose(
-        windows.map(
-            (w) =>
-                new Map<string, CoseValue>([
-                    ["w", w.window],
-                    ["d", w.widthMs],
-                    ["b", w.bits],
-                    ["k", w.hashes],
-                    ["f", w.filter],
-                ])
-        )
+        new Map<string, CoseValue>([
+            ["n", page.nextCursor],
+            ["o", page.oldest],
+            ["s", page.windows.map(encodeWindowMap)],
+            ["t", page.sealedThrough],
+        ])
     )
 }
 
+export function decodeDigestPage(bytes: Uint8Array): DigestPage {
+    const m = asMap(decodeCoseMap(bytes) as CoseValue)
+    const windows = m.get("s")
+    if (!Array.isArray(windows)) throw new Error("digest: windows must be an array")
+    return {
+        windows: windows.map(decodeWindowMap),
+        oldest: asNumber(m.get("o"), "o"),
+        sealedThrough: asNumber(m.get("t"), "t"),
+        nextCursor: asNumber(m.get("n"), "n"),
+    }
+}
+
+function encodeWindowMap(w: DigestWindow): Map<string, CoseValue> {
+    return new Map<string, CoseValue>([
+        ["b", w.bits],
+        ["d", w.widthMs],
+        ["f", w.filter],
+        ["k", w.hashes],
+        ["w", w.window],
+    ])
+}
+
+/** One window on its own — what a sealed window is stored as. */
+export function encodeDigestWindows(windows: readonly DigestWindow[]): Uint8Array {
+    return encodeCose(windows.map(encodeWindowMap))
+}
+
 export function decodeDigestWindows(bytes: Uint8Array): DigestWindow[] {
-    return decodeCoseArray(bytes).map((entry) => {
+    return decodeCoseArray(bytes).map((entry) => decodeWindowMap(entry))
+}
+
+function decodeWindowMap(entry: CoseValue): DigestWindow {
+    {
         const m = asMap(entry)
         const window = asNumber(m.get("w"), "w")
         const widthMs = asNumber(m.get("d"), "d")
@@ -209,7 +279,7 @@ export function decodeDigestWindows(bytes: Uint8Array): DigestWindow[] {
             throw new Error("digest: filter is shorter than its declared bit length")
         }
         return { window, widthMs, bits, hashes, filter }
-    })
+    }
 }
 
 function asMap(value: CoseValue): Map<string, CoseValue> {
@@ -269,10 +339,72 @@ export async function sealDueWindows(deps: SealDeps, limit = 16): Promise<number
     const claimable =
         due.length === limit && due.length > 0
             ? Math.max(...due)
-            : current - 1
+            : current - deps.widthMs
     const previous = await deps.index.readSealedThrough()
     if (previous === null || claimable > previous) {
         await deps.index.setSealedThrough(claimable)
     }
     return sealed
+}
+
+/** What serving a digest request needs. */
+export interface ServeDeps {
+    index: MonitorIndex
+    snapshot: SnapshotStore
+    widthMs: number
+    /**
+     * How many bytes of filters to return before deferring the rest to the
+     * next page.
+     *
+     * A **byte** budget rather than a window count, deliberately: a count
+     * is the thing that goes stale as the population grows. The same 144
+     * windows are a few kilobytes at a quiet change rate and approaching a
+     * megabyte at a hundred times it, so a count has to be re-tuned by
+     * hand exactly when nobody is looking. A budget self-adjusts — fatter
+     * windows simply mean fewer per page and more paging — and it is the
+     * quantity an operator can actually observe in production.
+     */
+    byteBudget: number
+    /** How long a sealed window is retained, for the `oldest` floor. */
+    retentionMs: number
+    nowMs(): number
+}
+
+/**
+ * Serve `[from, sealedThrough]`, up to the byte budget.
+ *
+ * Empty windows are synthesised rather than stored: a quiet interval is a
+ * real answer a client needs — "nothing changed here" — and materialising
+ * a filter for every one of them would cost storage proportional to time
+ * rather than to change.
+ */
+export async function serveDigest(
+    deps: ServeDeps,
+    from: number
+): Promise<DigestPage> {
+    const now = deps.nowMs()
+    const sealedThrough =
+        (await deps.index.readSealedThrough()) ??
+        windowOf(now, deps.widthMs) - deps.widthMs
+    const oldest = windowOf(now - deps.retentionMs, deps.widthMs)
+
+    // Never start below the floor: a cursor that predates retention is a
+    // gap the client must close by re-verifying, and `oldest` is how it
+    // finds out. Serving from the floor instead would look like coverage.
+    let cursor = Math.max(windowOf(from, deps.widthMs), oldest)
+
+    const windows: DigestWindow[] = []
+    let spent = 0
+    while (cursor <= sealedThrough && spent < deps.byteBudget) {
+        const stored = await deps.snapshot.getSealedWindow(String(cursor))
+        const w =
+            stored === null
+                ? sealWindow(cursor, deps.widthMs, [])
+                : decodeDigestWindows(stored)[0]
+        windows.push(w)
+        spent += w.filter.byteLength
+        cursor = nextWindow(cursor, deps.widthMs)
+    }
+
+    return { windows, oldest, sealedThrough, nextCursor: cursor }
 }

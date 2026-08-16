@@ -43,15 +43,21 @@ export {
 
 // The change digest.
 export {
+    decodeDigestPage,
     decodeDigestWindows,
+    encodeDigestPage,
     encodeDigestWindows,
     mightHaveChanged,
+    nextWindow,
     sealDueWindows,
     sealWindow,
+    serveDigest,
     sizeFor,
     windowOf,
+    type DigestPage,
     type DigestWindow,
     type SealDeps,
+    type ServeDeps,
 } from "./digest"
 
 // The authoritative read.

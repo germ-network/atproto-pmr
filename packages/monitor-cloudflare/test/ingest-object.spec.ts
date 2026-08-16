@@ -247,7 +247,9 @@ describe("digest windows", () => {
         const observedAtMs = 12 * 600_000 + 5_000
         const members = await inMonitorObj(stub, async (obj) => {
             await obj.complete(DID, "3m1", observedAtMs)
-            return obj.windowMembers(12)
+            // Identified by START INSTANT, so the width can be retuned
+            // without old and new windows colliding on one key.
+            return obj.windowMembers(12 * 600_000)
         })
         expect(members).toEqual([DID])
     })
@@ -255,9 +257,9 @@ describe("digest windows", () => {
     it("seals closed windows on the alarm, leaving the open one alone", async () => {
         const stub = freshStub()
         const now = Date.now()
-        const currentWindow = Math.floor(now / 600_000)
+        const currentWindow = Math.floor(now / 600_000) * 600_000
         const sealed = await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:old", "3m1", (currentWindow - 2) * 600_000)
+            await obj.complete("did:plc:old", "3m1", currentWindow - 2 * 600_000)
             await obj.complete("did:plc:now", "3m2", now)
             return sealDueWindows({
                 index: obj,
@@ -266,9 +268,9 @@ describe("digest windows", () => {
                 nowMs: () => now,
             })
         })
-        expect(sealed).toEqual([currentWindow - 2])
+        expect(sealed).toEqual([currentWindow - 2 * 600_000])
 
-        const bytes = await kvSnapshotStore(testEnv).getSealedWindow(String(currentWindow - 2))
+        const bytes = await kvSnapshotStore(testEnv).getSealedWindow(String(currentWindow - 2 * 600_000))
         const [w] = decodeDigestWindows(bytes!)
         expect(mightHaveChanged(w, "did:plc:old")).toBe(true)
         expect(mightHaveChanged(w, "did:plc:now")).toBe(false)
@@ -276,6 +278,27 @@ describe("digest windows", () => {
         // The current window is still accumulating.
         const stillOpen = await inMonitorObj(stub, (obj) => obj.windowMembers(currentWindow))
         expect(stillOpen).toEqual(["did:plc:now"])
+    })
+
+    it("keys a window by its start instant, divisible by the width", async () => {
+        // Identity is the start instant, not an index. An index is
+        // ambiguous the moment the width is tuned — index 5 means minutes
+        // 50-60 at ten minutes and 25-30 at five — so every key would mean
+        // two things. An instant means one thing under any width.
+        //
+        // It does NOT make retuning free: an instant divisible by both
+        // widths is a shared key, so changing the width requires clearing
+        // digest state (see the note on `DIGEST_WINDOW_MS`). What it buys
+        // is that the collision surface is aligned boundaries rather than
+        // every key, and any survivor is self-describing about its width.
+        const stub = freshStub()
+        const t = 12 * 600_000 + 5_000
+        const members = await inMonitorObj(stub, async (obj) => {
+            await obj.complete(DID, "3m1", t)
+            return obj.windowMembers(12 * 600_000)
+        })
+        expect(members).toEqual([DID])
+        expect((12 * 600_000) % 600_000).toBe(0)
     })
 
     it("tracks sealedThrough, the boundary between empty and unpublished", async () => {
@@ -292,7 +315,7 @@ describe("digest windows", () => {
             })
         )
         expect(await inMonitorObj(stub, (obj) => obj.readSealedThrough())).toBe(
-            Math.floor(now / 600_000) - 1
+            Math.floor(now / 600_000) * 600_000 - 600_000
         )
     })
 })

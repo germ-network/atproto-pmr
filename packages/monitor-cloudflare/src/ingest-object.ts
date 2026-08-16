@@ -3,8 +3,10 @@ import {
     decodeEvent,
     intake,
     sealDueWindows,
+    serveDigest,
     settleDue,
     windowOf,
+    type DigestPage,
     type Cursor,
     type DeltaCursor,
     type FetchedRecord,
@@ -161,8 +163,28 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     }
 
     private digestWidthMs(): number {
-        const parsed = Number.parseInt(this.env.DIGEST_WINDOW_MS, 10)
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : 600_000
+        return this.envInt(this.env.DIGEST_WINDOW_MS, 600_000)
+    }
+
+    private envInt(raw: string | undefined, fallback: number): number {
+        const parsed = Number.parseInt(raw ?? "", 10)
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+    }
+
+    /** Serve a digest page. Read-only, so a Worker may call it directly. */
+    async digestPage(from: number): Promise<DigestPage> {
+        return serveDigest(
+            {
+                index: this,
+                snapshot: kvSnapshotStore(this.env),
+                widthMs: this.digestWidthMs(),
+                byteBudget: this.envInt(this.env.DIGEST_BYTE_BUDGET, 65_536),
+                retentionMs:
+                    this.envInt(this.env.WINDOW_RETENTION_SECONDS, 604_800) * 1000,
+                nowMs: () => Date.now(),
+            },
+            from
+        )
     }
 
     async closedWindowsWithMembers(
