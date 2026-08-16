@@ -173,42 +173,125 @@ rate-limit.
 
 ### The change digest
 
-`GET /digest?cursor=…` — unauthenticated, identical bytes for every caller
-at the same cursor, and cacheable. This surface serves the population the
-other two cannot serve without cost: DIDs the device cares about that carry
-no public signal. The monitor publishes what changed and learns nothing
-about who cares; the device tests its private set locally and fetches the
-hits.
+`GET /digest?cursor=…` — unauthenticated, **identical bytes for every
+caller** at the same cursor, and cacheable. This surface serves the
+population the other two cannot serve without cost: DIDs the device cares
+about that carry no public signal. The monitor publishes what changed and
+learns nothing about who cares; the device tests its private set locally
+and fetches only the hits.
 
-- The monitor maintains **fixed windows** (width implementation-defined and
-  published). For each window it publishes a **Bloom filter over the DIDs
-  whose records changed in that window** — every change in its coverage,
-  not only registered DIDs'. Restricting the population to known-interesting
-  DIDs would make the filter a function of who registered, and would miss
-  the private contacts this surface exists for.
-- **The digest is a change notice over a baseline the client already holds,
-  not a source of truth**, so there is no genesis to sync. The cursor is an
-  opaque window identifier, held client-side; the monitor keeps no
-  per-client digest state. A new client's baseline is the records it
-  verifies directly at first contact, so it starts its cursor at the
-  current window and looks only forward.
-- Catch-up spans `[cursor, now]`, as a sequence of per-window filters or
-  their union at the monitor's option (a union's false-positive rate
-  degrades as windows merge; the response says which it is). Filter
-  parameters — size, hash count, window covered — ride with the response,
-  so the filter is self-describing.
-- **Past the published retention the answer is a defined "too old", and the
-  client falls back to direct re-verification** of its interest set — the
-  polling it would do without a digest. This is a return to the pre-digest
-  cost, not an error and not a gap in coverage.
+The digest is a **change notice over a baseline the client already holds**,
+not a source of truth, so there is no genesis to sync. A new client's
+baseline is the records it verifies directly at first contact; it starts
+its cursor at the current window and looks only forward.
 
-False positives are a size/rate tradeoff, not a privacy or correctness
-cost: a false positive triggers one verified fetch that finds nothing new,
-indistinguishable from routine polling. False negatives cannot occur within
-a covered window, since a Bloom filter has none. The miss that matters is a
-monitor withholding a change from the digest, which is caught where all
-monitor dishonesty is caught: cross-monitor comparison, and the own-DID
-push for one's own key.
+#### Windows
+
+A monitor divides time into **fixed windows** and publishes, for each, a
+filter over the DIDs whose records changed in it — every change in its
+coverage, not only those of registered DIDs. Restricting the population to
+known-interesting DIDs would make the filter a function of who registered,
+and would miss the private contacts this surface exists for.
+
+**A window is identified by its start instant**, in epoch milliseconds,
+which MUST be a multiple of the width. Not an index: `floor(t / width)` is
+ambiguous the moment a monitor retunes its width — index `5` covers
+minutes 50–60 at a ten-minute width and 25–30 at a five-minute one — so
+every identifier would name two different intervals. A client computes the
+window it wants from a timestamp and reads the width from any window it
+already holds.
+
+**Membership is by observation time**: a DID appears in the window in which
+*this monitor confirmed* the change, not the window in which the change was
+published. A monitor's authoritative fetch may lag arbitrarily — a
+counterpart's PDS may be unreachable for hours — and a sealed filter cannot
+be amended, so indexing by publication time would drop a change into a
+window already served and make it permanently invisible. Two consequences a
+client MUST respect:
+
+- **Window numbers are monitor-local.** Two honest monitors that confirmed
+  the same change at different moments place it in different windows.
+  Digest windows MUST NOT be compared across monitors; the `rev`
+  comparison is the only cross-monitor test
+  ([`trust-model.md`](trust-model.md#why-more-than-one-monitor-is-load-bearing)).
+- **A monitor's downtime is indistinguishable from quiet**, and correctly
+  so: nothing was observed, so nothing is reported, and the backlog appears
+  in whichever window finally confirms it.
+
+**Only closed windows are published.** The current window is still
+accumulating; serving it would return different bytes to two callers a
+second apart, forfeiting both cacheability and the identical-bytes property
+this surface's privacy rests on. The cost is a latency floor: a change is
+invisible to the digest for up to one window width. A client that needs
+tighter latency uses the own-DID push, which has none.
+
+#### The filter
+
+The filter is a **Bloom filter**, and its guarantee is one-sided in the
+direction that matters: a DID that changed MUST NEVER test negative. A
+false negative is a key change the device never learns about — precisely
+the withholding this component exists to detect. A false positive costs one
+fetch of a record that turns out unchanged.
+
+**A window MUST carry the parameters it was sealed under** — the filter
+length in bits, the hash count, and the window width. This is the load-
+bearing interoperability requirement, and it is what makes everything else
+about the filter an operator's choice rather than a specification's: a
+monitor may retune its sizing or its target false-positive rate at any
+time, and windows sealed under earlier values stay readable. **This
+specification therefore fixes no false-positive rate and no filter size.**
+Length in bits is carried explicitly because it is not recoverable from the
+byte length: a filter is padded to a byte boundary, and reading the padding
+as filter bits answers negative for DIDs that are present.
+
+A monitor SHOULD floor the filter size well above what the textbook sizing
+gives for very small populations. The asymptotic formula is a poor guide
+where windows hold a handful of members, which is the common case for a
+single collection: at one member it yields ten bits and seven hashes,
+saturating the filter and pushing the error rate roughly eightfold above
+its target, where a 64-bit floor costs eight bytes and removes the problem.
+
+Implementations MUST agree exactly on bit indexing — the hash input
+encoding, the derivation of positions from it, and the bit order within
+the filter — because a client that indexes differently reads a different
+filter and silently misses changes. That failure is invisible from both
+sides. The reference implementation's derivation and its test vectors are
+in `packages/monitor`; a second implementation MUST reproduce those
+vectors.
+
+#### The response
+
+A page, not a bare list of windows, because three facts have to travel with
+them and none is derivable from the windows alone:
+
+| field | meaning |
+|---|---|
+| `windows` | the sealed windows in `[cursor, sealedThrough]`, oldest first |
+| `oldest` | the earliest window still retained |
+| `sealedThrough` | the newest published window |
+| `nextCursor` | where to resume |
+
+**A client whose cursor precedes `oldest` has lost coverage** and MUST fall
+back to re-verifying its interest set directly — the cost it would pay with
+no digest at all. This is why the floor is published rather than implied:
+without it, "past retention" and "nothing changed in any window" are the
+same empty answer, and the failure is silent in exactly the case where
+coverage was lost. A monitor MUST NOT serve windows below `oldest`, since
+doing so would present a partial view as a complete one.
+
+**A monitor MAY return fewer windows than the range holds**, and a client
+knows it is caught up when `nextCursor` exceeds `sealedThrough` — not from
+a separate truncation flag, which would be a second source of the same
+truth and free to disagree with the first. A monitor SHOULD bound a page by
+the **size of the filters it carries** rather than by a window count: a
+count is fixed against a change rate that is not, so it goes stale as a
+population grows, where a byte budget self-adjusts.
+
+A window with no changes is a real answer and MUST be served as an empty
+filter rather than omitted, so that "nothing changed here" and "not
+published yet" stay distinguishable. A monitor need not store such windows;
+`sealedThrough` is what licenses synthesising them on read, since it
+asserts that everything at or below it has been sealed.
 
 ### The record fetch
 
@@ -271,9 +354,11 @@ above are designed to admit it without change.
   discovered — and a sensible default.
 - **How many monitors make the redundancy real**, and the shape of the
   no-independent-view warning.
-- **Offline catch-up across many windows** — union-degradation limits, and
-  whether prefix-sharded digests (fetch only the shards matching your DIDs'
-  hash prefixes) replace whole-population filters at scale.
+- **Prefix-sharded digests** — fetching only the shards matching your
+  DIDs' hash prefixes — as an alternative to whole-population filters at
+  scale. It trades a bounded, k-anonymous disclosure for a digest that
+  scales with the client's interest set rather than the monitor's
+  coverage. Not needed at the sizes a single collection produces.
 - **What the client does on detection** — alarm, refuse the record, both;
   refusal on a false positive is a self-inflicted outage, and skew makes
   false positives real.
@@ -282,5 +367,6 @@ above are designed to admit it without change.
   rotation; how the new key re-registers without that being mistaken for an
   attack).
 - **Concrete body schemas** — field-level CBOR for registration and the
-  delta response, and the digest's serialization, under the wire API's
-  [encoding rules](wire-api.md#deterministic-cbor).
+  delta response, under the wire API's
+  [encoding rules](wire-api.md#deterministic-cbor). The digest's own
+  serialization is settled above.
