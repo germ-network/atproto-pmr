@@ -14,6 +14,7 @@ import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
     compareObservations,
     compareRev,
+    type BackfillProgress,
     type MonitorIndex,
     type SnapshotEntry,
     type SnapshotStore,
@@ -49,6 +50,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
     let sealedThrough: number | null = null
+    let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
     const index: MonitorIndex = {
         readCursor: async () => null,
@@ -83,6 +85,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         dropWindow: async (w) => void members.delete(w),
         readSealedThrough: async () => sealedThrough,
         setSealedThrough: async (w) => void (sealedThrough = w),
+        readBackfillProgress: async () => backfillProgress,
+        setBackfillProgress: async (p) => void (backfillProgress = p),
     }
 
     const snapshot: SnapshotStore = {

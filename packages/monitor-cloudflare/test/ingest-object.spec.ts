@@ -13,6 +13,7 @@ import {
     mightHaveChanged,
     sealDueWindows,
     settleDue,
+    sweepBackfill,
     type FetchedRecord,
 } from "@germ-network/atproto-pmr-monitor"
 import { kvSnapshotStore } from "../src/snapshot-store"
@@ -326,6 +327,57 @@ describe("digest windows", () => {
         expect(await inMonitorObj(stub, (obj) => obj.readSealedThrough())).toBe(
             Math.floor(now / 600_000) * 600_000 - 600_000
         )
+    })
+})
+
+describe("backfill", () => {
+    it("starts unstarted, and persists progress across a separate entry into the object", async () => {
+        const stub = freshStub()
+        const before = await inMonitorObj(stub, (obj) => obj.readBackfillProgress())
+        expect(before).toEqual({ done: false, cursor: null })
+
+        await inMonitorObj(stub, (obj) =>
+            obj.setBackfillProgress({ done: false, cursor: "page-2" })
+        )
+        // A separate entry: state came from storage, not memory.
+        expect(await inMonitorObj(stub, (obj) => obj.readBackfillProgress())).toEqual({
+            done: false,
+            cursor: "page-2",
+        })
+    })
+
+    it("discovers a DID via the real index, and owes it for the next settle pass", async () => {
+        const stub = freshStub()
+        const swept = await inMonitorObj(stub, (obj) =>
+            sweepBackfill({
+                index: obj,
+                listRepos: async () => ({ dids: [DID], nextCursor: null }),
+            })
+        )
+        expect(swept).toEqual({ discovered: 1, done: true })
+
+        const owed = await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.duePending(Date.now(), 10)
+        )
+        expect(owed.map((p) => p.did)).toEqual([DID])
+    })
+
+    it("does not re-discover a DID the live tail already indexed", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.complete(DID, "3m1", Date.now())
+        )
+        const swept = await inMonitorObj(stub, (obj) =>
+            sweepBackfill({
+                index: obj,
+                listRepos: async () => ({ dids: [DID], nextCursor: null }),
+            })
+        )
+        expect(swept.discovered).toBe(0)
+        const owed = await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.duePending(Date.now(), 10)
+        )
+        expect(owed).toEqual([])
     })
 })
 

@@ -32,6 +32,7 @@ export {
 export {
     compareObservations,
     compareRev,
+    type BackfillProgress,
     type Cursor,
     type DeltaCursor,
     type IntakeOutcome,
@@ -80,3 +81,7 @@ export {
     type IntakeDecision,
     type SettleOutcome,
 } from "./ingest"
+
+// Tier 3: baseline build.
+export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
+export { sweepBackfill, type BackfillDeps, type SweepBackfillResult } from "./backfill"

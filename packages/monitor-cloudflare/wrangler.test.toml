@@ -32,6 +32,11 @@ DIGEST_FALSE_POSITIVE_RATE = "0.01"
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"
 
+# Tier 3's baseline build: how a DID published before this monitor's
+# connection opened, and never touched since, still gets discovered.
+BACKFILL_RELAY_URL = "https://relay.invalid"
+BACKFILL_BATCH = "100"
+
 [[kv_namespaces]]
 	binding = "records"
 	id = "test"
