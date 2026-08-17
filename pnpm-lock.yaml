@@ -53,6 +53,10 @@ importers:
         version: 4.1.10(vite@8.2.1(esbuild@0.28.1))
 
   packages/monitor:
+    dependencies:
+      '@noble/hashes':
+        specifier: ^2.3.0
+        version: 2.3.0
     devDependencies:
       '@germ-network/atproto-pmr-core':
         specifier: workspace:*

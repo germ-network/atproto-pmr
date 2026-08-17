@@ -26,6 +26,11 @@ import {
 export interface FetchedRecord {
     rev: string
     car: Uint8Array
+    /** The PDS this was fetched from. */
+    source: string
+    /** The atproto signing key resolved at fetch time; `null` if the DID
+     * document carried none. See `resolvePDSEndpoint` in core. */
+    signingKey: string | null
 }
 
 export interface IngestDeps {
@@ -137,6 +142,8 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         rev: record.rev,
         car: record.car,
         observedAtMs,
+        source: record.source,
+        signingKey: record.signingKey,
     })
     await deps.index.complete(did, record.rev, observedAtMs)
 

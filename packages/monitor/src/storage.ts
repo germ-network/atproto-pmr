@@ -42,6 +42,14 @@ export interface SnapshotEntry {
     /** The record as CAR — never a parsed form; the client verifies it. */
     car: Uint8Array
     observedAtMs: number
+    /** The PDS this was fetched from. */
+    source: string
+    /**
+     * The atproto repo signing key resolved at fetch time, `null` if the
+     * DID document carried none. Provenance, not a check this monitor
+     * performed — see `compareObservations`.
+     */
+    signingKey: string | null
 }
 
 /**
@@ -125,6 +133,39 @@ export interface MonitorIndex {
     revOf(did: string): Promise<string | null>
 
     /**
+     * Windows that have closed and hold members, oldest first.
+     *
+     * A window is indexed by **observation time** — when this monitor
+     * confirmed the change — not by when the change happened. The retry
+     * path forces it: a DID whose PDS was down settles hours late, and a
+     * sealed Bloom filter cannot be amended, so indexing by event time
+     * would drop that change into a window already published and make it
+     * permanently invisible. The cost is a fact clients depend on: a
+     * digest window says when this monitor *saw* a change, so window
+     * numbers are monitor-local and only `rev` is comparable across
+     * monitors.
+     */
+    closedWindowsWithMembers(currentWindow: number, limit: number): Promise<number[]>
+
+    /** The DIDs recorded in one window. */
+    windowMembers(window: number): Promise<string[]>
+
+    /** Drop a window's membership once its filter is durable. */
+    dropWindow(window: number): Promise<void>
+
+    /**
+     * The highest window sealed so far — the boundary between "definitely
+     * nothing changed" and "not published yet".
+     *
+     * Advances past empty windows too. A quiet interval and an interval
+     * this monitor was down are the same thing under observation-time
+     * indexing: nothing was observed, so nothing is reported, and the
+     * backlog lands in whichever window it is finally confirmed in.
+     */
+    readSealedThrough(): Promise<number | null>
+    setSealedThrough(window: number): Promise<void>
+
+    /**
      * Which of `dids` changed since `cursor`. The reason the index exists
      * rather than living wholly in the snapshot: a key-value serving store
      * can neither answer this nor promise read-your-writes.
@@ -154,4 +195,103 @@ export function compareRev(indexed: string | null, observed: string): RevCompari
         return indexed === null ? "advanced" : "unchanged"
     }
     return observed > indexed ? "advanced" : "regressed"
+}
+
+/**
+ * What `compareObservations` needs from one monitor's report of a DID —
+ * the fields of a `SnapshotEntry` that carry provenance, plus the bytes
+ * being compared. Deliberately not `SnapshotEntry` itself: window
+ * numbering (`MonitorIndex.closedWindowsWithMembers`) is monitor-local and
+ * not comparable across two independent monitors, but `observedAtMs` — a
+ * wall-clock reading — plays no part in the classification below only
+ * because this function does not need it to; a caller comparing two
+ * `skew` observations may still want it to guess which side is older.
+ */
+export interface Observation {
+    rev: string
+    source: string
+    signingKey: string | null
+    car: Uint8Array
+}
+
+/**
+ * What two independent observations of the same DID mean, together.
+ *
+ * Unlike `compareRev` — one monitor's own history, strictly ordered —
+ * these are two parties with no shared history, so there is no
+ * "regressed": only whether they agree, and if not, why.
+ */
+export type ObservationComparison =
+    /** Same authority, same rev, same bytes. Nothing to resolve. */
+    | "agree"
+    /** Same authority, differing rev. Ordinary — one side is merely older;
+     * `observedAtMs`, outside this function, is what could say which. */
+    | "skew"
+    /** Same authority, same rev, DIFFERING bytes. The strongest signal
+     * this function can raise, but **evidence to escalate, not proof**: a
+     * CAR's own block ordering is not required to be deterministic
+     * (atproto's own spec says so), so two honest fetches of the identical
+     * commit — different PDS software, or one upgraded between the two
+     * reads — can differ byte-for-byte without either side lying. What
+     * *would* prove misconduct is two independently-verified commits at
+     * the same `rev` with different content; this function stops at "the
+     * bytes disagree" because it does not parse CAR, and hands the
+     * decode-and-verify step to the client (Q-PMR-24). */
+    | "equivocation"
+    /** Differing `signingKey`. The DID document moved between the two
+     * observations — a question for the PLC log, not for these records,
+     * and for `did:web` not even that: there is no log, so a rotation
+     * there cannot be adjudicated at all (`spec/trust-model.md`). */
+    | "rotated"
+    /** Same authority, same rev, same bytes, different `source`. Not an
+     * alarm — a mirror or a migration in flight — but worth surfacing
+     * separately from `agree`, since a reader may still want to know the
+     * two monitors are not reading the same host. Note this is checked
+     * *after* content equality: two different hosts serving the same rev
+     * with differing bytes lands in `equivocation` above, not here, even
+     * though a benign serialization difference between two honest hosts
+     * would look identical from this function's point of view. */
+    | "different-source"
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false
+    }
+    return true
+}
+
+/**
+ * Classify what two monitors' observations of one DID mean, per
+ * `spec/key-transparency.md`'s comparison rule: **compare under a common
+ * authority, or not at all**. `signingKey` is checked first and pre-empts
+ * everything else — a `rev` or content comparison made across a rotation
+ * answers a question neither observation was actually asked.
+ *
+ * That check only *fires* when both sides resolved a key: a `null` on
+ * either side means rotation cannot be asserted (there is nothing to
+ * compare it against, not that it is ruled out), so comparison falls
+ * through to `rev`/content as if the key had never been checked at all.
+ * That fallback is sound whenever it disagrees — `equivocation`/`skew`
+ * still hold regardless of which authority was in effect — but it has one
+ * real blind spot: a genuine rotation whose two observations happen to
+ * carry identical `rev` and identical bytes (content is independent of
+ * which key signed it) reports `agree` if either side's key resolution
+ * failed, exactly as it would with no rotation at all. Narrow, but real:
+ * this function cannot see a rotation it has no key to compare.
+ */
+export function compareObservations(
+    a: Observation,
+    b: Observation
+): ObservationComparison {
+    if (a.signingKey !== null && b.signingKey !== null && a.signingKey !== b.signingKey) {
+        return "rotated"
+    }
+    if (a.rev !== b.rev) {
+        return "skew"
+    }
+    if (!bytesEqual(a.car, b.car)) {
+        return "equivocation"
+    }
+    return a.source === b.source ? "agree" : "different-source"
 }

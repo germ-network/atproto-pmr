@@ -26,5 +26,8 @@
 	},
 	"peerDependencies": {
 		"@germ-network/atproto-pmr-core": "*"
+	},
+	"dependencies": {
+		"@noble/hashes": "^2.3.0"
 	}
 }

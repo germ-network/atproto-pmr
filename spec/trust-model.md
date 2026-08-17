@@ -322,17 +322,53 @@ One such observer detects uniform malice. **Disagreement between observers
 is what exposes audience-targeted equivocation**, which no single observer
 can see at all.
 
-The comparison key is the repo `rev`:
+The comparison key is the repo `rev` — but only ever **under a common
+authority**. A monitor's record carries the signing key it resolved the
+record against at fetch time, alongside `rev`; compare two observations
+without checking that key first and a rotation reads as whichever alarm
+the rev/content difference happens to resemble, which is the wrong alarm.
+So the check runs in this order:
 
 | observation | reading |
 |---|---|
-| differing `rev` across monitors | ordinary skew — one is simply behind |
-| **same `rev`, different content** | alarm — someone is equivocating |
-| a `rev` that moved backwards | alarm — someone is replaying |
+| **differing signing key across monitors** | the DID document moved between the two fetches — a question for the PLC log, not for these two records; see below |
+| differing `rev`, same signing key | ordinary skew — one is simply behind |
+| **same `rev`, different content, same signing key** | escalate — decode and verify both; see below |
+| a `rev` that moved backwards, same signing key | alarm — someone is replaying |
 
 This is detection, not prevention — the same posture as Certificate
 Transparency. A client's response to an alarm is
 [not yet specified](#not-yet-specified).
+
+**Same `rev`, different bytes is the strongest signal available from `rev`
+and content alone, not proof.** CAR block ordering is not required to be
+deterministic, so two honest fetches of the identical commit — different
+PDS software, or one upgraded between the two reads — can differ
+byte-for-byte with nobody equivocating. What *would* prove misconduct is
+two independently decoded and verified commits at the same `rev` with
+genuinely different content; a monitor does not parse CAR
+([`key-transparency.md`](key-transparency.md#the-key-monitor)), so this
+row is where a client's own verifier takes over from monitor comparison.
+
+**A rotation is not itself the alarm.** Keys legitimately change. What a
+differing signing key means is narrower and stricter: the rev/content
+comparison above has no basis until the two records are placed against a
+common authority, and *that* is a PLC-log question — was there one
+rotation between the two observation times, in the direction the older
+record implies, or does the newer key already precede the older
+observation, which would mean one monitor is stale rather than that
+anything rotated. A client with only two disagreeing snapshots and no PLC
+read cannot tell those apart, and should not guess.
+
+**For `did:web` there is no log to consult at all.** The DID document is
+served by the publisher's own host, so a differing signing key across two
+monitors cannot be adjudicated the way a `did:plc` rotation can — a
+`did:web` operator can audience-split the document itself, converting
+what would be the one provable alarm above (same `rev`, different
+content) into an unresolvable "maybe it rotated." Until a stronger
+`did:web` anchor exists ([not yet specified](key-transparency.md#not-yet-specified)),
+a differing signing key there carries at least the weight of the alarm it
+pre-empts, not less.
 
 ### Choosing monitors is the client's job
 

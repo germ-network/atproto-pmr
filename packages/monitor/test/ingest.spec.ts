@@ -11,10 +11,18 @@
 import { describe, expect, it, vi } from "vitest"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
 import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
-import { compareRev, type MonitorIndex, type SnapshotStore } from "../src/storage"
+import {
+    compareObservations,
+    compareRev,
+    type MonitorIndex,
+    type SnapshotEntry,
+    type SnapshotStore,
+} from "../src/storage"
 
 const COLLECTION = "com.germnetwork.declaration"
 const DID = "did:plc:alice"
+const PDS = "https://pds.example"
+const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 
 function commit(rev: string, collection = COLLECTION): CommitEvent {
     const e = decodeEvent(
@@ -37,8 +45,10 @@ function commit(rev: string, collection = COLLECTION): CommitEvent {
 function harness(overrides: Partial<IngestDeps> = {}) {
     const revs = new Map<string, string>()
     const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
-    const records = new Map<string, { rev: string; car: Uint8Array; observedAtMs: number }>()
+    const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
+    const members = new Map<number, Set<string>>()
+    let sealedThrough: number | null = null
 
     const index: MonitorIndex = {
         readCursor: async () => null,
@@ -47,8 +57,12 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
             return { outcome: "accepted" }
         },
-        complete: async (did, rev) => {
+        complete: async (did, rev, observedAtMs) => {
             revs.set(did, rev)
+            const w = Math.floor(observedAtMs / 600_000)
+            const set = members.get(w) ?? new Set<string>()
+            set.add(did)
+            members.set(w, set)
             pending.delete(did)
         },
         duePending: async (nowMs) =>
@@ -63,6 +77,12 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
         clearPending: async (did) => void pending.delete(did),
         changedSince: async () => ({ dids: [], nextCursor: "0" }),
+        closedWindowsWithMembers: async (current, limit) =>
+            [...members.keys()].filter((w) => w < current).sort((a, b) => a - b).slice(0, limit),
+        windowMembers: async (w) => [...(members.get(w) ?? [])].sort(),
+        dropWindow: async (w) => void members.delete(w),
+        readSealedThrough: async () => sealedThrough,
+        setSealedThrough: async (w) => void (sealedThrough = w),
     }
 
     const snapshot: SnapshotStore = {
@@ -75,11 +95,16 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const deps: IngestDeps = {
         index,
         snapshot,
-        fetchRecord: async () => ({ rev: "3m2", car: new Uint8Array([1, 2, 3]) }),
+        fetchRecord: async () => ({
+            rev: "3m2",
+            car: new Uint8Array([1, 2, 3]),
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        }),
         nowMs: () => 1_000_000,
         ...overrides,
     }
-    return { deps, revs, pending, records }
+    return { deps, revs, pending, records, members, windows, sealedThrough: () => sealedThrough }
 }
 
 describe("intake", () => {
@@ -164,12 +189,27 @@ describe("settle", () => {
         expect(onChange).toHaveBeenCalledWith(DID, "3m2")
     })
 
+    it("carries the fetch's provenance into the stored entry", async () => {
+        // `fetchRecordCar` resolves `source`/`signingKey` and previously
+        // threw them away. This is the property that stops that
+        // regression: what was fetched must be what gets stored, not just
+        // `rev` and `car`.
+        const h = harness()
+        await settle(h.deps, DID)
+        expect(h.records.get(DID)).toMatchObject({ source: PDS, signingKey: SIGNING_KEY })
+    })
+
     it("raises a regression instead of overwriting it", async () => {
         // A rev moving backwards is the alarm the component exists for.
         const onRegression = vi.fn(async () => {})
         const h = harness({
             onRegression,
-            fetchRecord: async () => ({ rev: "3m1", car: new Uint8Array([9]) }),
+            fetchRecord: async () => ({
+                rev: "3m1",
+                car: new Uint8Array([9]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }),
         })
         h.revs.set(DID, "3m9")
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
@@ -215,7 +255,12 @@ describe("settleDue", () => {
         // reporting it as settled hid a permanent retry loop.
         const h = harness({
             verify: async () => false,
-            fetchRecord: async () => ({ rev: "3m1", car: new Uint8Array([1]) }),
+            fetchRecord: async () => ({
+                rev: "3m1",
+                car: new Uint8Array([1]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }),
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
@@ -237,5 +282,78 @@ describe("compareRev", () => {
         expect(compareRev("3m1", "3m1")).toBe("unchanged")
         expect(compareRev("3m1", "3m2")).toBe("advanced")
         expect(compareRev("3m2", "3m1")).toBe("regressed")
+    })
+})
+
+describe("compareObservations", () => {
+    const KEY_A = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
+    const KEY_B = "zQ3shPJ8gWuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmothr"
+    const HOST_A = "https://pds-a.example"
+    const HOST_B = "https://pds-b.example"
+    const CAR_1 = new Uint8Array([1, 2, 3])
+    const CAR_2 = new Uint8Array([9, 9, 9])
+
+    function observation(overrides: Partial<Parameters<typeof compareObservations>[0]> = {}) {
+        return { rev: "3m1", source: HOST_A, signingKey: KEY_A, car: CAR_1, ...overrides }
+    }
+
+    it("agrees when rev, content, and source all match", () => {
+        expect(compareObservations(observation(), observation())).toBe("agree")
+    })
+
+    it("calls it skew when only the rev differs under one authority", () => {
+        expect(compareObservations(observation(), observation({ rev: "3m2" }))).toBe("skew")
+    })
+
+    it("calls it rotated when the two sides resolved different signing keys", () => {
+        // Pre-empts every other check: a rev or content comparison across a
+        // rotation answers a question neither observation was asked.
+        expect(
+            compareObservations(
+                observation({ rev: "3m2", car: CAR_2 }),
+                observation({ signingKey: KEY_B })
+            )
+        ).toBe("rotated")
+    })
+
+    it("calls it equivocation when the SAME rev carries DIFFERENT content", () => {
+        // The strongest signal this function can raise from rev/content
+        // alone — escalate to decode-and-verify, per the doc comment on
+        // ObservationComparison; this function does not parse CAR, so it
+        // cannot itself distinguish real equivocation from non-deterministic
+        // CAR serialization between two honest fetches.
+        expect(compareObservations(observation(), observation({ car: CAR_2 }))).toBe(
+            "equivocation"
+        )
+    })
+
+    it("calls it different-source when rev and content agree but the host does not", () => {
+        expect(compareObservations(observation(), observation({ source: HOST_B }))).toBe(
+            "different-source"
+        )
+    })
+
+    it("does not assert rotation when only one side resolved a signing key", () => {
+        // There is nothing to compare a null against — treated as
+        // unresolved, not as a mismatch, so the weaker checks still apply.
+        expect(compareObservations(observation(), observation({ signingKey: null }))).toBe(
+            "agree"
+        )
+    })
+
+    it("still raises equivocation with an unresolved key, on the rev/content signal alone", () => {
+        // The fallback in compareObservations is only sound if it can still
+        // reach the alarm classes — a null signingKey must not silently cap
+        // the result at something weaker than what rev/content alone
+        // supports.
+        expect(
+            compareObservations(observation(), observation({ signingKey: null, car: CAR_2 }))
+        ).toBe("equivocation")
+    })
+
+    it("still raises skew with an unresolved key, on the rev signal alone", () => {
+        expect(
+            compareObservations(observation(), observation({ signingKey: null, rev: "3m2" }))
+        ).toBe("skew")
     })
 })

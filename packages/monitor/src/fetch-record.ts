@@ -44,7 +44,7 @@ export async function fetchRecordCar(
     options: FetchRecordOptions
 ): Promise<FetchedRecord> {
     const fetchImpl = options.fetchImpl ?? fetch
-    const pds = await resolvePDSEndpoint(did, fetchImpl)
+    const { endpoint: pds, signingKey } = await resolvePDSEndpoint(did, fetchImpl)
 
     const recordUrl = new URL(`${pds}/xrpc/com.atproto.sync.getRecord`)
     recordUrl.searchParams.set("did", did)
@@ -53,7 +53,7 @@ export async function fetchRecordCar(
 
     const car = await guardedFetchBytes(recordUrl.toString(), fetchImpl)
     const rev = await fetchLatestRev(pds, did, fetchImpl)
-    return { rev, car }
+    return { rev, car, source: pds, signingKey }
 }
 
 /**

@@ -20,6 +20,8 @@ const WINDOW_PREFIX = "win:"
 interface StoredMeta {
     rev: string
     observedAtMs: number
+    source: string
+    signingKey: string | null
 }
 
 /**
@@ -43,6 +45,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 rev: metadata.rev,
                 car: new Uint8Array(value),
                 observedAtMs: metadata.observedAtMs,
+                source: metadata.source,
+                signingKey: metadata.signingKey,
             }
         },
 
@@ -53,6 +57,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 metadata: {
                     rev: entry.rev,
                     observedAtMs: entry.observedAtMs,
+                    source: entry.source,
+                    signingKey: entry.signingKey,
                 } satisfies StoredMeta,
             })
         },

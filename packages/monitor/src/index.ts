@@ -30,16 +30,41 @@ export {
 
 // The storage seam.
 export {
+    compareObservations,
     compareRev,
     type Cursor,
     type DeltaCursor,
     type IntakeOutcome,
     type MonitorIndex,
+    type Observation,
+    type ObservationComparison,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
     type SnapshotStore,
 } from "./storage"
+
+// The change digest.
+export {
+    decodeDigestPage,
+    decodeDigestWindows,
+    encodeDigestPage,
+    encodeDigestWindows,
+    mightHaveChanged,
+    nextWindow,
+    sealDueWindows,
+    sealWindow,
+    serveDigest,
+    sizeFor,
+    windowOf,
+    type DigestPage,
+    type DigestWindow,
+    type SealDeps,
+    type ServeDeps,
+} from "./digest"
+
+// The digest endpoint.
+export { handleDigest, type DigestEndpointDeps } from "./digest-endpoint"
 
 // The authoritative read.
 export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"

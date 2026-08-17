@@ -8,13 +8,21 @@
  */
 import { env, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { settleDue, type FetchedRecord } from "@germ-network/atproto-pmr-monitor"
+import {
+    decodeDigestWindows,
+    mightHaveChanged,
+    sealDueWindows,
+    settleDue,
+    type FetchedRecord,
+} from "@germ-network/atproto-pmr-monitor"
 import { kvSnapshotStore } from "../src/snapshot-store"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
 
 const testEnv = env as unknown as MonitorEnv
 const DID = "did:plc:alice"
+const PDS = "https://pds.example"
+const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 
 let n = 0
 function freshStub(): DurableObjectStub<MonitorIngest> {
@@ -23,6 +31,14 @@ function freshStub(): DurableObjectStub<MonitorIngest> {
 }
 
 /** Reach in to drive the ingest object with a stubbed authoritative fetch. */
+/** Enter the object with its own type, mirroring inPMR upstream. */
+function inMonitorObj<R>(
+    stub: DurableObjectStub<MonitorIngest>,
+    fn: (obj: MonitorIngest) => R | Promise<R>
+): Promise<R> {
+    return runInDurableObject(stub, (instance) => fn(instance as MonitorIngest))
+}
+
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
     fetchRecord: (did: string) => Promise<FetchedRecord>
@@ -145,12 +161,19 @@ describe("settling what is owed", () => {
             obj.intake({ did: DID, rev: "3m1" }, "100")
         )
         const car = new Uint8Array([1, 2, 3])
-        const settled = await withFetch(stub, async () => ({ rev: "3m1", car }))
+        const settled = await withFetch(stub, async () => ({
+            rev: "3m1",
+            car,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        }))
         expect(settled).toBe(1)
 
         const stored = await kvSnapshotStore(testEnv).getRecord(DID)
         expect(stored?.rev).toBe("3m1")
         expect([...(stored?.car ?? [])]).toEqual([1, 2, 3])
+        expect(stored?.source).toBe(PDS)
+        expect(stored?.signingKey).toBe(SIGNING_KEY)
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.revOf(DID))).toBe("3m1")
     })
 
@@ -225,6 +248,87 @@ describe("the way in", () => {
     })
 })
 
+describe("digest windows", () => {
+    it("records a completed fetch in the window it was OBSERVED in", async () => {
+        // Observation time, not event time: a sealed filter cannot be
+        // amended, and the retry path settles arbitrarily late.
+        const stub = freshStub()
+        const observedAtMs = 12 * 600_000 + 5_000
+        const members = await inMonitorObj(stub, async (obj) => {
+            await obj.complete(DID, "3m1", observedAtMs)
+            // Identified by START INSTANT, so the width can be retuned
+            // without old and new windows colliding on one key.
+            return obj.windowMembers(12 * 600_000)
+        })
+        expect(members).toEqual([DID])
+    })
+
+    it("seals closed windows on the alarm, leaving the open one alone", async () => {
+        const stub = freshStub()
+        const now = Date.now()
+        const currentWindow = Math.floor(now / 600_000) * 600_000
+        const sealed = await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:old", "3m1", currentWindow - 2 * 600_000)
+            await obj.complete("did:plc:now", "3m2", now)
+            return sealDueWindows({
+                index: obj,
+                snapshot: kvSnapshotStore(testEnv),
+                widthMs: 600_000,
+                nowMs: () => now,
+            })
+        })
+        expect(sealed).toEqual([currentWindow - 2 * 600_000])
+
+        const bytes = await kvSnapshotStore(testEnv).getSealedWindow(String(currentWindow - 2 * 600_000))
+        const [w] = decodeDigestWindows(bytes!)
+        expect(mightHaveChanged(w, "did:plc:old")).toBe(true)
+        expect(mightHaveChanged(w, "did:plc:now")).toBe(false)
+
+        // The current window is still accumulating.
+        const stillOpen = await inMonitorObj(stub, (obj) => obj.windowMembers(currentWindow))
+        expect(stillOpen).toEqual(["did:plc:now"])
+    })
+
+    it("keys a window by its start instant, divisible by the width", async () => {
+        // Identity is the start instant, not an index. An index is
+        // ambiguous the moment the width is tuned — index 5 means minutes
+        // 50-60 at ten minutes and 25-30 at five — so every key would mean
+        // two things. An instant means one thing under any width.
+        //
+        // It does NOT make retuning free: an instant divisible by both
+        // widths is a shared key, so changing the width requires clearing
+        // digest state (see the note on `DIGEST_WINDOW_MS`). What it buys
+        // is that the collision surface is aligned boundaries rather than
+        // every key, and any survivor is self-describing about its width.
+        const stub = freshStub()
+        const t = 12 * 600_000 + 5_000
+        const members = await inMonitorObj(stub, async (obj) => {
+            await obj.complete(DID, "3m1", t)
+            return obj.windowMembers(12 * 600_000)
+        })
+        expect(members).toEqual([DID])
+        expect((12 * 600_000) % 600_000).toBe(0)
+    })
+
+    it("tracks sealedThrough, the boundary between empty and unpublished", async () => {
+        const stub = freshStub()
+        const now = Date.now()
+        const before = await inMonitorObj(stub, (obj) => obj.readSealedThrough())
+        expect(before).toBeNull()
+        await inMonitorObj(stub, (obj) =>
+            sealDueWindows({
+                index: obj,
+                snapshot: kvSnapshotStore(testEnv),
+                widthMs: 600_000,
+                nowMs: () => now,
+            })
+        )
+        expect(await inMonitorObj(stub, (obj) => obj.readSealedThrough())).toBe(
+            Math.floor(now / 600_000) * 600_000 - 600_000
+        )
+    })
+})
+
 describe("the snapshot store", () => {
     it("keeps records without a TTL — an unchanged record stays served", async () => {
         const store = kvSnapshotStore(testEnv)
@@ -232,9 +336,16 @@ describe("the snapshot store", () => {
             rev: "3m1",
             car: new Uint8Array([9]),
             observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
         })
         const back = await store.getRecord("did:plc:ttl")
-        expect(back).toMatchObject({ rev: "3m1", observedAtMs: 1 })
+        expect(back).toMatchObject({
+            rev: "3m1",
+            observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
     })
 
     it("returns null for a DID it has never seen", async () => {

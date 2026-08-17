@@ -50,6 +50,39 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     SETTLE_BATCH: string
 
     /**
+     * Bytes of filter a digest response carries before deferring the rest
+     * to the next page. A **byte** budget rather than a window count, so
+     * it does not go stale as the population grows: fatter windows simply
+     * mean fewer per page. This is the knob to tune against observed
+     * response sizes in production.
+     */
+    DIGEST_BYTE_BUDGET: string
+
+    /**
+     * Target false-positive rate for new filters. Free to retune at any
+     * time: every sealed window carries its own `bits` and `hashes`, so
+     * windows sealed under an older value stay readable.
+     */
+    DIGEST_FALSE_POSITIVE_RATE: string
+
+    /**
+     * Digest window width in milliseconds. Published with every filter, so
+     * it can change without coordinating a flag day for *clients*.
+     *
+     * **Changing it is not free on the server.** Windows are identified by
+     * their start instant rather than an index — which is what stops every
+     * key meaning two things — but an instant divisible by both the old
+     * and new width is still a shared key, and more fundamentally
+     * `sealedThrough` promises that an absent window below it is
+     * *empty* rather than *unknown*. A granularity change breaks that
+     * promise. So retuning this MUST be accompanied by clearing the sealed
+     * windows and `sealedThrough`; clients see `oldest` jump forward and
+     * fall back to direct re-verification, which is the defined behaviour
+     * for a gap.
+     */
+    DIGEST_WINDOW_MS: string
+
+    /**
      * How long a sealed digest window stays fetchable. Records never
      * expire; windows do — past this a client falls back to the direct
      * re-verification it would do with no digest at all.

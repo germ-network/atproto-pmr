@@ -151,7 +151,7 @@ export async function resolveDeclaration(
 ): Promise<DeclarationResolution> {
     let pdsEndpoint: string
     try {
-        pdsEndpoint = await resolvePDSEndpoint(senderDID, fetchImpl)
+        ;({ endpoint: pdsEndpoint } = await resolvePDSEndpoint(senderDID, fetchImpl))
     } catch (e) {
         return { found: false, reason: `PDS resolution failed: ${String(e)}` }
     }
