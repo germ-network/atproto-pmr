@@ -21,12 +21,11 @@ const MAX_TIP_CACHE_SECONDS = 300
 /**
  * What the endpoint needs, which is deliberately **not** the storage seam.
  *
- * `page` is a producer rather than an index, because the single writer that
- * owns the index is frequently not in the same process as the request
- * handler — in the reference deployment the handler runs in a Worker and
- * the index in a Durable Object. Taking the seam would mean one round trip
- * per index call; taking a producer means one, and the response contract
- * stays in this package either way.
+ * `page` is a producer rather than a `ServeDeps`, so this package's response
+ * contract (caching, encoding) stays decoupled from how a page is actually
+ * assembled. In the reference deployment that producer is `serveDigest`
+ * closed over KV — same process as the handler, no Durable Object in the
+ * path at all, which is the point: this signature doesn't know or care.
  */
 export interface DigestEndpointDeps {
     /** Window width, for bounding how long a tip page may be cached. */
