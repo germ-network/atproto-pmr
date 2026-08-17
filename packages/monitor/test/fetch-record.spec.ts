@@ -14,8 +14,13 @@ const PDS = "https://pds.example"
 const COLLECTION = "com.germnetwork.declaration"
 const CAR = new Uint8Array([0x0a, 0xa1, 0x63, 0x63, 0x61, 0x72])
 
+const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
+
 /** A PDS that answers the three calls a fetch makes, recording each URL. */
-function fixture(overrides: Record<string, () => Response> = {}) {
+function fixture(
+    overrides: Record<string, () => Response> = {},
+    documentOverrides: Record<string, unknown> = {}
+) {
     const seen: string[] = []
     const impl = (async (input: RequestInfo | URL) => {
         const url = String(input)
@@ -33,6 +38,15 @@ function fixture(overrides: Record<string, () => Response> = {}) {
                         serviceEndpoint: PDS,
                     },
                 ],
+                verificationMethod: [
+                    {
+                        id: "#atproto",
+                        type: "Multikey",
+                        controller: DID,
+                        publicKeyMultibase: SIGNING_KEY,
+                    },
+                ],
+                ...documentOverrides,
             })
         }
         if (url.includes("sync.getRecord")) {
@@ -57,6 +71,31 @@ describe("fetchRecordCar", () => {
         })
         expect(got.rev).toBe("3mszqbq6s3y2k")
         expect([...got.car]).toEqual([...CAR])
+    })
+
+    it("carries out the PDS it read from, and the signing key resolved with it", async () => {
+        // Both computed already, by `resolvePDSEndpoint`, to find the PDS —
+        // and previously thrown away. This is the provenance a client needs
+        // to compare two monitors' observations under a common authority.
+        const f = fixture()
+        const got = await fetchRecordCar(DID, {
+            collection: COLLECTION,
+            fetchImpl: f.impl,
+        })
+        expect(got.source).toBe(PDS)
+        expect(got.signingKey).toBe(SIGNING_KEY)
+    })
+
+    it("carries a null signingKey rather than failing, when the document has none", async () => {
+        // Absence does not block the fetch this module exists to make — a
+        // monitor still serves what it read; an atproto client is what
+        // fails a record against no key, not this resolver.
+        const f = fixture({}, { verificationMethod: undefined })
+        const got = await fetchRecordCar(DID, {
+            collection: COLLECTION,
+            fetchImpl: f.impl,
+        })
+        expect(got.signingKey).toBeNull()
     })
 
     it("calls sync.getRecord — never repo.getRecord, which returns JSON", async () => {

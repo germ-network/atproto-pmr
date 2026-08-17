@@ -30,11 +30,14 @@ export {
 
 // The storage seam.
 export {
+    compareObservations,
     compareRev,
     type Cursor,
     type DeltaCursor,
     type IntakeOutcome,
     type MonitorIndex,
+    type Observation,
+    type ObservationComparison,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,

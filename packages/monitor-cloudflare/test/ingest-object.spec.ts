@@ -21,6 +21,8 @@ import type { MonitorEnv } from "../src/env"
 
 const testEnv = env as unknown as MonitorEnv
 const DID = "did:plc:alice"
+const PDS = "https://pds.example"
+const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 
 let n = 0
 function freshStub(): DurableObjectStub<MonitorIngest> {
@@ -159,12 +161,19 @@ describe("settling what is owed", () => {
             obj.intake({ did: DID, rev: "3m1" }, "100")
         )
         const car = new Uint8Array([1, 2, 3])
-        const settled = await withFetch(stub, async () => ({ rev: "3m1", car }))
+        const settled = await withFetch(stub, async () => ({
+            rev: "3m1",
+            car,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        }))
         expect(settled).toBe(1)
 
         const stored = await kvSnapshotStore(testEnv).getRecord(DID)
         expect(stored?.rev).toBe("3m1")
         expect([...(stored?.car ?? [])]).toEqual([1, 2, 3])
+        expect(stored?.source).toBe(PDS)
+        expect(stored?.signingKey).toBe(SIGNING_KEY)
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.revOf(DID))).toBe("3m1")
     })
 
@@ -327,9 +336,16 @@ describe("the snapshot store", () => {
             rev: "3m1",
             car: new Uint8Array([9]),
             observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
         })
         const back = await store.getRecord("did:plc:ttl")
-        expect(back).toMatchObject({ rev: "3m1", observedAtMs: 1 })
+        expect(back).toMatchObject({
+            rev: "3m1",
+            observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
     })
 
     it("returns null for a DID it has never seen", async () => {

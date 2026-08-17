@@ -322,17 +322,33 @@ One such observer detects uniform malice. **Disagreement between observers
 is what exposes audience-targeted equivocation**, which no single observer
 can see at all.
 
-The comparison key is the repo `rev`:
+The comparison key is the repo `rev` — but only ever **under a common
+authority**. A monitor's record carries the signing key it resolved the
+record against at fetch time, alongside `rev`; compare two observations
+without checking that key first and a rotation reads as whichever alarm
+the rev/content difference happens to resemble, which is the wrong alarm.
+So the check runs in this order:
 
 | observation | reading |
 |---|---|
-| differing `rev` across monitors | ordinary skew — one is simply behind |
-| **same `rev`, different content** | alarm — someone is equivocating |
-| a `rev` that moved backwards | alarm — someone is replaying |
+| **differing signing key across monitors** | the DID document moved between the two fetches — a question for the PLC log, not for these two records; see below |
+| differing `rev`, same signing key | ordinary skew — one is simply behind |
+| **same `rev`, different content, same signing key** | alarm — someone is equivocating |
+| a `rev` that moved backwards, same signing key | alarm — someone is replaying |
 
 This is detection, not prevention — the same posture as Certificate
 Transparency. A client's response to an alarm is
 [not yet specified](#not-yet-specified).
+
+**A rotation is not itself the alarm.** Keys legitimately change. What a
+differing signing key means is narrower and stricter: the rev/content
+comparison above has no basis until the two records are placed against a
+common authority, and *that* is a PLC-log question — was there one
+rotation between the two observation times, in the direction the older
+record implies, or does the newer key already precede the older
+observation, which would mean one monitor is stale rather than that
+anything rotated. A client with only two disagreeing snapshots and no PLC
+read cannot tell those apart, and should not guess.
 
 ### Choosing monitors is the client's job
 

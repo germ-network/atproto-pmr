@@ -42,6 +42,14 @@ export interface SnapshotEntry {
     /** The record as CAR — never a parsed form; the client verifies it. */
     car: Uint8Array
     observedAtMs: number
+    /** The PDS this was fetched from. */
+    source: string
+    /**
+     * The atproto repo signing key resolved at fetch time, `null` if the
+     * DID document carried none. Provenance, not a check this monitor
+     * performed — see `compareObservations`.
+     */
+    signingKey: string | null
 }
 
 /**
@@ -187,4 +195,82 @@ export function compareRev(indexed: string | null, observed: string): RevCompari
         return indexed === null ? "advanced" : "unchanged"
     }
     return observed > indexed ? "advanced" : "regressed"
+}
+
+/**
+ * What `compareObservations` needs from one monitor's report of a DID —
+ * the fields of a `SnapshotEntry` that carry provenance, plus the bytes
+ * being compared. Deliberately not `SnapshotEntry` itself: `observedAtMs`
+ * is monitor-local (`MonitorIndex.closedWindowsWithMembers`) and has no
+ * meaning across two independent monitors, so it plays no part here.
+ */
+export interface Observation {
+    rev: string
+    source: string
+    signingKey: string | null
+    car: Uint8Array
+}
+
+/**
+ * What two independent observations of the same DID mean, together.
+ *
+ * Unlike `compareRev` — one monitor's own history, strictly ordered —
+ * these are two parties with no shared history, so there is no
+ * "regressed": only whether they agree, and if not, why.
+ */
+export type ObservationComparison =
+    /** Same authority, same rev, same bytes. Nothing to resolve. */
+    | "agree"
+    /** Same authority, differing rev. Ordinary — one side is merely older;
+     * `observedAtMs`, outside this function, is what could say which. */
+    | "skew"
+    /** Same authority, same rev, DIFFERING bytes. Provable misconduct: the
+     * DID's own key signed two different states under one rev label. */
+    | "equivocation"
+    /** Differing `signingKey`. The DID document moved between the two
+     * observations — a question for the PLC log, not for these records. */
+    | "rotated"
+    /** Same authority, same rev, same bytes, different `source`. Not an
+     * alarm — a mirror or a migration in flight — but worth surfacing
+     * separately from `agree`, since a reader may still want to know the
+     * two monitors are not reading the same host. */
+    | "different-source"
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false
+    }
+    return true
+}
+
+/**
+ * Classify what two monitors' observations of one DID mean, per
+ * `spec/key-transparency.md`'s comparison rule: **compare under a common
+ * authority, or not at all**. `signingKey` is checked first and pre-empts
+ * everything else — a `rev` or content comparison made across a rotation
+ * answers a question neither observation was actually asked.
+ *
+ * That check only *fires* when both sides resolved a key: a `null` on
+ * either side means rotation cannot be asserted (there is nothing to
+ * compare it against), not that it is ruled out, so comparison falls
+ * through to `rev`/content. That fallback stays sound with an unknown
+ * authority: `equivocation` is proven by `rev` equality plus a content
+ * difference alone — each side's bytes were independently valid CARs when
+ * fetched — so nothing above needs a confirmed shared key to hold.
+ */
+export function compareObservations(
+    a: Observation,
+    b: Observation
+): ObservationComparison {
+    if (a.signingKey !== null && b.signingKey !== null && a.signingKey !== b.signingKey) {
+        return "rotated"
+    }
+    if (a.rev !== b.rev) {
+        return "skew"
+    }
+    if (!bytesEqual(a.car, b.car)) {
+        return "equivocation"
+    }
+    return a.source === b.source ? "agree" : "different-source"
 }

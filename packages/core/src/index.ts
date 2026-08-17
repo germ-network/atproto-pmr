@@ -191,6 +191,7 @@ export {
     guardedFetchBytes,
     guardedFetchJSON,
     resolvePDSEndpoint,
+    type PDSResolution,
 } from "./atproto-fetch"
 export { deriveMessageId } from "./message-id"
 

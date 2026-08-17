@@ -319,17 +319,32 @@ whether to keep paging tells a cache whether the answer can be kept.
 ### The record fetch
 
 `GET /records/{did}` — unauthenticated. Returns the monitor's held record
-for the DID **as CAR**, with the `rev` and `observedAt` it holds. Never
-JSON: the response must be verifiable, because a monitor is as untrusted as
-any relay ([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)).
+for the DID **as CAR**, with the `rev`, `observedAt`, `source`, and
+`signingKey` it holds. Never JSON: the response must be verifiable, because
+a monitor is as untrusted as any relay
+([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)).
+
+`source` (the PDS the record was fetched from) and `signingKey` (the
+atproto verification method the DID document carried at fetch time, absent
+if the document carried none) are **provenance, not a check this monitor
+performed** — a monitor is a pass-through (Q-PMR-24) and does not verify.
+They are what makes the comparison below meaningful: a monitor's own
+fetch already discards nothing here, so a client comparing two monitors'
+records can tell a legitimate key rotation apart from a stale or dishonest
+observation, which `rev` and content alone cannot do.
 
 This is the community view: what this monitor holds as the current record
 for that DID. A client uses it to cross-check against its own fetch,
 against other monitors, and against what its relay resolved, applying the
-`rev` rules in
+comparison rules in
 [`trust-model.md`](trust-model.md#why-more-than-one-monitor-is-load-bearing):
-differing `rev` is skew; same `rev` with different content, or a `rev` that
-moved backwards, is the alarm.
+**compare under a common authority, or not at all** — check `signingKey`
+first, and only once it agrees does a `rev`/content comparison mean what
+it looks like it means. Differing `rev` under a shared authority is skew;
+same `rev` with different content is the alarm; a `rev` that moved
+backwards is the alarm. A differing `signingKey` is neither — it means the
+DID document moved between the two observations, which the PLC log
+settles, not these two records.
 
 ## The two comparisons, and their different weights
 
@@ -393,3 +408,9 @@ above are designed to admit it without change.
   delta response, under the wire API's
   [encoding rules](wire-api.md#deterministic-cbor). The digest's own
   serialization is settled above.
+- **A stronger rotation anchor.** `signingKey` alone says *that* the
+  authority differs, not *when* it changed relative to either observation.
+  For `did:plc`, the PLC log's operation CID would place a rotation in
+  time rather than merely flag it — an extra fetch against the log, worth
+  adding alongside the client-side verifier. `did:web` has no equivalent;
+  a document digest is the best available there.

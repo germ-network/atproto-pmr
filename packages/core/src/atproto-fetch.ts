@@ -204,10 +204,32 @@ async function readCappedBytes(
  * `@atproto/crypto` a dependency anyway — CAR verification for observation
  * would — reconsider importing rather than widening this.
  */
+/**
+ * What resolving a DID document actually yields: where to read the repo,
+ * and the authority its content is signed against.
+ */
+export interface PDSResolution {
+    /** The PDS service endpoint — what every caller before this one wanted. */
+    endpoint: string
+    /**
+     * The atproto repo signing key (`verificationMethod`, id `#atproto`,
+     * `publicKeyMultibase`), read from the same document fetch. `null` when
+     * the document carries none.
+     *
+     * This is provenance, not a check: nothing here verifies a record
+     * against it. It names the authority *this* resolution was made under,
+     * for a later reader to compare two observations against — "compare
+     * under a common authority, or not at all"
+     * (`spec/key-transparency.md`). Verification against it is the
+     * client's job, at the client's own resolution time.
+     */
+    signingKey: string | null
+}
+
 export async function resolvePDSEndpoint(
     did: string,
     fetchImpl: typeof fetch
-): Promise<string> {
+): Promise<PDSResolution> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
         doc = await guardedFetchJSON(
@@ -237,7 +259,10 @@ export async function resolvePDSEndpoint(
     if (service === null) {
         throw new Error("DID document has no #atproto_pds service")
     }
-    return service
+    return {
+        endpoint: service,
+        signingKey: extractSigningKey(doc as Record<string, unknown>),
+    }
 }
 
 /**
@@ -301,6 +326,39 @@ function extractPDSService(doc: Record<string, unknown>): string | null {
             return null
         }
         return serviceEndpoint
+    }
+    return null
+}
+
+/**
+ * The atproto repo signing key: `verificationMethod`, selected **by id
+ * first** — `#atproto`, either bare or absolute — mirroring
+ * `extractPDSService`'s own rule, and for the same reason: matching by
+ * `type` alone would resolve to a different key than the rest of the
+ * network the moment a document's entries disagree.
+ *
+ * Returns `null` rather than throwing when absent. Unlike a missing PDS
+ * service, a missing signing key does not block the fetch this module
+ * exists to make — a monitor still serves what it read, and an atproto
+ * client is what fails a record against no key, not this resolver.
+ */
+function extractSigningKey(doc: Record<string, unknown>): string | null {
+    const methods = doc.verificationMethod
+    if (!Array.isArray(methods)) return null
+
+    const docId = typeof doc.id === "string" ? doc.id : ""
+    for (const entry of methods) {
+        if (typeof entry !== "object" || entry === null) continue
+        const { id, type, publicKeyMultibase } = entry as {
+            id?: unknown
+            type?: unknown
+            publicKeyMultibase?: unknown
+        }
+        if (typeof id !== "string") continue
+        if (id !== "#atproto" && id !== `${docId}#atproto`) continue
+        if (type !== "Multikey") return null
+        if (typeof publicKeyMultibase !== "string") return null
+        return publicKeyMultibase
     }
     return null
 }

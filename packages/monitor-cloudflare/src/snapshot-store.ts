@@ -20,6 +20,8 @@ const WINDOW_PREFIX = "win:"
 interface StoredMeta {
     rev: string
     observedAtMs: number
+    source: string
+    signingKey: string | null
 }
 
 /**
@@ -43,6 +45,13 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 rev: metadata.rev,
                 car: new Uint8Array(value),
                 observedAtMs: metadata.observedAtMs,
+                // Older entries, written before provenance existed, carry no
+                // `source`/`signingKey` in their KV metadata. `""`/`null`
+                // read the same as "unknown" everywhere this is compared —
+                // never a false match — so a mixed store degrades safely
+                // rather than needing a backfill before Phase 1 can ship.
+                source: metadata.source ?? "",
+                signingKey: metadata.signingKey ?? null,
             }
         },
 
@@ -53,6 +62,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 metadata: {
                     rev: entry.rev,
                     observedAtMs: entry.observedAtMs,
+                    source: entry.source,
+                    signingKey: entry.signingKey,
                 } satisfies StoredMeta,
             })
         },
