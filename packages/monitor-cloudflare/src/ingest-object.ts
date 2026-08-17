@@ -28,6 +28,31 @@ import { kvSnapshotStore } from "./snapshot-store"
 const CONNECT_TIMEOUT_MS = 5_000
 
 /**
+ * Whether `armWatchdog` should replace the stored alarm: absent, OR
+ * already due. The second case is not hypothetical — observed in
+ * production, a due alarm that for whatever reason was never dispatched
+ * left `getAlarm()` permanently non-null, so the old "only if absent"
+ * check silently declined to fix it: the object kept answering `start()`
+ * successfully every poke while nothing was ever sealed or fetched again,
+ * because nothing ever replaced the stuck value. An overdue alarm is
+ * exactly as useless as no alarm; re-arming it is strictly an
+ * improvement, never a regression, since the platform's own guarantee to
+ * eventually deliver a pending alarm is not something this object can
+ * verify from the inside — waiting on it is a bet this object cannot
+ * afford to lose silently.
+ *
+ * A plain function, not inlined into `armWatchdog`, because the local
+ * dev runtime clears an overdue alarm back to `null` near-instantly —
+ * unlike the production incident this fixes, where it stayed non-null
+ * for hours — so the "already due" branch is only exercisable as a unit
+ * test against real numbers, not through the real storage in this repo's
+ * test harness.
+ */
+export function needsRearm(existingAlarmAt: number | null, nowMs: number): boolean {
+    return existingAlarmAt === null || existingAlarmAt <= nowMs
+}
+
+/**
  * The monitor's single writer: it holds the stream, and it is the only
  * thing that advances the cursor or the `rev` index.
  *
@@ -369,7 +394,8 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     protected async armWatchdog(): Promise<void> {
         const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
         if (!Number.isFinite(interval) || interval <= 0) return
-        if ((await this.db.getAlarm()) === null) {
+        const existing = await this.db.getAlarm()
+        if (needsRearm(existing, Date.now())) {
             await this.db.setAlarm(Date.now() + interval)
         }
     }
