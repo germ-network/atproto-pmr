@@ -17,6 +17,7 @@ import {
     type FetchedRecord,
 } from "@germ-network/atproto-pmr-monitor"
 import { DIGEST_MARKER_KEY, kvSnapshotStore } from "../src/snapshot-store"
+import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
 
@@ -174,6 +175,24 @@ describe("the way in", () => {
         })
         const after = await runInDurableObject(stub, (_o, state) => state.storage.getAlarm())
         expect(after).not.toBeNull()
+    })
+
+    it("needsRearm treats an overdue alarm the same as an absent one", () => {
+        // Real incident: a due alarm that was never dispatched left
+        // getAlarm() permanently non-null, and the old "only if null"
+        // guard treated that identically to a healthy pending alarm --
+        // start()/connect() kept succeeding every poke while nothing was
+        // ever sealed or fetched again, because nothing ever replaced it.
+        // Tested directly against real numbers, not through the DO's own
+        // storage: the local dev runtime clears an overdue alarm back to
+        // null almost instantly, unlike production, where this one stayed
+        // non-null for over three hours -- so the real storage can't
+        // reproduce the state this guards against.
+        const now = Date.now()
+        expect(needsRearm(null, now)).toBe(true)
+        expect(needsRearm(now - 60_000, now)).toBe(true)
+        expect(needsRearm(now, now)).toBe(true)
+        expect(needsRearm(now + 60_000, now)).toBe(false)
     })
 
     it(
@@ -420,3 +439,4 @@ describe("the snapshot store", () => {
         expect(await store.getDigestMarker()).toEqual({ sealedThrough: 42, oldest: 7 })
     })
 })
+
