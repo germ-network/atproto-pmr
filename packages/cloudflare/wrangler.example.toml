@@ -56,6 +56,19 @@ POOL_CAP_BYTES = "4000000"
 POOL_DEPTH_PER_SENDER = "3"
 POOL_DEPTH_UNDER_PRESSURE = "1"
 
+# Web Push delegation (spec/wire-api.md, "Push delivery — Web Push"). Set
+# this ONLY if this deployment cannot reach a push service itself and
+# delivers via a subscription the device mints for it; a relay with its own
+# push path leaves it unset and publishes no vapidKey at all.
+#
+# base64url, unpadded: the 65-byte uncompressed P-256 point
+# (0x04 ‖ X ‖ Y) that a device passes to its push service as the
+# applicationServerKey. Generate a P-256 keypair and put the PRIVATE half in
+# a secret (npx wrangler secret put VAPID_PRIVATE_KEY) — it signs the JWT
+# authorizing each delivery, and this public half is what a subscription is
+# bound to.
+# VAPID_PUBLIC_KEY = "BEl6...87 chars total"
+
 # KV namespace ids are placeholders. Create your own:
 #   npx wrangler kv namespace create <binding>
 [[kv_namespaces]]

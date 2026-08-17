@@ -8,6 +8,8 @@
  * an operator should choose. Pass your own.
  */
 
+import { base64URLToBinary } from "./util"
+
 export interface PMRLimits {
     /** Maximum sealed-payload size for a pair put, bytes. */
     messageMaxBytes: number
@@ -68,6 +70,47 @@ export function parseGrantLifecycle(raw: string): GrantLifecycle {
 }
 
 /**
+ * An uncompressed P-256 point — `0x04 ‖ X(32) ‖ Y(32)`, base64url, unpadded.
+ * The form a browser's `applicationServerKey` takes, so a client passes what
+ * it reads straight to its push service without reshaping it.
+ *
+ * Checked rather than trusted because the failure is silent and remote: a
+ * deployment publishing a malformed key still starts and still serves, and
+ * only fails when a device tries to subscribe against it. The shape check
+ * catches every realistic mistake — a compressed point, a JWK, a DER
+ * wrapper, standard base64 — without needing curve arithmetic to say so.
+ * An off-curve point that passes here is rejected by the client's own key
+ * import.
+ */
+export function parseVapidPublicKey(raw: string): string {
+    if (/[+/=]/.test(raw)) {
+        throw new Error(
+            "VAPID public key must be base64url and unpadded; " +
+                'got standard base64 ("+", "/", or "=")'
+        )
+    }
+    let bytes: Uint8Array
+    try {
+        bytes = base64URLToBinary(raw)
+    } catch {
+        throw new Error("VAPID public key is not valid base64url")
+    }
+    if (bytes.length !== 65) {
+        throw new Error(
+            "VAPID public key must be a 65-byte uncompressed P-256 point; " +
+                `got ${bytes.length} bytes`
+        )
+    }
+    if (bytes[0] !== 0x04) {
+        throw new Error(
+            "VAPID public key must be an uncompressed point (0x04-prefixed); " +
+                `got 0x${bytes[0]!.toString(16).padStart(2, "0")}`
+        )
+    }
+    return raw
+}
+
+/**
  * Which capability families a deployment serves.
  *
  * Short tokens rather than JMAP's vendor URLs. JMAP needs globally unique
@@ -109,6 +152,21 @@ export interface CapabilityBase {
 
 export interface CoreCapability extends CapabilityBase {
     challengeExpiry: number
+    /**
+     * This relay's VAPID public key, base64url, where it delegates push
+     * (`spec/wire-api.md`, "Push delivery — Web Push"). A client binds a
+     * subscription to it at creation, so a leaked endpoint still accepts
+     * delivery only from the key it was minted for.
+     *
+     * On `core` because registration is core's surface and a subscription
+     * is carried at registration, and because one deployment signs with one
+     * keypair — published per mailbox kind it would invite the question of
+     * which one to bind.
+     *
+     * Absent, never empty, where the deployment reaches its platform's push
+     * service directly and delegates nothing.
+     */
+    vapidKey?: string
 }
 
 /** Common to both mailbox kinds, published per kind rather than once. */
@@ -167,6 +225,13 @@ export interface PMRConfig {
      * document and wanting to know which release it came from.
      */
     configState: string
+    /**
+     * VAPID public key, base64url — set only where this deployment
+     * delegates push. Run it through `parseVapidPublicKey` when reading it
+     * from configuration. The private half never appears here: it signs
+     * delivery JWTs and belongs in a secret binding.
+     */
+    vapidPublicKey?: string
 }
 
 export const SUPPORTED_API_VERSIONS = ["1"] as const
@@ -233,6 +298,9 @@ export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
             versions: serves.versions,
             pathPrefix: serves.pathPrefix,
             challengeExpiry: limits.challengeExpirySeconds,
+            ...(config.vapidPublicKey !== undefined
+                ? { vapidKey: config.vapidPublicKey }
+                : {}),
         },
     }
     if (serves.didMailbox) capabilities.didMailbox = mailbox

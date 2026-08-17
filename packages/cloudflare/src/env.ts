@@ -47,4 +47,14 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
      * because it is the one thing vended to third parties.
      */
     GRANT_LIFECYCLE: string
+
+    /**
+     * VAPID public key, base64url — set only where this deployment
+     * delegates push rather than reaching a push service itself. Absent is
+     * the ordinary case, and a relay that delivers directly leaves it so.
+     *
+     * The private half is a secret binding, never a var: it signs the JWT
+     * that authorizes a delivery.
+     */
+    VAPID_PUBLIC_KEY?: string
 }

@@ -1048,9 +1048,12 @@ UnifiedPush distributors already expose.
 The delegation shape, in Web Push's terms:
 
 - The client **creates a subscription at its push service**, bound at
-  creation to the relay's VAPID public key (published in the relay's
-  [enabler document](#the-enabler-document) capability entry as
-  `vapidKey`). Creation is the consent step: only the registration's
+  creation to the relay's VAPID public key — published as `vapidKey` on
+  the [enabler document's](#the-enabler-document) `core` entry, where
+  registration lives and where a client already looks before it
+  registers. A host signs with one keypair, so the key is published once
+  rather than per mailbox kind, and its absence means the host delivers
+  push itself. Creation is the consent step: only the registration's
   owner can point a subscription at its own device, and the VAPID
   binding means a leaked endpoint still accepts delivery only from the
   key it was minted for. How a push service creates subscriptions is its
@@ -1122,7 +1125,8 @@ add a parallel array someone has to keep aligned with another one.
     "core": {
       "versions": ["1"],
       "pathPrefix": "/pmr/v1",
-      "challengeExpiry": 600
+      "challengeExpiry": 600,
+      "vapidKey": "BIPu0Xl58BSDv_BWNq6VB_Riag7dd4VrHv6zbc_bFD1H6PAM4KlD85f4G__Rztpsh-HR0h6hDYS3pJ9LCtKTlxY"
     },
     "didMailbox": {
       "versions": ["1"],
@@ -1159,6 +1163,11 @@ invite the reading where a missing field means yes.
 `core` exists as an entry so that the always-served surface has somewhere
 to declare its prefix and versions. Without it, `POST /pmr/v1/challenges`
 would be the one path a client could not discover.
+
+`core` also carries **`vapidKey`** where the host delegates push — the
+example above shows one that does. It is optional and absent by default;
+see [Push delivery](#push-delivery--web-push-optional) for what a client
+does with it.
 
 Every entry carries at least:
 

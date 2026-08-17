@@ -11,8 +11,13 @@ import { describe, expect, it } from "vitest"
 import {
     buildEnablerDocument,
     parseGrantLifecycle,
+    parseVapidPublicKey,
     type PMRConfig,
 } from "../src/config"
+
+/** A real uncompressed P-256 point, so the vectors are not merely shaped right. */
+const VAPID_KEY =
+    "BIPu0Xl58BSDv_BWNq6VB_Riag7dd4VrHv6zbc_bFD1H6PAM4KlD85f4G__Rztpsh-HR0h6hDYS3pJ9LCtKTlxY"
 
 function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
     return {
@@ -54,6 +59,45 @@ describe("parseGrantLifecycle", () => {
     it("rejects a typo rather than putting it on the wire", () => {
         expect(() => parseGrantLifecycle("drainin")).toThrow(
             /Unknown grant lifecycle "drainin"/
+        )
+    })
+})
+
+describe("parseVapidPublicKey", () => {
+    it("accepts an uncompressed P-256 point and hands it back unchanged", () => {
+        // Returned rather than reshaped: the client passes exactly these
+        // characters to its push service as the applicationServerKey.
+        expect(parseVapidPublicKey(VAPID_KEY)).toBe(VAPID_KEY)
+    })
+
+    it("rejects standard base64, which decodes but is the wrong alphabet", () => {
+        // The trap this catches: "+"/"/" decode to different bytes under
+        // base64url, so a key pasted from a standard-base64 tool would be
+        // published as a valid-looking key for a different point entirely.
+        const standard = VAPID_KEY.replace(/-/g, "+").replace(/_/g, "/") + "="
+        expect(() => parseVapidPublicKey(standard)).toThrow(/base64url and unpadded/)
+    })
+
+    it("rejects a compressed point, which is the same key in the wrong encoding", () => {
+        // 33 bytes, 0x02-prefixed. Valid P-256, useless as an
+        // applicationServerKey, and the mistake a P-256 export invites.
+        expect(() =>
+            parseVapidPublicKey("AoPu0Xl58BSDv_BWNq6VB_Riag7dd4VrHv6zbc_bFD1H")
+        ).toThrow(/65-byte uncompressed P-256 point; got 33 bytes/)
+    })
+
+    it("names the prefix it found when the length is right but the form is not", () => {
+        const bytes = new Uint8Array(65)
+        bytes[0] = 0x03
+        const wrongPrefix = Buffer.from(bytes).toString("base64url")
+        expect(() => parseVapidPublicKey(wrongPrefix)).toThrow(/got 0x03/)
+    })
+
+    it("rejects a string that is not base64 at all, rather than throwing raw", () => {
+        // atob's own DOMException says nothing about VAPID; an operator
+        // reading a boot log should not have to guess which var it meant.
+        expect(() => parseVapidPublicKey("not a key!!")).toThrow(
+            /VAPID public key/
         )
     })
 })
@@ -180,6 +224,39 @@ describe("buildEnablerDocument", () => {
         expect(buildEnablerDocument(config()).state).toMatch(
             /^2026-08-13\.1\.[0-9a-f]{8}$/
         )
+    })
+
+    it("publishes vapidKey on core, where a client about to register finds it", () => {
+        // On core because registration is core's surface and the
+        // subscription is carried at registration — and because one
+        // deployment signs with one keypair, so a per-mailbox-kind key
+        // would leave a client asking which one to bind to.
+        const doc = buildEnablerDocument(config({ vapidPublicKey: VAPID_KEY }))
+        expect(doc.capabilities.core.vapidKey).toBe(VAPID_KEY)
+        expect("vapidKey" in doc.capabilities.didMailbox!).toBe(false)
+        expect("vapidKey" in doc.capabilities.grant!).toBe(false)
+    })
+
+    it("OMITS vapidKey when the deployment delivers push itself", () => {
+        // Same rule as an unserved capability: a client tests for the key.
+        // Push delegation is optional, and a relay that reaches its own
+        // push service must not look like one asking to be delivered to.
+        expect("vapidKey" in buildEnablerDocument(config()).capabilities.core).toBe(
+            false
+        )
+    })
+
+    it("moves state when the VAPID key is added or rotated", () => {
+        // A client polls state to notice a change. A rotated key that left
+        // state still would strand subscriptions bound to the old one for a
+        // full cache lifetime, with nothing to signal the rotation.
+        const base = buildEnablerDocument(config()).state
+        const keyed = buildEnablerDocument(config({ vapidPublicKey: VAPID_KEY })).state
+        const rotated = buildEnablerDocument(
+            config({ vapidPublicKey: VAPID_KEY.replace(/^BIPu/, "BIPv") })
+        ).state
+        expect(keyed).not.toBe(base)
+        expect(rotated).not.toBe(keyed)
     })
 
     it("publishes nothing about pool sizing or blocked-sender behavior", () => {

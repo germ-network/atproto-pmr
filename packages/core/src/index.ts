@@ -58,6 +58,7 @@ export {
 export {
     buildEnablerDocument,
     parseGrantLifecycle,
+    parseVapidPublicKey,
     serveEnablerDocument,
     SUPPORTED_API_VERSIONS,
     SUPPORTED_ENCODINGS,
