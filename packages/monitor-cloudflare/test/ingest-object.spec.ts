@@ -226,6 +226,36 @@ describe("the way in", () => {
         expect(after).not.toBeNull()
     })
 
+    it(
+        "connect() aborts a stalled Jetstream upgrade rather than hanging forever",
+        async () => {
+            // Real regression: an upgrade fetch that accepts the connection
+            // and never completes the handshake used to hang connect()
+            // forever -- and because this runs inside alarm(), which is
+            // single-threaded with every other call into the object, the
+            // WHOLE object wedged: digestPage() and every other RPC queued
+            // behind it with no way out. Proven by a mock fetch that never
+            // resolves on its own; connect() must still settle (by
+            // rejecting), not hang. Asserts the outcome, not elapsed time.
+            const stub = freshStub()
+            const original = globalThis.fetch
+            globalThis.fetch = ((_url, init) =>
+                new Promise((_resolve, reject) => {
+                    init?.signal?.addEventListener("abort", () => {
+                        reject(new DOMException("The operation was aborted.", "AbortError"))
+                    })
+                })) as typeof fetch
+            try {
+                await expect(
+                    runInDurableObject(stub, (obj: MonitorIngest) => obj.connect())
+                ).rejects.toThrow(/abort/i)
+            } finally {
+                globalThis.fetch = original
+            }
+        },
+        10_000
+    )
+
     it("owes a re-read on demand, past the dedupe check", async () => {
         const stub = freshStub()
         const owed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
