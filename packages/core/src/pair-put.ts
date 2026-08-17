@@ -11,7 +11,7 @@ import {
     PairMailboxKey,
     PMRStore,
 } from "./storage.js"
-import { readBodyCapped } from "./util.js"
+import { BodyTooLargeError, readBodyCapped } from "./util.js"
 
 /**
  * Everything the pair-put handler needs, injected rather than reached for.
@@ -57,11 +57,17 @@ export interface PairPutDeps {
  * exactly one case: *this* sender's own provisioned mailbox being full,
  * the one disclosure per-sender reservation makes self-referential.
  *
- * The only distinguishable failure is a structurally malformed request —
- * oversized body, undecodable COSE, non-canonical signature — answered
- * `400` synchronously. Those reveal nothing about the recipient's mailbox,
- * only that the sender's own request is malformed, which the sender
- * already knows.
+ * The only distinguishable failures are refusals decided on the request's
+ * own bytes and this deployment's advertised limits, answered
+ * synchronously: `400` for an undecodable envelope or a non-canonical
+ * signature, `413` for a payload over the advertised maximum. Neither
+ * reveals anything about the recipient's mailbox — only that the sender's
+ * own request was malformed or too big, which the sender already knows and
+ * could have checked against a public document.
+ *
+ * `413` is kept distinct from `400` because the two are differently
+ * actionable: `400` says the sender's encoder is wrong, `413` says only
+ * that this message is too big and a smaller one would be accepted.
  */
 export async function handlePairPut(
     request: Request,
@@ -86,12 +92,17 @@ export async function handlePairPut(
         )
         envelope = decodePairPutEnvelope(bodyBytes)
         if (envelope.payload.payload.byteLength > config.limits.messageMaxBytes) {
-            return new Response("Payload exceeds the published maximum", {
-                status: 400,
+            return new Response("Payload exceeds the advertised maximum", {
+                status: 413,
             })
         }
         senderKey = asPairMailboxKey(envelope.payload.senderDID)
     } catch (e) {
+        if (e instanceof BodyTooLargeError) {
+            return new Response("Body exceeds the advertised maximum", {
+                status: 413,
+            })
+        }
         return new Response(`Malformed pair-put envelope: ${String(e)}`, {
             status: 400,
         })

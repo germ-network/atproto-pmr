@@ -6,7 +6,7 @@ import { grantMailboxKey } from "./mailbox-key.js"
 import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import { BodyStore, ChallengeStore, Directory, Locator, PMRStore } from "./storage.js"
-import { readBodyCapped } from "./util.js"
+import { BodyTooLargeError, readBodyCapped } from "./util.js"
 
 /**
  * Everything the grant-put handler needs, injected rather than reached for
@@ -26,15 +26,19 @@ export interface GrantPutDeps {
  * `POST /pmr/v1/inbox/grant:{address}/messages` — `spec/wire-api.md`, "The
  * grant-put payload" and "the closure exception".
  *
- * RESPONSE CONTRACT: `202`, always, for a well-formed request — no other
+ * RESPONSE CONTRACT: `202` for every address-dependent outcome — no other
  * code, no timing difference between an unknown address, a closed one, a
  * live one, or a bad tag. This is stricter than the pair put's own
  * uniformity: a pair put resolves and verifies BEFORE answering and stays
  * uniform by always answering the same way; a grant put has no
  * self-referential disclosure to permit at all, so **no address-dependent
- * step runs before the response**. Only structurally-malformed-request
- * rejection — decided from the request bytes alone — happens synchronously.
- * Everything else is `deps.defer`red.
+ * step runs before the response**.
+ *
+ * The only synchronous refusals are decided from the request bytes and this
+ * deployment's advertised limits: `400` for a malformed body, `413` for a
+ * message over the advertised maximum. Neither is address-dependent, which
+ * is exactly why they do not breach the uniformity requirement. Everything
+ * else is `deps.defer`red.
  */
 export async function handleGrantPut(
     request: Request,
@@ -65,14 +69,19 @@ export async function handleGrantPut(
             return new Response("Malformed grant put", { status: 400 })
         }
         if (m.byteLength > config.limits.messageMaxBytes) {
-            return new Response("Payload exceeds the published maximum", {
-                status: 400,
+            return new Response("Payload exceeds the advertised maximum", {
+                status: 413,
             })
         }
         nonce = n
         tag = t
         message = m
     } catch (e) {
+        if (e instanceof BodyTooLargeError) {
+            return new Response("Body exceeds the advertised maximum", {
+                status: 413,
+            })
+        }
         return new Response(`Malformed grant put: ${String(e)}`, {
             status: 400,
         })
