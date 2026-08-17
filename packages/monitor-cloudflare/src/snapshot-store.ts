@@ -45,13 +45,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 rev: metadata.rev,
                 car: new Uint8Array(value),
                 observedAtMs: metadata.observedAtMs,
-                // Older entries, written before provenance existed, carry no
-                // `source`/`signingKey` in their KV metadata. `""`/`null`
-                // read the same as "unknown" everywhere this is compared —
-                // never a false match — so a mixed store degrades safely
-                // rather than needing a backfill before Phase 1 can ship.
-                source: metadata.source ?? "",
-                signingKey: metadata.signingKey ?? null,
+                source: metadata.source,
+                signingKey: metadata.signingKey,
             }
         },
 

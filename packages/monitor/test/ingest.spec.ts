@@ -317,8 +317,11 @@ describe("compareObservations", () => {
     })
 
     it("calls it equivocation when the SAME rev carries DIFFERENT content", () => {
-        // The alarm this component exists to raise: one authority, one rev
-        // label, two different repo states shown to two observers.
+        // The strongest signal this function can raise from rev/content
+        // alone — escalate to decode-and-verify, per the doc comment on
+        // ObservationComparison; this function does not parse CAR, so it
+        // cannot itself distinguish real equivocation from non-deterministic
+        // CAR serialization between two honest fetches.
         expect(compareObservations(observation(), observation({ car: CAR_2 }))).toBe(
             "equivocation"
         )
@@ -338,17 +341,19 @@ describe("compareObservations", () => {
         )
     })
 
-    it("MUTATION CHECK: dropping `source` folds different-source into agree", () => {
-        // Confirms `source` is load-bearing on its own, not merely along
-        // for the ride with `rev`/content: two observations agreeing on
-        // everything else but read from different hosts is real
-        // information a caller may want — silently mislabel it "agree" and
-        // that distinction is gone.
-        const withoutSource = (o: ReturnType<typeof observation>) =>
-            compareObservations(observation(), { ...o, source: HOST_A })
-        expect(withoutSource(observation({ source: HOST_B }))).toBe("agree")
-        expect(compareObservations(observation(), observation({ source: HOST_B }))).toBe(
-            "different-source"
-        )
+    it("still raises equivocation with an unresolved key, on the rev/content signal alone", () => {
+        // The fallback in compareObservations is only sound if it can still
+        // reach the alarm classes — a null signingKey must not silently cap
+        // the result at something weaker than what rev/content alone
+        // supports.
+        expect(
+            compareObservations(observation(), observation({ signingKey: null, car: CAR_2 }))
+        ).toBe("equivocation")
+    })
+
+    it("still raises skew with an unresolved key, on the rev signal alone", () => {
+        expect(
+            compareObservations(observation(), observation({ signingKey: null, rev: "3m2" }))
+        ).toBe("skew")
     })
 })

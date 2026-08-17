@@ -332,10 +332,22 @@ function extractPDSService(doc: Record<string, unknown>): string | null {
 
 /**
  * The atproto repo signing key: `verificationMethod`, selected **by id
- * first** — `#atproto`, either bare or absolute — mirroring
- * `extractPDSService`'s own rule, and for the same reason: matching by
- * `type` alone would resolve to a different key than the rest of the
- * network the moment a document's entries disagree.
+ * only** — `#atproto`, either bare or absolute — matching
+ * `@atproto/common-web`'s `getVerificationMaterial`/`findItemById`
+ * exactly, id form included.
+ *
+ * Deliberately **not** filtered by `type`, unlike `extractPDSService`'s
+ * service-type check. That is not an inconsistency: it is what the
+ * reference does too (`getVerificationMaterial` returns `{type,
+ * publicKeyMultibase}` unfiltered; only its caller,
+ * `getDidKeyFromMultibase`, branches on `type` to know how to parse the
+ * bytes cryptographically). This module never parses the bytes — the
+ * value is provenance, compared as an opaque string in
+ * `compareObservations` — so there is nothing here for a type filter to
+ * protect, and one would only diverge from what the rest of the network
+ * resolves for documents still carrying a pre-`Multikey` type
+ * (`EcdsaSecp256k1VerificationKey2019` etc., which the reference still
+ * reads).
  *
  * Returns `null` rather than throwing when absent. Unlike a missing PDS
  * service, a missing signing key does not block the fetch this module
@@ -349,14 +361,12 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
     const docId = typeof doc.id === "string" ? doc.id : ""
     for (const entry of methods) {
         if (typeof entry !== "object" || entry === null) continue
-        const { id, type, publicKeyMultibase } = entry as {
+        const { id, publicKeyMultibase } = entry as {
             id?: unknown
-            type?: unknown
             publicKeyMultibase?: unknown
         }
         if (typeof id !== "string") continue
         if (id !== "#atproto" && id !== `${docId}#atproto`) continue
-        if (type !== "Multikey") return null
         if (typeof publicKeyMultibase !== "string") return null
         return publicKeyMultibase
     }

@@ -341,10 +341,14 @@ comparison rules in
 **compare under a common authority, or not at all** — check `signingKey`
 first, and only once it agrees does a `rev`/content comparison mean what
 it looks like it means. Differing `rev` under a shared authority is skew;
-same `rev` with different content is the alarm; a `rev` that moved
-backwards is the alarm. A differing `signingKey` is neither — it means the
-DID document moved between the two observations, which the PLC log
-settles, not these two records.
+a `rev` that moved backwards is the alarm; same `rev` with different
+content is the strongest signal available from these two fields alone,
+but escalates to a client's own decode-and-verify rather than standing as
+proof on its own — a CAR's block ordering is not guaranteed deterministic,
+so two honest fetches can differ byte-for-byte. A differing `signingKey`
+is neither skew nor an alarm — it means the DID document moved between the
+two observations, which the PLC log settles, not these two records
+(and which nothing settles at all for `did:web`).
 
 ## The two comparisons, and their different weights
 

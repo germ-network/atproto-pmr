@@ -38,9 +38,12 @@ function fixture(
                         serviceEndpoint: PDS,
                     },
                 ],
+                // Absolute id, matching what plc.directory actually serves
+                // (verified against a live document — `did:plc:...#atproto`,
+                // not bare `#atproto`).
                 verificationMethod: [
                     {
-                        id: "#atproto",
+                        id: `${DID}#atproto`,
                         type: "Multikey",
                         controller: DID,
                         publicKeyMultibase: SIGNING_KEY,
@@ -96,6 +99,53 @@ describe("fetchRecordCar", () => {
             fetchImpl: f.impl,
         })
         expect(got.signingKey).toBeNull()
+    })
+
+    it("resolves the BARE #atproto id form too, not just absolute", async () => {
+        const f = fixture(
+            {},
+            {
+                verificationMethod: [
+                    {
+                        id: "#atproto",
+                        type: "Multikey",
+                        controller: DID,
+                        publicKeyMultibase: SIGNING_KEY,
+                    },
+                ],
+            }
+        )
+        const got = await fetchRecordCar(DID, {
+            collection: COLLECTION,
+            fetchImpl: f.impl,
+        })
+        expect(got.signingKey).toBe(SIGNING_KEY)
+    })
+
+    it("carries the key through regardless of `type` — matches @atproto/identity, which never filters by it", async () => {
+        // `getVerificationMaterial` returns `{type, publicKeyMultibase}`
+        // unfiltered; only its OWN caller branches on `type` to know how to
+        // parse the bytes cryptographically. A document still carrying a
+        // pre-Multikey type (real for older did:plc documents) must resolve
+        // here exactly as it does everywhere else in the network.
+        const f = fixture(
+            {},
+            {
+                verificationMethod: [
+                    {
+                        id: `${DID}#atproto`,
+                        type: "EcdsaSecp256k1VerificationKey2019",
+                        controller: DID,
+                        publicKeyMultibase: SIGNING_KEY,
+                    },
+                ],
+            }
+        )
+        const got = await fetchRecordCar(DID, {
+            collection: COLLECTION,
+            fetchImpl: f.impl,
+        })
+        expect(got.signingKey).toBe(SIGNING_KEY)
     })
 
     it("calls sync.getRecord — never repo.getRecord, which returns JSON", async () => {
