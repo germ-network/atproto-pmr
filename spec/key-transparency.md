@@ -121,7 +121,6 @@ capability.
 |---|---|---|---|
 | `POST` | `/registrations` | anchor realm | register: own-DID push on any change |
 | `DELETE` | `/registrations` | anchor realm | deregister |
-| `GET` | `/changes?domain=&cursor=` | anchor realm | deltas for a public-interest domain |
 | `GET` | `/digest?cursor=` | none | Bloom filter of changed DIDs, by window |
 | `GET` | `/records/{did}` | none | the community view: one record, as CAR |
 
@@ -154,22 +153,6 @@ verifying, not by trusting the push content.
 Deregistration revokes the delegation and forgets the subscription. Nothing
 a monitor holds is issued to third parties, so dropping one leaves no peer
 holding anything that stops working.
-
-### Domain deltas
-
-`GET /changes?domain=follows&cursor=…` returns the records that changed,
-since the cursor, among a domain of DIDs derived from the caller's public
-records — for example the caller's follow graph. Naming this set to a
-monitor discloses nothing new: it is already a public record in the
-caller's own repo.
-
-The response is a page of `(did, rev, record CAR)` plus a `nextCursor`,
-following the [cursor convention](wire-api.md#not-yet-specified). The client
-verifies every returned record; the monitor's word is never the key.
-
-Authentication is the anchor realm: the request names a DID regardless, so
-authenticating costs no disclosure and gives the monitor a principal to
-rate-limit.
 
 ### The change digest
 
@@ -412,6 +395,13 @@ above are designed to admit it without change.
   delta response, under the wire API's
   [encoding rules](wire-api.md#deterministic-cbor). The digest's own
   serialization is settled above.
+- **Domain deltas** — a `GET /changes?domain=&cursor=` surface for a
+  public-interest domain of DIDs (e.g. the caller's follow graph), as a
+  cheaper alternative to the whole-population digest for a caller with a
+  large, publicly-derivable interest set. Superseded for now by the
+  change digest, which covers the same need without a second mechanism;
+  the `changedSince` seam it would have used was removed with the
+  DO-read-offload refactor since it had no production caller.
 - **A stronger rotation anchor.** `signingKey` alone says *that* the
   authority differs, not *when* it changed relative to either observation.
   For `did:plc`, the PLC log's operation CID would place a rotation in

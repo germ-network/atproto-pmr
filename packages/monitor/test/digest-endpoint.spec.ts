@@ -20,7 +20,20 @@ import {
 const WIDTH = 600_000
 const NOW = 100 * WIDTH
 
-function endpoint(sealed: Record<number, string[]> = {}, budget = 65_536) {
+/** Every physical window entry in `[fromWindow, toWindowInclusive]`, empty. */
+function emptyRange(fromWindow: number, toWindowInclusive: number): Record<number, string[]> {
+    const out: Record<number, string[]> = {}
+    for (let w = fromWindow; w <= toWindowInclusive; w += WIDTH) out[w] = []
+    return out
+}
+
+/**
+ * `sealed: null` (the default) means "fully propagated" — every window the
+ * marker claims is physically present, empty or not, which is the ordinary
+ * case in production and what most of these tests want. Pass an explicit
+ * (necessarily partial) map to test a real gap instead.
+ */
+function endpoint(sealed: Record<number, string[]> | null = null, budget = 65_536) {
     const serve = deps(sealed, budget)
     return {
         widthMs: WIDTH,
@@ -29,17 +42,19 @@ function endpoint(sealed: Record<number, string[]> = {}, budget = 65_536) {
     }
 }
 
-function deps(sealed: Record<number, string[]> = {}, budget = 65_536): ServeDeps {
+function deps(sealed: Record<number, string[]> | null = null, budget = 65_536): ServeDeps {
     const windows = new Map<string, Uint8Array>()
-    for (const [w, dids] of Object.entries(sealed)) {
+    const entries = sealed ?? emptyRange(90 * WIDTH, 99 * WIDTH)
+    for (const [w, dids] of Object.entries(entries)) {
         windows.set(w, encodeDigestWindows([sealWindow(Number(w), WIDTH, dids)]))
     }
     return {
-        index: { readSealedThrough: async () => NOW - WIDTH },
-        snapshot: { getSealedWindow: async (id: string) => windows.get(id) ?? null },
+        snapshot: {
+            getSealedWindow: async (id: string) => windows.get(id) ?? null,
+            getDigestMarker: async () => ({ sealedThrough: NOW - WIDTH, oldest: NOW - 10 * WIDTH }),
+        },
         widthMs: WIDTH,
         byteBudget: budget,
-        retentionMs: 10 * WIDTH,
         nowMs: () => NOW,
     } as unknown as ServeDeps
 }
@@ -108,5 +123,24 @@ describe("handleDigest", () => {
         )
         expect(page.oldest).toBe(90 * WIDTH)
         expect(page.windows[0].window).toBe(page.oldest)
+    })
+
+    it("does NOT cache as immutable when the page stopped at a REPLICATION GAP, not the true tip", async () => {
+        // The property the DO-read-offload could get wrong: a page a KV
+        // read replica truncated because a window has not propagated yet
+        // must not be cacheable the same way a genuinely complete page is
+        // — that would pin the lag as though it were the caught-up answer.
+        // Windows 91-92 are physically present; 93 onward is not, even
+        // though the marker (see `deps`) claims coverage through 99.
+        const response = await handleDigest(
+            endpoint({ [91 * WIDTH]: [], [92 * WIDTH]: [] }),
+            new Request(`https://monitor.example/digest?cursor=${91 * WIDTH}`)
+        )
+        const cc = response.headers.get("cache-control") ?? ""
+        expect(cc).not.toContain("immutable")
+        const page = decodeDigestPage(new Uint8Array(await response.arrayBuffer()))
+        // Clamped to what was actually confirmed, not the marker's 99*WIDTH.
+        expect(page.sealedThrough).toBe(92 * WIDTH)
+        expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
     })
 })

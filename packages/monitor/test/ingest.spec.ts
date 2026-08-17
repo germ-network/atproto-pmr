@@ -15,6 +15,7 @@ import {
     compareObservations,
     compareRev,
     type BackfillProgress,
+    type DigestMarker,
     type MonitorIndex,
     type SnapshotEntry,
     type SnapshotStore,
@@ -49,7 +50,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
-    let sealedThrough: number | null = null
+    let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
     const index: MonitorIndex = {
@@ -78,13 +79,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
         clearPending: async (did) => void pending.delete(did),
-        changedSince: async () => ({ dids: [], nextCursor: "0" }),
-        closedWindowsWithMembers: async (current, limit) =>
-            [...members.keys()].filter((w) => w < current).sort((a, b) => a - b).slice(0, limit),
         windowMembers: async (w) => [...(members.get(w) ?? [])].sort(),
         dropWindow: async (w) => void members.delete(w),
-        readSealedThrough: async () => sealedThrough,
-        setSealedThrough: async (w) => void (sealedThrough = w),
         readBackfillProgress: async () => backfillProgress,
         setBackfillProgress: async (p) => void (backfillProgress = p),
     }
@@ -94,6 +90,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         putRecord: async (did, entry) => void records.set(did, entry),
         getSealedWindow: async (id) => windows.get(id) ?? null,
         putSealedWindow: async (id, f) => void windows.set(id, f),
+        getDigestMarker: async () => marker,
+        putDigestMarker: async (m) => void (marker = m),
     }
 
     const deps: IngestDeps = {
@@ -108,7 +106,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         nowMs: () => 1_000_000,
         ...overrides,
     }
-    return { deps, revs, pending, records, members, windows, sealedThrough: () => sealedThrough }
+    return { deps, revs, pending, records, members, windows, marker: () => marker }
 }
 
 describe("intake", () => {
