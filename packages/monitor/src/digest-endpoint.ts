@@ -7,7 +7,7 @@
  */
 
 import { toResponseBody } from "@germ-network/atproto-pmr-core"
-import { encodeDigestPage, serveDigest, windowOf, type ServeDeps } from "./digest"
+import { encodeDigestPage, windowOf, type DigestPage } from "./digest"
 
 /**
  * Cache lifetime for a page that runs to the tip.
@@ -18,8 +18,25 @@ import { encodeDigestPage, serveDigest, windowOf, type ServeDeps } from "./diges
  */
 const MAX_TIP_CACHE_SECONDS = 300
 
+/**
+ * What the endpoint needs, which is deliberately **not** the storage seam.
+ *
+ * `page` is a producer rather than an index, because the single writer that
+ * owns the index is frequently not in the same process as the request
+ * handler — in the reference deployment the handler runs in a Worker and
+ * the index in a Durable Object. Taking the seam would mean one round trip
+ * per index call; taking a producer means one, and the response contract
+ * stays in this package either way.
+ */
+export interface DigestEndpointDeps {
+    /** Window width, for bounding how long a tip page may be cached. */
+    widthMs: number
+    nowMs(): number
+    page(from: number): Promise<DigestPage>
+}
+
 export async function handleDigest(
-    deps: ServeDeps,
+    deps: DigestEndpointDeps,
     request: Request
 ): Promise<Response> {
     const raw = new URL(request.url).searchParams.get("cursor")
@@ -33,7 +50,7 @@ export async function handleDigest(
         ? parsed
         : windowOf(deps.nowMs(), deps.widthMs)
 
-    const page = await serveDigest(deps, from)
+    const page = await deps.page(from)
 
     // A page that stops short of the tip is **immutable**: every window in
     // it is sealed, and the range is fully determined. A page that reaches

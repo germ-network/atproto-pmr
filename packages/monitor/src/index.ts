@@ -61,7 +61,7 @@ export {
 } from "./digest"
 
 // The digest endpoint.
-export { handleDigest } from "./digest-endpoint"
+export { handleDigest, type DigestEndpointDeps } from "./digest-endpoint"
 
 // The authoritative read.
 export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"

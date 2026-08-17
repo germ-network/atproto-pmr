@@ -12,12 +12,22 @@ import {
     decodeDigestPage,
     encodeDigestWindows,
     sealWindow,
+    serveDigest,
     windowOf,
     type ServeDeps,
 } from "../src/digest"
 
 const WIDTH = 600_000
 const NOW = 100 * WIDTH
+
+function endpoint(sealed: Record<number, string[]> = {}, budget = 65_536) {
+    const serve = deps(sealed, budget)
+    return {
+        widthMs: WIDTH,
+        nowMs: () => NOW,
+        page: (from: number) => serveDigest(serve, from),
+    }
+}
 
 function deps(sealed: Record<number, string[]> = {}, budget = 65_536): ServeDeps {
     const windows = new Map<string, Uint8Array>()
@@ -35,7 +45,7 @@ function deps(sealed: Record<number, string[]> = {}, budget = 65_536): ServeDeps
 }
 
 const get = (query = "") =>
-    handleDigest(deps(), new Request(`https://monitor.example/digest${query}`))
+    handleDigest(endpoint(), new Request(`https://monitor.example/digest${query}`))
 
 describe("handleDigest", () => {
     it("answers CBOR, unauthenticated", async () => {
@@ -83,7 +93,7 @@ describe("handleDigest", () => {
             fat[i * WIDTH] = Array.from({ length: 400 }, (_, j) => `did:plc:w${i}m${j}`)
         }
         const response = await handleDigest(
-            deps(fat, 600),
+            endpoint(fat, 600),
             new Request(`https://monitor.example/digest?cursor=${91 * WIDTH}`)
         )
         const cc = response.headers.get("cache-control") ?? ""
