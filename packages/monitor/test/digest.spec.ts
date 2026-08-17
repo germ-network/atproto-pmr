@@ -447,9 +447,14 @@ describe("serving a page", () => {
         expect(page).toEqual({
             windows: [],
             oldest: 42 * WIDTH,
-            sealedThrough: 42 * WIDTH,
+            // Clamped BELOW nextCursor, same convention as the gap clamp
+            // above — reporting them equal would satisfy handleDigest's
+            // `nextCursor <= sealedThrough` "complete" check and cache a
+            // fresh-deploy page as the immutable tip forever.
+            sealedThrough: 42 * WIDTH - WIDTH,
             nextCursor: 42 * WIDTH,
         })
+        expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
     })
 
     it("carries the floor, the ceiling, and where to resume", async () => {

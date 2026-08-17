@@ -62,6 +62,27 @@ function deps(sealed: Record<number, string[]> | null = null, budget = 65_536): 
 const get = (query = "") =>
     handleDigest(endpoint(), new Request(`https://monitor.example/digest${query}`))
 
+/** No digest has ever sealed — a fresh deploy, or a wake ahead of the first watchdog tick. */
+function endpointWithNoMarker() {
+    return {
+        widthMs: WIDTH,
+        nowMs: () => NOW,
+        page: (from: number) =>
+            serveDigest(
+                {
+                    snapshot: {
+                        getSealedWindow: async () => null,
+                        getDigestMarker: async () => null,
+                    },
+                    widthMs: WIDTH,
+                    byteBudget: 65_536,
+                    nowMs: () => NOW,
+                } as unknown as ServeDeps,
+                from
+            ),
+    }
+}
+
 describe("handleDigest", () => {
     it("answers CBOR, unauthenticated", async () => {
         const response = await get(`?cursor=${95 * WIDTH}`)
@@ -141,6 +162,25 @@ describe("handleDigest", () => {
         const page = decodeDigestPage(new Uint8Array(await response.arrayBuffer()))
         // Clamped to what was actually confirmed, not the marker's 99*WIDTH.
         expect(page.sealedThrough).toBe(92 * WIDTH)
+        expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
+    })
+
+    it("does NOT cache as immutable when no digest has EVER sealed", async () => {
+        // A fresh deploy answers with sealedThrough clamped below
+        // nextCursor (see serveDigest's null-marker branch) precisely so
+        // this doesn't happen: reporting them equal would satisfy
+        // handleDigest's own "complete" check and pin an empty, unchanged
+        // cursor as the immutable tip for a year, wedging every caller
+        // that respects the header behind a stale bootstrap forever.
+        const response = await handleDigest(
+            endpointWithNoMarker(),
+            new Request(`https://monitor.example/digest?cursor=${42 * WIDTH}`)
+        )
+        const cc = response.headers.get("cache-control") ?? ""
+        expect(cc).not.toContain("immutable")
+        const page = decodeDigestPage(new Uint8Array(await response.arrayBuffer()))
+        expect(page.windows).toHaveLength(0)
+        expect(page.nextCursor).toBe(42 * WIDTH)
         expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
     })
 })

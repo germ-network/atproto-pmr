@@ -419,9 +419,15 @@ export async function serveDigest(
         // of the first watchdog tick. There is no wall-clock fallback that
         // is honest: claiming coverage up to "now" would be exactly the
         // false claim this function exists to refuse. The request's own
-        // cursor is unchanged, so the caller learns nothing false and
-        // tries again shortly (see `handleDigest`'s caching).
-        return { windows: [], oldest: from, sealedThrough: from, nextCursor: from }
+        // cursor is unchanged, so the caller learns nothing false.
+        //
+        // `sealedThrough` is clamped BELOW `nextCursor`, same convention
+        // as the gap clamp below — reporting them equal would make
+        // `handleDigest`'s `nextCursor <= sealedThrough` completeness
+        // check read this as the fully-determined tip and cache it
+        // immutably for a year, wedging every caller behind a stale
+        // cursor for as long as the marker stays absent.
+        return { windows: [], oldest: from, sealedThrough: from - deps.widthMs, nextCursor: from }
     }
 
     // Never start below the floor: a cursor that predates retention is a

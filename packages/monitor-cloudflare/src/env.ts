@@ -76,9 +76,12 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * `sealedThrough` promises that an absent window below it is
      * *empty* rather than *unknown*. A granularity change breaks that
      * promise. So retuning this MUST be accompanied by clearing the sealed
-     * windows and `sealedThrough`; clients see `oldest` jump forward and
-     * fall back to direct re-verification, which is the defined behaviour
-     * for a gap.
+     * windows and the digest marker (`DigestMarker`, in `SnapshotStore`);
+     * clearing the marker to absent is itself a defined, safe state
+     * (`serveDigest` answers with the request's own cursor unchanged,
+     * never a false coverage claim) until the next seal republishes it —
+     * clients then see `oldest` jump forward and fall back to direct
+     * re-verification, the defined behaviour for a gap.
      */
     DIGEST_WINDOW_MS: string
 
