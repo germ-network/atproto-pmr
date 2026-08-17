@@ -22,6 +22,15 @@ import type { MonitorEnv } from "./env"
 import { kvSnapshotStore } from "./snapshot-store"
 
 /**
+ * Bound on the Jetstream WebSocket upgrade, matching the fetch guards in
+ * `@germ-network/atproto-pmr-core`'s `atproto-fetch.ts` (also 5s) — this
+ * runs on the same single-threaded object those calls run alongside,
+ * outside `connect`, so an unbounded network call here is exactly the
+ * same hazard.
+ */
+const CONNECT_TIMEOUT_MS = 5_000
+
+/**
  * The monitor's single writer: it holds the stream, and it is the only
  * thing that advances the cursor or the `rev` index.
  *
@@ -360,7 +369,20 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         if (this.socket === null) await this.connect()
     }
 
-    /** Open the stream at the stored cursor, or at the tip on first run. */
+    /**
+     * Open the stream at the stored cursor, or at the tip on first run.
+     *
+     * The upgrade fetch is bounded, unlike a plain request: this runs
+     * inside `alarm()`, which is single-threaded with every other call
+     * into this object — `digestPage()` included. An upstream that
+     * accepts the connection and never completes the handshake would
+     * otherwise wedge the object forever, with no self-heal, since the
+     * watchdog that is supposed to recover from exactly that is the thing
+     * stuck. Observed in production: Jetstream stopped answering, and
+     * every DO-touching route hung indefinitely while plain KV reads
+     * stayed fast — the object was blocked here, never reaching `alarm`'s
+     * `finally` to reschedule itself.
+     */
     async connect(): Promise<void> {
         if (this.socket !== null) return
         const cursor = await this.readCursor()
@@ -368,7 +390,17 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
 
-        const response = await fetch(url, { headers: { Upgrade: "websocket" } })
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS)
+        let response: Response
+        try {
+            response = await fetch(url, {
+                headers: { Upgrade: "websocket" },
+                signal: controller.signal,
+            })
+        } finally {
+            clearTimeout(timer)
+        }
         const ws = response.webSocket
         if (ws === null) throw new Error("jetstream did not upgrade")
         ws.accept()
