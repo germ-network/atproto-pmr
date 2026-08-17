@@ -45,6 +45,24 @@ export function base64URLToBinary(value: string): Uint8Array {
 }
 
 /**
+ * A body over the transport cap, distinguished from a decode failure so a
+ * caller can answer `413` rather than fold it into `400`
+ * (`spec/wire-api.md`, "Delivery — peer-facing").
+ *
+ * The cap is the advertised `messageMaxBytes` plus an unadvertised framing
+ * allowance, and refusing on it distinguishably is still disclosure-free: a
+ * sender who respects the advertised maximum can never reach it, so the
+ * refusal teaches nothing a conforming sender needed to know. The message
+ * carries no numbers, which keeps the allowance itself unpublished.
+ */
+export class BodyTooLargeError extends Error {
+    constructor() {
+        super("Body exceeds maximum size")
+        this.name = "BodyTooLargeError"
+    }
+}
+
+/**
  * Reads a request body, refusing anything over `maxBytes` without buffering
  * the excess.
  */
@@ -65,7 +83,7 @@ export async function readBodyCapped(
         total += value.byteLength
         if (total > maxBytes) {
             await reader.cancel()
-            throw new Error("Body exceeds maximum size")
+            throw new BodyTooLargeError()
         }
         chunks.push(value)
     }

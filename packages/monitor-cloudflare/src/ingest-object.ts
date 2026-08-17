@@ -2,10 +2,13 @@ import { DurableObject } from "cloudflare:workers"
 import {
     decodeEvent,
     intake,
+    listReposByCollection,
     sealDueWindows,
     serveDigest,
     settleDue,
+    sweepBackfill,
     windowOf,
+    type BackfillProgress,
     type DigestPage,
     type Cursor,
     type DeltaCursor,
@@ -233,6 +236,24 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         )
     }
 
+    async readBackfillProgress(): Promise<BackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'backfill'")
+            .toArray()[0]
+        // Absent means never started, same as an explicit `{done: false,
+        // cursor: null}` would — the meta table just has nothing to say yet.
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as BackfillProgress
+    }
+
+    async setBackfillProgress(progress: BackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
     async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
         return this.db.sql
             .exec<{ did: string; rev: string; attempts: number; not_before: number }>(
@@ -397,14 +418,30 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     }
 
     /**
-     * Watchdog and retry queue. Reconnects a dropped stream, then settles
-     * what is owed — the only thing standing between a PDS outage and a
-     * silently dropped DID, since the stream will not redeliver.
+     * Watchdog, backfill, and retry queue. Reconnects a dropped stream,
+     * discovers anything the live tail could never see on its own, then
+     * settles what is owed — the only thing standing between a PDS outage
+     * and a silently dropped DID, since the stream will not redeliver.
      */
     async alarm(): Promise<void> {
         try {
             if (this.socket === null) await this.connect()
         } finally {
+            // Before settling, so a DID this sweep just discovered is
+            // eligible for the same tick's settle pass rather than
+            // waiting a full watchdog interval — `SETTLE_BATCH` still
+            // caps how much of it actually gets fetched this tick either
+            // way, so a large page cannot turn into an unbounded fetch
+            // burst.
+            await sweepBackfill({
+                index: this,
+                listRepos: (cursor) =>
+                    listReposByCollection(cursor, {
+                        relayUrl: this.env.BACKFILL_RELAY_URL,
+                        collection: this.env.MONITOR_COLLECTION,
+                        limit: this.envInt(this.env.BACKFILL_BATCH, 100),
+                    }),
+            })
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
             // Sealed after settling, so anything confirmed on this wake

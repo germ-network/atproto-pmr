@@ -246,6 +246,15 @@ to reserve a quota against. Therefore:
   and one that never existed
   ([storage](storage-consistency.md#5-uniform-cost-for-address-resolution)).
 
+The uniformity requirement binds **address-dependent** outcomes. A refusal
+decidable from the request bytes and the deployment's own advertised limits
+alone — a key matching neither prefix, an undecodable envelope, a payload
+over the advertised maximum — is not address-dependent, and is permitted on
+both mailbox kinds; see
+[Delivery — peer-facing](#delivery--peer-facing). What closure forbids is a
+code that varies with *which state the destination was in*, and none of
+those do.
+
 An implementation that returns `404` or `410` instead has broken this
 property.
 
@@ -473,8 +482,9 @@ that makes the `400` below safe.
 The two kinds share a path and nothing else: their authentication and their
 permitted responses stay exactly as specified below and in
 [the closure exception](#the-closure-exception). A **grant put MUST answer
-`202` always**. A **pair put** may additionally answer `429`, for the
-reasons that follow.
+`202` for every address-dependent outcome**, refusing only on the request's
+own bytes. A **pair put** may additionally answer `429`, for the reasons
+that follow.
 
 For a pair put, the permitted responses are exhaustive:
 
@@ -484,21 +494,37 @@ For a pair put, the permitted responses are exhaustive:
   [blocked sender](#blocked-senders) whose synthetic state has room.
 - **`429 Too Many Requests` with `Retry-After`** — when *the sender's own*
   reservation is full.
+- **`400`** or **`413`**, under the conditions below, for a request refused
+  on its own bytes.
 
 Nothing else that depends on the recipient. A pair put MUST NOT disclose
 whether the recipient is active, whether the sender was blocked, whether
 the sender is provisioned, or whether the recipient exists in any state
-other than one that would produce these two answers.
+other than one that would produce these answers.
 
-One narrow exception, and the condition on it is what keeps it safe: a
-**structurally malformed** request — an undecodable envelope, a
-non-canonical signature, a payload over the published maximum — MAY be
-refused with `400`. Every such check MUST be evaluated **before any
-recipient- or sender-dependent lookup**, so its outcome is a function of
-the request bytes alone. A sender already knows whether their own request
-is well-formed and how large their own payload is, so this tells them
-nothing they did not supply. An implementation that cannot decide a `400`
-without consulting recipient state MUST answer `202` instead.
+Two narrow exceptions, and one shared condition is what keeps both safe:
+
+- A **structurally malformed** request — an undecodable envelope, a
+  non-canonical signature — MAY be refused with `400`.
+- A payload **over the maximum the enabler document advertises** MAY be
+  refused with `413 Content Too Large`.
+
+Every such check MUST be evaluated **before any recipient- or
+sender-dependent lookup**, so its outcome is a function of the request bytes
+and the deployment's own advertised limits alone. A sender already knows
+whether their own request is well-formed and how large their own payload is,
+and can read the limit it exceeded from a public document, so neither answer
+tells them anything they did not supply or could not already fetch. An
+implementation that cannot decide either without consulting recipient state
+MUST answer `202` instead.
+
+**`413` is separated from `400` because the two are differently
+actionable.** A `400` says the sender's encoder is wrong and the same bytes
+will never be accepted; a `413` says only that this message is too big, and
+a smaller one from the same encoder would be accepted. Folding the second
+into the first leaves a sender unable to tell a bug from a size, and the
+size cap is advertised precisely so that it can be respected rather than
+discovered.
 
 **Fullness is disclosable because senders are authenticated and each
 sender's mailbox is reserved to them**: a full mailbox is a fact about the
@@ -507,6 +533,20 @@ nothing the sender could not already infer from silence. `429` +
 `Retry-After` is that self-referential disclosure. Grant puts keep the
 uniform-`202` contract because they have no authenticated identity to
 reserve against.
+
+**Fullness answers `429`, and a relay MUST NOT substitute `507`.**
+`507 Insufficient Storage` is the more literal description of the condition
+and is the wrong code, for a reason that has nothing to do with disclosure:
+it is a `5xx`. Generic HTTP stacks, proxies, and CDNs treat `5xx` as an
+origin failure and retry it by default, often immediately and with no
+regard for `Retry-After`. That converts a condition the sender is supposed
+to back off from into one their transport retries at once, against the one
+mailbox already known to be full — and the retry is invisible to the
+application that would otherwise have honoured the delay. The condition is
+also not a server fault in the sense `5xx` denotes: the reservation is the
+sender's own, and it is full because of what the sender put in it. `429` is
+a `4xx`, takes `Retry-After` natively, and is what every client and
+intermediary already treats as "your quota — wait."
 
 **The real path refuses when full; it MUST NOT accept and evict.** A pair
 mailbox at capacity rejects the put and tells the sender: this does not
@@ -573,9 +613,10 @@ uniform.** A pair put resolves and verifies before answering, and
 achieves uniformity by answering `202` on every branch. A grant put has no
 self-referential disclosure to permit at all, so it goes further: **no
 address-dependent step runs before the response.** The only synchronous,
-pre-response work is rejecting a structurally malformed request — an
-undecodable body, a payload over the published maximum — decided from the
-request bytes alone, exactly as a pair put's `400` is. Address resolution,
+pre-response work is refusing a request on its own bytes — an undecodable
+body with `400`, a payload over the advertised maximum with `413` — decided
+from the request bytes and advertised limits alone, exactly as a pair put's
+are. Address resolution,
 challenge redemption, tag verification, storage, and delivery all run
 strictly after the `202`.
 
@@ -1286,13 +1327,16 @@ Three populations, and what each may learn is a security property:
 
 | audience | answer |
 |---|---|
-| peer, grant put | `202` **always** — no other code, no timing difference |
-| peer, pair put | `202`, or `429` + `Retry-After` when their own reservation is full, or `400` for a structurally malformed request decided on the request bytes alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
+| peer, grant put | `202` for every address-dependent outcome — no other code, no timing difference. `400` or `413` only where the refusal is decided on the request bytes and advertised limits alone |
+| peer, pair put | `202`, or `429` + `Retry-After` when their own reservation is full, or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
 The dividing line is authorization and what per-sender reservation makes
 self-referential: an owner gets diagnosis, an authenticated sender learns
-only their own quota state, an anonymous sender gets acknowledgement.
+only their own quota state, an anonymous sender gets acknowledgement. A
+refusal that rests on nothing but the sender's own bytes and a limit the
+deployment publishes crosses none of those lines, which is why it is
+permitted to every audience.
 
 The owner-facing error **body** format is
 [not yet specified](#not-yet-specified).
@@ -1305,6 +1349,15 @@ policy are implementation-defined. The operator picks them and advertises
 the peer-visible ones in the enabler document. No constants appear in
 this specification; none of them is something a peer or another relay
 must agree on.
+
+**Advertising a limit is what makes refusing on it disclosure-free.** A
+size cap a peer can read before sending is not information about the
+recipient, so exceeding it MAY be answered `413` rather than folded into
+the uniform `202`
+([Delivery — peer-facing](#delivery--peer-facing)). The converse binds too:
+a deployment that enforces a peer-visible cap it does not publish MUST NOT
+refuse on it distinguishably, because then the refusal is the only way a
+peer learns the limit exists.
 
 The recovery pool's sizing reasoning transfers even though its constants
 do not:
@@ -1328,7 +1381,8 @@ do not:
 - Sizing the threshold in senders, not storage, reflects what it governs:
   adjudication load — how many judgements the device is being asked for.
 
-Whatever a deployment picks, the put still answers `202`.
+Whatever a deployment picks for the pool, the put still answers `202`:
+pool sizing is recipient-side state, so no refusal may turn on it.
 
 ## Not yet specified
 

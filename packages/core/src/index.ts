@@ -203,6 +203,7 @@ export {
     verifyGrantPutTag,
 } from "./grant"
 export {
+    BodyTooLargeError,
     readBodyCapped,
     toResponseBody,
     base64URLToBinary,

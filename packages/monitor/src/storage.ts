@@ -174,7 +174,34 @@ export interface MonitorIndex {
         dids: readonly string[],
         since: DeltaCursor | null
     ): Promise<{ dids: string[]; nextCursor: DeltaCursor }>
+
+    /**
+     * Progress through tier 3's baseline build (`docs/monitor-ingest.md`,
+     * "Reconciliation") — a third position, over a third, unrelated
+     * sequence: not `Cursor` (the live tail) and not `DeltaCursor` (a
+     * client's digest position), but this monitor's own place in a relay's
+     * enumeration of every DID carrying the collection.
+     *
+     * Exists because the live tail alone only sees a DID from the moment
+     * this monitor's connection opened — anything published earlier and
+     * not touched since is invisible without this.
+     */
+    readBackfillProgress(): Promise<BackfillProgress>
+    setBackfillProgress(progress: BackfillProgress): Promise<void>
 }
+
+/**
+ * `done: false` carries `cursor: null` before the first page and the
+ * relay's own opaque cursor between pages — the same "resume where you
+ * left off, uninterpreted" shape as `Cursor`. `done: true` is terminal:
+ * the relay's enumeration was exhausted, so nothing remains to discover
+ * this way. (Re-sweeping periodically, to catch a relay that withholds a
+ * DID from one pass, is `docs/monitor-ingest.md`'s separate "Withholding
+ * sweep" — not implemented by this baseline-build pass.)
+ */
+export type BackfillProgress =
+    | { done: false; cursor: string | null }
+    | { done: true }
 
 /**
  * A `rev` that moved backwards is the alarm the whole component exists to

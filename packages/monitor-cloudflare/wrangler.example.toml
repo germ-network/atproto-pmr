@@ -45,6 +45,12 @@ DIGEST_FALSE_POSITIVE_RATE = "0.01"
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"
 
+# Tier 3's baseline build (docs/monitor-ingest.md, "Reconciliation"): how a
+# DID published before this monitor's connection opened, and never
+# touched since, still gets discovered. The live tail alone cannot see it.
+BACKFILL_RELAY_URL = "https://relay1.us-west.bsky.network"
+BACKFILL_BATCH = "100"
+
 # The snapshot and sealed digest windows. Read by plain Workers on the
 # public paths — the community view should scale like the public data it
 # is, rather than funnel through the ingest object.

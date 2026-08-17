@@ -88,4 +88,15 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * re-verification it would do with no digest at all.
      */
     WINDOW_RETENTION_SECONDS: string
+
+    /**
+     * The relay to enumerate for tier 3's baseline build
+     * (`com.atproto.sync.listReposByCollection`) — how a DID published
+     * before this monitor's connection opened, and never touched since,
+     * still gets discovered. The live tail alone cannot see it.
+     */
+    BACKFILL_RELAY_URL: string
+
+    /** DIDs to discover per relay page, per wake. */
+    BACKFILL_BATCH: string
 }
