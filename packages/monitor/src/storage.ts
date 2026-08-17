@@ -2,15 +2,24 @@
  * The monitor's storage seam, split the way the data's own properties split
  * it (`docs/monitor-ingest.md`, "State partition").
  *
- * Two stores, because two access patterns:
+ * Two stores, because two access patterns — and, since the DO-read-offload,
+ * two *processes*: `SnapshotStore` is the only thing a request handler may
+ * touch. `MonitorIndex` is write-path state private to the single writer
+ * that holds the stream; no read route may reach it, a boundary
+ * `ServeDeps` (`digest.ts`) enforces by not carrying an index at all.
  *
- * - `SnapshotStore` holds bytes the monitor merely *serves* — records and
- *   sealed digest windows. Public, re-fetchable, read-heavy, write-rare.
- *   Eventual consistency is acceptable here and only here: a stale read is
- *   `rev` skew, which the trust model already treats as ordinary.
- * - `MonitorIndex` holds the small state the monitor must *compare and
- *   query* under a single writer — the cursor, the `rev` index, pending
- *   fetches, and the open digest window.
+ * - `SnapshotStore` holds bytes the monitor *serves* — records, sealed
+ *   digest windows, and the digest marker. Public, re-fetchable,
+ *   read-heavy, write-rare. Eventual consistency is acceptable here and
+ *   only here: a stale read is `rev` skew (or, for the marker, a
+ *   replication lag `serveDigest` detects and stops at), which the trust
+ *   model already treats as ordinary.
+ * - `MonitorIndex` holds the small state that must be *compared and
+ *   queried* under a single writer — the cursor, the `rev` index, pending
+ *   fetches, and the open (unsealed) digest window's membership. Once a
+ *   window closes, its membership is sealed to `SnapshotStore` and the
+ *   index's copy is dropped — the index never holds anything a read route
+ *   needs.
  *
  * `rev` comparisons MUST read the index, never the snapshot: the snapshot
  * is a serving copy, not a truth.
@@ -22,19 +31,6 @@
  * never compares it to anything of its own.
  */
 export type Cursor = string
-
-/**
- * A position in **this monitor's own observation clock**, milliseconds.
- *
- * Deliberately a different type from `Cursor`, because they were briefly
- * the same one and the bug that produced is instructive: a stream cursor
- * in microseconds compared against an observation time in milliseconds is
- * off by a factor of a thousand, so the comparison silently answers
- * "nothing changed" forever rather than failing. A client's delta cursor
- * is issued by the monitor, from `nextCursor`, and is never the stream
- * position.
- */
-export type DeltaCursor = string
 
 /** What the monitor serves for one DID: the verified bytes and their rev. */
 export interface SnapshotEntry {
@@ -53,16 +49,48 @@ export interface SnapshotEntry {
 }
 
 /**
- * Serving-side storage. Entries carry **no TTL**: a record unchanged for
- * years must still be served. Disposable in the only sense that matters —
- * rebuildable from replay.
+ * The digest's own read cursor onto `SnapshotStore` — the two facts
+ * `serveDigest` needs and cannot derive from a window it does not yet
+ * have: how far sealing has actually reached, and how far back coverage
+ * still goes.
+ *
+ * Published as one object, not two keys, so a reader never observes them
+ * at different points in time relative to each other — only relative to
+ * the window bytes, which `serveDigest` already treats as possibly lagging
+ * (a missing window below `sealedThrough` is what a KV read replica behind
+ * the write looks like, not evidence that nothing happened).
+ */
+export interface DigestMarker {
+    /** The newest window sealing has confirmed, published-side. */
+    sealedThrough: number
+    /**
+     * The earliest window still retained. **Monotonic once published** —
+     * never allowed to move earlier — because a retention *increase* must
+     * not retroactively promise coverage for windows whose bytes already
+     * expired from `SnapshotStore` under the old, shorter retention.
+     */
+    oldest: number
+}
+
+/**
+ * Serving-side storage. Records carry **no TTL**: unchanged for years must
+ * still be served, disposable only in the sense that it is rebuildable
+ * from replay. Sealed windows and the marker are written once per window
+ * and never revised — a window cannot be rebuilt once its membership is
+ * dropped, and the marker only ever advances.
  */
 export interface SnapshotStore {
     getRecord(did: string): Promise<SnapshotEntry | null>
     putRecord(did: string, entry: SnapshotEntry): Promise<void>
-    /** Absent once past the published retention; a client then re-verifies. */
+    /** Absent means either genuinely unsealed, or not yet propagated to
+     * this replica — `serveDigest` is what tells those apart, using
+     * `getDigestMarker`; this store makes no claim either way. */
     getSealedWindow(windowId: string): Promise<Uint8Array | null>
     putSealedWindow(windowId: string, filter: Uint8Array): Promise<void>
+    /** `null` before the first window has ever sealed — a fresh deploy, or
+     * a wake ahead of the first watchdog tick. Not an error state. */
+    getDigestMarker(): Promise<DigestMarker | null>
+    putDigestMarker(marker: DigestMarker): Promise<void>
 }
 
 /** A fetch the monitor owes: recorded at intake, cleared on completion. */
@@ -133,54 +161,32 @@ export interface MonitorIndex {
     revOf(did: string): Promise<string | null>
 
     /**
-     * Windows that have closed and hold members, oldest first.
+     * The DIDs recorded in one window — a window is indexed by
+     * **observation time**, when this monitor confirmed the change, not
+     * when the change happened. The retry path forces it: a DID whose PDS
+     * was down settles hours late, and a sealed Bloom filter cannot be
+     * amended, so indexing by event time would drop that change into a
+     * window already published and make it permanently invisible. The
+     * cost is a fact clients depend on: a digest window says when this
+     * monitor *saw* a change, so window numbers are monitor-local and
+     * only `rev` is comparable across monitors.
      *
-     * A window is indexed by **observation time** — when this monitor
-     * confirmed the change — not by when the change happened. The retry
-     * path forces it: a DID whose PDS was down settles hours late, and a
-     * sealed Bloom filter cannot be amended, so indexing by event time
-     * would drop that change into a window already published and make it
-     * permanently invisible. The cost is a fact clients depend on: a
-     * digest window says when this monitor *saw* a change, so window
-     * numbers are monitor-local and only `rev` is comparable across
-     * monitors.
+     * Answers `[]` for a window with no members exactly as it would for
+     * one that never existed — `sealDueWindows` reads every window in
+     * range this way, empty or not, so nothing here needs to distinguish
+     * the two.
      */
-    closedWindowsWithMembers(currentWindow: number, limit: number): Promise<number[]>
-
-    /** The DIDs recorded in one window. */
     windowMembers(window: number): Promise<string[]>
 
-    /** Drop a window's membership once its filter is durable. */
+    /** Drop a window's membership once its filter is durable. A no-op if
+     * the window held none, which is the ordinary case for a quiet one. */
     dropWindow(window: number): Promise<void>
 
     /**
-     * The highest window sealed so far — the boundary between "definitely
-     * nothing changed" and "not published yet".
-     *
-     * Advances past empty windows too. A quiet interval and an interval
-     * this monitor was down are the same thing under observation-time
-     * indexing: nothing was observed, so nothing is reported, and the
-     * backlog lands in whichever window it is finally confirmed in.
-     */
-    readSealedThrough(): Promise<number | null>
-    setSealedThrough(window: number): Promise<void>
-
-    /**
-     * Which of `dids` changed since `cursor`. The reason the index exists
-     * rather than living wholly in the snapshot: a key-value serving store
-     * can neither answer this nor promise read-your-writes.
-     */
-    changedSince(
-        dids: readonly string[],
-        since: DeltaCursor | null
-    ): Promise<{ dids: string[]; nextCursor: DeltaCursor }>
-
-    /**
      * Progress through tier 3's baseline build (`docs/monitor-ingest.md`,
-     * "Reconciliation") — a third position, over a third, unrelated
-     * sequence: not `Cursor` (the live tail) and not `DeltaCursor` (a
-     * client's digest position), but this monitor's own place in a relay's
-     * enumeration of every DID carrying the collection.
+     * "Reconciliation") — a second position, distinct from `Cursor` (the
+     * live tail): this monitor's own place in a relay's enumeration of
+     * every DID carrying the collection.
      *
      * Exists because the live tail alone only sees a DID from the moment
      * this monitor's connection opened — anything published earlier and
@@ -227,12 +233,12 @@ export function compareRev(indexed: string | null, observed: string): RevCompari
 /**
  * What `compareObservations` needs from one monitor's report of a DID —
  * the fields of a `SnapshotEntry` that carry provenance, plus the bytes
- * being compared. Deliberately not `SnapshotEntry` itself: window
- * numbering (`MonitorIndex.closedWindowsWithMembers`) is monitor-local and
- * not comparable across two independent monitors, but `observedAtMs` — a
- * wall-clock reading — plays no part in the classification below only
- * because this function does not need it to; a caller comparing two
- * `skew` observations may still want it to guess which side is older.
+ * being compared. Deliberately not `SnapshotEntry` itself: digest window
+ * numbering is monitor-local and not comparable across two independent
+ * monitors, but `observedAtMs` — a wall-clock reading — plays no part in
+ * the classification below only because this function does not need it
+ * to; a caller comparing two `skew` observations may still want it to
+ * guess which side is older.
  */
 export interface Observation {
     rev: string

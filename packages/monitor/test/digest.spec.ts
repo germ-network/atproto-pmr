@@ -229,46 +229,59 @@ describe("known answers — this is the wire format", () => {
 })
 
 describe("sealing", () => {
-    /** Minimal index: only what sealing touches. */
-    function sealHarness(seed: Record<number, string[]> = {}) {
+    /** Minimal index + snapshot: only what sealing touches. */
+    function sealHarness(
+        seed: Record<number, string[]> = {},
+        initialMarker: { sealedThrough: number; oldest: number } | null = null
+    ) {
         const members = new Map<number, Set<string>>(
             Object.entries(seed).map(([w, d]) => [Number(w), new Set(d)])
         )
         const windows = new Map<string, Uint8Array>()
-        let sealedThrough: number | null = null
+        let marker = initialMarker
         const deps = {
             index: {
-                closedWindowsWithMembers: async (cur: number, limit: number) =>
-                    [...members.keys()].filter((w) => w < cur).sort((a, b) => a - b).slice(0, limit),
                 windowMembers: async (w: number) => [...(members.get(w) ?? [])].sort(),
                 dropWindow: async (w: number) => void members.delete(w),
-                readSealedThrough: async () => sealedThrough,
-                setSealedThrough: async (w: number) => void (sealedThrough = w),
             },
             snapshot: {
                 putSealedWindow: async (id: string, f: Uint8Array) => void windows.set(id, f),
                 getSealedWindow: async (id: string) => windows.get(id) ?? null,
+                getDigestMarker: async () => marker,
+                putDigestMarker: async (m: { sealedThrough: number; oldest: number }) =>
+                    void (marker = m),
             },
             widthMs: WIDTH,
+            retentionMs: 20 * WIDTH,
             nowMs: () => 10 * WIDTH + 1, // current window is 10
         } as unknown as SealDeps
-        return { deps, members, windows, sealedThrough: () => sealedThrough }
+        return { deps, members, windows, marker: () => marker }
     }
 
     it("seals closed windows and leaves the current one accumulating", async () => {
         // The open window must never be published: it would return
         // different bytes to two callers a second apart, which breaks both
-        // caching and the identical-bytes property.
-        const h = sealHarness({ [8 * WIDTH]: ["did:plc:a"], [10 * WIDTH]: ["did:plc:current"] })
+        // caching and the identical-bytes property. Window 9 is empty and
+        // between the marker and the current window, so it seals too —
+        // every window in range now gets a physical entry, not only the
+        // ones with members.
+        const h = sealHarness(
+            { [8 * WIDTH]: ["did:plc:a"], [10 * WIDTH]: ["did:plc:current"] },
+            { sealedThrough: 7 * WIDTH, oldest: 0 }
+        )
         const sealed = await sealDueWindows(h.deps)
-        expect(sealed).toEqual([8 * WIDTH])
+        expect(sealed).toEqual([8 * WIDTH, 9 * WIDTH])
         expect(h.windows.has(String(8 * WIDTH))).toBe(true)
+        expect(h.windows.has(String(9 * WIDTH))).toBe(true)
         expect(h.windows.has(String(10 * WIDTH))).toBe(false)
         expect(h.members.has(10 * WIDTH)).toBe(true)
     })
 
     it("a sealed window still answers for its members", async () => {
-        const h = sealHarness({ [8 * WIDTH]: ["did:plc:a", "did:plc:b"] })
+        const h = sealHarness(
+            { [8 * WIDTH]: ["did:plc:a", "did:plc:b"] },
+            { sealedThrough: 7 * WIDTH, oldest: 0 }
+        )
         await sealDueWindows(h.deps)
         const [w] = decodeDigestWindows(h.windows.get(String(8 * WIDTH))!)
         expect(mightHaveChanged(w, "did:plc:a")).toBe(true)
@@ -276,20 +289,27 @@ describe("sealing", () => {
         expect(mightHaveChanged(w, "did:plc:never")).toBe(false)
     })
 
-    it("advances sealedThrough past EMPTY windows", async () => {
-        // Nothing observed is a real answer, and a reader needs it to tell
-        // "nothing changed" from "not published yet" without the monitor
-        // materialising a filter for every quiet interval.
+    it("advances past EMPTY windows, writing a real entry for each", async () => {
+        // Nothing observed is a real answer, but it is no longer implied by
+        // a scalar advancing past it — `serveDigest` reads from a different
+        // process now, so an empty window needs a physical entry to be told
+        // apart from one that has not propagated here yet.
         const h = sealHarness({})
-        await sealDueWindows(h.deps)
-        expect(h.sealedThrough()).toBe(9 * WIDTH)
-        expect(h.windows.size).toBe(0)
+        const sealed = await sealDueWindows(h.deps)
+        expect(sealed).toEqual([9 * WIDTH])
+        expect(h.marker()?.sealedThrough).toBe(9 * WIDTH)
+        expect(h.windows.has(String(9 * WIDTH))).toBe(true)
+        const [w] = decodeDigestWindows(h.windows.get(String(9 * WIDTH))!)
+        expect(mightHaveChanged(w, "did:plc:anyone")).toBe(false)
     })
 
     it("drops membership only after the filter is durable", async () => {
         // A window cannot be rebuilt — the events that fed it are past —
         // so losing it to a failed write would be permanent.
-        const h = sealHarness({ [8 * WIDTH]: ["did:plc:a"] })
+        const h = sealHarness(
+            { [8 * WIDTH]: ["did:plc:a"] },
+            { sealedThrough: 7 * WIDTH, oldest: 0 }
+        )
         const failing = {
             ...h.deps,
             snapshot: {
@@ -304,27 +324,65 @@ describe("sealing", () => {
     })
 
     it("does not claim windows the batch limit left behind", async () => {
-        // Reporting sealed-through past an unsealed window would make it
+        // Reporting sealed-through past an unprocessed window would make it
         // read as definitively empty — a silent all-clear.
-        const h = sealHarness({ [2 * WIDTH]: ["did:plc:a"], [3 * WIDTH]: ["did:plc:b"], [4 * WIDTH]: ["did:plc:c"] })
+        const h = sealHarness(
+            { [2 * WIDTH]: ["did:plc:a"], [3 * WIDTH]: ["did:plc:b"], [4 * WIDTH]: ["did:plc:c"] },
+            { sealedThrough: 1 * WIDTH, oldest: 0 }
+        )
         const sealed = await sealDueWindows(h.deps, 2)
         expect(sealed).toEqual([2 * WIDTH, 3 * WIDTH])
-        expect(h.sealedThrough()).toBe(3 * WIDTH)
+        expect(h.marker()?.sealedThrough).toBe(3 * WIDTH)
         expect(h.members.has(4 * WIDTH)).toBe(true)
+        expect(h.windows.has(String(4 * WIDTH))).toBe(false)
     })
 
     it("never moves sealedThrough backwards", async () => {
         const h = sealHarness({})
         await sealDueWindows(h.deps)
-        expect(h.sealedThrough()).toBe(9 * WIDTH)
+        expect(h.marker()?.sealedThrough).toBe(9 * WIDTH)
         const earlier = { ...h.deps, nowMs: () => 5 * WIDTH } as unknown as SealDeps
         await sealDueWindows(earlier)
-        expect(h.sealedThrough()).toBe(9 * WIDTH)
+        expect(h.marker()?.sealedThrough).toBe(9 * WIDTH)
+    })
+
+    it("a fresh install starts coverage now, never retroactively", async () => {
+        // A monitor cannot claim to have observed a history it was not
+        // running for — starting from the dawn of time on first boot would
+        // be exactly that claim.
+        const h = sealHarness({})
+        expect(h.marker()).toBeNull()
+        await sealDueWindows(h.deps)
+        expect(h.marker()?.oldest).toBe(9 * WIDTH)
+    })
+
+    it("a retention INCREASE cannot move `oldest` earlier than what already expired", async () => {
+        // The monotonic half of the fix: raising WINDOW_RETENTION_SECONDS
+        // must not promise coverage back to a window whose KV bytes are
+        // already gone under the old, shorter retention — that would wedge
+        // serveDigest behind a floor it can never actually read past.
+        const h = sealHarness({}, { sealedThrough: 9 * WIDTH, oldest: 8 * WIDTH })
+        const raised = { ...h.deps, retentionMs: 1000 * WIDTH } as unknown as SealDeps
+        await sealDueWindows({ ...raised, nowMs: () => 11 * WIDTH + 1 })
+        expect(h.marker()?.oldest).toBe(8 * WIDTH)
     })
 })
 
 describe("serving a page", () => {
-    function serveHarness(sealed: Record<number, string[]> = {}, nowMs = 100 * WIDTH) {
+    type Marker = { sealedThrough: number; oldest: number }
+
+    /** Every physical window entry in `[fromWindow, toWindowInclusive]`, empty. */
+    function emptyRange(fromWindow: number, toWindowInclusive: number): Record<number, string[]> {
+        const out: Record<number, string[]> = {}
+        for (let w = fromWindow; w <= toWindowInclusive; w += WIDTH) out[w] = []
+        return out
+    }
+
+    function serveHarness(
+        sealed: Record<number, string[]> = {},
+        marker: Marker | null,
+        nowMs = 100 * WIDTH
+    ) {
         const windows = new Map<string, Uint8Array>()
         for (const [w, dids] of Object.entries(sealed)) {
             windows.set(w, encodeDigestWindows([sealWindow(Number(w), WIDTH, dids)]))
@@ -332,45 +390,87 @@ describe("serving a page", () => {
         return {
             windows,
             deps: {
-                index: { readSealedThrough: async () => nowMs - WIDTH },
-                snapshot: { getSealedWindow: async (id: string) => windows.get(id) ?? null },
+                snapshot: {
+                    getSealedWindow: async (id: string) => windows.get(id) ?? null,
+                    getDigestMarker: async () => marker,
+                },
                 widthMs: WIDTH,
                 byteBudget: 1024,
-                retentionMs: 10 * WIDTH,
                 nowMs: () => nowMs,
             } as unknown as ServeDeps,
         }
     }
 
-    it("synthesises empty windows rather than storing one per quiet interval", () => {
-        // "Nothing changed here" is an answer the client needs; paying
-        // storage proportional to TIME rather than to change to say it
-        // would be the wrong trade.
-        const h = serveHarness({}, 5 * WIDTH)
-        return serveDigest(h.deps, 2 * WIDTH).then((page) => {
-            expect(page.windows.length).toBe(3)
-            for (const w of page.windows) {
-                expect(mightHaveChanged(w, DIDS[0])).toBe(false)
-            }
+    it("serves real entries for windows that were sealed, including empty ones", async () => {
+        // Windows are physical entries now, whether or not anything
+        // happened in them — this is what lets a gap mean "not yet visible
+        // here" rather than "quiet interval", which the next two tests
+        // depend on.
+        const h = serveHarness(emptyRange(2 * WIDTH, 4 * WIDTH), {
+            sealedThrough: 4 * WIDTH,
+            oldest: 0,
+        })
+        const page = await serveDigest(h.deps, 2 * WIDTH)
+        expect(page.windows.length).toBe(3)
+        for (const w of page.windows) {
+            expect(mightHaveChanged(w, DIDS[0])).toBe(false)
+        }
+    })
+
+    it("stops at a gap rather than synthesizing, and CLAMPS sealedThrough below it", async () => {
+        // The property that keeps a lagging KV read replica from being
+        // cached as though it were caught up. Windows 90-92 are physically
+        // present; 93 onward is not, even though the marker claims
+        // coverage through 99 — a real gap, not a genuinely-empty window.
+        // Reporting the marker's own sealedThrough here would satisfy
+        // handleDigest's `nextCursor <= sealedThrough` "complete" check and
+        // cache the lag as the immutable tip.
+        const h = serveHarness(emptyRange(90 * WIDTH, 92 * WIDTH), {
+            sealedThrough: 99 * WIDTH,
+            oldest: 90 * WIDTH,
+        })
+        const page = await serveDigest(h.deps, 90 * WIDTH)
+        expect(page.windows.length).toBe(3)
+        expect(page.sealedThrough).toBe(92 * WIDTH)
+        expect(page.nextCursor).toBe(93 * WIDTH)
+        // The caller reads this as "not complete" and caches briefly, not
+        // as the immutable tip — see digest-endpoint.spec.ts for the header.
+        expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
+    })
+
+    it("answers an empty, unchanged-cursor page when nothing has EVER sealed", async () => {
+        // A fresh deploy, or a wake ahead of the first watchdog tick.
+        // Claiming coverage from the wall clock here would be exactly the
+        // false claim this function exists to refuse.
+        const h = serveHarness({}, null)
+        const page = await serveDigest(h.deps, 42 * WIDTH)
+        expect(page).toEqual({
+            windows: [],
+            oldest: 42 * WIDTH,
+            sealedThrough: 42 * WIDTH,
+            nextCursor: 42 * WIDTH,
         })
     })
 
     it("carries the floor, the ceiling, and where to resume", async () => {
-        const h = serveHarness({}, 5 * WIDTH)
+        const h = serveHarness(emptyRange(3 * WIDTH, 4 * WIDTH), {
+            sealedThrough: 4 * WIDTH,
+            oldest: 0,
+        })
         const page = await serveDigest(h.deps, 3 * WIDTH)
         expect(page.sealedThrough).toBe(4 * WIDTH)
         expect(page.nextCursor).toBe(5 * WIDTH)
-        expect(page.oldest).toBeLessThan(page.sealedThrough)
+        expect(page.oldest).toBe(0)
     })
 
     it("never serves below the retention floor, so a lost gap stays visible", async () => {
         // Serving from the floor when the cursor predates it would look
         // like coverage. `oldest` is how the client learns it must
         // re-verify instead.
-        // Default timeline, so the floor is genuinely above the request:
-        // now = window 100, retention 10 windows, so anything before
-        // window 90 is gone.
-        const h = serveHarness({})
+        const h = serveHarness(emptyRange(90 * WIDTH, 99 * WIDTH), {
+            sealedThrough: 99 * WIDTH,
+            oldest: 90 * WIDTH,
+        })
         const page = await serveDigest(h.deps, 0)
         expect(page.oldest).toBe(90 * WIDTH)
         expect(page.windows[0].window).toBe(page.oldest)
@@ -386,7 +486,7 @@ describe("serving a page", () => {
         for (let i = 1; i <= 20; i++) {
             fat[i * WIDTH] = Array.from({ length: 400 }, (_, j) => `did:plc:w${i}m${j}`)
         }
-        const h = serveHarness(fat, 25 * WIDTH)
+        const h = serveHarness(fat, { sealedThrough: 20 * WIDTH, oldest: 0 }, 25 * WIDTH)
         const small = await serveDigest({ ...h.deps, byteBudget: 600 }, WIDTH)
         const large = await serveDigest({ ...h.deps, byteBudget: 6000 }, WIDTH)
         expect(small.windows.length).toBeLessThan(large.windows.length)
@@ -399,8 +499,8 @@ describe("serving a page", () => {
     it("signals caught-up by nextCursor passing sealedThrough", async () => {
         // Rather than a truncated flag: one source of truth, nothing to
         // disagree with itself.
-        const h = serveHarness({}, 5 * WIDTH)
-        const page = await serveDigest(h.deps, 4 * WIDTH)
+        const h = serveHarness({}, { sealedThrough: 4 * WIDTH, oldest: 0 }, 5 * WIDTH)
+        const page = await serveDigest(h.deps, 5 * WIDTH)
         expect(page.nextCursor).toBeGreaterThan(page.sealedThrough)
     })
 })

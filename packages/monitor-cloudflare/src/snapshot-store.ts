@@ -1,4 +1,4 @@
-import type { SnapshotEntry, SnapshotStore } from "@germ-network/atproto-pmr-monitor"
+import type { DigestMarker, SnapshotEntry, SnapshotStore } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
 import type { MonitorIngest } from "./ingest-object"
 
@@ -8,13 +8,26 @@ import type { MonitorIngest } from "./ingest-object"
  * KV rather than Durable Object storage because the read paths are public,
  * cacheable, and want to run in plain Workers near the caller — the
  * community view should scale like the public data it is, not funnel
- * through one object in one location. Eventual consistency is acceptable
- * here and only here: a stale read is `rev` skew, which the trust model
- * already treats as ordinary. `rev` *comparisons* read the index instead.
+ * through one object in one location. **No request handler reaches the
+ * ingest object at all** — every read here, including the digest marker,
+ * is this store or nothing, which is what keeps a read from ever sharing
+ * fate with a wedged, evicted, or reconnecting writer.
+ *
+ * Eventual consistency is acceptable here and only here: a stale record
+ * read is `rev` skew, which the trust model already treats as ordinary,
+ * and a stale digest marker read is the replication lag `serveDigest`
+ * detects and stops at rather than silently papering over. `rev`
+ * *comparisons* read the index instead — never this store.
  */
 
 const RECORD_PREFIX = "rec:"
 const WINDOW_PREFIX = "win:"
+/** Singleton key — one marker for the whole digest, not one per window.
+ * Exported so a test can reset it directly: `env.records` is shared across
+ * tests in this package's suite (KV, unlike Durable Object storage, is not
+ * reset per test), and this is the one entry with no per-test-unique key
+ * to naturally avoid collision the way record and window keys do. */
+export const DIGEST_MARKER_KEY = "digest:marker"
 
 /** Stored beside the bytes so a reader knows what it holds without the index. */
 interface StoredMeta {
@@ -73,10 +86,26 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             // retention a client falls back to direct re-verification,
             // which is the cost it would pay with no digest at all. The
             // comment used to say this while the code kept them forever.
+            // Applies equally to an empty window's entry — it expires on
+            // the same schedule as the `oldest` floor `sealDueWindows`
+            // publishes for it, so the two never disagree about whether a
+            // window is still supposed to be readable.
             const ttl = Number.parseInt(env.WINDOW_RETENTION_SECONDS, 10)
             await env.records.put(WINDOW_PREFIX + windowId, filter, {
                 expirationTtl: Number.isFinite(ttl) ? Math.max(60, ttl) : undefined,
             })
+        },
+
+        async getDigestMarker(): Promise<DigestMarker | null> {
+            return env.records.get<DigestMarker>(DIGEST_MARKER_KEY, "json")
+        },
+
+        async putDigestMarker(marker: DigestMarker): Promise<void> {
+            // No TTL: this is the one entry that must never expire on its
+            // own schedule — its absence is a meaningful, explicit state
+            // (`serveDigest` treats it as "nothing sealed yet"), not
+            // something that should happen quietly under retention.
+            await env.records.put(DIGEST_MARKER_KEY, JSON.stringify(marker))
         },
     }
 }

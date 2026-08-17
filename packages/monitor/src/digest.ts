@@ -300,11 +300,15 @@ export interface SealDeps {
     snapshot: SnapshotStore
     /** Window width. Published with every filter, so it may change. */
     widthMs: number
+    /** How long a sealed window is retained — the floor `oldest` may not
+     * cross once published; see `DigestMarker.oldest`. */
+    retentionMs: number
     nowMs(): number
 }
 
 /**
- * Seal every window that has closed since the last pass.
+ * Seal every window that has closed since the last pass, **including
+ * empty ones**.
  *
  * Only *closed* windows are ever sealed, and therefore only closed windows
  * are ever served: the current one is still accumulating, so publishing it
@@ -313,43 +317,67 @@ export interface SealDeps {
  * privacy argument rests on. The cost is a latency floor: a change is
  * invisible to the digest for up to one window width.
  *
- * `sealedThrough` advances to the last closed window whether or not
- * anything was in it, which is what lets a reader tell "nothing changed"
- * from "not published yet" without materialising empty filters.
+ * Every window in range gets a physical entry now — even a quiet one —
+ * because `serveDigest` (since the DO-read-offload) can no longer tell
+ * "genuinely empty" from "sealed, not yet visible to this read replica"
+ * any other way: a KV write and a KV read are different processes with no
+ * shared transaction, so an absent window below the marker used to be a
+ * safe assumption only because the read path shared the writer's own
+ * storage. It no longer does.
  */
 export async function sealDueWindows(deps: SealDeps, limit = 16): Promise<number[]> {
     const current = windowOf(deps.nowMs(), deps.widthMs)
-    const due = await deps.index.closedWindowsWithMembers(current, limit)
+    const marker = await deps.snapshot.getDigestMarker()
+
+    // A fresh install has no prior marker and nothing to resume: coverage
+    // begins now, one window back, never retroactively — a monitor cannot
+    // claim to have observed a history it was not running for.
+    let cursor =
+        marker === null ? current - deps.widthMs : nextWindow(marker.sealedThrough, deps.widthMs)
 
     const sealed: number[] = []
-    for (const w of due) {
-        const members = await deps.index.windowMembers(w)
-        const filter = sealWindow(w, deps.widthMs, members)
+    while (cursor < current && sealed.length < limit) {
+        const members = await deps.index.windowMembers(cursor)
+        const filter = sealWindow(cursor, deps.widthMs, members)
         // Bytes durable before the membership is dropped: the reverse
         // order loses the window entirely if the write fails, and a window
-        // cannot be rebuilt — the events that fed it are long past.
-        await deps.snapshot.putSealedWindow(String(w), encodeDigestWindows([filter]))
-        await deps.index.dropWindow(w)
-        sealed.push(w)
+        // cannot be rebuilt — the events that fed it are long past. Safe
+        // to drop even when `members` is empty — the index answers `[]`
+        // either way, per `MonitorIndex.dropWindow`.
+        await deps.snapshot.putSealedWindow(String(cursor), encodeDigestWindows([filter]))
+        await deps.index.dropWindow(cursor)
+        sealed.push(cursor)
+        cursor = nextWindow(cursor, deps.widthMs)
     }
 
-    // Only claim up to what was actually processed: if the limit truncated
-    // the batch, windows beyond it still hold members and must not be
-    // reported as sealed-and-empty.
-    const claimable =
-        due.length === limit && due.length > 0
-            ? Math.max(...due)
-            : current - deps.widthMs
-    const previous = await deps.index.readSealedThrough()
-    if (previous === null || claimable > previous) {
-        await deps.index.setSealedThrough(claimable)
+    if (sealed.length > 0) {
+        const sealedThrough = sealed[sealed.length - 1]
+        const liveFloor = windowOf(deps.nowMs() - deps.retentionMs, deps.widthMs)
+        // Monotonic: a retention INCREASE must not promise coverage for a
+        // window whose bytes already expired from SnapshotStore under the
+        // old, shorter retention — that would wedge `serveDigest` behind a
+        // floor it can never actually read past. `marker` is null only on
+        // the very first seal, when nothing has expired yet, so the floor
+        // is simply wherever coverage started.
+        const oldest =
+            marker === null ? Math.max(liveFloor, sealed[0]) : Math.max(marker.oldest, liveFloor)
+        await deps.snapshot.putDigestMarker({ sealedThrough, oldest })
     }
+
     return sealed
 }
 
-/** What serving a digest request needs. */
+/**
+ * What serving a digest request needs — deliberately **not** `MonitorIndex`.
+ * A digest read is public, unauthenticated, and expected to run in a plain
+ * Worker near the caller; the index is private write-path state behind the
+ * single writer that holds the stream, in a different process in the
+ * reference deployment. A read path that could reach it would share its
+ * fate — if the writer is wedged, evicted, or mid-reconnect, every read
+ * would queue behind it too, which is exactly the failure this boundary
+ * exists to rule out by construction rather than by discipline.
+ */
 export interface ServeDeps {
-    index: MonitorIndex
     snapshot: SnapshotStore
     widthMs: number
     /**
@@ -365,46 +393,65 @@ export interface ServeDeps {
      * quantity an operator can actually observe in production.
      */
     byteBudget: number
-    /** How long a sealed window is retained, for the `oldest` floor. */
-    retentionMs: number
     nowMs(): number
 }
 
 /**
- * Serve `[from, sealedThrough]`, up to the byte budget.
+ * Serve `[from, sealedThrough]`, up to the byte budget — reading only
+ * `SnapshotStore`, never the writer.
  *
- * Empty windows are synthesised rather than stored: a quiet interval is a
- * real answer a client needs — "nothing changed here" — and materialising
- * a filter for every one of them would cost storage proportional to time
- * rather than to change.
+ * Every window in range is a **physical entry now** (`sealDueWindows`
+ * writes empty ones too), so a missing window below the marker's
+ * `sealedThrough` is no longer "genuinely nothing happened" the way it
+ * was when this read the writer's own storage — it is what replication
+ * lag to this read replica looks like. The two are told apart by
+ * stopping, not synthesizing: hitting a gap ends the page early and
+ * reports only what was actually confirmed, so a client re-asks from
+ * `nextCursor` rather than being told a lagging replica is caught up.
  */
 export async function serveDigest(
     deps: ServeDeps,
     from: number
 ): Promise<DigestPage> {
-    const now = deps.nowMs()
-    const sealedThrough =
-        (await deps.index.readSealedThrough()) ??
-        windowOf(now, deps.widthMs) - deps.widthMs
-    const oldest = windowOf(now - deps.retentionMs, deps.widthMs)
+    const marker = await deps.snapshot.getDigestMarker()
+    if (marker === null) {
+        // Nothing has ever sealed here — a fresh deploy, or a wake ahead
+        // of the first watchdog tick. There is no wall-clock fallback that
+        // is honest: claiming coverage up to "now" would be exactly the
+        // false claim this function exists to refuse. The request's own
+        // cursor is unchanged, so the caller learns nothing false and
+        // tries again shortly (see `handleDigest`'s caching).
+        return { windows: [], oldest: from, sealedThrough: from, nextCursor: from }
+    }
 
     // Never start below the floor: a cursor that predates retention is a
     // gap the client must close by re-verifying, and `oldest` is how it
     // finds out. Serving from the floor instead would look like coverage.
-    let cursor = Math.max(windowOf(from, deps.widthMs), oldest)
+    let cursor = Math.max(windowOf(from, deps.widthMs), marker.oldest)
 
     const windows: DigestWindow[] = []
     let spent = 0
-    while (cursor <= sealedThrough && spent < deps.byteBudget) {
+    let gapAt: number | null = null
+    while (cursor <= marker.sealedThrough && spent < deps.byteBudget) {
         const stored = await deps.snapshot.getSealedWindow(String(cursor))
-        const w =
-            stored === null
-                ? sealWindow(cursor, deps.widthMs, [])
-                : decodeDigestWindows(stored)[0]
+        if (stored === null) {
+            gapAt = cursor
+            break
+        }
+        const w = decodeDigestWindows(stored)[0]
         windows.push(w)
         spent += w.filter.byteLength
         cursor = nextWindow(cursor, deps.widthMs)
     }
 
-    return { windows, oldest, sealedThrough, nextCursor: cursor }
+    // A page that stopped at a gap is NOT the true tip, even though the
+    // marker says coverage runs further — report only what this replica
+    // actually confirmed, so `nextCursor > sealedThrough` falls out on its
+    // own and `handleDigest` does not cache a lag as though it were caught
+    // up. A page that stopped for any other reason (byte budget, or
+    // genuinely reaching the marker) reports the marker's own value: that
+    // coverage is real, only undelivered in this page.
+    const sealedThrough = gapAt === null ? marker.sealedThrough : gapAt - deps.widthMs
+
+    return { windows, oldest: marker.oldest, sealedThrough, nextCursor: cursor }
 }

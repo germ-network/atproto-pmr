@@ -34,7 +34,7 @@ export {
     compareRev,
     type BackfillProgress,
     type Cursor,
-    type DeltaCursor,
+    type DigestMarker,
     type IntakeOutcome,
     type MonitorIndex,
     type Observation,

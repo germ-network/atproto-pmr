@@ -16,7 +16,7 @@ import {
     sweepBackfill,
     type FetchedRecord,
 } from "@germ-network/atproto-pmr-monitor"
-import { kvSnapshotStore } from "../src/snapshot-store"
+import { DIGEST_MARKER_KEY, kvSnapshotStore } from "../src/snapshot-store"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
 
@@ -102,56 +102,6 @@ describe("the index", () => {
             return obj.duePending(Date.now(), 10)
         })
         expect(owed).toEqual([])
-    })
-
-    it("answers changedSince, which is why the index is not merely KV", async () => {
-        // REALISTIC MAGNITUDES, deliberately. An earlier version of this
-        // test used 1000/5000 with a cursor of 2000 — self-consistent
-        // numbers that passed while the production comparison was a stream
-        // cursor in MICROSECONDS against an observation time in
-        // MILLISECONDS, which is always false. Fixtures drawn from outside
-        // the real domain cannot catch a unit mismatch.
-        const stub = freshStub()
-        const now = Date.now()
-        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete("did:plc:old", "3m1", now - 60_000)
-            await obj.complete("did:plc:new", "3m2", now - 1_000)
-            return obj.changedSince(
-                ["did:plc:old", "did:plc:new", "did:plc:absent"],
-                String(now - 30_000)
-            )
-        })
-        expect(result.dids).toEqual(["did:plc:new"])
-    })
-
-    it("hands back a delta cursor usable as the next request's `since`", async () => {
-        // The round trip is the property: a cursor the monitor issued must
-        // exclude what it already reported. A stream cursor here would be
-        // 1000x out and silently report nothing, forever.
-        const stub = freshStub()
-        const now = Date.now()
-        const second = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete(DID, "3m1", now - 1_000)
-            const first = await obj.changedSince([DID], null)
-            expect(first.dids).toEqual([DID])
-            return obj.changedSince([DID], first.nextCursor)
-        })
-        expect(second.dids).toEqual([])
-    })
-
-    it("does not confuse the stream cursor with a delta cursor", async () => {
-        // Feed it a REAL Jetstream cursor (microseconds) as if someone
-        // wired the two together again: it must not silently answer
-        // "nothing changed" for a DID observed a second ago.
-        const stub = freshStub()
-        const now = Date.now()
-        const streamCursor = String(now * 1000)
-        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete(DID, "3m1", now - 1_000)
-            return obj.changedSince([DID], String(now - 30_000))
-        })
-        expect(result.dids).toEqual([DID])
-        expect(Number(streamCursor)).toBeGreaterThan(Number(result.nextCursor))
     })
 })
 
@@ -301,14 +251,26 @@ describe("digest windows", () => {
         const sealed = await inMonitorObj(stub, async (obj) => {
             await obj.complete("did:plc:old", "3m1", currentWindow - 2 * 600_000)
             await obj.complete("did:plc:now", "3m2", now)
+            // As if sealing had already progressed to just before the old
+            // window on a prior tick — a fresh install starts coverage
+            // "now", not retroactively, so this test needs a marker to
+            // exercise catching up on a real backlog.
+            await kvSnapshotStore(testEnv).putDigestMarker({
+                sealedThrough: currentWindow - 3 * 600_000,
+                oldest: currentWindow - 3 * 600_000,
+            })
             return sealDueWindows({
                 index: obj,
                 snapshot: kvSnapshotStore(testEnv),
                 widthMs: 600_000,
+                retentionMs: 7 * 24 * 60 * 60 * 1000,
                 nowMs: () => now,
             })
         })
-        expect(sealed).toEqual([currentWindow - 2 * 600_000])
+        // Both the old window AND the empty one between it and current seal
+        // — every window in range gets a physical entry now, not only the
+        // ones with members.
+        expect(sealed).toEqual([currentWindow - 2 * 600_000, currentWindow - 600_000])
 
         const bytes = await kvSnapshotStore(testEnv).getSealedWindow(String(currentWindow - 2 * 600_000))
         const [w] = decodeDigestWindows(bytes!)
@@ -341,22 +303,29 @@ describe("digest windows", () => {
         expect((12 * 600_000) % 600_000).toBe(0)
     })
 
-    it("tracks sealedThrough, the boundary between empty and unpublished", async () => {
+    it("tracks the digest marker, the boundary between empty and unpublished", async () => {
+        // The marker lives in KV now, not the object's own storage — a
+        // request handler reads it directly and never touches the object
+        // at all.
         const stub = freshStub()
         const now = Date.now()
-        const before = await inMonitorObj(stub, (obj) => obj.readSealedThrough())
+        // KV, unlike a fresh DO id, is shared across this file's tests —
+        // an earlier test may have already written the singleton marker
+        // key, so start from a known-clean state rather than assume one.
+        await testEnv.records.delete(DIGEST_MARKER_KEY)
+        const before = await kvSnapshotStore(testEnv).getDigestMarker()
         expect(before).toBeNull()
         await inMonitorObj(stub, (obj) =>
             sealDueWindows({
                 index: obj,
                 snapshot: kvSnapshotStore(testEnv),
                 widthMs: 600_000,
+                retentionMs: 7 * 24 * 60 * 60 * 1000,
                 nowMs: () => now,
             })
         )
-        expect(await inMonitorObj(stub, (obj) => obj.readSealedThrough())).toBe(
-            Math.floor(now / 600_000) * 600_000 - 600_000
-        )
+        const marker = await kvSnapshotStore(testEnv).getDigestMarker()
+        expect(marker?.sealedThrough).toBe(Math.floor(now / 600_000) * 600_000 - 600_000)
     })
 })
 
@@ -439,5 +408,15 @@ describe("the snapshot store", () => {
         await store.putSealedWindow("w1", new Uint8Array([4, 5]))
         expect([...((await store.getSealedWindow("w1")) ?? [])]).toEqual([4, 5])
         expect(await store.getSealedWindow("w-absent")).toBeNull()
+    })
+
+    it("round-trips the digest marker, absent until the first write", async () => {
+        // See the note on DIGEST_MARKER_KEY: KV is shared across this
+        // file's tests, so this starts from a known-clean state.
+        await testEnv.records.delete(DIGEST_MARKER_KEY)
+        const store = kvSnapshotStore(testEnv)
+        expect(await store.getDigestMarker()).toBeNull()
+        await store.putDigestMarker({ sealedThrough: 42, oldest: 7 })
+        expect(await store.getDigestMarker()).toEqual({ sealedThrough: 42, oldest: 7 })
     })
 })

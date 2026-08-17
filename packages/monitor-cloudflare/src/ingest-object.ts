@@ -4,14 +4,11 @@ import {
     intake,
     listReposByCollection,
     sealDueWindows,
-    serveDigest,
     settleDue,
     sweepBackfill,
     windowOf,
     type BackfillProgress,
-    type DigestPage,
     type Cursor,
-    type DeltaCursor,
     type FetchedRecord,
     type IngestDeps,
     type IntakeOutcome,
@@ -183,37 +180,6 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
     }
 
-    /** Serve a digest page. Read-only, so a Worker may call it directly. */
-    async digestPage(from: number): Promise<DigestPage> {
-        return serveDigest(
-            {
-                index: this,
-                snapshot: kvSnapshotStore(this.env),
-                widthMs: this.digestWidthMs(),
-                byteBudget: this.envInt(this.env.DIGEST_BYTE_BUDGET, 65_536),
-                retentionMs:
-                    this.envInt(this.env.WINDOW_RETENTION_SECONDS, 604_800) * 1000,
-                nowMs: () => Date.now(),
-            },
-            from
-        )
-    }
-
-    async closedWindowsWithMembers(
-        currentWindow: number,
-        limit: number
-    ): Promise<number[]> {
-        return this.db.sql
-            .exec<{ window: number }>(
-                "SELECT DISTINCT window FROM window_members WHERE window < ? " +
-                    "ORDER BY window LIMIT ?",
-                currentWindow,
-                limit
-            )
-            .toArray()
-            .map((r) => r.window)
-    }
-
     async windowMembers(window: number): Promise<string[]> {
         return this.db.sql
             .exec<{ did: string }>(
@@ -226,23 +192,6 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
 
     async dropWindow(window: number): Promise<void> {
         this.db.sql.exec("DELETE FROM window_members WHERE window = ?", window)
-    }
-
-    async readSealedThrough(): Promise<number | null> {
-        const row = this.db.sql
-            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'sealed_through'")
-            .toArray()[0]
-        if (row === undefined) return null
-        const parsed = Number(row.v)
-        return Number.isFinite(parsed) ? parsed : null
-    }
-
-    async setSealedThrough(window: number): Promise<void> {
-        this.db.sql.exec(
-            "INSERT INTO meta (k, v) VALUES ('sealed_through', ?) " +
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            String(window)
-        )
     }
 
     async readBackfillProgress(): Promise<BackfillProgress> {
@@ -293,32 +242,6 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             .exec<{ rev: string }>("SELECT rev FROM revs WHERE did = ?", did)
             .toArray()[0]
         return row?.rev ?? null
-    }
-
-    /**
-     * Compared in **this monitor's observation clock**, never against the
-     * stream cursor: those are different quantities in different units,
-     * and comparing them answers "nothing changed" forever rather than
-     * failing. The cursor handed back is drawn from the same clock.
-     */
-    async changedSince(
-        dids: readonly string[],
-        since: DeltaCursor | null
-    ): Promise<{ dids: string[]; nextCursor: DeltaCursor }> {
-        const now = Date.now()
-        if (dids.length === 0) return { dids: [], nextCursor: String(now) }
-        const parsed = since === null ? 0 : Number(since)
-        const bound = Number.isFinite(parsed) ? parsed : 0
-        const holes = dids.map(() => "?").join(",")
-        const changed = this.db.sql
-            .exec<{ did: string }>(
-                `SELECT did FROM revs WHERE observed_at > ? AND did IN (${holes})`,
-                bound,
-                ...dids
-            )
-            .toArray()
-            .map((r) => r.did)
-        return { dids: changed, nextCursor: String(now) }
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -374,14 +297,16 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
      *
      * The upgrade fetch is bounded, unlike a plain request: this runs
      * inside `alarm()`, which is single-threaded with every other call
-     * into this object — `digestPage()` included. An upstream that
-     * accepts the connection and never completes the handshake would
-     * otherwise wedge the object forever, with no self-heal, since the
-     * watchdog that is supposed to recover from exactly that is the thing
-     * stuck. Observed in production: Jetstream stopped answering, and
-     * every DO-touching route hung indefinitely while plain KV reads
-     * stayed fast — the object was blocked here, never reaching `alarm`'s
-     * `finally` to reschedule itself.
+     * into this object. An upstream that accepts the connection and never
+     * completes the handshake would otherwise wedge the object forever,
+     * with no self-heal, since the watchdog that is supposed to recover
+     * from exactly that is the thing stuck. Observed in production before
+     * the digest read path moved off this object entirely: Jetstream
+     * stopped answering, and every route that RPC'd in here hung
+     * indefinitely while plain KV reads stayed fast — this object was
+     * blocked here, never reaching `alarm`'s `finally` to reschedule
+     * itself. No request handler reaches this object anymore, so a wedge
+     * here now only delays ingest, never a read.
      */
     async connect(): Promise<void> {
         if (this.socket !== null) return
@@ -482,6 +407,8 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
                 index: this,
                 snapshot: kvSnapshotStore(this.env),
                 widthMs: this.digestWidthMs(),
+                retentionMs:
+                    this.envInt(this.env.WINDOW_RETENTION_SECONDS, 604_800) * 1000,
                 nowMs: () => Date.now(),
             })
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
