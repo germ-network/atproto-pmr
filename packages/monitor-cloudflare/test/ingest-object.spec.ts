@@ -6,7 +6,12 @@
  * across an eviction, that a replayed event costs no fetch, and that a
  * failed fetch stays owed — because the stream will not redeliver it.
  */
-import { env, runInDurableObject } from "cloudflare:test"
+import {
+    env,
+    evictDurableObject,
+    runDurableObjectAlarm,
+    runInDurableObject,
+} from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import {
     decodeDigestWindows,
@@ -57,16 +62,72 @@ function withFetch(
 }
 
 describe("the index", () => {
-    it("advances the cursor with intake, and survives eviction", async () => {
+    it("advances the cursor with intake, read back on a separate entry", async () => {
+        // Proves the cursor lives in storage, not an in-memory field --
+        // but NOT that it survives an eviction: `runInDurableObject` reuses
+        // the same live instance across calls to one stub unless something
+        // actually evicts it in between. See "the alarm chain resumes..."
+        // below for the real eviction test.
         const stub = freshStub()
         await runInDurableObject(stub, (obj: MonitorIngest) =>
             obj.intake({ did: DID, rev: "3m1" }, "1786695916763191")
         )
-        // A separate entry into the object: state came from storage, not memory.
         const cursor = await runInDurableObject(stub, (obj: MonitorIngest) =>
             obj.readCursor()
         )
         expect(cursor).toBe("1786695916763191")
+    })
+
+    it("the alarm chain resumes the Jetstream cursor across an eviction", async () => {
+        // The design's actual resilience claim (ingest-object.ts's class
+        // doc comment): an eviction is indistinguishable from any other
+        // gap because the alarm reconnects from the STORED cursor. That
+        // needs a genuine eviction to prove -- evictDurableObject() tears
+        // down the in-memory instance (including `socket`) while keeping
+        // storage, which the platform's own eviction does too. A test that
+        // only reuses the same live instance across calls (the test above)
+        // cannot tell "storage is durable" from "the reconnect logic
+        // actually reads it back", since neither one is exercised without
+        // a real instance teardown in between.
+        const stub = freshStub()
+        const cursor = "1786695916763191"
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, cursor)
+            // An alarm survives eviction (it's platform-scheduled state,
+            // not in-memory) -- arm one so runDurableObjectAlarm below has
+            // something to fire on the fresh post-eviction instance.
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+
+        await evictDurableObject(stub)
+
+        // alarm() also runs sweepBackfill() and settleDue() in the same
+        // tick, both of which call fetch too -- so every request is
+        // recorded rather than just the last one, and the Jetstream
+        // request is found by its URL rather than assumed to be first.
+        const requestedUrls: string[] = []
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) => {
+            requestedUrls.push(typeof url === "string" ? url : url.toString())
+            // A real 200 with no `webSocket`, not an invalid status --
+            // connect() then throws its own "did not upgrade" error on
+            // the missing socket, same as any other fetch call here that
+            // has nowhere real to reach in this harness. The URL each
+            // call was given, captured above, is the property under test.
+            return Promise.resolve(new Response(null, { status: 200 }))
+        }) as typeof fetch
+
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // Expected: every fetch in this tick fails the same way.
+        } finally {
+            globalThis.fetch = original
+        }
+
+        const jetstreamRequest = requestedUrls.find((u) => u.includes("jetstream"))
+        expect(jetstreamRequest).toBeDefined()
+        expect(new URL(jetstreamRequest!).searchParams.get("cursor")).toBe(cursor)
     })
 
     it("owes a fetch for an unseen rev", async () => {
