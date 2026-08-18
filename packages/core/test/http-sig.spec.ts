@@ -138,6 +138,19 @@ describe("a well-formed signature verifies", () => {
         })
         expect(verify(signed.headers, publicKey, body).valid).toBe(true)
     })
+
+    it("accepts a request with a query string — signRequest covers @query by default", () => {
+        const { secretKey, publicKey } = keypair()
+        const url = `${URL_}?cursor=abc`
+        const signed = signRequest({
+            method: "GET",
+            url,
+            nonce: "challenge-3",
+            keyid: "thumb",
+            secretKey,
+        })
+        expect(verify(signed.headers, publicKey, null, url, "GET").valid).toBe(true)
+    })
 })
 
 describe("the profile's refusals", () => {
@@ -262,6 +275,59 @@ describe("the profile's refusals", () => {
             "https://other-relay.example/pmr/v1/grants"
         )
         expect(elsewhere.valid).toBe(false)
+    })
+
+    it("rejects a request with a query string that does not cover @query", () => {
+        // Without this, a signature authenticates the endpoint but not
+        // which query was asked for — a captured signature could be
+        // replayed against any query the base URL accepts.
+        const { secretKey, publicKey } = keypair()
+        const url = `${URL_}?cursor=abc`
+        const signed = signRequest({
+            method: "GET",
+            url,
+            nonce: "n",
+            keyid: "thumb",
+            secretKey,
+            components: ["@method", "@authority", "@path"],
+        })
+        const outcome = verify(signed.headers, publicKey, null, url, "GET")
+        expect(outcome.valid).toBe(false)
+        if (outcome.valid) throw new Error("unreachable")
+        expect(outcome.reason).toContain("@query")
+    })
+
+    it("rejects a query swap — @query is covered, so a captured request cannot be pointed at a different cursor", () => {
+        const { secretKey, publicKey } = keypair()
+        const signed = signRequest({
+            method: "GET",
+            url: `${URL_}?cursor=abc`,
+            nonce: "n",
+            keyid: "thumb",
+            secretKey,
+        })
+        const swapped = verify(
+            signed.headers,
+            publicKey,
+            null,
+            `${URL_}?cursor=zzz`,
+            "GET"
+        )
+        expect(swapped.valid).toBe(false)
+    })
+
+    it("does not require @query on a request with no query string", () => {
+        // The gate is on the request, not the route: a bare GET still
+        // verifies with the same three required components as before.
+        const { secretKey, publicKey } = keypair()
+        const signed = signRequest({
+            method: "GET",
+            url: URL_,
+            nonce: "n",
+            keyid: "thumb",
+            secretKey,
+        })
+        expect(verify(signed.headers, publicKey, null, URL_, "GET").valid).toBe(true)
     })
 
     it("never trusts alg from the message", () => {

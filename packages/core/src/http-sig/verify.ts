@@ -108,6 +108,18 @@ export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
         return { valid: false, reason: "bodied request must cover content-digest" }
     }
 
+    // Same reasoning as the body check, for the other thing `@path` alone
+    // does not cover: a query string. Without this, a signature
+    // authenticates the endpoint but not which page/cursor/filter was
+    // asked for, so a captured signature could be replayed against any
+    // query the base URL accepts — on a cursor-paged surface, that both
+    // extends what a captor can page through and lets a query get
+    // silently rewritten without invalidating the signature.
+    const hasQuery = new URL(request.url).search !== ""
+    if (hasQuery && !covered.has("@query")) {
+        return { valid: false, reason: "request with a query string must cover @query" }
+    }
+
     // The algorithm is pinned to what the resolved key implies. `alg` in
     // the message is checked for conformance but never consulted to decide
     // how to verify — trusting it would let a signer nominate a weaker

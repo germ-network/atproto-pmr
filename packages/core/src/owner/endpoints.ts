@@ -1,12 +1,14 @@
 import { redeemChallenge } from "../challenge.js"
 import { encodeOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
+import { messageEntryFields } from "../events.js"
 import { deriveGrantAddress } from "../grant.js"
 import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
-import { asPairMailboxKey, isPairMailboxKey } from "../mailbox-key.js"
+import { asMailboxKey, asPairMailboxKey, isPairMailboxKey } from "../mailbox-key.js"
 import { binaryToBase64URL, readBodyCapped, toResponseBody } from "../util.js"
 import type {
+    BodyStore,
     Directory,
     PairMailboxKey,
     RegistrationFields,
@@ -598,6 +600,129 @@ export async function handleGrantDelete(
 
     await a.auth.store.invalidateGrant(address)
     await deps.directory.deleteGrantAddress(address)
+
+    return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
+}
+
+// MARK: - Messages
+
+/**
+ * Deps specific to the REST delivery surface, layered onto `OwnerDeps`.
+ *
+ * `bodies` is needed because `OwnerDeps` has no `BodyStore` — every other
+ * owner capability reads only `PMRStore`, and message bytes live
+ * separately (`storage.ts`'s `BodyStore`).
+ */
+export interface MessagesConfig {
+    bodies: BodyStore
+    /**
+     * Mailboxes per catch-up page — bounds mailboxes, NOT messages, since
+     * that is the unit `openMailboxes` paginates on. A provisioned mailbox
+     * can hold its full per-sender byte cap, so this must stay small
+     * enough that one page cannot approach the platform's own
+     * subrequest/response-size ceilings.
+     */
+    catchUpPageMailboxes: number
+    /** Refuses a single acks request naming more than this many. */
+    maxAcksPerRequest: number
+}
+
+/**
+ * `GET /pmr/v1/messages?cursor=` — REST catch-up for a client that cannot
+ * hold `GET /pmr/v1/events`'s socket.
+ *
+ * One `openMailboxes` call per request, unlike `drainBacklog`'s socket
+ * path (`events.ts`), which loops to `nextCursor === null` itself — here
+ * the CLIENT drives pagination, as with every other cursor-paged
+ * capability in this codebase.
+ *
+ * A ref whose body is missing (expired, or racing retention) is skipped,
+ * matching `drainBacklog` — there is nothing left to deliver, and the ack
+ * path is idempotent either way. An all-empty page with a non-null `n` is
+ * legal (`storage.ts`'s `openMailboxes` doc comment); the client MUST keep
+ * paging on `n` rather than treating an empty `ms` as the end.
+ */
+export async function handleMessagesList(
+    request: Request,
+    deps: OwnerDeps & MessagesConfig
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const cursor = new URL(request.url).searchParams.get("cursor")
+    const page = await a.auth.store.openMailboxes(cursor, deps.catchUpPageMailboxes)
+
+    const ms: CoseValue[] = []
+    for (const entry of page.entries) {
+        for (const ref of entry.messages) {
+            const body = await deps.bodies.getBody(ref.messageId)
+            if (body === null) continue
+            ms.push(messageEntryFields(entry.key, ref, body))
+        }
+    }
+
+    return amortize(
+        cbor([
+            ["ms", ms],
+            ["n", page.nextCursor],
+        ]),
+        a.auth.did,
+        deps
+    )
+}
+
+/**
+ * `POST /pmr/v1/messages/acks` — batch ack, idempotent up to
+ * `maxAcksPerRequest` (published as `core.maxAckBatch`, `config.ts`).
+ *
+ * Body: `{ "a": [ {k, id}, … ] }` — `{k, id}` matches the socket's `#ack`
+ * frame body verbatim (`events.ts`'s `decodeAckFrame`), so a client's ack
+ * logic is the same shape on either surface.
+ *
+ * Validate-then-execute, matching `handlePoolAdjudication`: a malformed
+ * `k` (or a non-string `id`) fails the WHOLE batch with 400 before
+ * anything is removed. This composes cleanly because `remove` cannot fail
+ * on an unknown record (`storage.ts` contract 6) — the only way an entry
+ * can be "bad" is a request-shape problem decidable from the bytes alone,
+ * exactly the class this codebase already answers 400 to. Non-atomicity
+ * across the execute loop itself is unavoidable (a mid-loop storage
+ * failure leaves earlier removes committed) and is safe BECAUSE of that
+ * same contract: the client's retry of the whole batch is a no-op for
+ * whatever already succeeded.
+ */
+export async function handleMessagesAcks(
+    request: Request,
+    deps: OwnerDeps & MessagesConfig
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    let acks: { key: string; messageId: string }[]
+    try {
+        const map = decodeCoseMap(a.body ?? new Uint8Array(0))
+        const raw = map.get("a")
+        if (!Array.isArray(raw)) throw new Error("expected an array")
+        acks = raw.map((entry) => {
+            if (!(entry instanceof Map)) throw new Error("expected a map")
+            const k = entry.get("k")
+            const id = entry.get("id")
+            if (typeof k !== "string" || typeof id !== "string") {
+                throw new Error("expected string k/id")
+            }
+            asMailboxKey(k) // throws on a key matching neither prefix
+            return { key: k, messageId: id }
+        })
+    } catch {
+        return new Response("Malformed body", { status: 400 })
+    }
+
+    if (acks.length > deps.maxAcksPerRequest) {
+        return new Response("Too many acks requested", { status: 400 })
+    }
+
+    for (const ack of acks) {
+        await a.auth.store.remove(asMailboxKey(ack.key), ack.messageId)
+    }
 
     return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
 }

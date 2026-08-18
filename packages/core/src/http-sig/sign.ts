@@ -37,12 +37,17 @@ export interface SignedRequestParts {
 export function signRequest(opts: SignOptions): SignedRequestParts {
     const label = opts.label ?? DEFAULT_LABEL
     const hasBody = opts.body !== undefined && opts.body.byteLength > 0
+    const hasQuery = new URL(opts.url).search !== ""
 
     const components =
         opts.components ??
-        (hasBody
-            ? ["@method", "@authority", "@path", "content-digest"]
-            : ["@method", "@authority", "@path"])
+        [
+            "@method",
+            "@authority",
+            "@path",
+            ...(hasQuery ? ["@query"] : []),
+            ...(hasBody ? ["content-digest"] : []),
+        ]
 
     const headers: Record<string, string> = {}
     if (hasBody) {
