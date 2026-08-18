@@ -1167,6 +1167,7 @@ add a parallel array someone has to keep aligned with another one.
       "versions": ["1"],
       "pathPrefix": "/pmr/v1",
       "challengeExpiry": 600,
+      "maxAckBatch": 64,
       "vapidKey": "BIPu0Xl58BSDv_BWNq6VB_Riag7dd4VrHv6zbc_bFD1H6PAM4KlD85f4G__Rztpsh-HR0h6hDYS3pJ9LCtKTlxY"
     },
     "didMailbox": {
@@ -1209,6 +1210,11 @@ would be the one path a client could not discover.
 example above shows one that does. It is optional and absent by default;
 see [Push delivery](#push-delivery--web-push-optional) for what a client
 does with it.
+
+`core` also carries **`maxAckBatch`** — the maximum number of entries a
+single `POST /pmr/v1/messages/acks` request may carry (see
+[Delivery — owner-facing](#delivery--owner-facing)). A batch over this
+limit is rejected whole, before anything is removed.
 
 Every entry carries at least:
 
