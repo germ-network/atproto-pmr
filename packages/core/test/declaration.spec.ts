@@ -380,12 +380,19 @@ describe("PDS resolution matches @atproto/identity", () => {
         expect((await resolveDeclaration(DID_PLC, fetchImpl)).found).toBe(false)
     })
 
-    it("asks fetch to refuse redirects on every request", async () => {
+    it("asks fetch not to auto-follow redirects on every request", async () => {
         // Whether a redirect is followed is the real fetch's behaviour, not
         // something a fixture can exercise — so the property pinned here is
         // that the option is actually passed. Without it the https check is
         // decorative: it validates the URL we chose, and a 302 goes
         // somewhere it never runs again.
+        //
+        // "manual", not the Fetch spec's "error": Cloudflare Workers'
+        // fetch() implements only "follow" and "manual", throwing a
+        // TypeError on "error" in production — invisible here because this
+        // fixture, like every other in this file, never validates its
+        // `init` argument the way a real runtime does. The refusal itself
+        // is `atproto-fetch.spec.ts`'s `isRedirect` coverage.
         const keyBytes = new Uint8Array(32).fill(0x55)
         const { impl, calls } = recordingFetch({
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
@@ -397,7 +404,7 @@ describe("PDS resolution matches @atproto/identity", () => {
         // Both hops: the directory and the PDS.
         expect(calls.length).toBe(2)
         for (const call of calls) {
-            expect(call.init?.redirect).toBe("error")
+            expect(call.init?.redirect).toBe("manual")
         }
     })
 })
