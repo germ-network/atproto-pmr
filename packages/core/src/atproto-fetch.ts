@@ -46,6 +46,26 @@ const FETCH_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BYTES = 64 * 1024
 
 /**
+ * True for a redirect under `redirect: "manual"`. Two forms, because the
+ * runtime decides which one shows up: Cloudflare Workers returns the PDS's
+ * actual 3xx status and `Location` header, while the WHATWG fetch spec
+ * (browsers, undici) collapses it to an opaque status-0 response with
+ * `type: "opaqueredirect"`. Checking status alone misses the second form;
+ * checking type alone misses the first.
+ *
+ * `.type` is read through an `unknown` cast rather than compared against
+ * the `ResponseType` literal union directly: Cloudflare's own workers-types
+ * narrow that union to exclude `"opaqueredirect"` (a runtime it never
+ * itself produces), which makes the literal comparison a TypeScript error
+ * for any downstream package — like this one — that also typechecks
+ * against workers-types.
+ */
+function isRedirect(response: Response): boolean {
+    if (response.status >= 300 && response.status < 400) return true
+    return (response as { type: unknown }).type === "opaqueredirect"
+}
+
+/**
  * `fetch` with the bounds above, plus the https-only check.
  *
  * The body is read through a capped reader rather than `response.json()`,
@@ -76,9 +96,18 @@ export async function guardedFetchJSON(
             // it validates the URL we chose, and a `302` would take us
             // somewhere it never runs again. That is the whole SSRF hole
             // reopened by a redirect an attacker's PDS controls.
-            redirect: "error",
+            //
+            // "manual", not the spec's "error": Cloudflare Workers' fetch()
+            // implements only "follow" and "manual", throwing a TypeError on
+            // "error" — a production-only failure, since every test here
+            // injects a mock fetchImpl that never validates the option at
+            // all. The refusal happens explicitly below instead.
+            redirect: "manual",
             headers: { accept: "application/did+ld+json,application/json" },
         })
+        if (isRedirect(response)) {
+            throw new Error("refusing a redirect")
+        }
         if (!response.ok) {
             throw new Error(`endpoint answered ${response.status}`)
         }
@@ -142,9 +171,13 @@ export async function guardedFetchBytes(
     try {
         const response = await fetchImpl(url, {
             signal: controller.signal,
-            redirect: "error",
+            // See guardedFetchJSON: "error" throws on Cloudflare Workers.
+            redirect: "manual",
             headers: { accept: "application/vnd.ipld.car" },
         })
+        if (isRedirect(response)) {
+            throw new Error("refusing a redirect")
+        }
         if (!response.ok) {
             throw new Error(`endpoint answered ${response.status}`)
         }
