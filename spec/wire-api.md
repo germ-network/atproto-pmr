@@ -912,14 +912,23 @@ body   = { ... type-specific fields ... }
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
 
-**Ordering on connect: `#capabilities` first, then every queued message,
-oldest mailbox first, then `#pool` if and only if the pool is non-empty,
-then `#caughtUp`, always.** This is not an optimization — it costs no extra
-push, no extra round trip, and no extra wake, because the device is already
-attached and already draining — it is the property that lets a device treat
-"real mail" and "merely waiting to be judged" as answered in that priority
-order. `#capabilities` leads because it frames how to read everything after
-it.
+**Ordering on connect, among the connect-time backlog frames: `#capabilities`
+first, then every queued message, oldest mailbox first, then `#pool` if and
+only if the pool is non-empty, then `#caughtUp`, always.** This is not an
+optimization — it costs no extra push, no extra round trip, and no extra
+wake, because the device is already attached and already draining — it is
+the property that lets a device treat "real mail" and "merely waiting to be
+judged" as answered in that priority order. `#capabilities` leads because it
+frames how to read everything after it.
+
+**A live `#delivery` MAY interleave anywhere after `#capabilities`,
+including mid-backlog or between `#pool` and `#caughtUp`.** Only
+`#capabilities`-first is an ordering guarantee against the *entire*
+connection; the backlog ordering above is a guarantee among the backlog
+frames themselves, not a promise that nothing else arrives between them. A
+message newly delivered while a connect-time drain is still in flight is not
+required to wait for `#caughtUp` — see the redelivery note below for why an
+early or duplicate arrival is still safe to act on.
 
 #### `#capabilities`
 
@@ -977,11 +986,11 @@ retained-out, and a client that never receives the live push still
 recovers it on its next reconnect-drain.
 
 A client MAY receive the same `#delivery` more than once on a
-connection — a live push can race the connect-time drain, since both read
-from the same mailbox independently. A client MUST treat `(k, id)` as the
-identity of a message rather than assuming at-most-once delivery.
-Redelivery is already safe: `id` is a content address and acks are
-idempotent.
+connection — a live push can race the connect-time drain, since the drain
+reads the mailbox independently of whatever arrives live in the meantime. A
+client MUST treat `(k, id)` as the identity of a message rather than
+assuming at-most-once delivery. Redelivery is already safe: `id` is a
+content address and acks are idempotent.
 
 **This is deliberately not a durable, resumable event log with a sequence
 cursor**, unlike atproto's own ephemeral commit stream. A message here
