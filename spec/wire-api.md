@@ -976,6 +976,13 @@ since an unacked message already persists in its mailbox until acked or
 retained-out, and a client that never receives the live push still
 recovers it on its next reconnect-drain.
 
+A client MAY receive the same `#delivery` more than once on a
+connection — a live push can race the connect-time drain, since both read
+from the same mailbox independently. A client MUST treat `(k, id)` as the
+identity of a message rather than assuming at-most-once delivery.
+Redelivery is already safe: `id` is a content address and acks are
+idempotent.
+
 **This is deliberately not a durable, resumable event log with a sequence
 cursor**, unlike atproto's own ephemeral commit stream. A message here
 stays durable in its mailbox queue until acked, so reconnecting and

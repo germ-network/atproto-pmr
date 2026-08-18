@@ -4,7 +4,7 @@
  * before caughtUp, only if non-empty" ordering property.
  */
 import { env } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import {
     decodeFrame,
     encodeCose,
@@ -277,5 +277,253 @@ describe("routing", () => {
         const stub = freshStub()
         const response = await stub.fetch("https://relay.example/pmr/v1/events")
         expect(response.status).toBe(426)
+    })
+})
+
+describe("live push", () => {
+    it("append() does no socket I/O — deliverLive is the only push", async () => {
+        // T1. A raw post-append() snapshot would be race-prone (frame
+        // delivery to the listener is itself async), so this counts total
+        // delivered frames after BOTH calls settle: if append() had also
+        // pushed, the count would be 2, not 1.
+        const stub = freshStub()
+        const { ws } = await connectAndDrain(stub)
+        const delivered: DecodedFrame[] = []
+        ws.addEventListener("message", (event) => {
+            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+
+        const ref = { messageId: "m1", byteLength: 5 }
+        await inPMR(stub, (pmr) =>
+            pmr.append("did:plc:alice", ref, new Uint8Array([1]), 0)
+        )
+        await inPMR(stub, (pmr) =>
+            pmr.deliverLive("did:plc:alice", ref, new TextEncoder().encode("hello"))
+        )
+        await expect.poll(() => delivered.length).toBe(1)
+        expect(delivered[0].type).toBe("delivery")
+        expect(delivered[0].body.get("id")).toBe("m1")
+    })
+
+    it("deliverLive pushes to an already-connected socket, no reconnect", async () => {
+        // T3.
+        const stub = freshStub()
+        const { ws } = await connectAndDrain(stub)
+        const delivered: DecodedFrame[] = []
+        ws.addEventListener("message", (event) => {
+            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+
+        await inPMR(stub, (pmr) =>
+            pmr.deliverLive(
+                "did:plc:alice",
+                {
+                    messageId: "m1",
+                    byteLength: 5,
+                    hint: { senderDID: "did:plc:bob", anchorKeyThumbprint: "th" },
+                },
+                new TextEncoder().encode("hello")
+            )
+        )
+        await expect.poll(() => delivered.length).toBe(1)
+        expect(delivered[0].type).toBe("delivery")
+        expect(delivered[0].body.get("k")).toBe("did:plc:alice")
+        expect(delivered[0].body.get("id")).toBe("m1")
+        expect(
+            new TextDecoder().decode(delivered[0].body.get("m") as Uint8Array)
+        ).toBe("hello")
+        expect(delivered[0].body.get("sd")).toBe("did:plc:bob")
+    })
+
+    it("fans out to every attached socket", async () => {
+        // T6.
+        const stub = freshStub()
+        const { ws: ws1 } = await connectAndDrain(stub)
+        const { ws: ws2 } = await connectAndDrain(stub)
+        const received1: DecodedFrame[] = []
+        const received2: DecodedFrame[] = []
+        ws1.addEventListener("message", (event) => {
+            received1.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+        ws2.addEventListener("message", (event) => {
+            received2.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+
+        await inPMR(stub, (pmr) =>
+            pmr.deliverLive(
+                "did:plc:alice",
+                { messageId: "m1", byteLength: 5 },
+                new TextEncoder().encode("hello")
+            )
+        )
+        await expect.poll(() => received1.length).toBe(1)
+        await expect.poll(() => received2.length).toBe(1)
+    })
+
+    it("is a no-op with nothing attached, and does not throw", async () => {
+        // T7.
+        const stub = freshStub()
+        await expect(
+            inPMR(stub, (pmr) =>
+                pmr.deliverLive(
+                    "did:plc:alice",
+                    { messageId: "m1", byteLength: 5 },
+                    new TextEncoder().encode("hello")
+                )
+            )
+        ).resolves.toBeUndefined()
+    })
+
+    it("a socket whose send() throws does not block delivery to the others", async () => {
+        // T11. Pins the guarded `ws.send` in `broadcast()`. A plain
+        // client-side `ws.close()` doesn't exercise this: this test
+        // runtime drops a cleanly-closed socket from `ctx.getWebSockets()`
+        // immediately, so `broadcast()` never even attempts to send to it
+        // (confirmed by mutation-testing an earlier version of this test
+        // that used `close()` — it passed with the guard removed). What the
+        // guard actually protects against is a peer that dropped WITHOUT a
+        // clean close, which the platform may not have noticed yet — so
+        // this test forces the failure directly on the DO-side socket.
+        const stub = freshStub()
+        const { ws: ws1 } = await connectAndDrain(stub)
+        const { ws: ws2 } = await connectAndDrain(stub)
+        const received: DecodedFrame[] = []
+        const record = (event: MessageEvent) => {
+            received.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        }
+        ws1.addEventListener("message", record)
+        ws2.addEventListener("message", record)
+
+        await inPMR(stub, (pmr) => {
+            const [socket] = (
+                pmr as unknown as { ctx: DurableObjectState }
+            ).ctx.getWebSockets()
+            vi.spyOn(socket, "send").mockImplementation(() => {
+                throw new Error("simulated dropped peer")
+            })
+        })
+
+        await expect(
+            inPMR(stub, (pmr) =>
+                pmr.deliverLive(
+                    "did:plc:alice",
+                    { messageId: "m1", byteLength: 5 },
+                    new TextEncoder().encode("hello")
+                )
+            )
+        ).resolves.toBeUndefined()
+        // Exactly one of the two sockets received it — the other's send
+        // threw and was swallowed rather than blocking the rest of the fan-out.
+        await expect.poll(() => received.length).toBe(1)
+    })
+
+    it("invalidateGrant still succeeds even if a socket's send() throws", async () => {
+        // T12. Regression guard for the adjacent fix: broadcastCapabilities
+        // now routes through the same guarded broadcast().
+        const stub = freshStub()
+        const future = Math.floor(Date.now() / 1000) + 3600
+        await inPMR(stub, (pmr) =>
+            pmr.issueGrant("addr-live", new Uint8Array(32), future)
+        )
+        await connectAndDrain(stub)
+        await inPMR(stub, (pmr) => {
+            const [socket] = (
+                pmr as unknown as { ctx: DurableObjectState }
+            ).ctx.getWebSockets()
+            vi.spyOn(socket, "send").mockImplementation(() => {
+                throw new Error("simulated dropped peer")
+            })
+        })
+
+        await expect(
+            inPMR(stub, (pmr) => pmr.invalidateGrant("addr-live"))
+        ).resolves.toBeUndefined()
+    })
+
+    it("deliverLive and drainBacklog produce byte-identical frames for the same entry", async () => {
+        // T13.
+        const stub = freshStub()
+        const ref = {
+            messageId: "m1",
+            byteLength: 5,
+            hint: { senderDID: "did:plc:bob", anchorKeyThumbprint: "th" },
+        }
+        const body = new TextEncoder().encode("hello")
+
+        await inPMR(stub, (pmr) => pmr.append("did:plc:alice", ref, new Uint8Array([1]), 0))
+        await testEnv.messages.put("m1", body)
+        const { frames: drained } = await connectAndDrain(stub)
+        const viaDrain = drained.find((f) => f.type === "delivery")!
+
+        const { ws: second } = await connectAndDrain(stub)
+        const viaLive: DecodedFrame[] = []
+        second.addEventListener("message", (event) => {
+            viaLive.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+        await inPMR(stub, (pmr) => pmr.deliverLive("did:plc:alice", ref, body))
+        await expect.poll(() => viaLive.length).toBe(1)
+
+        expect([...viaLive[0].body.entries()]).toEqual([...viaDrain.body.entries()])
+    })
+})
+
+describe("live push on pool provisioning", () => {
+    it("pushes provisioned messages to an attached socket without a reconnect", async () => {
+        const stub = freshStub()
+        await inPMR(stub, (pmr) =>
+            pmr.appendToPool(
+                "did:plc:recovering",
+                { messageId: "m1", byteLength: 5 },
+                new Uint8Array([1]),
+                0
+            )
+        )
+        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
+
+        const { ws } = await connectAndDrain(stub)
+        const delivered: DecodedFrame[] = []
+        ws.addEventListener("message", (event) => {
+            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+
+        const moved = await inPMR(stub, (pmr) =>
+            pmr.provisionFromPool("did:plc:recovering", 0)
+        )
+        expect(moved).toHaveLength(1)
+
+        await expect.poll(() => delivered.length).toBe(1)
+        expect(delivered[0].type).toBe("delivery")
+        expect(delivered[0].body.get("k")).toBe("did:plc:recovering")
+        expect(delivered[0].body.get("id")).toBe("m1")
+    })
+
+    it("is a no-op with nothing attached, and does not throw", async () => {
+        const stub = freshStub()
+        await inPMR(stub, (pmr) =>
+            pmr.appendToPool(
+                "did:plc:recovering",
+                { messageId: "m1", byteLength: 5 },
+                new Uint8Array([1]),
+                0
+            )
+        )
+        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
+
+        await expect(
+            inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:recovering", 0))
+        ).resolves.toEqual([{ messageId: "m1", byteLength: 5 }])
+    })
+
+    it("provisioning an empty sender pushes nothing", async () => {
+        const stub = freshStub()
+        const { ws } = await connectAndDrain(stub)
+        const delivered: DecodedFrame[] = []
+        ws.addEventListener("message", (event) => {
+            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
+        })
+
+        await inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:nobody", 0))
+        await new Promise((r) => setTimeout(r, 10))
+        expect(delivered).toHaveLength(0)
     })
 })

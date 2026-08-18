@@ -288,6 +288,28 @@ export interface PMRStore {
     /** CONSISTENCY CONTRACT (6): MUST succeed on an already-removed record. */
     remove(key: MailboxKey, messageId: MessageId): Promise<void>
 
+    /**
+     * Best-effort live delivery of a message that was just appended and whose
+     * body has already been persisted — `spec/wire-api.md`, "New messages MUST
+     * be pushed to an attached connection as they arrive".
+     *
+     * OPTIONAL: an adapter with no live-connection concept omits it, and the
+     * message is still delivered by reconnect-drain or REST catch-up. A caller
+     * MUST treat a rejection as nothing-happened — the entry stays queued until
+     * acked, so nothing is lost.
+     *
+     * The bytes are a PARAMETER rather than re-read from the `BodyStore`
+     * because the caller writes the body AFTER `append` resolves
+     * (`pair-put.ts`, `grant-put.ts`): an implementation that read them back
+     * would race its own caller's write.
+     *
+     * CALLERS MUST NOT call this on a response path. `append` is awaited before
+     * a pair put answers, so a push issued from inside it would make the put's
+     * latency depend on whether the recipient is connected. This is the reason
+     * it is a separate operation rather than folded into `append`.
+     */
+    deliverLive?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
+
     /** True for a provisioned mailbox *or* a blocked sender. */
     hasMailbox(key: MailboxKey): Promise<boolean>
 

@@ -3,6 +3,7 @@ import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
     drainBacklog,
     encodeCapabilitiesFrame,
+    encodeDeliveryFrame,
     handleAckFrame,
     parseGrantLifecycle,
     type AppendResult,
@@ -122,6 +123,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * last grant expires rather than on a deployment-wide schedule. A
      * deployment can therefore be `draining` while a client that holds no
      * live grants is correctly told `absent`.
+     *
+     * `fetch()` relies on this method's only await (`listGrants`, below)
+     * being a DO *storage* read: that keeps the input gate closed for the
+     * duration, so a concurrent `deliverLive` RPC cannot land on the new
+     * socket before `#capabilities` does. Adding a non-storage await here
+     * (a `fetch()` call, a timer) would reopen that race — don't.
      */
     private async effectiveCapabilities(): Promise<EffectiveCapabilities> {
         // Parsed rather than read loosely: an unrecognized value is a
@@ -160,8 +167,38 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     private async broadcastCapabilities(): Promise<void> {
         const sockets = this.ctx.getWebSockets()
         if (sockets.length === 0) return
-        const frame = encodeCapabilitiesFrame(await this.effectiveCapabilities())
-        for (const ws of sockets) ws.send(frame)
+        this.broadcast(encodeCapabilitiesFrame(await this.effectiveCapabilities()))
+    }
+
+    /**
+     * Fan out one frame to every attached connection.
+     *
+     * Every socket on this object belongs to THIS registration — the router
+     * resolves the stub from the authenticated DID — so there is no
+     * per-socket routing to do and no tag to filter on: an owner's devices
+     * all receive an owner's mail. Same reasoning `drainBacklog` already
+     * relies on.
+     *
+     * A send to a socket the peer dropped can throw; that is not the
+     * caller's problem, and letting it propagate would fail an owner
+     * request (or a deferred put) over a connection that is already gone.
+     */
+    private broadcast(frame: Uint8Array): void {
+        for (const ws of this.ctx.getWebSockets()) {
+            try {
+                ws.send(frame)
+            } catch {}
+        }
+    }
+
+    /** `PMRStore.deliverLive` — see `storage.ts` for why the bytes are a parameter. */
+    async deliverLive(
+        key: MailboxKey,
+        ref: MessageRef,
+        message: Uint8Array
+    ): Promise<void> {
+        if (this.ctx.getWebSockets().length === 0) return
+        this.broadcast(encodeDeliveryFrame(key, ref, message))
     }
 
     // MARK: - The events socket
@@ -560,7 +597,29 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
         await this.db.put(mailboxKey(key), [...queue, ...moved])
         await this.releasePool(key, pooled)
+
+        // Live push, deferred past this RPC's own response. Unlike
+        // `deliverLive`'s pair/grant-put callers, there's no body-write race
+        // to avoid here: these bodies were persisted when each message was
+        // first pooled (`pair-put.ts`), well before this adjudication call,
+        // so a KV read-back is safe.
+        if (moved.length > 0 && this.ctx.getWebSockets().length > 0) {
+            this.ctx.waitUntil(this.pushProvisioned(key, moved))
+        }
+
         return moved
+    }
+
+    private async pushProvisioned(
+        key: MailboxKey,
+        moved: MessageRef[]
+    ): Promise<void> {
+        const bodies = kvBodyStore(this.env)
+        for (const ref of moved) {
+            const body = await bodies.getBody(ref.messageId)
+            if (body === null) continue
+            this.broadcast(encodeDeliveryFrame(key, ref, body))
+        }
     }
 
     /** Drop the pooled entries and suppress the sender until `until`. */
