@@ -38,6 +38,7 @@ function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
             challengeExpirySeconds: 600,
             grantExpirySeconds: 2_592_000,
             maxGrantsPerRequest: 20,
+            maxAcksPerRequest: 64,
         },
         pool: {
             capBytes: 5_000_000,

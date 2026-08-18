@@ -65,16 +65,21 @@ export function decodeFrame(bytes: Uint8Array): DecodedFrame {
 }
 
 /**
- * A queued message, pair or grant mailbox alike — the socket does not
- * distinguish them, matching `openMailboxes`. `sd`/`kt` (the relay's
- * verification hint) are present only when the ref carries one, which pair
- * mailboxes do and grant mailboxes never do.
+ * A queued message's field vocabulary, pair or grant mailbox alike — the
+ * socket does not distinguish them, matching `openMailboxes`. `sd`/`kt`
+ * (the relay's verification hint) are present only when the ref carries
+ * one, which pair mailboxes do and grant mailboxes never do.
+ *
+ * Shared with the REST catch-up route (`owner/endpoints.ts`'s
+ * `handleMessagesList`), which reuses these exact keys unwrapped in a
+ * frame — so a client decodes one message shape whether it arrived on the
+ * socket or by polling `GET /pmr/v1/messages`.
  */
-export function encodeDeliveryFrame(
+export function messageEntryFields(
     mailboxKey: string,
     ref: MessageRef,
     message: Uint8Array
-): Uint8Array {
+): Map<string, CoseValue> {
     const entries: [string, CoseValue][] = [
         ["k", mailboxKey],
         ["id", ref.messageId],
@@ -84,7 +89,15 @@ export function encodeDeliveryFrame(
         entries.push(["sd", ref.hint.senderDID])
         entries.push(["kt", ref.hint.anchorKeyThumbprint])
     }
-    return encodeFrame("delivery", new Map(entries))
+    return new Map(entries)
+}
+
+export function encodeDeliveryFrame(
+    mailboxKey: string,
+    ref: MessageRef,
+    message: Uint8Array
+): Uint8Array {
+    return encodeFrame("delivery", messageEntryFields(mailboxKey, ref, message))
 }
 
 /**
@@ -239,9 +252,15 @@ export async function drainBacklog(
 }
 
 /**
- * Acks are idempotent — `remove` already succeeds on an unknown record, and
- * a key naming neither mailbox kind names nothing this store could hold, so
- * it is the same no-op rather than a distinct error.
+ * Acks are idempotent for a *known* key shape — `remove` already succeeds
+ * on an unknown record. A key naming neither mailbox kind is different: it
+ * fails `asMailboxKey`'s parse and throws, and is absorbed here only
+ * because the socket's frame dispatcher wraps every inbound frame in an
+ * umbrella catch (`PMRObject.webSocketMessage`) — there is no owner-facing
+ * "you sent something bad" channel on a long-lived connection, so a
+ * malformed ack is silently dropped rather than torn down as an error.
+ * The REST ack endpoint has no such umbrella and answers a malformed key
+ * with an explicit `400` instead.
  */
 export async function handleAckFrame(
     deps: EventsDeps,

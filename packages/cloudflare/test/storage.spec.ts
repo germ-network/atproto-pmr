@@ -796,6 +796,44 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         })
     })
 
+    it("a forged cursor cannot escape the mailbox key family into pool/synthetic/grant-row state", async () => {
+        // The cursor is now a wire-visible value (GER-2214's REST catch-up
+        // publishes it verbatim), so a caller can hand back an arbitrary
+        // string, not just one this object issued. `openMailboxes` passes
+        // it straight to `startAfter` — safe only because `prefix` is
+        // ALSO given and constrains every returned key regardless of
+        // where `startAfter` sorts. This pins that composition rather
+        // than assuming it.
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:pooled", ref("m2"), freshNonce(), T0)
+            await pmr.block("did:plc:blocked", T0)
+
+            // Sorts after every real "mbox:" key and lands inside the
+            // "pool:"/"syn:" key ranges — the forgery a caller who read the
+            // key layout off a real cursor could construct.
+            const forged = "pool:"
+            const page = await pmr.openMailboxes(forged, 100)
+            expect(page.entries).toEqual([])
+            expect(page.nextCursor).toBeNull()
+        })
+    })
+
+    it("a forged cursor from BEFORE every real key still returns only mailbox entries", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
+            await pmr.appendToPool("did:plc:pooled", ref("m2"), freshNonce(), T0)
+
+            // "grantrow:" sorts BEFORE "mbox:", so startAfter alone (with
+            // no prefix filter) would include the grant-row family too.
+            const forged = "grantrow:"
+            const page = await pmr.openMailboxes(forged, 100)
+            expect(page.entries.map((e) => e.key)).toEqual(["did:plc:a"])
+        })
+    })
+
     it("a DID containing ':' round-trips through the prefix strip", async () => {
         const stub = freshStub()
         const did = "did:web:relay.example:users:eve"

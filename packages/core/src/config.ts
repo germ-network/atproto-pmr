@@ -25,6 +25,8 @@ export interface PMRLimits {
     grantExpirySeconds: number
     /** Refuses a single `POST /pmr/v1/grants` request for more than this many. */
     maxGrantsPerRequest: number
+    /** Refuses a single `POST /pmr/v1/messages/acks` request naming more than this many. */
+    maxAcksPerRequest: number
 }
 
 export interface PoolLimits {
@@ -152,6 +154,14 @@ export interface CapabilityBase {
 
 export interface CoreCapability extends CapabilityBase {
     challengeExpiry: number
+    /**
+     * Published cap on a single `POST /pmr/v1/messages/acks` request —
+     * `spec/wire-api.md`'s delivery table names this as required ("batch
+     * ack; idempotent, up to the enabler document's limit"), not optional
+     * polish. What is enforced and what is published come from the same
+     * `PMRLimits.maxAcksPerRequest` value, so the two cannot drift.
+     */
+    maxAckBatch: number
     /**
      * This relay's VAPID public key, base64url, where it delegates push
      * (`spec/wire-api.md`, "Push delivery — Web Push"). A client binds a
@@ -298,6 +308,7 @@ export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
             versions: serves.versions,
             pathPrefix: serves.pathPrefix,
             challengeExpiry: limits.challengeExpirySeconds,
+            maxAckBatch: limits.maxAcksPerRequest,
             ...(config.vapidPublicKey !== undefined
                 ? { vapidKey: config.vapidPublicKey }
                 : {}),

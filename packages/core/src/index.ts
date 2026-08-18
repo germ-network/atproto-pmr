@@ -129,12 +129,15 @@ export {
     handleGrantSet,
     handleGrantsCreate,
     handleGrantsList,
+    handleMessagesAcks,
+    handleMessagesList,
     handlePoolAdjudication,
     handlePoolList,
     handleRegistrationCreate,
     handleRegistrationDelete,
     handleRegistrationRead,
     type GrantConfig,
+    type MessagesConfig,
     type OwnerDeps,
 } from "./owner/endpoints.js"
 
