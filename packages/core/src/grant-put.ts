@@ -143,5 +143,10 @@ async function deliver(
             message,
             nowSeconds + deps.config.limits.messageExpirySeconds
         )
+        // Best effort: a failed push costs a reconnect-drain, never a
+        // message — the entry stays queued until acked either way.
+        try {
+            await store.deliverLive?.(grantMailboxKey(address), ref, message)
+        } catch {}
     }
 }

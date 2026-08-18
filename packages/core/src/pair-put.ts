@@ -192,7 +192,24 @@ export async function handlePairPut(
             // unconditionally — is what keeps "no bytes for a blocked
             // sender" true even though this code cannot tell blocked from
             // real. `duplicate` never re-stores; the body already landed.
-            deps.defer(storeBody())
+            deps.defer(
+                (async () => {
+                    await storeBody()
+                    // Best effort, and sequenced after the body write: a
+                    // failed push costs the recipient a reconnect-drain,
+                    // never a message, since the entry stays queued either
+                    // way. Swallowing the error here (not on storeBody)
+                    // keeps that asymmetry — the body MUST land even if the
+                    // live push doesn't.
+                    try {
+                        await store.deliverLive?.(
+                            mailboxKey,
+                            ref,
+                            envelope.payload.payload
+                        )
+                    } catch {}
+                })()
+            )
         }
         return new Response(null, { status: 202 })
     }
