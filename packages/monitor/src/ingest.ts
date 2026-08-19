@@ -137,6 +137,27 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         return "rejected"
     }
 
+    // A DID-document rotation lands here even when `rev` is unchanged —
+    // `intake`'s "reverify" path exists for exactly this case (an identity
+    // event, not a repo commit). Compare against what was previously
+    // served so a pure key rotation still notifies a registered device,
+    // not only a rev movement: a key rotation is arguably the single most
+    // security-relevant thing this component exists to catch.
+    //
+    // Only checked on "unchanged" — an "advanced" movement already fires
+    // `onChange` below regardless, so resolving the full previous record
+    // (a KV round trip carrying the whole CAR) would be wasted work on
+    // every ordinary, non-rotation settle.
+    let keyRotated = false
+    if (movement === "unchanged") {
+        const previous = await deps.snapshot.getRecord(did)
+        keyRotated =
+            previous !== null &&
+            previous.signingKey !== null &&
+            record.signingKey !== null &&
+            previous.signingKey !== record.signingKey
+    }
+
     const observedAtMs = deps.nowMs()
     await deps.snapshot.putRecord(did, {
         rev: record.rev,
@@ -147,7 +168,7 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
     })
     await deps.index.complete(did, record.rev, observedAtMs)
 
-    if (movement === "advanced") await deps.onChange?.(did, record.rev)
+    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, record.rev)
     return "stored"
 }
 

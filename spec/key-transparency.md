@@ -119,15 +119,27 @@ capability.
 
 | method | path | auth | purpose |
 |---|---|---|---|
-| `POST` | `/registrations` | anchor realm | register: own-DID push on any change |
-| `DELETE` | `/registrations` | anchor realm | deregister |
+| `POST` | `/registration` | anchor realm | register, or rebind the push subscription |
+| `DELETE` | `/registration` | anchor realm | deregister |
 | `GET` | `/digest?cursor=` | none | Bloom filter of changed DIDs, by window |
 | `GET` | `/records/{did}` | none | the community view: one record, as CAR |
+
+Singular throughout, including `POST` — a deliberate divergence from the
+PMR, whose create is plural (`POST /pmr/v1/registrations`) while its
+read/mutate/delete are singular (`wire-api.md`'s convention: an owner's own
+single resource is singular, with no identifier in the path, since the
+authenticated identity names it). The PMR needs the split because create
+and mutate are different operations (`PATCH` covers the mutable fields).
+Here `POST` **is** both create and rebind — there is no separate `PATCH` —
+so one singular path names the one resource for every verb that touches it.
 
 ### Registration and the own-DID push
 
 A registration binds a DID to a push destination; the monitor pushes when
-that DID's own record changes. This is the security primitive of the
+that DID's own record changes — a rev advancing or regressing, and a key
+rotation observed via an identity event even when `rev` did not move, since
+a rotation is arguably the single most security-relevant thing this
+component exists to catch. This is the security primitive of the
 component: the device holds ground truth for its own key, so a single
 honest monitor detects a malicious publication of it.
 
@@ -140,15 +152,43 @@ notification before swapping keys: the swap notifies the push destination
 bound to the old key. Registration is publish-then-register — a record must
 exist to authenticate against.
 
+**This property only holds if a mutation of an EXISTING registration is
+verified against the key stored at create time, never the currently-declared
+one.** `POST` with no existing registration verifies against the DID's
+current declaration (there is nothing else to check against). `POST` with
+an existing registration, and `DELETE`, both verify against the *stored*
+key, unconditionally — and the stored key is never rewritten by a `POST`,
+only the subscription fields are. A legitimate key rotation is therefore
+**`DELETE`, signed with the old stored key, followed by re-`POST`**, which
+verifies against the now-current declaration — never an in-place rebind of
+the key itself. A device that loses its old key before completing this
+(e.g. a reinstall) cannot rebind or deregister; that is bounded and
+self-healing, since the stranded subscription eventually answers 404/410 at
+the push service and the registration is dropped, ready for the device to
+re-register fresh under its current key.
+
+Body (provisional CBOR, single-letter keys — the same vocabulary the PMR's
+owner endpoints use): `{ pse: string, psk: bstr(32), psi: uint(0..255) }` —
+the subscription endpoint, its 32-byte content key, and the device-assigned
+`keyId`. Required, unlike the PMR's own registration: a monitor registration
+with no destination has no meaning. A monitor registration's subscription
+is its own, never shared with a co-located relay's — `keyId` is
+device-global across every deliverer a device holds.
+
 Push delivery is [Web Push](wire-api.md#push-delivery--web-push-optional),
 with both custody properties intact: the monitor holds a subscription,
 never a push token, and the payload is sealed under a device-provisioned
 symmetric content key the push service cannot read. A **browser** client
 can register with a monitor using the literal Push API — its subscription
 comes from its browser's own push service, with no additional
-infrastructure anywhere in the path. The push carries the changed DID and
-the monitor's observed `rev`; the device responds by fetching and
-verifying, not by trusting the push content.
+infrastructure anywhere in the path. **The push is content-free** — exactly
+`{t:"d"}`, per [the sealed payload](wire-api.md#the-sealed-payload), never
+the changed DID or the observed `rev`: bundling "here's what changed" would
+let a compromised deliverer assert a declaration directly to the device,
+bypassing the fetch-and-compare-across-monitors step this system exists to
+force. There is only one DID a registration's push could mean, so the
+device already knows which record to re-fetch and verify; it must never
+trust the push content itself.
 
 Deregistration revokes the delegation and forgets the subscription. Nothing
 a monitor holds is issued to third parties, so dropping one leaves no peer
@@ -387,14 +427,15 @@ above are designed to admit it without change.
 - **What the client does on detection** — alarm, refuse the record, both;
   refusal on a false positive is a self-inflicted outage, and skew makes
   false positives real.
-- **Registration lifecycle** — expiry, and the rebind flow after a
-  legitimate key rotation (the old key's push destination fires on the
-  rotation; how the new key re-registers without that being mistaken for an
-  attack).
-- **Concrete body schemas** — field-level CBOR for registration and the
-  delta response, under the wire API's
-  [encoding rules](wire-api.md#deterministic-cbor). The digest's own
-  serialization is settled above.
+- **Registration expiry.** The rebind flow after a legitimate key rotation
+  is now specified above (delete under the old key, re-register under the
+  new); what is still open is whether a registration should lapse on its
+  own after long inactivity. A registration stranded by a device that lost
+  its key is reclaimed by the push service's 404/410 discard, not by
+  expiry, so this is a cost/hygiene question rather than a correctness gap.
+- **Concrete body schema for the delta response** — the digest's own
+  serialization is settled above; registration's body is now specified
+  above too.
 - **Domain deltas** — a `GET /changes?domain=&cursor=` surface for a
   public-interest domain of DIDs (e.g. the caller's follow graph), as a
   cheaper alternative to the whole-population digest for a caller with a

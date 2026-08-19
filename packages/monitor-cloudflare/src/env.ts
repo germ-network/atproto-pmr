@@ -102,4 +102,16 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /** DIDs to discover per relay page, per wake. */
     BACKFILL_BATCH: string
+
+    /**
+     * The registration surface: own-DID push. Optional — a deployment that
+     * does not bind this serves the monitor with no registration/push
+     * capability at all (`onChange` no-ops), matching `webPushSender`'s
+     * "not configured → no-op" contract in `@germ-network/atproto-pmr-cloudflare`.
+     *
+     * Deliberately not the relay's own storage: see `MonitorRegistration`'s
+     * doc comment in `@germ-network/atproto-pmr-monitor` for why a
+     * registration must outlive a co-hosted relay registration.
+     */
+    registrations?: KVNamespace
 }

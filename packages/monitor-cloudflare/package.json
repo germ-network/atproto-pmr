@@ -18,6 +18,7 @@
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.18.7",
+		"@germ-network/atproto-pmr-core": "workspace:*",
 		"@germ-network/atproto-pmr-monitor": "workspace:*",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10",
@@ -29,6 +30,7 @@
 		"test": "vitest run"
 	},
 	"peerDependencies": {
+		"@germ-network/atproto-pmr-core": "*",
 		"@germ-network/atproto-pmr-monitor": "*"
 	}
 }

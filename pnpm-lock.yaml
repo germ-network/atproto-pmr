@@ -67,6 +67,9 @@ importers:
       '@germ-network/atproto-pmr-core':
         specifier: workspace:*
         version: link:../core
+      '@noble/curves':
+        specifier: ^2.3.0
+        version: 2.3.0
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -79,6 +82,9 @@ importers:
       '@cloudflare/vitest-pool-workers':
         specifier: ^0.18.7
         version: 0.18.8(@vitest/runner@4.1.10)(@vitest/snapshot@4.1.10)(vitest@4.1.10(vite@8.2.1(esbuild@0.28.1)))
+      '@germ-network/atproto-pmr-core':
+        specifier: workspace:*
+        version: link:../core
       '@germ-network/atproto-pmr-monitor':
         specifier: workspace:*
         version: link:../monitor
