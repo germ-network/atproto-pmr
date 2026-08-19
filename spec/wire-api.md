@@ -1155,12 +1155,72 @@ against an endpoint the attacker must separately possess — the same
 stakes as a leaked capability URL, already bounded by the push service's
 rate limits.
 
-The sealed payload carries the originating relay's host, so the device's
-notification extension can select the right decryption context. The
-lifecycle is RFC 8030's: a relay MUST discard a subscription answered
-with `404` or `410`, and the device kills one by unsubscribing at its
-push service — individually, without disturbing the registration, the
-mailbox grants, or any other subscription.
+The originating relay's host is bound into the seal as the AEAD's
+**additional authenticated data** — authenticated, but never transmitted.
+`key_id` alone already tells the device which relay a subscription
+belongs to (a device resolves `key_id → (host, content key)` from its own
+provisioning record before it ever attempts to open a seal), so carrying
+the host again inside the encrypted plaintext would be redundant. Binding
+it as AAD instead means a `key_id`/host mismatch — a cross-wired key, or
+an attacker attempting to replay a seal under the wrong context — fails
+the AEAD tag outright, rather than merely being *noticed* after a
+successful decrypt. The lifecycle is RFC 8030's: a relay MUST discard a
+subscription answered with `404` or `410`, and the device kills one by
+unsubscribing at its push service — individually, without disturbing the
+registration, the mailbox grants, or any other subscription.
+
+#### The sealed payload
+
+Once decrypted, the plaintext is a CBOR map using this specification's
+existing short-key vocabulary — the same one `#delivery` and the other
+socket frames use:
+
+| field | meaning |
+|---|---|
+| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed |
+| `k` | present when `t` is `"m"`: the mailbox key the message landed in |
+| `id` | present when `t` is `"m"`: the message's id |
+| `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
+| `sd` / `kt` | present under the same condition as `m`, for a pair-mailbox entry: the verification hint, identical to `#delivery`'s `sd`/`kt` |
+
+```json
+{ "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }
+```
+
+**A relay SHOULD include the message when it fits, and MUST fall back to
+a content-free wake when it does not.** Deciding this per push, at seal
+time — not per deployment or per message kind — is what lets a small
+text message arrive fully renderable straight from the push, with no
+round trip, while a message near or over the size ceiling degrades
+gracefully to a wake. This is a size decision, not a disclosure one:
+nothing here discloses more than the recipient's own device is already
+entitled to fetch over the events socket or REST catch-up — the push
+service only ever sees opaque ciphertext either way, whether that
+ciphertext is twenty bytes or two thousand.
+
+**`t: "p"` and `t: "d"` are always exactly `{t}` and nothing else — this
+is permanent, not merely the current state of what's implemented.**
+
+- `t: "p"` (the pool's adjudication threshold crossed) MUST NOT carry
+  content, and MUST NOT be sent on individual pool arrival. Per-arrival
+  notice to a stranger's message is exactly the harassment vector pool
+  adjudication's batching exists to prevent (see [The recovery
+  pool](#the-recovery-pool)) — "on threshold, an absent device is
+  woken... it spends one per round, never one per arrival" applies here
+  exactly as it does to the events socket's own `#pool` frame.
+- `t: "d"` (a watched DID's declaration changed) MUST NOT carry the
+  changed content. A key-transparency monitor's whole purpose is
+  catching a source — hostile or merely buggy — that lies by omission or
+  serves something stale; bundling "here's what changed" into the push
+  would let a compromised or misbehaving deliverer assert a declaration
+  directly to a device, bypassing the fetch-and-compare-across-monitors
+  step this mechanism exists to force. This holds even though the
+  declaration record itself is a signed, self-authenticating commit —
+  the risk here is withholding or staleness, not forgery, and no single
+  pushed blob can prove the *absence* of a conflicting version elsewhere.
+  A registration watches only its own DID (see [Registration and the
+  own-DID push](key-transparency.md#registration-and-the-own-did-push)),
+  so `t: "d"` carries no DID field: there is only one DID it could mean.
 
 ### The enabler document
 

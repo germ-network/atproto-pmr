@@ -208,6 +208,17 @@ export async function handlePairPut(
                             envelope.payload.payload
                         )
                     } catch {}
+                    // Same asymmetry as deliverLive: a failed push costs
+                    // nothing beyond itself, so its error is swallowed
+                    // separately rather than let it prevent deliverLive
+                    // from running or vice versa.
+                    try {
+                        await store.deliverPush?.(
+                            mailboxKey,
+                            ref,
+                            envelope.payload.payload
+                        )
+                    } catch {}
                 })()
             )
         }

@@ -196,20 +196,35 @@ export async function handleRegistrationCreate(
         anchorKey: encodeOkpEd25519Key({ x: anchorKey }),
         lastActive: deps.nowSeconds,
     }
-    // A push grant may accompany the registration. It is a capability —
-    // an id, a symmetric key, an expiry — and never a push token.
+    // A Web Push subscription may accompany the registration: a capability
+    // URL and a device-provisioned content key, never a push token. Present
+    // fields are validated as a unit — a malformed-but-present subscription
+    // answers 400 rather than being silently dropped, since a client typo
+    // would otherwise produce a registration that looks fine and never
+    // receives a push.
     if (body !== null && body.byteLength > 0) {
         try {
             const map = decodeCoseMap(body)
-            const id = map.get("pgi")
-            const key = map.get("pgk")
-            const expiry = map.get("pge")
-            if (
-                typeof id === "string" &&
-                key instanceof Uint8Array &&
-                typeof expiry === "number"
-            ) {
-                fields.pushGrant = { id, key, expiry }
+            const endpoint = map.get("pse")
+            const contentKey = map.get("psk")
+            const keyId = map.get("psi")
+            const anyPresent =
+                endpoint !== undefined ||
+                contentKey !== undefined ||
+                keyId !== undefined
+            if (anyPresent) {
+                if (
+                    typeof endpoint !== "string" ||
+                    !(contentKey instanceof Uint8Array) ||
+                    contentKey.byteLength !== 32 ||
+                    typeof keyId !== "number" ||
+                    !Number.isInteger(keyId) ||
+                    keyId < 0 ||
+                    keyId > 255
+                ) {
+                    return new Response("Malformed body", { status: 400 })
+                }
+                fields.pushSubscription = { endpoint, contentKey, keyId }
             }
         } catch {
             return new Response("Malformed body", { status: 400 })
@@ -233,13 +248,16 @@ export async function handleRegistrationCreate(
     // cannot reach this line without already holding the key they would be
     // installing.
     //
-    // `pushGrant` is written only when the request carried one, so
+    // `pushSubscription` is written only when the request carried one, so
     // re-registering to refresh a key does not silently drop push delivery.
+    // This is also the content key's rotation path: the spec says it
+    // "rotates by registration update", and this write-through is that
+    // update — no separate PATCH exists or is needed for it.
     await deps.store(locator).update({
         anchorKey: fields.anchorKey,
         lastActive: fields.lastActive,
-        ...(fields.pushGrant !== undefined
-            ? { pushGrant: fields.pushGrant }
+        ...(fields.pushSubscription !== undefined
+            ? { pushSubscription: fields.pushSubscription }
             : {}),
     })
 
@@ -260,8 +278,9 @@ export async function handleRegistrationRead(
         cbor([
         ["did", reg.did],
         ["la", reg.lastActive],
-        // The push grant's key is never echoed back; only whether one exists.
-        ["pg", reg.pushGrant !== undefined],
+        // The subscription's endpoint and content key are never echoed
+        // back; only whether one exists.
+        ["ps", reg.pushSubscription !== undefined],
         ]),
         a.auth.did,
         deps

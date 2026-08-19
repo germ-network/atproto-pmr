@@ -12,6 +12,7 @@
 import { ed25519 } from "@noble/curves/ed25519.js"
 import { describe, expect, it } from "vitest"
 import { encodeBinding } from "../src/challenge"
+import { decodeCoseMap, encodeCose, type CoseValue } from "../src/cose/cbor"
 import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../src/cose/key"
 import { signRequest } from "../src/http-sig/sign"
 import {
@@ -106,9 +107,19 @@ async function challengeFor(w: ReturnType<typeof world>, did: string) {
     return c
 }
 
-function signedRequest(url: string, method: string, secretKey: Uint8Array, nonce: string) {
-    const parts = signRequest({ method, url, nonce, keyid: "t", secretKey })
-    return new Request(url, { method, headers: parts.headers })
+function signedRequest(
+    url: string,
+    method: string,
+    secretKey: Uint8Array,
+    nonce: string,
+    body?: Uint8Array
+) {
+    const parts = signRequest({ method, url, nonce, keyid: "t", secretKey, body })
+    return new Request(url, {
+        method,
+        headers: parts.headers,
+        ...(body !== undefined ? { body } : {}),
+    })
 }
 
 describe("anchor-key rotation does not lock the owner out", () => {
@@ -227,7 +238,7 @@ describe("anchor-key rotation does not lock the owner out", () => {
         ])
     })
 
-    it("re-registering without a push grant does not drop an existing one", async () => {
+    it("re-registering without a push subscription does not drop an existing one", async () => {
         // Refreshing a key must not silently break push delivery.
         const w = world()
         const key = ed25519.utils.randomSecretKey()
@@ -239,14 +250,20 @@ describe("anchor-key rotation does not lock the owner out", () => {
         )
         w.rows.set(DID, {
             ...w.rows.get(DID)!,
-            pushGrant: { id: "pg", key: new Uint8Array([1, 2]), expiry: T0 + 999 },
+            pushSubscription: {
+                endpoint: "https://push.example/sub/abc",
+                contentKey: new Uint8Array(32).fill(7),
+                keyId: 3,
+            },
         })
 
         await handleRegistrationCreate(
             signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
             deps(w)
         )
-        expect(w.rows.get(DID)!.pushGrant?.id).toBe("pg")
+        expect(w.rows.get(DID)!.pushSubscription?.endpoint).toBe(
+            "https://push.example/sub/abc"
+        )
     })
 
     it("stores the anchor key as a COSE_Key blob, never raw bytes", async () => {
@@ -264,5 +281,148 @@ describe("anchor-key rotation does not lock the owner out", () => {
         // schema migration.
         expect(stored.byteLength).toBeGreaterThan(32)
         expect(parseOkpEd25519Key(stored).x.byteLength).toBe(32)
+    })
+})
+
+describe("the Web Push subscription", () => {
+    function subscriptionBody(fields: Record<string, CoseValue>): Uint8Array {
+        return encodeCose(new Map<string, CoseValue>(Object.entries(fields)))
+    }
+
+    it("a well-formed subscription is decoded and stored in full", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+        const contentKey = new Uint8Array(32).fill(9)
+
+        const body = subscriptionBody({
+            pse: "https://push.example/sub/xyz",
+            psk: contentKey,
+            psi: 42,
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(201)
+        expect(w.rows.get(DID)!.pushSubscription).toEqual({
+            endpoint: "https://push.example/sub/xyz",
+            contentKey,
+            keyId: 42,
+        })
+    })
+
+    it("a subscription missing psk answers 400 and stores nothing", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const body = subscriptionBody({
+            pse: "https://push.example/sub/xyz",
+            psi: 42,
+            // psk omitted — present-but-incomplete, not absent-entirely.
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(400)
+        expect(w.rows.has(DID)).toBe(false)
+    })
+
+    it("a contentKey of the wrong length answers 400", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const body = subscriptionBody({
+            pse: "https://push.example/sub/xyz",
+            psk: new Uint8Array(31),
+            psi: 42,
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(400)
+    })
+
+    it("a keyId outside 0..255 answers 400", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const body = subscriptionBody({
+            pse: "https://push.example/sub/xyz",
+            psk: new Uint8Array(32),
+            psi: 300,
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(400)
+    })
+
+    it("no subscription fields at all is a normal registration, not an error", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        expect(response.status).toBe(201)
+        expect(w.rows.get(DID)!.pushSubscription).toBeUndefined()
+    })
+
+    it("the read endpoint reports ps: true and never echoes the endpoint or content key", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+        const contentKey = new Uint8Array(32).fill(9)
+
+        await handleRegistrationCreate(
+            signedRequest(
+                CREATE_URL,
+                "POST",
+                key,
+                await challengeFor(w, DID),
+                subscriptionBody({
+                    pse: "https://push.example/sub/xyz",
+                    psk: contentKey,
+                    psi: 42,
+                })
+            ),
+            deps(w)
+        )
+
+        const response = await handleRegistrationRead(
+            signedRequest(READ_URL, "GET", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        const map = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        expect(map.get("ps")).toBe(true)
+        expect(map.has("pse")).toBe(false)
+        expect(map.has("psk")).toBe(false)
+        expect(map.has("psi")).toBe(false)
+    })
+
+    it("the read endpoint reports ps: false when no subscription exists", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        const response = await handleRegistrationRead(
+            signedRequest(READ_URL, "GET", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        const map = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        expect(map.get("ps")).toBe(false)
     })
 })

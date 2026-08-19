@@ -148,5 +148,8 @@ async function deliver(
         try {
             await store.deliverLive?.(grantMailboxKey(address), ref, message)
         } catch {}
+        try {
+            await store.deliverPush?.(grantMailboxKey(address), ref, message)
+        } catch {}
     }
 }

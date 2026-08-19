@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers"
 import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
+    buildMessagePushPayload,
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
@@ -25,6 +26,7 @@ import {
 } from "@germ-network/atproto-pmr-core"
 import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
+import { webPushSender } from "./push-sender"
 
 /**
  * One Durable Object per relay — the per-PMR store from
@@ -199,6 +201,37 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<void> {
         if (this.ctx.getWebSockets().length === 0) return
         this.broadcast(encodeDeliveryFrame(key, ref, message))
+    }
+
+    /**
+     * `PMRStore.deliverPush` — Web Push, where this deployment delegates
+     * it (`webPushSender` returns `null` and this no-ops otherwise).
+     *
+     * Loads the registration fresh rather than accepting it as a
+     * parameter: unlike `deliverLive`, this doesn't run once per socket —
+     * it needs the subscription, which lives on the registration, not on
+     * anything the caller already holds.
+     */
+    async deliverPush(
+        key: MailboxKey,
+        ref: MessageRef,
+        message: Uint8Array
+    ): Promise<void> {
+        const sender = webPushSender(this.env)
+        if (sender === null) return
+        const reg = await this.load()
+        if (reg?.pushSubscription === undefined) return
+
+        const plaintext = buildMessagePushPayload({
+            key,
+            ref,
+            message,
+            maxSealedBytes: sender.maxSealedBytes,
+        })
+        const result = await sender.send(reg.pushSubscription, plaintext)
+        if (result.outcome === "discard") {
+            await this.update({ pushSubscription: undefined })
+        }
     }
 
     // MARK: - The events socket
@@ -598,13 +631,36 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(mailboxKey(key), [...queue, ...moved])
         await this.releasePool(key, pooled)
 
-        // Live push, deferred past this RPC's own response. Unlike
-        // `deliverLive`'s pair/grant-put callers, there's no body-write race
-        // to avoid here: these bodies were persisted when each message was
-        // first pooled (`pair-put.ts`), well before this adjudication call,
-        // so a KV read-back is safe.
-        if (moved.length > 0 && this.ctx.getWebSockets().length > 0) {
-            this.ctx.waitUntil(this.pushProvisioned(key, moved))
+        // Live push and Web Push, both deferred past this RPC's own
+        // response. Unlike `deliverLive`/`deliverPush`'s pair/grant-put
+        // callers, there's no body-write race to avoid here: these bodies
+        // were persisted when each message was first pooled
+        // (`pair-put.ts`), well before this adjudication call, so a KV
+        // read-back is safe.
+        if (moved.length > 0) {
+            // Gated on socket attachment — correct here, since a live
+            // broadcast to zero sockets does nothing. Do NOT nest the Web
+            // Push call below inside this same gate: Web Push exists
+            // precisely for the case where no socket is attached, so
+            // gating it on socket presence would silently suppress it in
+            // exactly the case it's for.
+            if (this.ctx.getWebSockets().length > 0) {
+                this.ctx.waitUntil(this.pushProvisioned(key, moved))
+            }
+            // One push per adjudication batch, not one per moved ref —
+            // per-ref pushes burn germ-service's 200/day budget for no
+            // benefit, since `Topic` collapse at APNs does not conserve
+            // it. A single wake is enough: the device's own catch-up
+            // (REST or reconnect-drain) recovers every provisioned
+            // message regardless of how many this one mentions.
+            const bodies = kvBodyStore(this.env)
+            const [first] = moved
+            this.ctx.waitUntil(
+                (async () => {
+                    const body = await bodies.getBody(first.messageId)
+                    if (body !== null) await this.deliverPush(key, first, body)
+                })()
+            )
         }
 
         return moved

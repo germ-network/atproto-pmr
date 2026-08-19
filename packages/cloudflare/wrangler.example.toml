@@ -35,6 +35,12 @@ new_sqlite_classes = ["PMRObject"]
 # that does transfer.
 # ─────────────────────────────────────────────────────────────────────────
 [vars]
+# The host this relay serves. A protocol input (grant address derivation is
+# domain-separated by it), not routing — and also the additional
+# authenticated data a Web Push seal binds (below), so it must match what a
+# device already resolves for a given key_id.
+HOST_NAME = "my-relay.example"
+
 # active | draining | absent. `draining` stops vending new grants while
 # still accepting puts to already-vended addresses, which is how grant
 # issuance is retired without stranding mail peers hold addresses for.
@@ -57,17 +63,34 @@ POOL_DEPTH_PER_SENDER = "3"
 POOL_DEPTH_UNDER_PRESSURE = "1"
 
 # Web Push delegation (spec/wire-api.md, "Push delivery — Web Push"). Set
-# this ONLY if this deployment cannot reach a push service itself and
-# delivers via a subscription the device mints for it; a relay with its own
-# push path leaves it unset and publishes no vapidKey at all.
+# ALL FIVE of these together ONLY if this deployment cannot reach a push
+# service itself and delivers via a subscription the device mints for it —
+# partial configuration is treated as none, and a relay with its own push
+# path leaves all five unset and publishes no vapidKey at all.
 #
-# base64url, unpadded: the 65-byte uncompressed P-256 point
-# (0x04 ‖ X ‖ Y) that a device passes to its push service as the
-# applicationServerKey. Generate a P-256 keypair and put the PRIVATE half in
-# a secret (npx wrangler secret put VAPID_PRIVATE_KEY) — it signs the JWT
-# authorizing each delivery, and this public half is what a subscription is
-# bound to.
+# VAPID_PUBLIC_KEY: base64url, unpadded — the 65-byte uncompressed P-256
+# point (0x04 ‖ X ‖ Y) that a device passes to its push service as the
+# applicationServerKey.
 # VAPID_PUBLIC_KEY = "BEl6...87 chars total"
+#
+# VAPID_PRIVATE_KEY: a SECRET, never a var — the raw 32-byte P-256 scalar,
+# base64url, that signs each delivery's authorizing JWT. Generate the
+# keypair and set the private half with:
+#   npx wrangler secret put VAPID_PRIVATE_KEY
+#
+# VAPID_SUBJECT: a mailto: or https: contact (RFC 8292 §2.1) some push
+# services require.
+# VAPID_SUBJECT = "mailto:ops@my-relay.example"
+#
+# PUSH_MAX_SEALED_BYTES: the push service's payload ceiling, in bytes,
+# including the seal's fixed overhead — push-service-specific, not a
+# protocol constant. A sender the relay itself does not operate (a browser
+# push service, a UnifiedPush distributor) may have a different ceiling
+# than this example's.
+# PUSH_MAX_SEALED_BYTES = "2880"
+#
+# PUSH_TTL_SECONDS: RFC 8030 TTL sent with every delivery.
+# PUSH_TTL_SECONDS = "86400"
 
 # KV namespace ids are placeholders. Create your own:
 #   npx wrangler kv namespace create <binding>
