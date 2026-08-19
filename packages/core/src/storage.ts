@@ -168,11 +168,19 @@ export interface RegistrationFields {
      */
     anchorKey: Uint8Array
     /**
-     * The push grant this relay holds, where the deployment uses push
-     * delegation: a capability, not an identity. A relay MUST NOT store a
-     * push token.
+     * The Web Push subscription this relay delivers on, where the
+     * deployment delegates push. A capability URL and a content key —
+     * never a push token (spec/wire-api.md, "the relay never holds a
+     * push token").
      */
-    pushGrant?: { id: string; key: Uint8Array; expiry: number }
+    pushSubscription?: {
+        /** RFC 8030 capability URL. Opaque; never parsed except for its origin. */
+        endpoint: string
+        /** 32 bytes, AES-256-GCM. Device-provisioned; rotates by registration update. */
+        contentKey: Uint8Array
+        /** Device-assigned, 0..255, device-global across deliverers. */
+        keyId: number
+    }
     lastActive: number
 }
 
@@ -309,6 +317,25 @@ export interface PMRStore {
      * it is a separate operation rather than folded into `append`.
      */
     deliverLive?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
+
+    /**
+     * Best-effort Web Push notification for a message that was just
+     * appended and whose body has already been persisted —
+     * `spec/wire-api.md`, "Push delivery — Web Push (optional)".
+     *
+     * OPTIONAL in the same two senses `deliverLive` is: an adapter with no
+     * push-delegation concept omits it, and a deployment that HAS the
+     * concept but holds no subscription for this registration is expected
+     * to no-op internally rather than error. Same bytes-as-parameter
+     * reasoning as `deliverLive` — the body is written after `append`
+     * resolves, so re-reading it here would race that write.
+     *
+     * CALLERS MUST NOT call this on a response path, for the identical
+     * reason `deliverLive` is a separate operation from `append`: a put's
+     * latency must not depend on whether sealing and POSTing a push
+     * succeeds, or on the recipient's push service being reachable at all.
+     */
+    deliverPush?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
 
     /** True for a provisioned mailbox *or* a blocked sender. */
     hasMailbox(key: MailboxKey): Promise<boolean>

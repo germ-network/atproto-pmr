@@ -32,6 +32,15 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
 
     pmrs: DurableObjectNamespace<TPMR>
 
+    /**
+     * The host this relay serves — `PMRConfig.hostName`'s deployment-level
+     * twin. Previously wired only at the deployment's own deps-wiring layer
+     * (for grant address derivation); promoted onto the base env because
+     * `deliverPush` needs it directly inside the Durable Object, to bind
+     * into the Web Push seal's additional authenticated data.
+     */
+    HOST_NAME: string
+
     /** Per-sender capacity of a provisioned pair mailbox. */
     MAX_MESSAGES_PER_PAIR_SENDER: string
 
@@ -57,4 +66,19 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
      * that authorizes a delivery.
      */
     VAPID_PUBLIC_KEY?: string
+    /**
+     * Secret binding. The raw 32-byte P-256 scalar, base64url — the private
+     * half of `VAPID_PUBLIC_KEY`; signs delivery JWTs. Set via
+     * `wrangler secret put VAPID_PRIVATE_KEY`, never a plain var.
+     */
+    VAPID_PRIVATE_KEY?: string
+    /** A `mailto:` or `https:` contact for the VAPID JWT's `sub` claim (RFC 8292 §2.1). */
+    VAPID_SUBJECT?: string
+    /**
+     * The push service's payload ceiling, in bytes, including this seal's
+     * fixed overhead — push-service-specific, not a protocol constant.
+     */
+    PUSH_MAX_SEALED_BYTES?: string
+    /** RFC 8030 `TTL`, seconds. */
+    PUSH_TTL_SECONDS?: string
 }

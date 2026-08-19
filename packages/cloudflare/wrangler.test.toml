@@ -16,6 +16,7 @@ new_sqlite_classes = ["PMRObject"]
 # implementation-defined; tests read them from env rather than hardcoding,
 # so any operator's numbers work here.
 [vars]
+HOST_NAME = "relay.example"
 MAX_MESSAGES_PER_PAIR_SENDER = "25"
 POOL_CAP_BYTES = "4000000"
 POOL_DEPTH_PER_SENDER = "3"
