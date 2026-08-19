@@ -224,6 +224,19 @@ export async function handleRegistrationCreate(
                 ) {
                     return new Response("Malformed body", { status: 400 })
                 }
+                // A non-URL or non-https endpoint would otherwise pass this
+                // check, store, and read back `ps: true` — a registration
+                // that "looks fine" but silently never delivers, exactly
+                // what this 400 exists to prevent (see the comment above).
+                let parsedEndpoint: URL
+                try {
+                    parsedEndpoint = new URL(endpoint)
+                } catch {
+                    return new Response("Malformed body", { status: 400 })
+                }
+                if (parsedEndpoint.protocol !== "https:") {
+                    return new Response("Malformed body", { status: 400 })
+                }
                 fields.pushSubscription = { endpoint, contentKey, keyId }
             }
         } catch {

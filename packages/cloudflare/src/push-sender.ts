@@ -57,11 +57,20 @@ export function webPushSender<TPMR extends PMRObject>(
         return null
     }
 
+    const maxSealedBytes = parseInt(env.PUSH_MAX_SEALED_BYTES)
+    const ttlSeconds = parseInt(env.PUSH_TTL_SECONDS)
+    // A non-numeric var is a misconfiguration, not partial config — fold it
+    // into the same "not configured" no-op rather than letting NaN silently
+    // degrade every push to its pointer-only form (payload.ts's fits-check
+    // and seal.ts's size-ceiling check both treat a NaN comparison as
+    // false, so neither throws nor includes the message).
+    if (!Number.isFinite(maxSealedBytes) || !Number.isFinite(ttlSeconds)) {
+        return null
+    }
+
     const publicKey = env.VAPID_PUBLIC_KEY
     const privateKey = base64URLToBinary(env.VAPID_PRIVATE_KEY)
     const subject = env.VAPID_SUBJECT
-    const maxSealedBytes = parseInt(env.PUSH_MAX_SEALED_BYTES)
-    const ttlSeconds = parseInt(env.PUSH_TTL_SECONDS)
     const hostAad = new TextEncoder().encode(env.HOST_NAME)
 
     return {

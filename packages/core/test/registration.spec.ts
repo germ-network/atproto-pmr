@@ -364,6 +364,41 @@ describe("the Web Push subscription", () => {
         expect(response.status).toBe(400)
     })
 
+    it("a non-https endpoint answers 400", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const body = subscriptionBody({
+            pse: "http://push.example/sub/xyz",
+            psk: new Uint8Array(32),
+            psi: 1,
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(400)
+        expect(w.rows.has(DID)).toBe(false)
+    })
+
+    it("an unparseable endpoint answers 400", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        const body = subscriptionBody({
+            pse: "not a url at all",
+            psk: new Uint8Array(32),
+            psi: 1,
+        })
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID), body),
+            deps(w)
+        )
+        expect(response.status).toBe(400)
+    })
+
     it("no subscription fields at all is a normal registration, not an error", async () => {
         const w = world()
         const key = ed25519.utils.randomSecretKey()

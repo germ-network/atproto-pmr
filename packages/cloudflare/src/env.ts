@@ -34,10 +34,10 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
 
     /**
      * The host this relay serves — `PMRConfig.hostName`'s deployment-level
-     * twin. Previously wired only at the deps layer (`api.ts`, for grant
-     * address derivation); promoted onto the base env because `deliverPush`
-     * needs it directly inside the Durable Object, to bind into the Web
-     * Push seal's additional authenticated data.
+     * twin. Previously wired only at the deployment's own deps-wiring layer
+     * (for grant address derivation); promoted onto the base env because
+     * `deliverPush` needs it directly inside the Durable Object, to bind
+     * into the Web Push seal's additional authenticated data.
      */
     HOST_NAME: string
 
