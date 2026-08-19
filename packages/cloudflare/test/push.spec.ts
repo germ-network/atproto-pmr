@@ -70,6 +70,7 @@ async function withSubscription(
 
 afterEach(() => {
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
 })
 
 describe("deliverPush — disabled deployment", () => {
@@ -301,7 +302,7 @@ describe("deliverPush — enabled, subscription present", () => {
         expect(reg?.pushSubscription).toBeUndefined()
     })
 
-    it("a single 401 does NOT clear the subscription", async () => {
+    it("a single 401 does NOT clear the subscription, but logs the failure", async () => {
         const stub = freshStub()
         await withPushEnabled(stub)
         await withSubscription(stub, {
@@ -310,15 +311,63 @@ describe("deliverPush — enabled, subscription present", () => {
             keyId: 1,
         })
         vi.stubGlobal("fetch", async () => new Response(null, { status: 401 }))
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
         await inPMR(stub, (pmr) =>
             pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
         )
         const reg = await inPMR(stub, (pmr) => pmr.load())
         expect(reg?.pushSubscription).toBeDefined()
+
+        // A "failed" outcome is the base-wide-misconfiguration case (a
+        // rotated VAPID key that no longer pairs, an exhausted quota) —
+        // this is the one outcome that must not be silent, or the failure
+        // is invisible until a user reports missed notifications.
+        expect(errorSpy).toHaveBeenCalledTimes(1)
+        expect(errorSpy.mock.calls[0].join(" ")).toContain("https://push.example")
+        expect(errorSpy.mock.calls[0].join(" ")).toContain("401")
     })
 
-    it("a fetch that throws does not propagate out of deliverPush", async () => {
+    it("404/410 discard is expected lifecycle, not a logged failure", async () => {
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await withSubscription(stub, {
+            endpoint: "https://push.example/sub/1",
+            contentKey: new Uint8Array(32).fill(1),
+            keyId: 1,
+        })
+        vi.stubGlobal("fetch", async () => new Response(null, { status: 404 }))
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await inPMR(stub, (pmr) =>
+            pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
+        )
+
+        expect(errorSpy).not.toHaveBeenCalled()
+    })
+
+    it("a 429 (retry) is expected transient rate-limiting, not a logged failure", async () => {
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await withSubscription(stub, {
+            endpoint: "https://push.example/sub/1",
+            contentKey: new Uint8Array(32).fill(1),
+            keyId: 1,
+        })
+        vi.stubGlobal(
+            "fetch",
+            async () => new Response(null, { status: 429, headers: { "Retry-After": "30" } })
+        )
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await inPMR(stub, (pmr) =>
+            pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
+        )
+
+        expect(errorSpy).not.toHaveBeenCalled()
+    })
+
+    it("a fetch that throws does not propagate out of deliverPush, and logs the error", async () => {
         const stub = freshStub()
         await withPushEnabled(stub)
         await withSubscription(stub, {
@@ -329,16 +378,44 @@ describe("deliverPush — enabled, subscription present", () => {
         vi.stubGlobal("fetch", async () => {
             throw new Error("network down")
         })
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
         await expect(
             inPMR(stub, (pmr) =>
                 pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
             )
-        ).rejects.toThrow()
-        // Note: deliverPush itself does not swallow errors — that discipline
-        // lives at the pair-put.ts/grant-put.ts call sites, which wrap the
-        // call in their own try/catch. This test documents that division of
-        // responsibility rather than asserting deliverPush is itself silent.
+        ).resolves.toBeUndefined()
+
+        expect(errorSpy).toHaveBeenCalledTimes(1)
+        expect(errorSpy.mock.calls[0].join(" ")).toContain("https://push.example")
+    })
+
+    it("a malformed VAPID_PRIVATE_KEY throws before any request, and is still caught and logged", async () => {
+        // webPushSender decodes VAPID_PRIVATE_KEY eagerly, before send() is
+        // ever called — a corrupted secret throws right there, outside a
+        // guard scoped to only sender.send(). This is the same
+        // base-wide-misconfiguration class the rest of this file exercises
+        // via a 401, just triggered a step earlier.
+        const stub = freshStub()
+        await withPushEnabled(stub, { VAPID_PRIVATE_KEY: "not valid base64url!!!" })
+        await withSubscription(stub, {
+            endpoint: "https://push.example/sub/1",
+            contentKey: new Uint8Array(32).fill(1),
+            keyId: 1,
+        })
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await expect(
+            inPMR(stub, (pmr) =>
+                pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
+            )
+        ).resolves.toBeUndefined()
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+        expect(errorSpy).toHaveBeenCalledTimes(1)
+        expect(errorSpy.mock.calls[0].join(" ")).toContain("https://push.example")
     })
 })
 
