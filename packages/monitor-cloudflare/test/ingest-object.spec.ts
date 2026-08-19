@@ -12,7 +12,9 @@ import {
     runDurableObjectAlarm,
     runInDurableObject,
 } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { gcm } from "@noble/ciphers/aes.js"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { binaryToBase64URL } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
     mightHaveChanged,
@@ -20,7 +22,9 @@ import {
     settleDue,
     sweepBackfill,
     type FetchedRecord,
+    type IngestDeps,
 } from "@germ-network/atproto-pmr-monitor"
+import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvSnapshotStore } from "../src/snapshot-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -46,6 +50,15 @@ function inMonitorObj<R>(
     return runInDurableObject(stub, (instance) => fn(instance as MonitorIngest))
 }
 
+/**
+ * Builds its own `IngestDeps` by hand and does NOT set `onChange` /
+ * `onRegression` — both are optional on `IngestDeps` and `settle()` calls
+ * them via `?.()`, so omitting them means they silently never fire through
+ * this helper. Fine for tests that only care about the index/snapshot; the
+ * wrong tool for anything asserting on own-DID push side effects — use
+ * `withFetchThroughRealOnChange` (in the "own-DID push" describe block)
+ * for those instead, which routes through the object's real `deps()`.
+ */
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
     fetchRecord: (did: string) => Promise<FetchedRecord>
@@ -501,3 +514,376 @@ describe("the snapshot store", () => {
     })
 })
 
+describe("own-DID push", () => {
+    // Not a real, curve-paired keypair — matches `push.spec.ts`'s upstream
+    // precedent: nothing here cross-verifies a signature, only that the
+    // right bytes reach the right place.
+    const PRIVATE_KEY_B64 = binaryToBase64URL(crypto.getRandomValues(new Uint8Array(32)))
+    const PUBLIC_KEY_B64 = binaryToBase64URL(
+        (() => {
+            const bytes = crypto.getRandomValues(new Uint8Array(65))
+            bytes[0] = 0x04
+            return bytes
+        })()
+    )
+    const HOST_NAME = "monitor.example"
+
+    async function withPushEnabled(
+        stub: DurableObjectStub<MonitorIngest>,
+        extra: Record<string, string> = {}
+    ): Promise<void> {
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const held = obj as unknown as { env: MonitorEnv }
+            held.env = {
+                ...held.env,
+                HOST_NAME,
+                VAPID_PUBLIC_KEY: PUBLIC_KEY_B64,
+                VAPID_PRIVATE_KEY: PRIVATE_KEY_B64,
+                VAPID_SUBJECT: "mailto:ops@relay.example",
+                PUSH_MAX_SEALED_BYTES: "2880",
+                PUSH_TTL_SECONDS: "86400",
+                ...extra,
+            }
+        })
+    }
+
+    async function putRegistration(
+        did: string,
+        overrides: Partial<{ endpoint: string; contentKey: Uint8Array; keyId: number }> = {}
+    ): Promise<void> {
+        await kvMonitorRegistrationStore(testEnv)!.put({
+            did,
+            anchorKey: new Uint8Array([1]),
+            pushSubscription: {
+                endpoint: overrides.endpoint ?? "https://push.example/sub/1",
+                contentKey: overrides.contentKey ?? new Uint8Array(32).fill(1),
+                keyId: overrides.keyId ?? 7,
+            },
+            registeredAt: 0,
+        })
+    }
+
+    /**
+     * Reaches past `notifyRegistration`'s `ctx.waitUntil` wrapper to call
+     * the real work directly and await it — the same reasoning
+     * `deliverDeclarationPush`'s own doc comment gives: asserting on the
+     * result of something handed to `waitUntil` races the runtime's own
+     * background scheduling, which is not guaranteed to have run by the
+     * time `runInDurableObject`'s outer promise resolves.
+     */
+    function callDeliverDeclarationPush(
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string
+    ): Promise<void> {
+        return runInDurableObject(stub, (obj: MonitorIngest) =>
+            (obj as unknown as { deliverDeclarationPush(did: string): Promise<void> })
+                .deliverDeclarationPush(did)
+        )
+    }
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+        vi.restoreAllMocks()
+    })
+
+    it("POSTs a sealed {t:\"d\"} push to the registered subscription", async () => {
+        const did = "did:plc:push-advance"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await putRegistration(did)
+
+        let seenUrl: string | undefined
+        let seenAuth: string | null = null
+        let seenTopic: string | null = null
+        vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+            seenUrl = typeof input === "string" ? input : input.toString()
+            const headers = new Headers(init?.headers)
+            seenAuth = headers.get("Authorization")
+            seenTopic = headers.get("Topic")
+            return new Response(null, { status: 201 })
+        })
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(seenUrl).toBe("https://push.example/sub/1")
+        expect(seenAuth).toMatch(/^vapid t=.+, k=.+$/)
+        // A constant Topic per declaration-change push, so a burst from one
+        // subscriber (a hostile PDS churning revs) collapses at the push
+        // service instead of eating into the subscription's daily quota.
+        expect(seenTopic).toBe("d")
+    })
+
+    it("a discard response (404/410) deletes the registration", async () => {
+        const did = "did:plc:push-discard"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await putRegistration(did)
+        vi.stubGlobal("fetch", async () => new Response(null, { status: 404 }))
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(await kvMonitorRegistrationStore(testEnv)!.load(did)).toBeNull()
+    })
+
+    it("a single 401 does NOT delete the registration, but logs the failure", async () => {
+        // A `"failed"` outcome is the base-wide-misconfiguration case (a
+        // rotated VAPID key that no longer pairs) — the one outcome that
+        // must not be silent, matching `push.spec.ts`'s equivalent test on
+        // the PMR side. `pushDeclarationChange` cannot throw one, so this
+        // is the one that only a live check on its returned outcome, not
+        // a bare try/catch, can catch.
+        const did = "did:plc:push-failed"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await putRegistration(did)
+        vi.stubGlobal("fetch", async () => new Response(null, { status: 401 }))
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(await kvMonitorRegistrationStore(testEnv)!.load(did)).not.toBeNull()
+        expect(errorSpy).toHaveBeenCalledTimes(1)
+        expect(errorSpy.mock.calls[0].join(" ")).toContain("401")
+    })
+
+    it("the sealed body is bound to this deployment's HOST_NAME as AAD", async () => {
+        // Mirrors `packages/cloudflare/test/push.spec.ts`'s AAD test: the
+        // one thing that would otherwise pass every other test here even
+        // with `aad:` dropped from `push-sender.ts`.
+        const did = "did:plc:push-aad"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        const contentKey = new Uint8Array(32).fill(3)
+        await putRegistration(did, { contentKey })
+
+        let seenBody: Uint8Array | undefined
+        vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
+            seenBody = init?.body instanceof Uint8Array ? init.body : undefined
+            return new Response(null, { status: 201 })
+        })
+
+        await callDeliverDeclarationPush(stub, did)
+
+        const nonce = seenBody!.slice(1, 13)
+        const ciphertextAndTag = seenBody!.slice(13)
+
+        expect(() => gcm(contentKey, nonce).decrypt(ciphertextAndTag)).toThrow()
+        expect(() =>
+            gcm(contentKey, nonce, new TextEncoder().encode("wrong.host")).decrypt(
+                ciphertextAndTag
+            )
+        ).toThrow()
+
+        const recovered = gcm(
+            contentKey,
+            nonce,
+            new TextEncoder().encode(HOST_NAME)
+        ).decrypt(ciphertextAndTag)
+        expect(recovered.byteLength).toBeGreaterThan(0)
+    })
+
+    it("no registration for the DID: no push attempted", async () => {
+        const did = "did:plc:push-unregistered"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it("no push configuration bound: a silent no-op", async () => {
+        const did = "did:plc:push-unconfigured"
+        const stub = freshStub()
+        // withPushEnabled is deliberately NOT called.
+        await putRegistration(did)
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it("is a no-op when VAPID is only PARTIALLY configured", async () => {
+        const did = "did:plc:push-partial-config"
+        const stub = freshStub()
+        await putRegistration(did)
+        // Only the public key — no private key, subject, etc. Partial
+        // configuration is treated the same as none, not a degraded push.
+        await withPushEnabled(stub, {})
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const held = obj as unknown as { env: MonitorEnv }
+            held.env = { ...held.env, VAPID_PRIVATE_KEY: undefined as unknown as string }
+        })
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it("is a no-op when PUSH_MAX_SEALED_BYTES is non-numeric — a misconfiguration, not a degraded push", async () => {
+        const did = "did:plc:push-nan-config"
+        const stub = freshStub()
+        await putRegistration(did)
+        await withPushEnabled(stub, { PUSH_MAX_SEALED_BYTES: "not-a-number" })
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+    })
+
+    it("a push that throws does not propagate, and is logged", async () => {
+        const did = "did:plc:push-throws"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await putRegistration(did)
+        vi.stubGlobal("fetch", async () => {
+            throw new Error("network down")
+        })
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await expect(callDeliverDeclarationPush(stub, did)).resolves.toBeUndefined()
+
+        expect(errorSpy).toHaveBeenCalled()
+    })
+
+    it("a malformed VAPID_PRIVATE_KEY throws before any request, and is still caught and logged", async () => {
+        // monitorWebPushSender decodes VAPID_PRIVATE_KEY eagerly, before
+        // send() is ever called — a corrupted secret throws right there,
+        // outside a guard scoped to only the send call. Same
+        // base-wide-misconfiguration class as the test above, just
+        // triggered a step earlier — and the same class of bug this
+        // session already found and fixed once on the PMR side
+        // (atproto-pmr#15, `pmr-object.ts`'s `deliverPush`).
+        const did = "did:plc:push-bad-key"
+        const stub = freshStub()
+        await withPushEnabled(stub, { VAPID_PRIVATE_KEY: "not valid base64url!!!" })
+        await putRegistration(did)
+        const fetchSpy = vi.fn()
+        vi.stubGlobal("fetch", fetchSpy)
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+        await expect(callDeliverDeclarationPush(stub, did)).resolves.toBeUndefined()
+
+        expect(fetchSpy).not.toHaveBeenCalled()
+        expect(errorSpy).toHaveBeenCalled()
+    })
+
+    describe("wiring: settle() reaches deliverDeclarationPush without waiting for it", () => {
+        // These prove `onChange`/`onRegression` actually kick off the real
+        // work (not just that the real work is correct in isolation, which
+        // the tests above cover) — by replacing `deliverDeclarationPush`
+        // with a spy *before* `settle()` runs. The call happens
+        // synchronously (the promise is constructed and handed to
+        // `ctx.waitUntil` in the same tick), so awaiting `settleDue`'s own
+        // return is enough to observe it — no reliance on `waitUntil`
+        // actually finishing its background work.
+        /**
+         * `withFetch` (this file's other helper) builds its own `IngestDeps`
+         * by hand and never sets `onChange`/`onRegression`, so `settle()`'s
+         * `deps.onChange?.(...)` optional-call silently no-ops through that
+         * path — fine for the tests that only care about the index/snapshot,
+         * wrong for these, which exist to prove `onChange`/`onRegression`
+         * are wired to something real. This reaches the object's own
+         * `deps()` (what `alarm()` itself uses) instead, so the real
+         * `onChange`/`onRegression` methods are the ones `settle()` calls.
+         */
+        function withFetchThroughRealOnChange(
+            stub: DurableObjectStub<MonitorIngest>,
+            fetchRecord: (did: string) => Promise<FetchedRecord>
+        ) {
+            return runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const realDeps = (obj as unknown as { deps(): IngestDeps }).deps()
+                return settleDue({ ...realDeps, fetchRecord })
+            })
+        }
+
+        function spyOnDeliver(
+            stub: DurableObjectStub<MonitorIngest>
+        ): Promise<ReturnType<typeof vi.fn>> {
+            return runInDurableObject(stub, (obj: MonitorIngest) => {
+                const held = obj as unknown as {
+                    deliverDeclarationPush(did: string): Promise<void>
+                }
+                const spy = vi.fn(async () => {})
+                held.deliverDeclarationPush = spy
+                return spy
+            })
+        }
+
+        it("an advancing rev calls deliverDeclarationPush with the changed DID", async () => {
+            const did = "did:plc:push-wiring-advance"
+            const stub = freshStub()
+            const spy = await spyOnDeliver(stub)
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.intake({ did, rev: "3m1" }, "c1")
+            )
+
+            await withFetchThroughRealOnChange(stub, async () => ({
+                rev: "3m1",
+                car: new Uint8Array([1]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }))
+
+            expect(spy).toHaveBeenCalledWith(did)
+        })
+
+        it("a regression also calls deliverDeclarationPush", async () => {
+            const did = "did:plc:push-wiring-regression"
+            const stub = freshStub()
+            const spy = await spyOnDeliver(stub)
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.complete(did, "3m9", Date.now())
+            )
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.intake({ did, rev: "3m1" }, "c1")
+            )
+
+            await withFetchThroughRealOnChange(stub, async () => ({
+                rev: "3m1",
+                car: new Uint8Array([1]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }))
+
+            expect(spy).toHaveBeenCalledWith(did)
+        })
+
+        it("an unchanged rev with no key rotation does NOT call deliverDeclarationPush", async () => {
+            const did = "did:plc:push-wiring-unchanged"
+            const stub = freshStub()
+            const spy = await spyOnDeliver(stub)
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.complete(did, "3m1", Date.now())
+            )
+            // Intake a DIFFERENT claimed rev than what's already indexed,
+            // so this genuinely owes a fetch rather than deduping to
+            // "duplicate" (same rev in, same rev already indexed) — which
+            // would never even reach `settle()`, making this test pass
+            // for the wrong reason regardless of the branch under test.
+            // `fetchRecord` below then reports back the SAME rev that was
+            // already indexed, the way a reverify (an identity event, not
+            // a real change) actually plays out.
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.intake({ did, rev: "3m2" }, "c1")
+            )
+
+            await withFetchThroughRealOnChange(stub, async () => ({
+                rev: "3m1",
+                car: new Uint8Array([1]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }))
+
+            expect(spy).not.toHaveBeenCalled()
+        })
+    })
+})
