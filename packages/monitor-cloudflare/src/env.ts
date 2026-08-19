@@ -114,4 +114,20 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * registration must outlive a co-hosted relay registration.
      */
     registrations?: KVNamespace
+
+    /**
+     * Web Push configuration for the own-DID push — all optional, and
+     * required together (`push-sender.ts`'s `monitorWebPushSender`
+     * contract: partial configuration is treated the same as none). The
+     * same var names the PMR side uses (`@germ-network/atproto-pmr-cloudflare`'s
+     * `PMREnv`), deliberately: a deployment that co-hosts a relay and a
+     * monitor configures push once and satisfies both interfaces from the
+     * same env, rather than each needing its own VAPID keypair and secret.
+     */
+    HOST_NAME?: string
+    VAPID_PUBLIC_KEY?: string
+    VAPID_PRIVATE_KEY?: string
+    VAPID_SUBJECT?: string
+    PUSH_MAX_SEALED_BYTES?: string
+    PUSH_TTL_SECONDS?: string
 }

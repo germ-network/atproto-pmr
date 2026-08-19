@@ -75,6 +75,13 @@ export {
     type MonitorRegistrationDeps,
 } from "./registration-endpoint"
 
+// The deliverer: sends the own-DID push.
+export {
+    pushDeclarationChange,
+    type DeclarationPushSender,
+    type NotifyDeps,
+} from "./notify"
+
 // The authoritative read.
 export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"
 

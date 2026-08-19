@@ -3,6 +3,7 @@ import {
     decodeEvent,
     intake,
     listReposByCollection,
+    pushDeclarationChange,
     sealDueWindows,
     settleDue,
     sweepBackfill,
@@ -16,6 +17,8 @@ import {
     type PendingFetch,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
+import { monitorWebPushSender } from "./push-sender"
+import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSnapshotStore } from "./snapshot-store"
 
 /**
@@ -281,15 +284,84 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         )
     }
 
-    /** Own-DID push, where a registration holds this DID. */
-    protected onChange(_did: string, _rev: string): Promise<void> {
+    /**
+     * Own-DID push, where a registration holds this DID. The default here
+     * is a real implementation, not a stub to override: any deployment
+     * that binds `registrations` and the push vars (`env.ts`) gets working
+     * own-DID push for free, which is what keeps a deployment subclass
+     * (e.g. `GermMonitor`) from needing to know anything about push at
+     * all — it only supplies the authoritative fetch.
+     */
+    protected onChange(did: string, _rev: string): Promise<void> {
+        this.notifyRegistration(did)
         return Promise.resolve()
     }
 
-    /** A rev that moved backwards. Never silent in a real deployment. */
+    /**
+     * A rev that moved backwards. Never silent in a real deployment — and,
+     * like `onChange`, pushes to a registered device: a regression is
+     * exactly the kind of change `spec/key-transparency.md`'s "own-DID
+     * push on any change" means to cover, arguably more urgently than an
+     * ordinary advance.
+     */
     protected onRegression(did: string, indexed: string, observed: string): Promise<void> {
         console.log("monitor: rev regression", { did, indexed, observed })
+        this.notifyRegistration(did)
         return Promise.resolve()
+    }
+
+    /**
+     * Fire-and-forget: kicks off `deliverDeclarationPush` and hands it to
+     * `ctx.waitUntil` without awaiting it here, so it runs deferred from
+     * `settle()`'s own completion — exactly as `packages/cloudflare`'s
+     * `pmr-object.ts` defers its push. Split from `deliverDeclarationPush`
+     * itself (rather than inlined) so a test can invoke the real work
+     * directly and await it, the same way `push.spec.ts` tests
+     * `PMRObject.deliverPush` directly rather than through its own
+     * deferred call sites — asserting on the result of something wrapped
+     * in `waitUntil` is a race by construction, not a fixture problem.
+     */
+    private notifyRegistration(did: string): void {
+        this.ctx.waitUntil(this.deliverDeclarationPush(did))
+    }
+
+    /**
+     * The actual own-DID push: compose the sender, load the registration,
+     * send, and drop the registration on `discard`. Never throws — a push
+     * failure must not propagate back into `settle()`, whose caller
+     * (`settleDue`) treats any throw as a transient fetch failure and
+     * re-schedules the PDS read. That would be wrong here: the record
+     * already settled correctly, and only the notification failed. So
+     * every failure — a thrown error, or a `"failed"` delivery outcome
+     * (e.g. a rotated VAPID key that no longer pairs) — is caught and
+     * logged here, using only the subscription endpoint's origin, never
+     * the full capability URL. `"discard"`/`"retry"`/`"delivered"` are
+     * expected lifecycle, not failures, and stay unlogged — matching the
+     * PMR's own `deliverPush` (`pmr-object.ts`), including why a `"failed"`
+     * outcome needs its own explicit check: `pushDeclarationChange` cannot
+     * throw one, so nothing here would ever see it without checking.
+     *
+     * The whole body is guarded, not just the send: `monitorWebPushSender`
+     * decodes `VAPID_PRIVATE_KEY` eagerly, so a malformed secret throws
+     * right there, before any request is attempted — the same
+     * base-wide-misconfiguration class the PMR's own `deliverPush` guards
+     * against for the same reason.
+     */
+    private async deliverDeclarationPush(did: string): Promise<void> {
+        try {
+            const registrations = kvMonitorRegistrationStore(this.env)
+            const sender = monitorWebPushSender(this.env)
+            if (registrations === null || sender === null) return
+
+            const result = await pushDeclarationChange(did, { registrations, sender })
+            if (result?.outcome === "failed") {
+                console.error(
+                    `monitor onChange: push service answered ${result.status} for ${did}`
+                )
+            }
+        } catch (err) {
+            console.error(`monitor onChange: push failed for ${did}:`, err)
+        }
     }
 
     private deps(): IngestDeps {
