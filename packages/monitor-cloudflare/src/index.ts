@@ -29,8 +29,19 @@
  * deliberately *not* here: they are KV reads that belong in a plain
  * Worker, so the community view scales and caches like the public data it
  * is. Use `kvSnapshotStore` from the request handler.
+ *
+ * The registration surface's endpoints (`@germ-network/atproto-pmr-monitor`'s
+ * `handleMonitorRegistrationCreate`/`handleMonitorRegistrationDelete`) are
+ * request-handler code too, and need a `MonitorRegistrationStore` to wire
+ * up — `kvMonitorRegistrationStore` is that adapter, for the same reason
+ * `kvSnapshotStore` is exported here rather than kept internal to
+ * `MonitorIngest`. `monitorWebPushSender` stays unexported: unlike the
+ * store, nothing outside `MonitorIngest`'s own `onChange`/`onRegression`
+ * needs to compose a sender, matching `@germ-network/atproto-pmr-cloudflare`'s
+ * `webPushSender`, which is the same kind of internal-only composition.
  */
 
 export { MonitorIngest } from "./ingest-object"
+export { kvMonitorRegistrationStore } from "./registration-store"
 export { kvSnapshotStore } from "./snapshot-store"
 export type { MonitorEnv } from "./env"
