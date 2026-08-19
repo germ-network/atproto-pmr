@@ -191,6 +191,76 @@ describe("settle", () => {
         expect(onChange).toHaveBeenCalledWith(DID, "3m2")
     })
 
+    it("fires the change hook on a pure key rotation, even with rev unchanged", async () => {
+        // The identity-event path (`intake`'s "reverify") lands here with
+        // an unchanged rev whenever a DID's document rotated without a new
+        // commit — a pure key rotation is arguably the single most
+        // security-relevant thing this component exists to catch, so it
+        // must not go silent just because `rev` didn't move.
+        const ROTATED_KEY = "zQ3shRotatedKeyNotARealMultikey00000000000"
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            fetchRecord: async () => ({
+                rev: "3m2",
+                car: new Uint8Array([1, 2, 3]),
+                source: PDS,
+                signingKey: ROTATED_KEY,
+            }),
+        })
+        h.revs.set(DID, "3m2")
+        h.records.set(DID, {
+            rev: "3m2",
+            car: new Uint8Array([1, 2, 3]),
+            observedAtMs: 500_000,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m2")
+    })
+
+    it("does not fire the change hook when neither rev nor signing key moved", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({ onChange })
+        h.revs.set(DID, "3m2")
+        h.records.set(DID, {
+            rev: "3m2",
+            car: new Uint8Array([1, 2, 3]),
+            observedAtMs: 500_000,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it("does not treat an unresolved signing key on either side as a rotation", async () => {
+        // Mirrors `compareObservations`' own documented blind spot: a
+        // `null` key on either side means rotation cannot be asserted, not
+        // that one is ruled out.
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            fetchRecord: async () => ({
+                rev: "3m2",
+                car: new Uint8Array([1, 2, 3]),
+                source: PDS,
+                signingKey: null,
+            }),
+        })
+        h.revs.set(DID, "3m2")
+        h.records.set(DID, {
+            rev: "3m2",
+            car: new Uint8Array([1, 2, 3]),
+            observedAtMs: 500_000,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(onChange).not.toHaveBeenCalled()
+    })
+
     it("carries the fetch's provenance into the stored entry", async () => {
         // `fetchRecordCar` resolves `source`/`signingKey` and previously
         // threw them away. This is the property that stops that

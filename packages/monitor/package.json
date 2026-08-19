@@ -16,6 +16,7 @@
 		"node": ">=24"
 	},
 	"devDependencies": {
+		"@noble/curves": "^2.3.0",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10",
 		"@germ-network/atproto-pmr-core": "workspace:*"

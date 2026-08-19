@@ -57,3 +57,13 @@ BACKFILL_BATCH = "100"
 [[kv_namespaces]]
 	binding = "records"
 	id = "PROVISION_BEFORE_DEPLOY"
+
+# Optional: the registration surface (own-DID push). Omit this binding
+# entirely to run a monitor with no registration/push capability — the
+# registration endpoints then have nothing to serve, and `onChange` no-ops.
+# Deliberately its own namespace, not the relay's registration storage: see
+# `MonitorRegistration`'s doc comment (`@germ-network/atproto-pmr-monitor`)
+# for why a registration must outlive a co-hosted relay registration.
+[[kv_namespaces]]
+	binding = "registrations"
+	id = "PROVISION_BEFORE_DEPLOY"

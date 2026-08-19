@@ -67,6 +67,14 @@ export {
 // The digest endpoint.
 export { handleDigest, type DigestEndpointDeps } from "./digest-endpoint"
 
+// The registration surface: own-DID push.
+export type { MonitorRegistration, MonitorRegistrationStore } from "./registration"
+export {
+    handleMonitorRegistrationCreate,
+    handleMonitorRegistrationDelete,
+    type MonitorRegistrationDeps,
+} from "./registration-endpoint"
+
 // The authoritative read.
 export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"
 

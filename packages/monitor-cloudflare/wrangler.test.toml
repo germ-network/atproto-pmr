@@ -40,3 +40,7 @@ BACKFILL_BATCH = "100"
 [[kv_namespaces]]
 	binding = "records"
 	id = "test"
+
+[[kv_namespaces]]
+	binding = "registrations"
+	id = "test-registrations"
