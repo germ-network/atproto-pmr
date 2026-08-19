@@ -100,6 +100,15 @@ const NONCE_SEEN_SET_SIZE = 256
 const nonceHex = (n: Nonce) =>
     [...n].map((b) => b.toString(16).padStart(2, "0")).join("")
 
+/** For logging: the push-service host, never the full capability URL. */
+const safeOrigin = (endpoint: string): string => {
+    try {
+        return new URL(endpoint).origin
+    } catch {
+        return "<unparseable endpoint>"
+    }
+}
+
 export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     private readonly db: DurableObjectStorage
     /**
@@ -211,26 +220,55 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * parameter: unlike `deliverLive`, this doesn't run once per socket —
      * it needs the subscription, which lives on the registration, not on
      * anything the caller already holds.
+     *
+     * Unlike the bare interface contract ("a caller MUST treat a
+     * rejection as nothing-happened"), THIS implementation never rejects:
+     * every failure is caught and logged here rather than left to
+     * whichever caller happens to be holding a `try/catch`. Without this,
+     * a base-wide misconfiguration (a rotated VAPID key that no longer
+     * pairs, an exhausted push-service quota) fails every delivery
+     * silently forever — nothing server-side would ever show it. `failed`
+     * and a thrown error are logged; `discard` (404/410) and `retry`
+     * (429) are normal lifecycle, not logged as failures.
+     *
+     * Logs only the endpoint's origin, never the full capability URL —
+     * the path carries an opaque token a log line has no reason to keep.
      */
     async deliverPush(
         key: MailboxKey,
         ref: MessageRef,
         message: Uint8Array
     ): Promise<void> {
-        const sender = webPushSender(this.env)
-        if (sender === null) return
         const reg = await this.load()
         if (reg?.pushSubscription === undefined) return
+        const endpointOrigin = safeOrigin(reg.pushSubscription.endpoint)
 
-        const plaintext = buildMessagePushPayload({
-            key,
-            ref,
-            message,
-            maxSealedBytes: sender.maxSealedBytes,
-        })
-        const result = await sender.send(reg.pushSubscription, plaintext)
-        if (result.outcome === "discard") {
-            await this.update({ pushSubscription: undefined })
+        // The whole body is guarded, not just `sender.send()`: constructing
+        // the sender itself decodes `VAPID_PRIVATE_KEY` eagerly
+        // (`webPushSender` in push-sender.ts), so a malformed secret throws
+        // right there — before any request is even attempted. That's the
+        // same base-wide-misconfiguration class this logging exists to
+        // catch, so it has to be inside the guard too.
+        try {
+            const sender = webPushSender(this.env)
+            if (sender === null) return
+
+            const plaintext = buildMessagePushPayload({
+                key,
+                ref,
+                message,
+                maxSealedBytes: sender.maxSealedBytes,
+            })
+            const result = await sender.send(reg.pushSubscription, plaintext)
+            if (result.outcome === "discard") {
+                await this.update({ pushSubscription: undefined })
+            } else if (result.outcome === "failed") {
+                console.error(
+                    `deliverPush: push service answered ${result.status} for ${endpointOrigin}`
+                )
+            }
+        } catch (err) {
+            console.error(`deliverPush: failed for ${endpointOrigin}:`, err)
         }
     }
 
