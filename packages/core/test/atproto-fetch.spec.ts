@@ -11,7 +11,7 @@
  * to provide automatically.
  */
 import { describe, expect, it } from "vitest"
-import { guardedFetchBytes, guardedFetchJSON } from "../src/atproto-fetch"
+import { guardedFetchBytes, guardedFetchJSON, RecordNotFoundError } from "../src/atproto-fetch"
 
 const URL_ = "https://pds.example.com/xrpc/thing"
 
@@ -91,5 +91,56 @@ describe("guardedFetchBytes", () => {
         const fetchImpl = (async () => new Response(bytes)) as typeof fetch
         const result = await guardedFetchBytes(URL_, fetchImpl)
         expect([...result]).toEqual([...bytes])
+    })
+
+    it("throws RecordNotFoundError when the body names a caller-supplied terminal error", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RepoNotFound", message: "gone" }), {
+                status: 400,
+            })) as typeof fetch
+        await expect(
+            guardedFetchBytes(URL_, fetchImpl, { terminalErrorNames: ["RepoNotFound"] })
+        ).rejects.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("a bare 404 with no matching error body is the generic error, NOT RecordNotFoundError", async () => {
+        const fetchImpl = (async () => new Response(null, { status: 404 })) as typeof fetch
+        const rejection = guardedFetchBytes(URL_, fetchImpl, {
+            terminalErrorNames: ["RepoNotFound"],
+        })
+        await expect(rejection).rejects.toThrow(/404/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("an error body naming something NOT in terminalErrorNames stays generic", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "InternalServerError" }), {
+                status: 500,
+            })) as typeof fetch
+        const rejection = guardedFetchBytes(URL_, fetchImpl, {
+            terminalErrorNames: ["RepoNotFound"],
+        })
+        await expect(rejection).rejects.toThrow(/500/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("a 500 is the generic error when no terminalErrorNames option is passed at all", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RepoNotFound" }), {
+                status: 500,
+            })) as typeof fetch
+        const rejection = guardedFetchBytes(URL_, fetchImpl)
+        await expect(rejection).rejects.toThrow(/500/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("an unparseable error body falls back to the generic error", async () => {
+        const fetchImpl = (async () =>
+            new Response("not json", { status: 400 })) as typeof fetch
+        const rejection = guardedFetchBytes(URL_, fetchImpl, {
+            terminalErrorNames: ["RepoNotFound"],
+        })
+        await expect(rejection).rejects.toThrow(/400/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
     })
 })

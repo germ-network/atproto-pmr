@@ -14,6 +14,7 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
@@ -51,6 +52,15 @@ export interface IngestDeps {
     onChange?(did: string, rev: string): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
     onRegression?(did: string, indexed: string, observed: string): Promise<void>
+    /**
+     * Raised when the watched declaration is confirmed deleted at the
+     * source (the PDS's own XRPC error body named a terminal state —
+     * `RepoNotFound` and siblings — not merely being unreachable)
+     * — arguably the single most alarming thing this component could
+     * observe, and as deserving of a push to a registered device as a
+     * rev advancing.
+     */
+    onDelete?(did: string): Promise<void>
     nowMs(): number
 }
 
@@ -107,9 +117,12 @@ export async function intake(
  * `rejected` is not an error: the look happened and the answer was an
  * alarm. It is separated from `stored` because the obligation is
  * discharged either way — retrying a regression would hammer the PDS of
- * the very DID under attack, forever, with the same answer.
+ * the very DID under attack, forever, with the same answer. `deleted` is
+ * its own case rather than folded into `rejected`: unlike a regression or
+ * a failed verification, there is no record left to have an opinion
+ * about — the source confirmed it is gone.
  */
-export type SettleOutcome = "stored" | "rejected"
+export type SettleOutcome = "stored" | "rejected" | "deleted"
 
 /**
  * Steps 2 and 3, off the read loop. Safe to call for a DID owed more than
@@ -117,10 +130,28 @@ export type SettleOutcome = "stored" | "rejected"
  * collapses into a single authoritative read.
  *
  * Throws only on *transient* failure (the PDS is unreachable), which is
- * what tells the caller to retry with backoff.
+ * what tells the caller to retry with backoff. A `RecordNotFoundError` is
+ * NOT transient — it means the fetch succeeded and the PDS authoritatively
+ * said the record does not exist — and is handled here rather than
+ * re-thrown, specifically so it does not fall into `settleDue`'s retry
+ * path: retrying an answer that will not change until something happens
+ * again accomplishes nothing but leaving the obligation owed forever.
  */
 export async function settle(deps: IngestDeps, did: string): Promise<SettleOutcome> {
-    const record = await deps.fetchRecord(did)
+    let record: FetchedRecord
+    try {
+        record = await deps.fetchRecord(did)
+    } catch (err) {
+        if (!(err instanceof RecordNotFoundError)) throw err
+        // Confirmed gone at the source. Nothing left to verify or index,
+        // so this skips straight to disposing of what's stored and
+        // notifying — the checks below (verify, regression, rotation) all
+        // assume a record exists to compare, which there no longer is.
+        await deps.snapshot.deleteRecord(did)
+        await deps.index.clearPending(did)
+        await deps.onDelete?.(did)
+        return "deleted"
+    }
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
         // Not evidence of anything the monitor may serve. Terminal, not

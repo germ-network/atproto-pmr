@@ -136,12 +136,19 @@ so one singular path names the one resource for every verb that touches it.
 ### Registration and the own-DID push
 
 A registration binds a DID to a push destination; the monitor pushes when
-that DID's own record changes — a rev advancing or regressing, and a key
-rotation observed via an identity event even when `rev` did not move, since
-a rotation is arguably the single most security-relevant thing this
-component exists to catch. This is the security primitive of the
-component: the device holds ground truth for its own key, so a single
-honest monitor detects a malicious publication of it.
+that DID's own record changes — a rev advancing or regressing, a key
+rotation observed via an identity event even when `rev` did not move, and
+the declaration being deleted outright (the source PDS authoritatively
+confirming the record no longer exists, not merely being unreachable).
+Deletion is not treated as a lesser case: it is arguably the single most
+alarming kind of change this component could observe, and is what a rev
+regression or a key rotation are each one step short of. On a confirmed
+deletion the monitor also stops serving the stale record — continuing to
+answer `GET /records/{did}` with proof of a record that no longer exists
+to be proven would misrepresent the community view, not merely leave it
+stale. This is the security primitive of the component: the device holds
+ground truth for its own key, so a single honest monitor detects a
+malicious publication of it — or its disappearance.
 
 **Registration authenticates to the declared anchor key** (the same
 `anchor` realm a relay registration uses), not to any atproto-side

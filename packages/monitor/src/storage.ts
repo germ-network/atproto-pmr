@@ -82,6 +82,16 @@ export interface DigestMarker {
 export interface SnapshotStore {
     getRecord(did: string): Promise<SnapshotEntry | null>
     putRecord(did: string, entry: SnapshotEntry): Promise<void>
+    /**
+     * The one case a record is disposed of outright, unlike the "no TTL"
+     * rule above: a confirmed deletion at the source (the PDS's own XRPC
+     * error body named a terminal state for this DID's declaration, not
+     * merely being unreachable). Continuing to serve a stale CAR after
+     * that would be actively misleading — the community view would claim
+     * to hold proof of a record that no longer exists to be proven. A
+     * no-op if nothing was stored for `did`.
+     */
+    deleteRecord(did: string): Promise<void>
     /** Absent means either genuinely unsealed, or not yet propagated to
      * this replica — `serveDigest` is what tells those apart, using
      * `getDigestMarker`; this store makes no claim either way. */

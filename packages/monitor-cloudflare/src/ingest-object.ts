@@ -311,6 +311,18 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     }
 
     /**
+     * The watched declaration was confirmed deleted at the source. Pushes
+     * to a registered device the same as `onChange`/`onRegression` — the
+     * device re-fetches, finds nothing, and reacts accordingly; this
+     * object never asserts what the change was, only that one happened.
+     */
+    protected onDelete(did: string): Promise<void> {
+        console.log("monitor: declaration deleted", { did })
+        this.notifyRegistration(did)
+        return Promise.resolve()
+    }
+
+    /**
      * Fire-and-forget: kicks off `deliverDeclarationPush` and hands it to
      * `ctx.waitUntil` without awaiting it here, so it runs deferred from
      * `settle()`'s own completion — exactly as `packages/cloudflare`'s
@@ -371,6 +383,7 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             fetchRecord: (did) => this.fetchRecord(did),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
+            onDelete: (did) => this.onDelete(did),
             nowMs: () => Date.now(),
         }
     }

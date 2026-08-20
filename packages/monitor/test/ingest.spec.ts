@@ -9,6 +9,7 @@
  * set covers the gap between "seen" and "stored".
  */
 import { describe, expect, it, vi } from "vitest"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
 import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
@@ -88,6 +89,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const snapshot: SnapshotStore = {
         getRecord: async (did) => records.get(did) ?? null,
         putRecord: async (did, entry) => void records.set(did, entry),
+        deleteRecord: async (did) => void records.delete(did),
         getSealedWindow: async (id) => windows.get(id) ?? null,
         putSealedWindow: async (id, f) => void windows.set(id, f),
         getDigestMarker: async () => marker,
@@ -303,6 +305,63 @@ describe("settle", () => {
         expect(h.revs.size).toBe(0)
         expect(h.pending.has(DID)).toBe(false)
     })
+
+    it("a confirmed deletion disposes of the stored record and clears the obligation", async () => {
+        // The record previously existed and was served — that's what
+        // needs disposing of. Confirming the deletion path actually
+        // removes it, not just skips re-adding it.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, {
+            rev: "3m1",
+            car: new Uint8Array([1]),
+            observedAtMs: 500_000,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.records.has(DID)).toBe(false)
+        expect(h.pending.has(DID)).toBe(false)
+    })
+
+    it("a confirmed deletion fires onDelete, not onChange or onRegression", async () => {
+        const onChange = vi.fn(async () => {})
+        const onRegression = vi.fn(async () => {})
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            onRegression,
+            onDelete,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+
+        await settle(h.deps, DID)
+
+        expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(onChange).not.toHaveBeenCalled()
+        expect(onRegression).not.toHaveBeenCalled()
+    })
+
+    it("a genuinely unresolvable DID (never seen before) is still handled cleanly by a deletion", async () => {
+        // No prior record, no prior indexed rev -- deleteRecord/clearPending
+        // on nothing must no-op rather than throw.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await expect(settle(h.deps, DID)).resolves.toBe("deleted")
+    })
 })
 
 describe("settleDue", () => {
@@ -345,6 +404,30 @@ describe("settleDue", () => {
         expect(await settleDue(h.deps)).toBe(1)
         expect(h.pending.size).toBe(0)
         expect(h.revs.get(DID)).toBe("3m2")
+    })
+
+    it("a confirmed deletion is discharged, NOT retried like a transient failure — the bug this pins", async () => {
+        // Before this fix: guardedFetchBytes threw a generic Error on
+        // every non-ok status, so settle() could not tell "the record is
+        // gone" from "the PDS is unreachable" -- both propagated out of
+        // fetchRecord, settleDue's catch treated a confirmed deletion the
+        // same as an outage, and deferPending re-queued it with backoff
+        // forever. A declaration being deleted -- the single most
+        // alarming kind of change this component exists to catch -- would
+        // never actually settle, never push, and would sit retrying
+        // against an answer that could not change.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+
+        expect(await settleDue(h.deps)).toBe(0)
+        // The proof: gone from pending entirely, not deferred with a
+        // later notBeforeMs the way a transient failure is (compare the
+        // "keeps a failed fetch owed, with backoff" test above).
+        expect(h.pending.has(DID)).toBe(false)
     })
 })
 

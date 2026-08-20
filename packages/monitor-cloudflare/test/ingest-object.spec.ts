@@ -14,7 +14,7 @@ import {
 } from "cloudflare:test"
 import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { binaryToBase64URL } from "@germ-network/atproto-pmr-core"
+import { binaryToBase64URL, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
     mightHaveChanged,
@@ -496,6 +496,25 @@ describe("the snapshot store", () => {
         expect(await kvSnapshotStore(testEnv).getRecord("did:plc:nobody")).toBeNull()
     })
 
+    it("deleteRecord removes a served record; a subsequent getRecord is null", async () => {
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord("did:plc:gone", {
+            rev: "3m1",
+            car: new Uint8Array([9]),
+            observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await store.deleteRecord("did:plc:gone")
+        expect(await store.getRecord("did:plc:gone")).toBeNull()
+    })
+
+    it("deleteRecord on a DID that was never stored is a no-op, not an error", async () => {
+        await expect(
+            kvSnapshotStore(testEnv).deleteRecord("did:plc:never-stored")
+        ).resolves.toBeUndefined()
+    })
+
     it("round-trips a sealed window", async () => {
         const store = kvSnapshotStore(testEnv)
         await store.putSealedWindow("w1", new Uint8Array([4, 5]))
@@ -884,6 +903,21 @@ describe("own-DID push", () => {
             }))
 
             expect(spy).not.toHaveBeenCalled()
+        })
+
+        it("a confirmed deletion also calls deliverDeclarationPush", async () => {
+            const did = "did:plc:push-wiring-deleted"
+            const stub = freshStub()
+            const spy = await spyOnDeliver(stub)
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.intake({ did, rev: "3m1" }, "c1")
+            )
+
+            await withFetchThroughRealOnChange(stub, async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            })
+
+            expect(spy).toHaveBeenCalledWith(did)
         })
     })
 })

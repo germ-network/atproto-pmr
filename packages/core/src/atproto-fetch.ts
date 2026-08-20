@@ -46,6 +46,32 @@ const FETCH_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BYTES = 64 * 1024
 
 /**
+ * The endpoint's own XRPC error body named one of the caller-supplied
+ * `terminalErrorNames` — a confirmed, authoritative "this does not exist
+ * (or is not currently reachable through this identity)", not a transient
+ * failure. Distinguished from `guardedFetchBytes`'s generic error so a
+ * caller can tell "the PDS is unreachable, retry" from "the PDS was
+ * reached and it named a terminal state" without parsing an error message
+ * itself. The two demand opposite handling: the first should be retried
+ * with backoff, and retrying the second forever accomplishes nothing but
+ * burning the retry queue on an answer that will not change until
+ * something happens again.
+ *
+ * Deliberately NOT raised from a bare HTTP status code alone (see the
+ * `terminalErrorNames` param) — a 404 from an arbitrary https endpoint
+ * proves nothing about atproto-level state; it could as easily be a
+ * misconfigured proxy or a wrong vhost while the real PDS is merely down.
+ * Only a body that actually names one of the caller's expected XRPC
+ * errors counts as confirmation.
+ */
+export class RecordNotFoundError extends Error {
+    constructor(xrpcErrorName: string) {
+        super(`endpoint's XRPC error body named "${xrpcErrorName}"`)
+        this.name = "RecordNotFoundError"
+    }
+}
+
+/**
  * True for a redirect under `redirect: "manual"`. Two forms, because the
  * runtime decides which one shows up: Cloudflare Workers returns the PDS's
  * actual 3xx status and `Location` header, while the WHATWG fetch spec
@@ -143,6 +169,30 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
     return new TextDecoder().decode(joined)
 }
 
+/**
+ * Best-effort: a small, capped read looking only for XRPC's
+ * `{"error": "<Name>", "message": "..."}` error-body shape. Never throws —
+ * an unparseable, empty, or oversized body just means "no name available",
+ * which the caller falls back to a generic error for. This intentionally
+ * duplicates `readCapped`'s reader loop rather than reusing it directly:
+ * that one propagates a size-limit exception outward (correct for a
+ * successful response, where an oversized body is itself the failure);
+ * this one must swallow every failure, because it runs on the already-
+ * failing path and an error parsing the *error* body must not replace the
+ * real one.
+ */
+async function tryReadXrpcErrorName(response: Response): Promise<string | null> {
+    try {
+        const text = await readCapped(response, MAX_RESPONSE_BYTES)
+        const body = JSON.parse(text) as unknown
+        if (typeof body !== "object" || body === null) return null
+        const name = (body as Record<string, unknown>).error
+        return typeof name === "string" ? name : null
+    } catch {
+        return null
+    }
+}
+
 
 /**
  * The same guards, returning bytes — for `com.atproto.sync.getRecord`,
@@ -154,7 +204,20 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
 export async function guardedFetchBytes(
     url: string,
     fetchImpl: typeof fetch,
-    maxBytes = MAX_CAR_BYTES
+    options: {
+        maxBytes?: number
+        /**
+         * XRPC `error` field values (from a JSON error body) that mean
+         * "confirmed absent, not transient" — raises `RecordNotFoundError`
+         * instead of the generic status-code `Error` when the body names
+         * one of them. Caller-supplied rather than hardcoded here: which
+         * names mean "gone" is a property of the specific XRPC method
+         * being called (its own lexicon's `errors` list), which this
+         * generic SSRF-guarded fetch has no business knowing on its own.
+         * Omit to keep every non-ok response generic, as before.
+         */
+        terminalErrorNames?: readonly string[]
+    } = {}
 ): Promise<Uint8Array> {
     let parsed: URL
     try {
@@ -179,9 +242,15 @@ export async function guardedFetchBytes(
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
+            if (options.terminalErrorNames !== undefined) {
+                const name = await tryReadXrpcErrorName(response)
+                if (name !== null && options.terminalErrorNames.includes(name)) {
+                    throw new RecordNotFoundError(name)
+                }
+            }
             throw new Error(`endpoint answered ${response.status}`)
         }
-        return await readCappedBytes(response, maxBytes)
+        return await readCappedBytes(response, options.maxBytes ?? MAX_CAR_BYTES)
     } finally {
         clearTimeout(timer)
     }
