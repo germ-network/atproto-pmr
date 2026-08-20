@@ -51,8 +51,16 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
+    const deleted = new Set<string>()
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
+
+    const addToWindow = (did: string, observedAtMs: number) => {
+        const w = Math.floor(observedAtMs / 600_000)
+        const set = members.get(w) ?? new Set<string>()
+        set.add(did)
+        members.set(w, set)
+    }
 
     const index: MonitorIndex = {
         readCursor: async () => null,
@@ -63,12 +71,16 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         },
         complete: async (did, rev, observedAtMs) => {
             revs.set(did, rev)
-            const w = Math.floor(observedAtMs / 600_000)
-            const set = members.get(w) ?? new Set<string>()
-            set.add(did)
-            members.set(w, set)
+            addToWindow(did, observedAtMs)
+            pending.delete(did)
+            deleted.delete(did)
+        },
+        completeDeletion: async (did, observedAtMs) => {
+            deleted.add(did)
+            addToWindow(did, observedAtMs)
             pending.delete(did)
         },
+        isDeleted: async (did) => deleted.has(did),
         duePending: async (nowMs) =>
             [...pending.entries()]
                 .filter(([, p]) => p.notBeforeMs <= nowMs)
@@ -108,7 +120,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         nowMs: () => 1_000_000,
         ...overrides,
     }
-    return { deps, revs, pending, records, members, windows, marker: () => marker }
+    return { deps, revs, pending, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake", () => {
@@ -155,6 +167,23 @@ describe("intake", () => {
         // leaves the record unchanged while changing what verifies it, so
         // the dedupe check would otherwise suppress the one fetch needed.
         expect(h.pending.has(DID)).toBe(true)
+    })
+
+    it("ignores identity events for a DID already confirmed deleted -- the noise this pins", async () => {
+        // Before isDeleted existed: every identity/account/sync event for
+        // an already-deleted DID re-owed a fetch, which rediscovered the
+        // same deletion and re-pushed to a registered device again --
+        // unbounded repeat noise for one already-known fact, not a new
+        // change. The rev floor alone can't tell "known-good, watch for
+        // rotation" from "known-gone, nothing left to rotate" -- that's
+        // exactly what isDeleted is for.
+        const h = harness()
+        h.revs.set(DID, "3m1")
+        h.deleted.add(DID)
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(h.pending.size).toBe(0)
     })
 })
 
@@ -361,6 +390,56 @@ describe("settle", () => {
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
         await expect(settle(h.deps, DID)).resolves.toBe("deleted")
+    })
+
+    it("a confirmed deletion reaches the digest window, same as a stored change would", async () => {
+        // Before completeDeletion existed, the deleted branch only cleared
+        // the pending row -- the DID never entered window_members, so the
+        // community-wide digest never learned the single most alarming
+        // kind of change this component exists to catch.
+        const h = harness({
+            nowMs: () => 500_000,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await settle(h.deps, DID)
+
+        expect(await h.deps.index.windowMembers(0)).toContain(DID)
+    })
+
+    it("a confirmed deletion marks the DID isDeleted, without disturbing the rev floor", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound")
+            },
+        })
+        h.revs.set(DID, "3m1")
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await settle(h.deps, DID)
+
+        expect(await h.deps.index.isDeleted(DID)).toBe(true)
+        // The floor survives -- clearing it would let a later republish at
+        // a lower rev than "3m1" launder a rollback past regression
+        // detection.
+        expect(h.revs.get(DID)).toBe("3m1")
+    })
+
+    it("a resurrection (a later successful settle) clears the isDeleted mark", async () => {
+        const h = harness({
+            fetchRecord: async () => ({
+                rev: "3m9",
+                car: new Uint8Array([9]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }),
+        })
+        h.deleted.add(DID)
+        await intake(h.deps, { collection: COLLECTION }, commit("3m9"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(await h.deps.index.isDeleted(DID)).toBe(false)
     })
 })
 

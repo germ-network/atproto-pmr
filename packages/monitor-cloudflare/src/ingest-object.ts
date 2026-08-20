@@ -105,6 +105,10 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
                     did TEXT NOT NULL,
                     PRIMARY KEY (window, did)
                 );
+                CREATE TABLE IF NOT EXISTS deleted (
+                    did TEXT PRIMARY KEY,
+                    deleted_at INTEGER NOT NULL
+                );
             `)
         })
     }
@@ -181,6 +185,10 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
      * The window is chosen by **observation time**, `observedAtMs`, not by
      * when the change happened: a sealed filter cannot be amended, and the
      * retry path settles arbitrarily late.
+     *
+     * Also drops any `deleted` mark for `did` — reaching here at all means
+     * the ordinary commit path just fetched and stored a live record for
+     * it, so a prior deletion no longer holds.
      */
     async complete(did: string, rev: string, observedAtMs: number): Promise<void> {
         this.db.sql.exec(
@@ -197,6 +205,36 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             did
         )
         this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+        this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+    }
+
+    /**
+     * Deletion's counterpart to `complete`: mark `did` gone, add it to the
+     * open digest window the same way a stored change would, and discharge
+     * the pending row — one batch, same atomicity argument. Deliberately
+     * leaves `revs` untouched; see `MonitorIndex.completeDeletion`.
+     */
+    async completeDeletion(did: string, observedAtMs: number): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
+            did,
+            observedAtMs
+        )
+        this.db.sql.exec(
+            "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                "ON CONFLICT(window, did) DO NOTHING",
+            windowOf(observedAtMs, this.digestWidthMs()),
+            did
+        )
+        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    }
+
+    async isDeleted(did: string): Promise<boolean> {
+        const row = this.db.sql
+            .exec<{ did: string }>("SELECT did FROM deleted WHERE did = ?", did)
+            .toArray()[0]
+        return row !== undefined
     }
 
     private digestWidthMs(): number {

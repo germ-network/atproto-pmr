@@ -178,6 +178,53 @@ describe("the index", () => {
         })
         expect(owed).toEqual([])
     })
+
+    it("completeDeletion marks isDeleted, clears the obligation, and reaches the digest window", async () => {
+        const stub = freshStub()
+        const observedAtMs = Date.now()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "100")
+            await obj.completeDeletion(DID, observedAtMs)
+            return {
+                isDeleted: await obj.isDeleted(DID),
+                owed: (await obj.duePending(Date.now(), 10)).length,
+                members: await obj.windowMembers(
+                    Math.floor(observedAtMs / 600_000) * 600_000
+                ),
+            }
+        })
+        expect(result.isDeleted).toBe(true)
+        expect(result.owed).toBe(0)
+        expect(result.members).toContain(DID)
+    })
+
+    it("completeDeletion leaves the rev index untouched -- the regression floor survives", async () => {
+        const stub = freshStub()
+        const untouched = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now())
+            await obj.completeDeletion(DID, Date.now())
+            return obj.revOf(DID)
+        })
+        expect(untouched).toBe("3m1")
+    })
+
+    it("a later complete() (resurrection) clears a prior completeDeletion mark", async () => {
+        const stub = freshStub()
+        const isDeleted = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.completeDeletion(DID, Date.now())
+            await obj.complete(DID, "3m9", Date.now())
+            return obj.isDeleted(DID)
+        })
+        expect(isDeleted).toBe(false)
+    })
+
+    it("isDeleted is false for a DID never marked deleted", async () => {
+        const stub = freshStub()
+        const isDeleted = await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.isDeleted(DID)
+        )
+        expect(isDeleted).toBe(false)
+    })
 })
 
 describe("settling what is owed", () => {

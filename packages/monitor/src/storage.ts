@@ -160,8 +160,44 @@ export interface MonitorIndex {
      * Apply a completed fetch: index the rev, add the DID to the open
      * window, clear the pending row — **atomically**, and only after the
      * bytes are durable in the `SnapshotStore`.
+     *
+     * Also clears any prior `completeDeletion` mark for `did`. A DID that
+     * reaches here again did so through the ordinary commit path — a real
+     * republish — so whatever `isDeleted` said before this call no longer
+     * applies; leaving it set would wrongly suppress reverification of a
+     * DID that is live again.
      */
     complete(did: string, rev: string, observedAtMs: number): Promise<void>
+
+    /**
+     * Apply a confirmed deletion: mark `did`'s declaration gone, add it to
+     * the open digest window, and discharge the pending row — atomically,
+     * the same shape as `complete`. A deletion is a change the digest must
+     * reflect like any other; skipping this would mean the community view
+     * never learns the single most alarming kind of change this component
+     * exists to catch.
+     *
+     * Deliberately does NOT touch the `rev` index (`revOf` keeps answering
+     * the last-known rev): that floor is what lets a later republish at a
+     * lower rev than what was seen before deletion still be caught as a
+     * regression. Clearing it would let a delete-then-republish launder a
+     * rollback past the one check that exists to catch it.
+     */
+    completeDeletion(did: string, observedAtMs: number): Promise<void>
+
+    /**
+     * Whether `did`'s declaration is currently marked confirmed-deleted.
+     *
+     * Exists so `intake`'s reverify path (identity/account/sync events,
+     * which arrive for every DID regardless of collection) can stop
+     * re-owing a fetch for a DID already known gone — without this, every
+     * subsequent identity event for an already-deleted DID re-triggers
+     * `settle`, which re-fetches, reconfirms the same deletion, and
+     * re-pushes to a registered device: correct on any one occurrence, but
+     * unbounded noise across every later event for that DID. Cleared the
+     * moment `complete` runs for the DID again (see there).
+     */
+    isDeleted(did: string): Promise<boolean>
 
     /** Retry queue. A fetch that failed is owed until it succeeds. */
     duePending(nowMs: number, limit: number): Promise<PendingFetch[]>

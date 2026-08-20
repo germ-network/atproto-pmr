@@ -97,6 +97,10 @@ export async function intake(
         // `intake` because the dedupe check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
         if (known === null) return "ignored"
+        // A DID confirmed deleted has no live record to re-verify against
+        // — re-owing here would only rediscover the same deletion and
+        // re-push it, once per identity/account/sync event, forever.
+        if (await deps.index.isDeleted(event.did)) return "ignored"
         await deps.index.owe(event.did, known)
         return "reverify"
     }
@@ -143,12 +147,14 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         record = await deps.fetchRecord(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        // Confirmed gone at the source. Nothing left to verify or index,
-        // so this skips straight to disposing of what's stored and
-        // notifying — the checks below (verify, regression, rotation) all
-        // assume a record exists to compare, which there no longer is.
+        // Confirmed gone at the source. Nothing left to verify or index
+        // by rev, so this skips straight to disposing of what's stored —
+        // the checks below (verify, regression, rotation) all assume a
+        // record exists to compare, which there no longer is. It still
+        // reaches the digest window, the same as a stored change would:
+        // `completeDeletion` is `complete`'s deletion-shaped counterpart.
         await deps.snapshot.deleteRecord(did)
-        await deps.index.clearPending(did)
+        await deps.index.completeDeletion(did, deps.nowMs())
         await deps.onDelete?.(did)
         return "deleted"
     }
