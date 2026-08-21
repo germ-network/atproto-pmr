@@ -105,6 +105,10 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
                     did TEXT NOT NULL,
                     PRIMARY KEY (window, did)
                 );
+                CREATE TABLE IF NOT EXISTS deleted (
+                    did TEXT PRIMARY KEY,
+                    deleted_at INTEGER NOT NULL
+                );
             `)
         })
     }
@@ -181,6 +185,10 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
      * The window is chosen by **observation time**, `observedAtMs`, not by
      * when the change happened: a sealed filter cannot be amended, and the
      * retry path settles arbitrarily late.
+     *
+     * Also drops any `deleted` mark for `did` — reaching here at all means
+     * the ordinary commit path just fetched and stored a live record for
+     * it, so a prior deletion no longer holds.
      */
     async complete(did: string, rev: string, observedAtMs: number): Promise<void> {
         this.db.sql.exec(
@@ -197,6 +205,45 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             did
         )
         this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+        this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+    }
+
+    /**
+     * Deletion's counterpart to `complete`: add `did` to the open digest
+     * window the same way a stored change would, and discharge the
+     * pending row — one batch, same atomicity argument. Deliberately
+     * leaves `revs` untouched; see `MonitorIndex.completeDeletion`.
+     *
+     * `permanent` gates only the `deleted` row — see that method's own
+     * doc for why a reversible state must NOT mark `did` `isDeleted`.
+     */
+    async completeDeletion(
+        did: string,
+        observedAtMs: number,
+        permanent: boolean
+    ): Promise<void> {
+        if (permanent) {
+            this.db.sql.exec(
+                "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
+                did,
+                observedAtMs
+            )
+        }
+        this.db.sql.exec(
+            "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                "ON CONFLICT(window, did) DO NOTHING",
+            windowOf(observedAtMs, this.digestWidthMs()),
+            did
+        )
+        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    }
+
+    async isDeleted(did: string): Promise<boolean> {
+        const row = this.db.sql
+            .exec<{ did: string }>("SELECT did FROM deleted WHERE did = ?", did)
+            .toArray()[0]
+        return row !== undefined
     }
 
     private digestWidthMs(): number {
@@ -311,6 +358,18 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     }
 
     /**
+     * The watched declaration was confirmed deleted at the source. Pushes
+     * to a registered device the same as `onChange`/`onRegression` — the
+     * device re-fetches, finds nothing, and reacts accordingly; this
+     * object never asserts what the change was, only that one happened.
+     */
+    protected onDelete(did: string): Promise<void> {
+        console.log("monitor: declaration deleted", { did })
+        this.notifyRegistration(did)
+        return Promise.resolve()
+    }
+
+    /**
      * Fire-and-forget: kicks off `deliverDeclarationPush` and hands it to
      * `ctx.waitUntil` without awaiting it here, so it runs deferred from
      * `settle()`'s own completion — exactly as `packages/cloudflare`'s
@@ -371,6 +430,7 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             fetchRecord: (did) => this.fetchRecord(did),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
+            onDelete: (did) => this.onDelete(did),
             nowMs: () => Date.now(),
         }
     }

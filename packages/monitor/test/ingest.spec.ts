@@ -9,6 +9,7 @@
  * set covers the gap between "seen" and "stored".
  */
 import { describe, expect, it, vi } from "vitest"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
 import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
@@ -50,8 +51,16 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
+    const deleted = new Set<string>()
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
+
+    const addToWindow = (did: string, observedAtMs: number) => {
+        const w = Math.floor(observedAtMs / 600_000)
+        const set = members.get(w) ?? new Set<string>()
+        set.add(did)
+        members.set(w, set)
+    }
 
     const index: MonitorIndex = {
         readCursor: async () => null,
@@ -62,12 +71,16 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         },
         complete: async (did, rev, observedAtMs) => {
             revs.set(did, rev)
-            const w = Math.floor(observedAtMs / 600_000)
-            const set = members.get(w) ?? new Set<string>()
-            set.add(did)
-            members.set(w, set)
+            addToWindow(did, observedAtMs)
+            pending.delete(did)
+            deleted.delete(did)
+        },
+        completeDeletion: async (did, observedAtMs, permanent) => {
+            if (permanent) deleted.add(did)
+            addToWindow(did, observedAtMs)
             pending.delete(did)
         },
+        isDeleted: async (did) => deleted.has(did),
         duePending: async (nowMs) =>
             [...pending.entries()]
                 .filter(([, p]) => p.notBeforeMs <= nowMs)
@@ -88,6 +101,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
     const snapshot: SnapshotStore = {
         getRecord: async (did) => records.get(did) ?? null,
         putRecord: async (did, entry) => void records.set(did, entry),
+        deleteRecord: async (did) => void records.delete(did),
         getSealedWindow: async (id) => windows.get(id) ?? null,
         putSealedWindow: async (id, f) => void windows.set(id, f),
         getDigestMarker: async () => marker,
@@ -106,7 +120,7 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         nowMs: () => 1_000_000,
         ...overrides,
     }
-    return { deps, revs, pending, records, members, windows, marker: () => marker }
+    return { deps, revs, pending, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake", () => {
@@ -153,6 +167,23 @@ describe("intake", () => {
         // leaves the record unchanged while changing what verifies it, so
         // the dedupe check would otherwise suppress the one fetch needed.
         expect(h.pending.has(DID)).toBe(true)
+    })
+
+    it("ignores identity events for a DID already confirmed deleted -- the noise this pins", async () => {
+        // Before isDeleted existed: every identity/account/sync event for
+        // an already-deleted DID re-owed a fetch, which rediscovered the
+        // same deletion and re-pushed to a registered device again --
+        // unbounded repeat noise for one already-known fact, not a new
+        // change. The rev floor alone can't tell "known-good, watch for
+        // rotation" from "known-gone, nothing left to rotate" -- that's
+        // exactly what isDeleted is for.
+        const h = harness()
+        h.revs.set(DID, "3m1")
+        h.deleted.add(DID)
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(h.pending.size).toBe(0)
     })
 })
 
@@ -303,6 +334,161 @@ describe("settle", () => {
         expect(h.revs.size).toBe(0)
         expect(h.pending.has(DID)).toBe(false)
     })
+
+    it("a confirmed deletion disposes of the stored record and clears the obligation", async () => {
+        // The record previously existed and was served — that's what
+        // needs disposing of. Confirming the deletion path actually
+        // removes it, not just skips re-adding it.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, {
+            rev: "3m1",
+            car: new Uint8Array([1]),
+            observedAtMs: 500_000,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.records.has(DID)).toBe(false)
+        expect(h.pending.has(DID)).toBe(false)
+    })
+
+    it("a confirmed deletion fires onDelete, not onChange or onRegression", async () => {
+        const onChange = vi.fn(async () => {})
+        const onRegression = vi.fn(async () => {})
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            onRegression,
+            onDelete,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+
+        await settle(h.deps, DID)
+
+        expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(onChange).not.toHaveBeenCalled()
+        expect(onRegression).not.toHaveBeenCalled()
+    })
+
+    it("a genuinely unresolvable DID (never seen before) is still handled cleanly by a deletion", async () => {
+        // No prior record, no prior indexed rev -- deleteRecord/clearPending
+        // on nothing must no-op rather than throw.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await expect(settle(h.deps, DID)).resolves.toBe("deleted")
+    })
+
+    it("a confirmed deletion reaches the digest window, same as a stored change would", async () => {
+        // Before completeDeletion existed, the deleted branch only cleared
+        // the pending row -- the DID never entered window_members, so the
+        // community-wide digest never learned the single most alarming
+        // kind of change this component exists to catch.
+        const h = harness({
+            nowMs: () => 500_000,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await settle(h.deps, DID)
+
+        expect(await h.deps.index.windowMembers(0)).toContain(DID)
+    })
+
+    it("a confirmed deletion marks the DID isDeleted, without disturbing the rev floor", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await settle(h.deps, DID)
+
+        expect(await h.deps.index.isDeleted(DID)).toBe(true)
+        // The floor survives -- clearing it would let a later republish at
+        // a lower rev than "3m1" launder a rollback past regression
+        // detection.
+        expect(h.revs.get(DID)).toBe("3m1")
+    })
+
+    it("a resurrection (a later successful settle) clears the isDeleted mark", async () => {
+        const h = harness({
+            fetchRecord: async () => ({
+                rev: "3m9",
+                car: new Uint8Array([9]),
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            }),
+        })
+        h.deleted.add(DID)
+        await intake(h.deps, { collection: COLLECTION }, commit("3m9"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(await h.deps.index.isDeleted(DID)).toBe(false)
+    })
+
+    it("a REVERSIBLE terminal state (RepoDeactivated) disposes, pushes, and reaches the digest -- but does NOT mark isDeleted", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onDelete,
+            nowMs: () => 500_000,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoDeactivated", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, {
+            rev: "3m1",
+            car: new Uint8Array([1]),
+            observedAtMs: 100,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.records.has(DID)).toBe(false)
+        expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(await h.deps.index.windowMembers(0)).toContain(DID)
+        expect(await h.deps.index.isDeleted(DID)).toBe(false)
+    })
+
+    it("the wedge this all pins: a reinstated account (no republish) is rechecked, NOT stuck forever", async () => {
+        // A reversible terminal state must not permanently suppress the
+        // one signal that would ever notice a reversal: a later
+        // identity/account/sync event for the same DID. Walks the full
+        // path -- settle marks it reversibly gone, then a fresh identity
+        // event must still schedule a recheck, exactly as it would for
+        // any other DID this monitor already holds.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoDeactivated", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await settle(h.deps, DID)
+        expect(h.pending.has(DID)).toBe(false)
+
+        const id = { kind: "account" as const, did: DID, seq: 2, timeMs: null }
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c2")).toBe("reverify")
+        expect(h.pending.has(DID)).toBe(true)
+    })
 })
 
 describe("settleDue", () => {
@@ -345,6 +531,30 @@ describe("settleDue", () => {
         expect(await settleDue(h.deps)).toBe(1)
         expect(h.pending.size).toBe(0)
         expect(h.revs.get(DID)).toBe("3m2")
+    })
+
+    it("a confirmed deletion is discharged, NOT retried like a transient failure — the bug this pins", async () => {
+        // Before this fix: guardedFetchBytes threw a generic Error on
+        // every non-ok status, so settle() could not tell "the record is
+        // gone" from "the PDS is unreachable" -- both propagated out of
+        // fetchRecord, settleDue's catch treated a confirmed deletion the
+        // same as an outage, and deferPending re-queued it with backoff
+        // forever. A declaration being deleted -- the single most
+        // alarming kind of change this component exists to catch -- would
+        // never actually settle, never push, and would sit retrying
+        // against an answer that could not change.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            },
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+
+        expect(await settleDue(h.deps)).toBe(0)
+        // The proof: gone from pending entirely, not deferred with a
+        // later notBeforeMs the way a transient failure is (compare the
+        // "keeps a failed fetch owed, with backoff" test above).
+        expect(h.pending.has(DID)).toBe(false)
     })
 })
 

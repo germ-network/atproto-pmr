@@ -14,7 +14,7 @@ import {
 } from "cloudflare:test"
 import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { binaryToBase64URL } from "@germ-network/atproto-pmr-core"
+import { binaryToBase64URL, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
     mightHaveChanged,
@@ -177,6 +177,80 @@ describe("the index", () => {
             return obj.duePending(Date.now(), 10)
         })
         expect(owed).toEqual([])
+    })
+
+    it("completeDeletion marks isDeleted, clears the obligation, and reaches the digest window", async () => {
+        const stub = freshStub()
+        const observedAtMs = Date.now()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "100")
+            await obj.completeDeletion(DID, observedAtMs, true)
+            return {
+                isDeleted: await obj.isDeleted(DID),
+                owed: (await obj.duePending(Date.now(), 10)).length,
+                members: await obj.windowMembers(
+                    Math.floor(observedAtMs / 600_000) * 600_000
+                ),
+            }
+        })
+        expect(result.isDeleted).toBe(true)
+        expect(result.owed).toBe(0)
+        expect(result.members).toContain(DID)
+    })
+
+    it("completeDeletion leaves the rev index untouched -- the regression floor survives", async () => {
+        const stub = freshStub()
+        const untouched = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now())
+            await obj.completeDeletion(DID, Date.now(), true)
+            return obj.revOf(DID)
+        })
+        expect(untouched).toBe("3m1")
+    })
+
+    it("a later complete() (resurrection) clears a prior completeDeletion mark", async () => {
+        const stub = freshStub()
+        const isDeleted = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.completeDeletion(DID, Date.now(), true)
+            await obj.complete(DID, "3m9", Date.now())
+            return obj.isDeleted(DID)
+        })
+        expect(isDeleted).toBe(false)
+    })
+
+    it("isDeleted is false for a DID never marked deleted", async () => {
+        const stub = freshStub()
+        const isDeleted = await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.isDeleted(DID)
+        )
+        expect(isDeleted).toBe(false)
+    })
+
+    it("a REVERSIBLE completeDeletion (permanent=false) still reaches the digest and clears pending, but does NOT mark isDeleted", async () => {
+        // The wedge this pins: RepoTakendown/RepoSuspended/RepoDeactivated
+        // are reversible account-lifecycle states. Marking isDeleted for
+        // one of these would permanently suppress every later
+        // identity/account/sync event for the DID (see intake's reverify
+        // guard) -- with no jetstream signal this object decodes that
+        // could ever un-suppress it. A DID reinstated after suspension,
+        // without ever republishing its declaration, would then stay
+        // unserved and unwatched forever.
+        const stub = freshStub()
+        const observedAtMs = Date.now()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "100")
+            await obj.completeDeletion(DID, observedAtMs, false)
+            return {
+                isDeleted: await obj.isDeleted(DID),
+                owed: (await obj.duePending(Date.now(), 10)).length,
+                members: await obj.windowMembers(
+                    Math.floor(observedAtMs / 600_000) * 600_000
+                ),
+            }
+        })
+        expect(result.isDeleted).toBe(false)
+        expect(result.owed).toBe(0)
+        expect(result.members).toContain(DID)
     })
 })
 
@@ -494,6 +568,25 @@ describe("the snapshot store", () => {
 
     it("returns null for a DID it has never seen", async () => {
         expect(await kvSnapshotStore(testEnv).getRecord("did:plc:nobody")).toBeNull()
+    })
+
+    it("deleteRecord removes a served record; a subsequent getRecord is null", async () => {
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord("did:plc:gone", {
+            rev: "3m1",
+            car: new Uint8Array([9]),
+            observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await store.deleteRecord("did:plc:gone")
+        expect(await store.getRecord("did:plc:gone")).toBeNull()
+    })
+
+    it("deleteRecord on a DID that was never stored is a no-op, not an error", async () => {
+        await expect(
+            kvSnapshotStore(testEnv).deleteRecord("did:plc:never-stored")
+        ).resolves.toBeUndefined()
     })
 
     it("round-trips a sealed window", async () => {
@@ -884,6 +977,21 @@ describe("own-DID push", () => {
             }))
 
             expect(spy).not.toHaveBeenCalled()
+        })
+
+        it("a confirmed deletion also calls deliverDeclarationPush", async () => {
+            const did = "did:plc:push-wiring-deleted"
+            const stub = freshStub()
+            const spy = await spyOnDeliver(stub)
+            await runInDurableObject(stub, (obj: MonitorIngest) =>
+                obj.intake({ did, rev: "3m1" }, "c1")
+            )
+
+            await withFetchThroughRealOnChange(stub, async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            })
+
+            expect(spy).toHaveBeenCalledWith(did)
         })
     })
 })

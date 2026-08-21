@@ -82,6 +82,18 @@ export interface DigestMarker {
 export interface SnapshotStore {
     getRecord(did: string): Promise<SnapshotEntry | null>
     putRecord(did: string, entry: SnapshotEntry): Promise<void>
+    /**
+     * The one case a record is disposed of outright, unlike the "no TTL"
+     * rule above: a confirmed terminal state at the source for this
+     * DID's declaration (`RecordNotFoundError`; not merely being
+     * unreachable) — permanent or reversible alike, since a reversible
+     * state (a takedown or suspension) still means the source cannot
+     * currently attest to this record either. Continuing to serve a
+     * stale CAR through that would be actively misleading — the
+     * community view would claim to hold proof of a record the source no
+     * longer serves. A no-op if nothing was stored for `did`.
+     */
+    deleteRecord(did: string): Promise<void>
     /** Absent means either genuinely unsealed, or not yet propagated to
      * this replica — `serveDigest` is what tells those apart, using
      * `getDigestMarker`; this store makes no claim either way. */
@@ -150,8 +162,56 @@ export interface MonitorIndex {
      * Apply a completed fetch: index the rev, add the DID to the open
      * window, clear the pending row — **atomically**, and only after the
      * bytes are durable in the `SnapshotStore`.
+     *
+     * Also clears any prior `completeDeletion` mark for `did`. A DID that
+     * reaches here again did so through the ordinary commit path — a real
+     * republish — so whatever `isDeleted` said before this call no longer
+     * applies; leaving it set would wrongly suppress reverification of a
+     * DID that is live again.
      */
     complete(did: string, rev: string, observedAtMs: number): Promise<void>
+
+    /**
+     * Apply a confirmed deletion: add `did` to the open digest window and
+     * discharge the pending row — atomically, the same shape as
+     * `complete`. A deletion is a change the digest must reflect like any
+     * other; skipping this would mean the community view never learns the
+     * single most alarming kind of change this component exists to catch.
+     *
+     * Deliberately does NOT touch the `rev` index (`revOf` keeps answering
+     * the last-known rev): that floor is what lets a later republish at a
+     * lower rev than what was seen before deletion still be caught as a
+     * regression. Clearing it would let a delete-then-republish launder a
+     * rollback past the one check that exists to catch it.
+     *
+     * `permanent` gates only whether this ALSO marks `did` `isDeleted` —
+     * not whether the digest/pending-clear happen, which occur either
+     * way. `false` is for a reversible account-lifecycle state (a
+     * takedown or suspension that may lift): the digest and any push
+     * still fire, correctly, but the DID must stay open to a future
+     * identity/account/sync event rechecking it, since that is the only
+     * way a reversal is ever noticed. `true` marking `isDeleted` is what
+     * that suppression is for — see `isDeleted`.
+     */
+    completeDeletion(did: string, observedAtMs: number, permanent: boolean): Promise<void>
+
+    /**
+     * Whether `did`'s declaration is marked *permanently* confirmed-gone
+     * — set only by a `completeDeletion(did, _, true)` call, never by a
+     * reversible one.
+     *
+     * Exists so `intake`'s reverify path (identity/account/sync events,
+     * which arrive for every DID regardless of collection) can stop
+     * re-owing a fetch for a DID already known permanently gone — without
+     * this, every subsequent identity event for such a DID re-triggers
+     * `settle`, which re-fetches, reconfirms the same deletion, and
+     * re-pushes to a registered device: correct on any one occurrence,
+     * but unbounded noise across every later event for that DID. A DID
+     * marked deleted only reversibly is deliberately NOT suppressed here,
+     * so those events keep flowing and a reversal still gets noticed.
+     * Cleared the moment `complete` runs for the DID again (see there).
+     */
+    isDeleted(did: string): Promise<boolean>
 
     /** Retry queue. A fetch that failed is owed until it succeeds. */
     duePending(nowMs: number, limit: number): Promise<PendingFetch[]>

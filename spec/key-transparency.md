@@ -136,12 +136,27 @@ so one singular path names the one resource for every verb that touches it.
 ### Registration and the own-DID push
 
 A registration binds a DID to a push destination; the monitor pushes when
-that DID's own record changes — a rev advancing or regressing, and a key
-rotation observed via an identity event even when `rev` did not move, since
-a rotation is arguably the single most security-relevant thing this
-component exists to catch. This is the security primitive of the
-component: the device holds ground truth for its own key, so a single
-honest monitor detects a malicious publication of it.
+that DID's own record changes — a rev advancing or regressing, a key
+rotation observed via an identity event even when `rev` did not move, and
+a **repo-level** terminal state confirmed at the source (the repo gone,
+taken down, suspended, or deactivated — never inferred from a bare
+unreachability). This is deliberately narrower than "the record deleted":
+per `com.atproto.sync.getRecord`'s own lexicon, deleting a single record
+still answers with an inclusion-exclusion proof over the *repo*, which
+flows through the ordinary rev-advance path above, not this one — a
+repo-level state is what has no such proof to serve instead. Not every
+one of these is permanent, either: a takedown or suspension may lift, and
+the monitor keeps that DID open to the next identity/account event
+noticing a reversal rather than treating it as settled forever. Even so,
+this is not a lesser case: it is arguably the single most alarming kind
+of change this component could observe, one step further than a rev
+regression or a key rotation. On a confirmed repo-level state the monitor
+also stops serving the stale record — continuing to answer
+`GET /records/{did}` with proof of a record whose repo no longer serves
+it would misrepresent the community view, not merely leave it stale.
+This is the security primitive of the component: the device holds ground
+truth for its own key, so a single honest monitor detects a malicious
+publication of it — or its disappearance.
 
 **Registration authenticates to the declared anchor key** (the same
 `anchor` realm a relay registration uses), not to any atproto-side

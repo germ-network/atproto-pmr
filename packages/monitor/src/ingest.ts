@@ -14,6 +14,7 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
@@ -51,6 +52,16 @@ export interface IngestDeps {
     onChange?(did: string, rev: string): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
     onRegression?(did: string, indexed: string, observed: string): Promise<void>
+    /**
+     * Raised when the watched declaration is confirmed unobtainable at
+     * the source (`RecordNotFoundError` — see its own doc comment for the
+     * two ways this gets confirmed — not merely being unreachable). Fires
+     * for a reversible account state too, not only a permanent one: a
+     * device deserves to know about a takedown or suspension as much as
+     * an outright deletion, even though the monitor itself keeps
+     * re-checking a reversible one rather than treating it as settled.
+     */
+    onDelete?(did: string): Promise<void>
     nowMs(): number
 }
 
@@ -87,6 +98,10 @@ export async function intake(
         // `intake` because the dedupe check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
         if (known === null) return "ignored"
+        // A DID confirmed deleted has no live record to re-verify against
+        // — re-owing here would only rediscover the same deletion and
+        // re-push it, once per identity/account/sync event, forever.
+        if (await deps.index.isDeleted(event.did)) return "ignored"
         await deps.index.owe(event.did, known)
         return "reverify"
     }
@@ -107,9 +122,12 @@ export async function intake(
  * `rejected` is not an error: the look happened and the answer was an
  * alarm. It is separated from `stored` because the obligation is
  * discharged either way — retrying a regression would hammer the PDS of
- * the very DID under attack, forever, with the same answer.
+ * the very DID under attack, forever, with the same answer. `deleted` is
+ * its own case rather than folded into `rejected`: unlike a regression or
+ * a failed verification, there is no record left to have an opinion
+ * about — the source confirmed it is gone.
  */
-export type SettleOutcome = "stored" | "rejected"
+export type SettleOutcome = "stored" | "rejected" | "deleted"
 
 /**
  * Steps 2 and 3, off the read loop. Safe to call for a DID owed more than
@@ -117,10 +135,35 @@ export type SettleOutcome = "stored" | "rejected"
  * collapses into a single authoritative read.
  *
  * Throws only on *transient* failure (the PDS is unreachable), which is
- * what tells the caller to retry with backoff.
+ * what tells the caller to retry with backoff. A `RecordNotFoundError` is
+ * NOT transient — it means the fetch succeeded and the PDS authoritatively
+ * said the record does not exist — and is handled here rather than
+ * re-thrown, specifically so it does not fall into `settleDue`'s retry
+ * path: retrying an answer that will not change until something happens
+ * again accomplishes nothing but leaving the obligation owed forever.
  */
 export async function settle(deps: IngestDeps, did: string): Promise<SettleOutcome> {
-    const record = await deps.fetchRecord(did)
+    let record: FetchedRecord
+    try {
+        record = await deps.fetchRecord(did)
+    } catch (err) {
+        if (!(err instanceof RecordNotFoundError)) throw err
+        // Confirmed gone at the source. Nothing left to verify or index
+        // by rev, so this skips straight to disposing of what's stored —
+        // the checks below (verify, regression, rotation) all assume a
+        // record exists to compare, which there no longer is. It still
+        // reaches the digest window, the same as a stored change would:
+        // `completeDeletion` is `complete`'s deletion-shaped counterpart.
+        // `err.permanent` decides only whether this ALSO suppresses
+        // future reverify events (see `MonitorIndex.isDeleted`) — a
+        // reversible state (an account takedown/suspension that may
+        // lift) still disposes of the stale snapshot and still pushes,
+        // but must stay open to a later event noticing the reversal.
+        await deps.snapshot.deleteRecord(did)
+        await deps.index.completeDeletion(did, deps.nowMs(), err.permanent)
+        await deps.onDelete?.(did)
+        return "deleted"
+    }
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
         // Not evidence of anything the monitor may serve. Terminal, not

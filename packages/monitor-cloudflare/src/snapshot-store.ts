@@ -76,6 +76,10 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             })
         },
 
+        async deleteRecord(did: string): Promise<void> {
+            await env.records.delete(RECORD_PREFIX + did)
+        },
+
         async getSealedWindow(windowId: string): Promise<Uint8Array | null> {
             const v = await env.records.get(WINDOW_PREFIX + windowId, "arrayBuffer")
             return v === null ? null : new Uint8Array(v)
