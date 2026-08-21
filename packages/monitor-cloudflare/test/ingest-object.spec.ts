@@ -184,7 +184,7 @@ describe("the index", () => {
         const observedAtMs = Date.now()
         const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.intake({ did: DID, rev: "3m1" }, "100")
-            await obj.completeDeletion(DID, observedAtMs)
+            await obj.completeDeletion(DID, observedAtMs, true)
             return {
                 isDeleted: await obj.isDeleted(DID),
                 owed: (await obj.duePending(Date.now(), 10)).length,
@@ -202,7 +202,7 @@ describe("the index", () => {
         const stub = freshStub()
         const untouched = await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.complete(DID, "3m1", Date.now())
-            await obj.completeDeletion(DID, Date.now())
+            await obj.completeDeletion(DID, Date.now(), true)
             return obj.revOf(DID)
         })
         expect(untouched).toBe("3m1")
@@ -211,7 +211,7 @@ describe("the index", () => {
     it("a later complete() (resurrection) clears a prior completeDeletion mark", async () => {
         const stub = freshStub()
         const isDeleted = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.completeDeletion(DID, Date.now())
+            await obj.completeDeletion(DID, Date.now(), true)
             await obj.complete(DID, "3m9", Date.now())
             return obj.isDeleted(DID)
         })
@@ -224,6 +224,33 @@ describe("the index", () => {
             obj.isDeleted(DID)
         )
         expect(isDeleted).toBe(false)
+    })
+
+    it("a REVERSIBLE completeDeletion (permanent=false) still reaches the digest and clears pending, but does NOT mark isDeleted", async () => {
+        // The wedge this pins: RepoTakendown/RepoSuspended/RepoDeactivated
+        // are reversible account-lifecycle states. Marking isDeleted for
+        // one of these would permanently suppress every later
+        // identity/account/sync event for the DID (see intake's reverify
+        // guard) -- with no jetstream signal this object decodes that
+        // could ever un-suppress it. A DID reinstated after suspension,
+        // without ever republishing its declaration, would then stay
+        // unserved and unwatched forever.
+        const stub = freshStub()
+        const observedAtMs = Date.now()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "100")
+            await obj.completeDeletion(DID, observedAtMs, false)
+            return {
+                isDeleted: await obj.isDeleted(DID),
+                owed: (await obj.duePending(Date.now(), 10)).length,
+                members: await obj.windowMembers(
+                    Math.floor(observedAtMs / 600_000) * 600_000
+                ),
+            }
+        })
+        expect(result.isDeleted).toBe(false)
+        expect(result.owed).toBe(0)
+        expect(result.members).toContain(DID)
     })
 })
 
@@ -961,7 +988,7 @@ describe("own-DID push", () => {
             )
 
             await withFetchThroughRealOnChange(stub, async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             })
 
             expect(spy).toHaveBeenCalledWith(did)

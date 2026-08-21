@@ -209,18 +209,27 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
     }
 
     /**
-     * Deletion's counterpart to `complete`: mark `did` gone, add it to the
-     * open digest window the same way a stored change would, and discharge
-     * the pending row — one batch, same atomicity argument. Deliberately
+     * Deletion's counterpart to `complete`: add `did` to the open digest
+     * window the same way a stored change would, and discharge the
+     * pending row — one batch, same atomicity argument. Deliberately
      * leaves `revs` untouched; see `MonitorIndex.completeDeletion`.
+     *
+     * `permanent` gates only the `deleted` row — see that method's own
+     * doc for why a reversible state must NOT mark `did` `isDeleted`.
      */
-    async completeDeletion(did: string, observedAtMs: number): Promise<void> {
-        this.db.sql.exec(
-            "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
-            did,
-            observedAtMs
-        )
+    async completeDeletion(
+        did: string,
+        observedAtMs: number,
+        permanent: boolean
+    ): Promise<void> {
+        if (permanent) {
+            this.db.sql.exec(
+                "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
+                did,
+                observedAtMs
+            )
+        }
         this.db.sql.exec(
             "INSERT INTO window_members (window, did) VALUES (?, ?) " +
                 "ON CONFLICT(window, did) DO NOTHING",

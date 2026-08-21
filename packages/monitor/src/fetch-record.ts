@@ -61,6 +61,21 @@ const TERMINAL_XRPC_ERRORS = [
     "RepoDeactivated",
 ] as const
 
+/**
+ * The subset of `TERMINAL_XRPC_ERRORS` with no path back short of the
+ * subject republishing from scratch. `RepoTakendown`/`RepoSuspended`/
+ * `RepoDeactivated` are deliberately excluded — atproto's own account
+ * lifecycle treats all three as *reversible*, and this monitor's own wake
+ * signal for that reversal is a jetstream `#account` event for a DID it
+ * already holds. Treating them as permanent would mean a DID that gets
+ * suspended and later reinstated, without ever republishing its
+ * declaration, has no path back to being served or watched again — a
+ * bounded, one-time correctness event turned into a standing bug. Only
+ * `RecordNotFound`/`RepoNotFound` earn that treatment: a repo or record
+ * atproto itself says will never exist at that identity again.
+ */
+const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
+
 export async function fetchRecordCar(
     did: string,
     options: FetchRecordOptions
@@ -75,6 +90,7 @@ export async function fetchRecordCar(
 
     const car = await guardedFetchBytes(recordUrl.toString(), fetchImpl, {
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
+        permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
     const rev = await fetchLatestRev(pds, did, fetchImpl)
     return { rev, car, source: pds, signingKey }

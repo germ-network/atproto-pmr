@@ -75,8 +75,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             pending.delete(did)
             deleted.delete(did)
         },
-        completeDeletion: async (did, observedAtMs) => {
-            deleted.add(did)
+        completeDeletion: async (did, observedAtMs, permanent) => {
+            if (permanent) deleted.add(did)
             addToWindow(did, observedAtMs)
             pending.delete(did)
         },
@@ -341,7 +341,7 @@ describe("settle", () => {
         // removes it, not just skips re-adding it.
         const h = harness({
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         h.revs.set(DID, "3m1")
@@ -368,7 +368,7 @@ describe("settle", () => {
             onRegression,
             onDelete,
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
@@ -385,7 +385,7 @@ describe("settle", () => {
         // on nothing must no-op rather than throw.
         const h = harness({
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
@@ -400,7 +400,7 @@ describe("settle", () => {
         const h = harness({
             nowMs: () => 500_000,
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
@@ -412,7 +412,7 @@ describe("settle", () => {
     it("a confirmed deletion marks the DID isDeleted, without disturbing the rev floor", async () => {
         const h = harness({
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         h.revs.set(DID, "3m1")
@@ -440,6 +440,54 @@ describe("settle", () => {
 
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(await h.deps.index.isDeleted(DID)).toBe(false)
+    })
+
+    it("a REVERSIBLE terminal state (RepoDeactivated) disposes, pushes, and reaches the digest -- but does NOT mark isDeleted", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onDelete,
+            nowMs: () => 500_000,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoDeactivated", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, {
+            rev: "3m1",
+            car: new Uint8Array([1]),
+            observedAtMs: 100,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.records.has(DID)).toBe(false)
+        expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(await h.deps.index.windowMembers(0)).toContain(DID)
+        expect(await h.deps.index.isDeleted(DID)).toBe(false)
+    })
+
+    it("the wedge this all pins: a reinstated account (no republish) is rechecked, NOT stuck forever", async () => {
+        // A reversible terminal state must not permanently suppress the
+        // one signal that would ever notice a reversal: a later
+        // identity/account/sync event for the same DID. Walks the full
+        // path -- settle marks it reversibly gone, then a fresh identity
+        // event must still schedule a recheck, exactly as it would for
+        // any other DID this monitor already holds.
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RepoDeactivated", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await settle(h.deps, DID)
+        expect(h.pending.has(DID)).toBe(false)
+
+        const id = { kind: "account" as const, did: DID, seq: 2, timeMs: null }
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c2")).toBe("reverify")
+        expect(h.pending.has(DID)).toBe(true)
     })
 })
 
@@ -497,7 +545,7 @@ describe("settleDue", () => {
         // against an answer that could not change.
         const h = harness({
             fetchRecord: async () => {
-                throw new RecordNotFoundError("RepoNotFound")
+                throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")

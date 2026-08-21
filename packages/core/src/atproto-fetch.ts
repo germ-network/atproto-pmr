@@ -46,28 +46,38 @@ const FETCH_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BYTES = 64 * 1024
 
 /**
- * The endpoint's own XRPC error body named one of the caller-supplied
- * `terminalErrorNames` — a confirmed, authoritative "this does not exist
- * (or is not currently reachable through this identity)", not a transient
- * failure. Distinguished from `guardedFetchBytes`'s generic error so a
- * caller can tell "the PDS is unreachable, retry" from "the PDS was
- * reached and it named a terminal state" without parsing an error message
- * itself. The two demand opposite handling: the first should be retried
- * with backoff, and retrying the second forever accomplishes nothing but
- * burning the retry queue on an answer that will not change until
- * something happens again.
+ * The endpoint confirmed a terminal state — a caller-recognized signal
+ * that this does not exist (or is not currently reachable through this
+ * identity), not a transient failure. Raised by two distinct mechanisms
+ * (see `guardedFetchBytes`'s `terminalErrorNames` and `guardedFetchJSON`'s
+ * `terminalMessagePrefixes`), both structured around the same idea:
+ * distinguish "the endpoint is unreachable, retry" from "the endpoint was
+ * reached and it confirmed a terminal state" without a caller having to
+ * parse an error message itself. The two demand opposite handling: the
+ * first should be retried with backoff, and retrying the second forever
+ * accomplishes nothing but burning the retry queue on an answer that will
+ * not change until something happens again.
  *
- * Deliberately NOT raised from a bare HTTP status code alone (see the
- * `terminalErrorNames` param) — a 404 from an arbitrary https endpoint
- * proves nothing about atproto-level state; it could as easily be a
- * misconfigured proxy or a wrong vhost while the real PDS is merely down.
- * Only a body that actually names one of the caller's expected XRPC
- * errors counts as confirmation.
+ * Deliberately NOT raised from a bare HTTP status code alone — a 404 from
+ * an arbitrary https endpoint proves nothing on its own; it could as
+ * easily be a misconfigured proxy or a wrong vhost while the real service
+ * is merely down. Only a body that actually confirms a recognized
+ * terminal state counts.
+ *
+ * `permanent` separates two shapes of terminal state a caller may need to
+ * treat differently: an outcome with no path back short of the subject
+ * republishing from scratch (a deleted record, a fully gone repo), versus
+ * a reversible state (an account takedown/suspension/deactivation) that
+ * may later resolve on its own. A caller that does not need the
+ * distinction may treat both alike.
  */
 export class RecordNotFoundError extends Error {
-    constructor(xrpcErrorName: string) {
-        super(`endpoint's XRPC error body named "${xrpcErrorName}"`)
+    readonly permanent: boolean
+
+    constructor(reason: string, permanent: boolean) {
+        super(`confirmed unobtainable: ${reason}`)
         this.name = "RecordNotFoundError"
+        this.permanent = permanent
     }
 }
 
@@ -100,7 +110,29 @@ function isRedirect(response: Response): boolean {
  */
 export async function guardedFetchJSON(
     url: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    options: {
+        /**
+         * Message-prefix strings that mean "confirmed permanently gone",
+         * matched against a failing response's `{"message": "..."}` body.
+         *
+         * **Not the same mechanism as `guardedFetchBytes`'s
+         * `terminalErrorNames`.** That one matches an atproto XRPC error
+         * body's `error` field exactly, against a lexicon the endpoint
+         * itself publishes and commits to. This one exists for services
+         * this module also talks to that speak plain REST with free-text
+         * messages and no schema commitment at all (the PLC directory) —
+         * so it can only ever be a best-effort PREFIX match, never an
+         * exact one, against prose one does not control. A caller that
+         * omits this gets exactly today's behavior: every non-ok status
+         * is the generic error. A prefix that stops matching (the
+         * upstream rewords its message) fails CLOSED, back to the
+         * generic error and its retry — never toward wrongly confirming
+         * a terminal state, since this can only narrow what counts as
+         * terminal, never widen it past an actual non-ok response.
+         */
+        terminalMessagePrefixes?: readonly string[]
+    } = {}
 ): Promise<unknown> {
     let parsed: URL
     try {
@@ -135,12 +167,44 @@ export async function guardedFetchJSON(
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
+            if (options.terminalMessagePrefixes !== undefined) {
+                const message = await tryReadMessageField(response)
+                if (
+                    message !== null &&
+                    options.terminalMessagePrefixes.some((p) => message.startsWith(p))
+                ) {
+                    // A directory-confirmed terminal state has no path
+                    // back short of the subject republishing under a new
+                    // identity — always permanent, unlike the reversible
+                    // account-lifecycle states `guardedFetchBytes` sees.
+                    throw new RecordNotFoundError(message, true)
+                }
+            }
             throw new Error(`endpoint answered ${response.status}`)
         }
         const text = await readCapped(response, MAX_RESPONSE_BYTES)
         return JSON.parse(text) as unknown
     } finally {
         clearTimeout(timer)
+    }
+}
+
+/**
+ * Best-effort: a small, capped read looking only for a plain REST error
+ * body's `{"message": "...", ...}` shape — the PLC directory's shape, not
+ * XRPC's. Mirrors `tryReadXrpcErrorName` below exactly, field name aside;
+ * see that one for why this duplicates the reader loop rather than
+ * sharing it with `readCapped`.
+ */
+async function tryReadMessageField(response: Response): Promise<string | null> {
+    try {
+        const text = await readCapped(response, MAX_RESPONSE_BYTES)
+        const body = JSON.parse(text) as unknown
+        if (typeof body !== "object" || body === null) return null
+        const message = (body as Record<string, unknown>).message
+        return typeof message === "string" ? message : null
+    } catch {
+        return null
     }
 }
 
@@ -217,6 +281,20 @@ export async function guardedFetchBytes(
          * Omit to keep every non-ok response generic, as before.
          */
         terminalErrorNames?: readonly string[]
+        /**
+         * The subset of `terminalErrorNames` that additionally means
+         * "irreversible" — sets `RecordNotFoundError.permanent`. Some
+         * terminal states a lexicon defines are lifecycle states with a
+         * path back (an account takedown or suspension may lift); only
+         * the caller knows which of its own terminal names carry that
+         * distinction, so — like `terminalErrorNames` itself — this is
+         * supplied, not guessed at here. Omitted, or a name matched in
+         * `terminalErrorNames` but absent here, defaults `permanent` to
+         * `true`: the safer default when a caller has not opted into the
+         * distinction is the one this mechanism shipped with originally,
+         * not a silent narrowing of what counts as gone.
+         */
+        permanentErrorNames?: readonly string[]
     } = {}
 ): Promise<Uint8Array> {
     let parsed: URL
@@ -245,7 +323,10 @@ export async function guardedFetchBytes(
             if (options.terminalErrorNames !== undefined) {
                 const name = await tryReadXrpcErrorName(response)
                 if (name !== null && options.terminalErrorNames.includes(name)) {
-                    throw new RecordNotFoundError(name)
+                    const permanent =
+                        options.permanentErrorNames === undefined ||
+                        options.permanentErrorNames.includes(name)
+                    throw new RecordNotFoundError(name, permanent)
                 }
             }
             throw new Error(`endpoint answered ${response.status}`)
@@ -328,6 +409,30 @@ export interface PDSResolution {
     signingKey: string | null
 }
 
+/**
+ * The PLC directory's own message prefix (`packages/server/src/error.ts`,
+ * `did-method-plc`) for a DID whose *last operation is a tombstone* —
+ * read directly off the reference server's source and cross-checked
+ * against a live 404 from `plc.directory` for a never-registered DID,
+ * which answers the sibling prefix "DID not registered: " instead.
+ *
+ * Deliberately excludes "DID not registered: " — that prefix means no
+ * operation was ever recorded for this DID at all, which for a DID this
+ * monitor previously resolved successfully is anomalous (a directory-side
+ * issue, not a legitimate state change) rather than confirmation of
+ * anything, so it stays on the generic/retryable path.
+ *
+ * This is inherently weaker evidence than `guardedFetchBytes`'s XRPC
+ * `error`-field matching: the PLC directory speaks a plain REST error
+ * shape with a free-text `message` and no schema commitment at all, so
+ * this can only be a prefix match against someone else's prose, not
+ * against a published lexicon. See `guardedFetchJSON`'s
+ * `terminalMessagePrefixes` doc for why that failure mode is safe: a
+ * wording change upstream fails CLOSED, back to the pre-existing
+ * generic-retry behavior, never toward wrongly declaring a live DID gone.
+ */
+const PLC_TOMBSTONE_MESSAGE_PREFIX = "DID not available: "
+
 export async function resolvePDSEndpoint(
     did: string,
     fetchImpl: typeof fetch
@@ -336,9 +441,17 @@ export async function resolvePDSEndpoint(
     if (did.startsWith("did:plc:")) {
         doc = await guardedFetchJSON(
             `https://plc.directory/${encodeURIComponent(did)}`,
-            fetchImpl
+            fetchImpl,
+            { terminalMessagePrefixes: [PLC_TOMBSTONE_MESSAGE_PREFIX] }
         )
     } else if (did.startsWith("did:web:")) {
+        // No terminal detection here, unlike the did:plc branch above: a
+        // did:web DID has no directory or operation log to confirm
+        // against, only the document host's own HTTP answer — and this
+        // module already treats an arbitrary https endpoint's bare 404 as
+        // proving nothing (see `RecordNotFoundError`'s own doc comment).
+        // A 404 here stays genuinely ambiguous: gone, or the host is
+        // merely down.
         doc = await guardedFetchJSON(didWebDocumentURL(did), fetchImpl)
     } else {
         throw new Error(`unsupported DID method: ${did}`)

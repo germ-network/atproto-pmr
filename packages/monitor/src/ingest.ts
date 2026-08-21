@@ -53,12 +53,13 @@ export interface IngestDeps {
     /** Raised when an observed rev moves backwards. Never silent. */
     onRegression?(did: string, indexed: string, observed: string): Promise<void>
     /**
-     * Raised when the watched declaration is confirmed deleted at the
-     * source (the PDS's own XRPC error body named a terminal state —
-     * `RepoNotFound` and siblings — not merely being unreachable)
-     * — arguably the single most alarming thing this component could
-     * observe, and as deserving of a push to a registered device as a
-     * rev advancing.
+     * Raised when the watched declaration is confirmed unobtainable at
+     * the source (`RecordNotFoundError` — see its own doc comment for the
+     * two ways this gets confirmed — not merely being unreachable). Fires
+     * for a reversible account state too, not only a permanent one: a
+     * device deserves to know about a takedown or suspension as much as
+     * an outright deletion, even though the monitor itself keeps
+     * re-checking a reversible one rather than treating it as settled.
      */
     onDelete?(did: string): Promise<void>
     nowMs(): number
@@ -153,8 +154,13 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         // record exists to compare, which there no longer is. It still
         // reaches the digest window, the same as a stored change would:
         // `completeDeletion` is `complete`'s deletion-shaped counterpart.
+        // `err.permanent` decides only whether this ALSO suppresses
+        // future reverify events (see `MonitorIndex.isDeleted`) — a
+        // reversible state (an account takedown/suspension that may
+        // lift) still disposes of the stale snapshot and still pushes,
+        // but must stay open to a later event noticing the reversal.
         await deps.snapshot.deleteRecord(did)
-        await deps.index.completeDeletion(did, deps.nowMs())
+        await deps.index.completeDeletion(did, deps.nowMs(), err.permanent)
         await deps.onDelete?.(did)
         return "deleted"
     }
