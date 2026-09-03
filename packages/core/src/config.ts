@@ -17,6 +17,17 @@ export interface PMRLimits {
     framingAllowanceBytes: number
     /** Message retention, seconds. */
     messageExpirySeconds: number
+    /**
+     * Maximum sealed-attachment upload size, bytes. Optional: set only where
+     * the deployment serves attachments. Attachments are always-on wherever a
+     * mailbox capability is served, but a deployment that has not implemented
+     * them yet advertises no cap — so a mailbox may be served without this,
+     * and it publishes into the enabler (below) only when present. Advertising
+     * it is what lets an over-size upload be refused `413` rather than folded
+     * into the uniform `202` (`spec/wire-api.md`, "Limits are
+     * implementation-defined").
+     */
+    attachmentMaxBytes?: number
     /** Per-sender capacity of a provisioned pair mailbox. */
     maxMessagesPerPairSender: number
     /** Challenge TTL, seconds. */
@@ -183,6 +194,13 @@ export interface CoreCapability extends CapabilityBase {
 export interface MailboxCapability extends CapabilityBase {
     messageMaxBytes: number
     messageExpiry: number
+    /**
+     * Maximum sealed-attachment upload size, bytes. Published so exceeding it
+     * MAY be answered `413` rather than folded into the uniform `202`
+     * (`spec/wire-api.md`, "Limits are implementation-defined"). Absent where
+     * the deployment does not serve attachments.
+     */
+    attachmentMaxBytes?: number
 }
 
 export interface GrantCapability extends MailboxCapability {
@@ -302,6 +320,9 @@ export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
         pathPrefix: serves.pathPrefix,
         messageMaxBytes: limits.messageMaxBytes,
         messageExpiry: limits.messageExpirySeconds,
+        ...(limits.attachmentMaxBytes !== undefined
+            ? { attachmentMaxBytes: limits.attachmentMaxBytes }
+            : {}),
     }
     const capabilities: Capabilities = {
         core: {

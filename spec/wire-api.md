@@ -1013,6 +1013,13 @@ meaningful across reconnects and MUST NOT be treated as a cursor.
 Ranged reads are REQUIRED: a client resuming an interrupted transfer picks
 up at a segment boundary.
 
+A deployment that serves a mailbox capability serves attachments for it, and
+publishes the peer-visible size cap as `attachmentMaxBytes` on that mailbox's
+enabler entry (above) — advertised, so an over-size upload MAY be refused
+`413` rather than folded into the uniform `202`, exactly as
+`messageMaxBytes` governs a message put. Budget and retention are not
+peer-visible and are not published (see "Limits are implementation-defined").
+
 ### Records are CAR, wherever they are relayed
 
 **Repo records MUST be exchanged as CAR** — the signed commit plus the
@@ -1250,13 +1257,15 @@ add a parallel array someone has to keep aligned with another one.
       "versions": ["1"],
       "pathPrefix": "/pmr/v1",
       "messageMaxBytes": 10000,
-      "messageExpiry": 2592000
+      "messageExpiry": 2592000,
+      "attachmentMaxBytes": 5242880
     },
     "grant": {
       "versions": ["1"],
       "pathPrefix": "/pmr/v1",
       "messageMaxBytes": 10000,
       "messageExpiry": 2592000,
+      "attachmentMaxBytes": 5242880,
       "lifecycle": "active",
       "maxPerRequest": 20
     }
