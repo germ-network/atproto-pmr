@@ -197,6 +197,26 @@ describe("buildEnablerDocument", () => {
         expect(caps.grant!.maxPerRequest).toBe(c.limits.maxGrantsPerRequest)
     })
 
+    it("advertises attachmentMaxBytes on every served mailbox when set", () => {
+        // Advertising the cap is what makes an over-size upload refusable
+        // `413` rather than folded into the uniform `202` — the enforced
+        // value and the published one come from the same limit.
+        const c = config({
+            limits: { ...config().limits, attachmentMaxBytes: 5_242_880 },
+        })
+        const caps = buildEnablerDocument(c).capabilities
+        expect(caps.didMailbox!.attachmentMaxBytes).toBe(5_242_880)
+        expect(caps.grant!.attachmentMaxBytes).toBe(5_242_880)
+    })
+
+    it("omits attachmentMaxBytes where the deployment serves no attachments", () => {
+        // A deployment that has not implemented attachments advertises no cap;
+        // a client tests for the key rather than reading a sentinel.
+        const caps = buildEnablerDocument(config()).capabilities
+        expect("attachmentMaxBytes" in caps.grant!).toBe(false)
+        expect("attachmentMaxBytes" in caps.didMailbox!).toBe(false)
+    })
+
     it("moves state when a config-only change moves the document", () => {
         // The failure this pins: lifecycle, size caps, and expiries all come
         // from deployment config an operator edits without touching source.
