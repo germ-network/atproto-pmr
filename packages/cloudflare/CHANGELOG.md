@@ -1,8 +1,8 @@
 # @germ-network/atproto-pmr-cloudflare
 
-## 1.0.0
+## 0.1.1
 
-### Minor Changes
+### Patch Changes
 
 - [#23](https://github.com/germ-network/atproto-pmr/pull/23) [`ade4873`](https://github.com/germ-network/atproto-pmr/commit/ade4873f39246c0dd9d5ac10435d0bd3880b292a) Thanks [@germ-mark](https://github.com/germ-mark)! - Add the own-DID declaration watch (pause-not-teardown).
 
@@ -33,4 +33,4 @@
 ### Patch Changes
 
 - Updated dependencies [[`ade4873`](https://github.com/germ-network/atproto-pmr/commit/ade4873f39246c0dd9d5ac10435d0bd3880b292a)]:
-  - @germ-network/atproto-pmr-core@0.2.0
+  - @germ-network/atproto-pmr-core@0.1.1
