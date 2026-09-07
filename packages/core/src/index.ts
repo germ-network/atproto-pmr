@@ -34,7 +34,16 @@ export type {
     RegistrationFields,
     ResolvedAddress,
     VerificationHint,
+    WatchState,
 } from "./storage"
+
+// The own-DID declaration watch — pause-not-teardown decision logic.
+export {
+    classifyDeclaration,
+    reconcileWatchState,
+    INITIAL_WATCH_STATE,
+    type WatchOutcome,
+} from "./watch"
 
 // The one inbox path's key prefixes.
 export {

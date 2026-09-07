@@ -119,6 +119,63 @@ describe("guardedFetchJSON", () => {
         await expect(rejection).rejects.toThrow(/404/)
         await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
     })
+
+    it("throws RecordNotFoundError when the body names a caller-supplied terminal XRPC error", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RecordNotFound", message: "nope" }), {
+                status: 404,
+            })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, fetchImpl, {
+            terminalErrorNames: ["RecordNotFound"],
+        })
+        await expect(rejection).rejects.toBeInstanceOf(RecordNotFoundError)
+        // Default when a name is terminal but not listed as permanent.
+        await expect(rejection).rejects.toMatchObject({ permanent: true })
+    })
+
+    it("permanentErrorNames narrows a terminal XRPC error to reversible", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RepoSuspended" }), { status: 400 })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, fetchImpl, {
+            terminalErrorNames: ["RepoSuspended", "RepoNotFound"],
+            permanentErrorNames: ["RepoNotFound"],
+        })
+        await expect(rejection).rejects.toBeInstanceOf(RecordNotFoundError)
+        await expect(rejection).rejects.toMatchObject({ permanent: false })
+    })
+
+    it("an error name NOT in terminalErrorNames stays the generic error", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "InvalidRequest" }), { status: 400 })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, fetchImpl, {
+            terminalErrorNames: ["RecordNotFound"],
+        })
+        await expect(rejection).rejects.toThrow(/400/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("a terminal XRPC error stays generic when terminalErrorNames is omitted -- opt-in only", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RecordNotFound" }), { status: 404 })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, fetchImpl)
+        await expect(rejection).rejects.toThrow(/404/)
+        await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
+    })
+
+    it("reads the failing body once and still matches a message prefix when both options are set", async () => {
+        // A PLC-style body carrying only `message` (no `error`) must still be
+        // caught by terminalMessagePrefixes even when terminalErrorNames is
+        // also configured — the single combined read must not drop it.
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ message: "DID not available: did:plc:xyz" }), {
+                status: 404,
+            })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, fetchImpl, {
+            terminalErrorNames: ["RecordNotFound"],
+            terminalMessagePrefixes: ["DID not available: "],
+        })
+        await expect(rejection).rejects.toBeInstanceOf(RecordNotFoundError)
+    })
 })
 
 describe("guardedFetchBytes", () => {
