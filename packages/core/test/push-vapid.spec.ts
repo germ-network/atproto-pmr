@@ -23,12 +23,13 @@ describe("signVapidJWT", () => {
         const parts = jwt.split(".")
         expect(parts).toHaveLength(3)
         const sig = base64URLToBinary(parts[2])
+        // Raw ECDSA P-256 is r||s = exactly 64 bytes. A DER signature (the
+        // format: 'der' mistake this guards against) is a variable-length
+        // SEQUENCE, ~70-72 bytes for real r/s and never 64, so the length
+        // alone discriminates raw from DER. (An earlier first-byte 0x30 sniff
+        // was ~1/256 flaky: the top byte of r is uniformly random and is
+        // legitimately 0x30 now and then.)
         expect(sig.byteLength).toBe(64)
-        // A DER signature starts with 0x30 (SEQUENCE tag); a raw r||s
-        // signature's first byte is just the top byte of r, essentially
-        // never 0x30 for a real key. This is the regression test for the
-        // format: 'der' mistake.
-        expect(sig[0]).not.toBe(0x30)
     })
 
     it("header is alg: ES256", () => {
