@@ -1,6 +1,6 @@
 {
 	"name": "@germ-network/atproto-pmr-monitor",
-	"version": "1.0.0",
+	"version": "0.1.1",
 	"private": true,
 	"description": "Key monitor logic — firehose ingest and the snapshot it serves, parameterized over a storage seam",
 	"license": "MIT",
