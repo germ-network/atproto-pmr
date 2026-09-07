@@ -1,12 +1,15 @@
 import { DurableObject } from "cloudflare:workers"
 import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
+    INITIAL_WATCH_STATE,
     buildMessagePushPayload,
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
     handleAckFrame,
+    isPairMailboxKey,
     parseGrantLifecycle,
+    reconcileWatchState,
     type AppendResult,
     type EffectiveCapabilities,
     type GrantLifecycle,
@@ -23,6 +26,8 @@ import {
     type RegistrationFields,
     type SyntheticBehavior,
     type SyntheticState,
+    type WatchOutcome,
+    type WatchState,
 } from "@germ-network/atproto-pmr-core"
 import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
@@ -44,6 +49,8 @@ import { webPushSender } from "./push-sender"
 
 const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
+/** The own-DID declaration watch's `WatchState` (`watch.ts`). */
+const KEY_WATCH = "watch"
 
 /**
  * The key families — which *kind of record* this is, an axis orthogonal to
@@ -359,6 +366,39 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
+    // MARK: - The declaration watch
+
+    async readWatchState(): Promise<WatchState> {
+        return (await this.db.get<WatchState>(KEY_WATCH)) ?? INITIAL_WATCH_STATE
+    }
+
+    async writeWatchState(state: WatchState): Promise<void> {
+        await this.db.put(KEY_WATCH, state)
+    }
+
+    /**
+     * Fold one re-check outcome into the paused flag — the atomic
+     * read-modify-write (`watch.ts`, `reconcileWatchState`), atomic here by
+     * this object's single-threaded execution and storage input gate.
+     *
+     * The DRIVER lives outside this object and calls this: it does the
+     * authoritative declaration re-fetch and classification itself, so no
+     * network call happens here. In this deployment the driver is a
+     * firehose-fed queue consumer (`GermMonitor` enqueues on a declaration
+     * change; the Worker's `queue()` handler re-fetches and calls this); a
+     * relational adopter would drive it from a cron + `dueForWork` sweep.
+     * `unknown` only stamps the check and is a no-op on the flag — a driver
+     * typically retries a transient rather than recording it.
+     */
+    async applyDeclarationOutcome(
+        outcome: WatchOutcome,
+        nowSeconds: number
+    ): Promise<void> {
+        await this.writeWatchState(
+            reconcileWatchState(await this.readWatchState(), outcome, nowSeconds)
+        )
+    }
+
     // MARK: - Pair mailboxes
 
     /**
@@ -397,6 +437,19 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
+        }
+
+        // PAUSE (watch.ts): the owner's own declared anchor key is confirmed
+        // gone, so DID-addressed mail is absorbed — no bytes, no delivery, and
+        // (unlike an accepted append) no nonce recorded, because the pause is
+        // transient and a resend after the key returns must still land. Only
+        // pair (`did:`) keys pause; a `grant:`-keyed put (grant-put.ts) passes
+        // through untouched, since pause stops DID-addressed mail and keeps
+        // grant-addressed mail. The response is the same 202 a real append
+        // yields; the trigger (the owner's declaration) is public, so this is
+        // not a blocking-style secret that needs timing parity.
+        if (isPairMailboxKey(key) && (await this.readWatchState()).paused) {
+            return { outcome: "appended", persistBody: false }
         }
 
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
@@ -579,6 +632,13 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
+        }
+
+        // PAUSE (watch.ts): the pool is DID-addressed by construction, so a
+        // paused registration absorbs every pooled put — no bytes, no nonce
+        // recorded — exactly as `append` absorbs a paused pair put. See there.
+        if ((await this.readWatchState()).paused) {
+            return { outcome: "pooled", persistBody: false }
         }
 
         const discardedUntil = await this.db.get<number>(discardKey(key))

@@ -184,6 +184,39 @@ export interface RegistrationFields {
     lastActive: number
 }
 
+/**
+ * Per-registration state of the own-DID declaration watch
+ * (`spec/wire-api.md`, "A registration lives while the anchor key stays in the
+ * DID's declaration"; `spec/storage-consistency.md`, "the last observed
+ * declaration revision, the last check time, the currently trusted anchor key,
+ * and the paused flag"). The currently-trusted key is `RegistrationFields.
+ * anchorKey` and is not duplicated here; this holds the flag and the stamp.
+ *
+ * MUST be keyed by DID, never by anchor key, so a disappearance or a later
+ * rotation cannot orphan it (`spec/wire-api.md`). The decision logic that
+ * produces it is in `watch.ts`.
+ */
+export interface WatchState {
+    /**
+     * True while the owner's declared anchor key is confirmed gone or changed.
+     * While set, DID-addressed mail is absorbed (see `append`/`appendToPool`)
+     * and grant-addressed mail is unaffected. Reversible: cleared when the
+     * trusted key is observed present again. Never triggers deregistration.
+     */
+    paused: boolean
+    /** Seconds since the epoch of the last completed re-check; `0` = never. */
+    lastCheckAt: number
+}
+
+/**
+ * What one re-check of the owner's own declaration concluded, against the key
+ * the relay currently trusts (`watch.ts`, `classifyDeclaration`): `present`
+ * (unpause), `absent` — gone or a different key, rotation being deferred to
+ * GER-2212 — (pause), or `unknown` (a transient/unreachable failure, which
+ * moves nothing so a PDS blip never pauses a healthy mailbox).
+ */
+export type WatchOutcome = "present" | "absent" | "unknown"
+
 export interface ResolvedAddress {
     locator: Locator
     /**
@@ -268,9 +301,48 @@ export interface PMRStore {
     update(fields: Partial<RegistrationFields>): Promise<void>
 
     /**
+     * The own-DID declaration watch's state (`watch.ts`, `WatchState`).
+     * `readWatchState` MUST return `INITIAL_WATCH_STATE` (unpaused) for a
+     * registration that has never been checked, so a store with no watch row
+     * behaves as live rather than as an error. Scoped to this registration,
+     * like everything else on this store.
+     */
+    readWatchState(): Promise<WatchState>
+    writeWatchState(state: WatchState): Promise<void>
+
+    /**
+     * Fold one re-check outcome into this registration's watch state — the
+     * atomic read-modify-write of the paused flag (`watch.ts`,
+     * `reconcileWatchState`). The DRIVER decides when to call this and does the
+     * authoritative declaration re-fetch + classification itself (germ: a
+     * firehose-fed queue consumer; a relational adopter: a cron + `dueForWork`
+     * sweep), so this method takes no network dependency — it only records the
+     * conclusion. A caller passes `present`/`absent`; `unknown` is a no-op that
+     * only stamps the check, and a driver typically retries a transient rather
+     * than recording it. MUST be atomic (contract 1's shape) so concurrent
+     * rechecks for one DID cannot interleave the read and the write.
+     */
+    applyDeclarationOutcome(outcome: WatchOutcome, nowSeconds: number): Promise<void>
+
+    /**
      * Appends to a provisioned pair mailbox, or advances the synthetic
      * mailbox if the sender is blocked. **The caller cannot tell which
      * happened, and neither can the sender.**
+     *
+     * PAUSE (`watch.ts`): when this registration's `readWatchState().paused`
+     * is set — the owner's own declared anchor key is confirmed gone — a
+     * DID-addressed (`did:`-keyed, pair) put from any sender MUST be absorbed:
+     * no bytes, no delivery, no nonce recorded, and an accepted-shaped outcome
+     * so the response stays the uniform 202 a real append yields. (The
+     * already-seen-nonce check runs first, as always, so a replay of a
+     * pre-pause envelope answers `duplicate` — also a no-op 202 — rather than
+     * the absorb; observationally identical.) `append` also receives
+     * `grant:`-keyed puts (see `grant-put.ts`), which MUST pass through
+     * untouched — pause stops DID-addressed mail and keeps grant-addressed
+     * mail. The nonce is deliberately NOT recorded on a paused absorb: the
+     * pause is transient, so a resend after the key returns must still land.
+     * Mail already queued when the pause begins is left in place (pause is not
+     * teardown); only new admission is gated.
      *
      * CONSISTENCY CONTRACT (1): the capacity check and the write MUST be
      * one atomic step, or two concurrent puts both observe room and both
@@ -371,6 +443,12 @@ export interface PMRStore {
      *
      * CONSISTENCY CONTRACT (7) applies here too, and the discard check MUST
      * run inside this call — see `PoolAppendResult`.
+     *
+     * PAUSE: the pool is DID-addressed by construction (a `PairMailboxKey`),
+     * so when this registration is paused (`readWatchState().paused`) every
+     * pooled put MUST be absorbed — `pooled` with `persistBody: false`, no
+     * bytes and no nonce recorded — exactly as `append` absorbs a paused pair
+     * put. See `append`.
      */
     appendToPool(
         key: PairMailboxKey,

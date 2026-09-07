@@ -49,7 +49,23 @@ import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/k
 
 export type DeclarationResolution =
     | { found: true; anchorKey: OkpEd25519Key }
-    | { found: false; reason: string }
+    | {
+          found: false
+          reason: string
+          /**
+           * True only when the PDS was actually reached and it definitively
+           * has no usable anchor key for this DID — a confirmed-gone record
+           * or repo (`RecordNotFoundError`), a 200 with no `currentKey`, or a
+           * `currentKey` present but unparseable/unsupported. Absent/false
+           * means the failure was transient (resolution failed, the PDS was
+           * unreachable, a timeout): "confirmed absent" and "cannot tell"
+           * demand opposite handling, and the declaration watch MUST pause a
+           * mailbox only on the former, never inferring absence from bare
+           * unreachability (`spec/key-transparency.md`). The pair-put
+           * admission path ignores this field and reads only `found`.
+           */
+          confirmed?: boolean
+      }
 
 /**
  * The germ declaration's anchor-key field: NOT COSE. One field —
@@ -82,6 +98,23 @@ const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 2
  * caller-supplied `PMRConfig`.
  */
 const DECLARATION_COLLECTION_NSID = "com.germnetwork.declaration"
+
+/**
+ * `com.atproto.repo.getRecord`'s terminal XRPC errors — a body that confirms
+ * this DID's declaration is unobtainable rather than merely unreachable. The
+ * same repo-level lifecycle set `fetch-record.ts` recognizes for the monitor's
+ * `sync.getRecord`; here it lets the declaration watch tell a real
+ * disappearance (pause) from a transient PDS blip (leave the mailbox alone).
+ * A missing single record is answered by the reference PDS as a 200 with no
+ * `currentKey`, handled below, so it need not appear here.
+ */
+const DECLARATION_TERMINAL_XRPC_ERRORS = [
+    "RecordNotFound",
+    "RepoNotFound",
+    "RepoTakendown",
+    "RepoSuspended",
+    "RepoDeactivated",
+] as const
 
 /**
  * Atproto's JSON data-model bytes representation: `{"$bytes": "<base64>"}`,
@@ -136,7 +169,11 @@ function isRawDeclarationRecord(value: unknown): value is RawDeclarationRecord {
     return typeof value === "object" && value !== null
 }
 
-import { guardedFetchJSON, resolvePDSEndpoint } from "./atproto-fetch"
+import {
+    guardedFetchJSON,
+    RecordNotFoundError,
+    resolvePDSEndpoint,
+} from "./atproto-fetch"
 
 /**
  * DID -> DID document -> PDS -> declaration, per atproto-pmr.md's own
@@ -153,7 +190,13 @@ export async function resolveDeclaration(
     try {
         ;({ endpoint: pdsEndpoint } = await resolvePDSEndpoint(senderDID, fetchImpl))
     } catch (e) {
-        return { found: false, reason: `PDS resolution failed: ${String(e)}` }
+        // A PLC tombstone surfaces as `RecordNotFoundError` and is a
+        // confirmed disappearance; any other resolution failure is transient.
+        return {
+            found: false,
+            reason: `PDS resolution failed: ${String(e)}`,
+            confirmed: e instanceof RecordNotFoundError,
+        }
     }
 
     let record: unknown
@@ -162,16 +205,31 @@ export async function resolveDeclaration(
         url.searchParams.set("repo", senderDID)
         url.searchParams.set("collection", DECLARATION_COLLECTION_NSID)
         url.searchParams.set("rkey", "self")
-        const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
+        const body = (await guardedFetchJSON(url.toString(), fetchImpl, {
+            terminalErrorNames: DECLARATION_TERMINAL_XRPC_ERRORS,
+        })) as {
             value?: unknown
         }
         record = body.value
     } catch (e) {
-        return { found: false, reason: `declaration fetch failed: ${String(e)}` }
+        // The PDS answered with a terminal XRPC error (record/repo gone or
+        // taken down) → confirmed; anything else (unreachable, timeout, a
+        // bare non-ok) → transient, and the watch must not pause on it.
+        return {
+            found: false,
+            reason: `declaration fetch failed: ${String(e)}`,
+            confirmed: e instanceof RecordNotFoundError,
+        }
     }
 
     if (!isRawDeclarationRecord(record) || record.currentKey === undefined) {
-        return { found: false, reason: "declaration: no currentKey present" }
+        // The PDS was reached and answered 200 with no `currentKey`: the key
+        // is definitively absent, not merely unreachable.
+        return {
+            found: false,
+            reason: "declaration: no currentKey present",
+            confirmed: true,
+        }
     }
 
     try {
@@ -188,9 +246,13 @@ export async function resolveDeclaration(
             anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
         }
     } catch (e) {
+        // Reached, key field present but unparseable or an unsupported
+        // algorithm (e.g. a rotation to a key type this relay does not
+        // accept): the trusted key is definitively no longer usably present.
         return {
             found: false,
             reason: `declaration: malformed currentKey: ${String(e)}`,
+            confirmed: true,
         }
     }
 }

@@ -251,6 +251,101 @@ describe("resolution failures are reported, not thrown", () => {
 })
 
 /**
+ * `confirmed` on a `found:false` result: reached-and-definitively-absent vs
+ * merely unreachable. The declaration watch (`watch.ts`) MUST pause a mailbox
+ * only on the former — a transient PDS blip must never pause a healthy one —
+ * so these pin exactly which failures are confirmed. The pair-put admission
+ * path ignores the field, so its behavior is unchanged either way.
+ */
+describe("confirmed vs transient absence (declaration watch)", () => {
+    it("confirms absence when getRecord answers a terminal XRPC error", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(
+                    { error: "RecordNotFound", message: "Could not locate record" },
+                    404
+                ),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBe(true)
+    })
+
+    it("confirms absence when the record is present but carries no currentKey", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse({ value: { version: "1.1.0" } }),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBe(true)
+    })
+
+    it("confirms absence when currentKey is present but unparseable", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, new Uint8Array(3)))),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBe(true)
+    })
+
+    it("does NOT confirm absence on a bare non-200 (proves nothing — could be a down host)", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse({}, 503),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBeFalsy()
+    })
+
+    it("does NOT confirm absence when the PDS is unreachable", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () => {
+                throw new Error("network down")
+            },
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBeFalsy()
+    })
+
+    it("confirms absence on a PLC tombstone (DID not available)", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse({ message: "DID not available: did:plc:..." }, 404),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBe(true)
+    })
+
+    it("does NOT confirm absence on a bare PLC 404 (never-registered / down directory)", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () =>
+                jsonResponse({ message: "DID not registered: did:plc:..." }, 404),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(false)
+        if (result.found) throw new Error("unreachable")
+        expect(result.confirmed).toBeFalsy()
+    })
+})
+
+/**
  * These pin the five places our resolver had drifted from
  * `@atproto/identity`. Each one was a real bug, and one was a security
  * hole — so they are here to stop the drift returning, not to describe

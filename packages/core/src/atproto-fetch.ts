@@ -132,6 +132,21 @@ export async function guardedFetchJSON(
          * terminal, never widen it past an actual non-ok response.
          */
         terminalMessagePrefixes?: readonly string[]
+        /**
+         * XRPC `error`-field values that mean "confirmed absent, not
+         * transient" — the JSON twin of `guardedFetchBytes`'s
+         * `terminalErrorNames`, for `com.atproto.repo.getRecord` and the
+         * other XRPC methods this module reads as JSON. Matches the error
+         * body's `error` field exactly (a published lexicon commits to it),
+         * where `terminalMessagePrefixes` best-effort-matches free-text
+         * `message` prose. Both are checked on a non-ok response, error name
+         * first; either match raises `RecordNotFoundError`.
+         */
+        terminalErrorNames?: readonly string[]
+        /** As `guardedFetchBytes`: the subset of `terminalErrorNames` that is
+         *  irreversible. Omitted, or a terminal name absent here, defaults
+         *  `permanent` to `true`. */
+        permanentErrorNames?: readonly string[]
     } = {}
 ): Promise<unknown> {
     let parsed: URL
@@ -167,17 +182,35 @@ export async function guardedFetchJSON(
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
-            if (options.terminalMessagePrefixes !== undefined) {
-                const message = await tryReadMessageField(response)
+            if (
+                options.terminalErrorNames !== undefined ||
+                options.terminalMessagePrefixes !== undefined
+            ) {
+                // Read the failing body ONCE and test both signals against
+                // it — the stream cannot be consumed twice.
+                const err = await tryReadXrpcError(response)
                 if (
-                    message !== null &&
-                    options.terminalMessagePrefixes.some((p) => message.startsWith(p))
+                    options.terminalErrorNames !== undefined &&
+                    err.error !== null &&
+                    options.terminalErrorNames.includes(err.error)
+                ) {
+                    const permanent =
+                        options.permanentErrorNames === undefined ||
+                        options.permanentErrorNames.includes(err.error)
+                    throw new RecordNotFoundError(err.error, permanent)
+                }
+                if (
+                    options.terminalMessagePrefixes !== undefined &&
+                    err.message !== null &&
+                    options.terminalMessagePrefixes.some((p) =>
+                        err.message!.startsWith(p)
+                    )
                 ) {
                     // A directory-confirmed terminal state has no path
                     // back short of the subject republishing under a new
                     // identity — always permanent, unlike the reversible
                     // account-lifecycle states `guardedFetchBytes` sees.
-                    throw new RecordNotFoundError(message, true)
+                    throw new RecordNotFoundError(err.message, true)
                 }
             }
             throw new Error(`endpoint answered ${response.status}`)
@@ -190,21 +223,30 @@ export async function guardedFetchJSON(
 }
 
 /**
- * Best-effort: a small, capped read looking only for a plain REST error
- * body's `{"message": "...", ...}` shape — the PLC directory's shape, not
- * XRPC's. Mirrors `tryReadXrpcErrorName` below exactly, field name aside;
- * see that one for why this duplicates the reader loop rather than
- * sharing it with `readCapped`.
+ * Best-effort: a small, capped read of a non-ok body for BOTH the XRPC
+ * `{"error": "<Name>"}` field and the plain-REST `{"message": "..."}` field,
+ * so `guardedFetchJSON` can test terminal error names and terminal message
+ * prefixes against one read (the body stream is consumable once). Never
+ * throws — an unparseable, empty, or oversized body yields two nulls, which
+ * the caller falls back to a generic status error for; an error parsing the
+ * *error* body must not replace the real one.
  */
-async function tryReadMessageField(response: Response): Promise<string | null> {
+async function tryReadXrpcError(
+    response: Response
+): Promise<{ error: string | null; message: string | null }> {
     try {
         const text = await readCapped(response, MAX_RESPONSE_BYTES)
         const body = JSON.parse(text) as unknown
-        if (typeof body !== "object" || body === null) return null
-        const message = (body as Record<string, unknown>).message
-        return typeof message === "string" ? message : null
+        if (typeof body !== "object" || body === null) {
+            return { error: null, message: null }
+        }
+        const rec = body as Record<string, unknown>
+        return {
+            error: typeof rec.error === "string" ? rec.error : null,
+            message: typeof rec.message === "string" ? rec.message : null,
+        }
     } catch {
-        return null
+        return { error: null, message: null }
     }
 }
 
