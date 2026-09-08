@@ -132,3 +132,53 @@ describe("applyDeclarationOutcome folds a re-check into the paused flag", () => 
         })
     })
 })
+
+describe("applyDeclarationOutcome enforces the monotonic-rev watermark", () => {
+    it("records the observed rev and advances the flag on a newer rev", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.applyDeclarationOutcome("absent", T0, "3m5")
+            const s = await pmr.readWatchState()
+            expect(s.paused).toBe(true)
+            expect(s.lastObservedRev).toBe("3m5")
+        })
+    })
+
+    it("refuses an older rev — a reordered/replayed recheck cannot unpause", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.applyDeclarationOutcome("absent", T0, "3m5") // paused at 3m5
+            // A stale wake re-fetched a (colluding/cached) present at an older rev.
+            await pmr.applyDeclarationOutcome("present", T0 + 1, "3m4")
+            const s = await pmr.readWatchState()
+            expect(s.paused).toBe(true) // still paused — the older rev was refused
+            expect(s.lastObservedRev).toBe("3m5") // watermark not regressed
+        })
+    })
+
+    it("applies a newer rev over an earlier one (ordinary forward progress)", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.applyDeclarationOutcome("absent", T0, "3m5")
+            await pmr.applyDeclarationOutcome("present", T0 + 1, "3m6")
+            const s = await pmr.readWatchState()
+            expect(s.paused).toBe(false)
+            expect(s.lastObservedRev).toBe("3m6")
+        })
+    })
+
+    it("a rev-less apply still pauses (fail-safe) without a watermark to compare", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.applyDeclarationOutcome("absent", T0)
+            expect((await pmr.readWatchState()).paused).toBe(true)
+        })
+    })
+
+    it("migrates a pre-watermark row: an old {paused,lastCheckAt} row accepts the first rev", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            // A row written before `lastObservedRev` existed (GER-2209 era).
+            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
+            await pmr.applyDeclarationOutcome("present", T0 + 1, "3m1")
+            const s = await pmr.readWatchState()
+            expect(s.paused).toBe(false)
+            expect(s.lastObservedRev).toBe("3m1")
+        })
+    })
+})

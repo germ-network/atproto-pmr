@@ -206,6 +206,23 @@ export interface WatchState {
     paused: boolean
     /** Seconds since the epoch of the last completed re-check; `0` = never. */
     lastCheckAt: number
+    /**
+     * The repo rev observed at the last re-check accepted under the watermark —
+     * the spec's "last observed declaration revision"
+     * (`spec/storage-consistency.md`). Advanced on ANY accepted rev-carrying
+     * apply, not only one that changes `paused` (a `present` over an
+     * already-live registration still advances it), so the floor tracks the
+     * freshest observation rather than the last flag flip. The monotonic-rev
+     * watermark
+     * (`spec/trust-model.md`): `applyDeclarationOutcome` refuses any re-check
+     * whose observed rev is not strictly newer than this, so a reordered or
+     * replayed recheck (Cloudflare Queues are unordered + at-least-once) cannot
+     * clobber a fresher pause decision with a staler one, and a rev that moved
+     * *backwards* is a rollback it declines. Optional: never-checked, and
+     * pre-existing rows written before this field existed, read as absent and
+     * are treated as "no floor yet" (any rev advances).
+     */
+    lastObservedRev?: string
 }
 
 /**
@@ -321,8 +338,25 @@ export interface PMRStore {
      * only stamps the check, and a driver typically retries a transient rather
      * than recording it. MUST be atomic (contract 1's shape) so concurrent
      * rechecks for one DID cannot interleave the read and the write.
+     *
+     * `observedRev` is the repo rev the driver read authoritatively at re-check
+     * time (`resolveDeclarationWithRev`) — the monotonic-rev watermark
+     * (`WatchState.lastObservedRev`). When present, a `present`/`absent` outcome
+     * whose rev is not strictly newer than the stored one is REFUSED (the flag
+     * is left as-is; only the check is stamped): a reordered/replayed recheck,
+     * or a PDS rollback, must not move a pause set from a fresher observation.
+     * Omitted (a confirmed-gone repo with no rev to read) applies the outcome
+     * without advancing the watermark — pausing is fail-safe. A driver MUST NOT
+     * omit the rev for a `present`/unpause, though: an unpause advances no
+     * watermark and so would not be replay-safe, and the driver treats a present
+     * read whose rev it could not obtain as transient instead (the deployment's
+     * `recheckAndApply`).
      */
-    applyDeclarationOutcome(outcome: WatchOutcome, nowSeconds: number): Promise<void>
+    applyDeclarationOutcome(
+        outcome: WatchOutcome,
+        nowSeconds: number,
+        observedRev?: string
+    ): Promise<void>
 
     /**
      * Appends to a provisioned pair mailbox, or advances the synthetic

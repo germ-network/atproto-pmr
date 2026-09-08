@@ -45,6 +45,9 @@ export {
     type WatchOutcome,
 } from "./watch"
 
+// Repo-revision comparison, shared by the monitor's rev index and the watch.
+export { compareRev, type RevComparison } from "./rev"
+
 // The one inbox path's key prefixes.
 export {
     asMailboxKey,
@@ -197,10 +200,16 @@ export {
 } from "./cose/cbor"
 
 // Declaration resolution and content addressing.
-export { resolveDeclaration, type DeclarationResolution } from "./declaration"
+export {
+    resolveDeclaration,
+    resolveDeclarationWithRev,
+    type DeclarationResolution,
+    type DeclarationWithRev,
+} from "./declaration"
 // Shared with the key monitor: the SSRF guards are the security boundary
 // for every consumer, so they are reused rather than reimplemented.
 export {
+    fetchLatestRev,
     guardedFetchBytes,
     guardedFetchJSON,
     resolvePDSEndpoint,

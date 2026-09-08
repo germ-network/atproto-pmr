@@ -13,8 +13,8 @@
  */
 
 import {
+    fetchLatestRev,
     guardedFetchBytes,
-    guardedFetchJSON,
     resolvePDSEndpoint,
 } from "@germ-network/atproto-pmr-core"
 import type { FetchedRecord } from "./ingest"
@@ -92,39 +92,10 @@ export async function fetchRecordCar(
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
+    // `rev` read authoritatively from the PDS, never taken from the wake
+    // signal (a hostile feed could otherwise fake or mask a rollback). Shared
+    // with the relay's watch via core — see `fetchLatestRev`. One extra round
+    // trip per *changed* record is nothing at a single collection's change rate.
     const rev = await fetchLatestRev(pds, did, fetchImpl)
     return { rev, car, source: pds, signingKey }
-}
-
-/**
- * The repo `rev`, read from the PDS rather than taken from the wake
- * signal.
- *
- * Trusting the stream's `rev` would hand a hostile feed the ability to
- * fake a regression alarm, or to mask a real one by reporting a rev that
- * only moves forward — and the regression rule is the thing this whole
- * component exists to enforce. One extra round trip per *changed* record
- * is nothing at the rate a single collection changes.
- *
- * `getLatestCommit` gives the repo's rev, which is what the comparison
- * rules in `trust-model.md` are written against: a rev that moves
- * backwards is a rollback, and identical revs with differing content is
- * equivocation. It advances on any commit to the repo, not only this
- * record — harmless here, because the collection filter means a fetch only
- * happens when this record actually changed.
- */
-async function fetchLatestRev(
-    pds: string,
-    did: string,
-    fetchImpl: typeof fetch
-): Promise<string> {
-    const url = new URL(`${pds}/xrpc/com.atproto.sync.getLatestCommit`)
-    url.searchParams.set("did", did)
-    const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
-        rev?: unknown
-    }
-    if (typeof body.rev !== "string" || body.rev.length === 0) {
-        throw new Error("getLatestCommit returned no rev")
-    }
-    return body.rev
 }

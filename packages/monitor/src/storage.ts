@@ -277,18 +277,11 @@ export type BackfillProgress =
  * an index rebuilt from one would adopt an outage-window rollback as its
  * baseline.
  */
-export type RevComparison = "unchanged" | "advanced" | "regressed"
-
-/**
- * atproto revs are TIDs — lexicographically sortable, so ordering needs no
- * parsing.
- */
-export function compareRev(indexed: string | null, observed: string): RevComparison {
-    if (indexed === null || indexed === observed) {
-        return indexed === null ? "advanced" : "unchanged"
-    }
-    return observed > indexed ? "advanced" : "regressed"
-}
+// `compareRev`/`RevComparison` now live in core — the single definition the
+// relay's own-DID declaration watch (`watch.ts`) shares, so the two cannot
+// drift on what "newer" means. Re-exported here so the monitor's own importers
+// and `packages/monitor`'s public surface are unchanged.
+export { compareRev, type RevComparison } from "@germ-network/atproto-pmr-core"
 
 /**
  * What `compareObservations` needs from one monitor's report of a DID —

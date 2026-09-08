@@ -20,6 +20,7 @@
  */
 
 import type { DeclarationResolution } from "./declaration.js"
+import { compareRev } from "./rev.js"
 import type { WatchOutcome, WatchState } from "./storage.js"
 
 export type { WatchOutcome, WatchState } from "./storage.js"
@@ -52,27 +53,54 @@ export function classifyDeclaration(
 export const INITIAL_WATCH_STATE: WatchState = { paused: false, lastCheckAt: 0 }
 
 /**
- * Fold one re-check outcome into watch state.
+ * Fold one re-check outcome into watch state, under the monotonic-rev watermark.
  *
- * - `present` → unpause (and stamp the check).
- * - `absent`  → pause (and stamp).
  * - `unknown` → leave `paused` exactly as it was; only stamp the check. A
  *   transient failure must move nothing: it neither pauses a live mailbox nor
  *   unpauses a genuinely-gone one (recovery is confirmed by a later `present`).
+ * - a `present`/`absent` carrying an `observedRev` that is NOT strictly newer
+ *   than `prev.lastObservedRev` → REFUSED: leave `paused`, only stamp. This is
+ *   the watermark — a reordered/replayed recheck (Cloudflare Queues are
+ *   unordered + at-least-once), or a PDS rev that moved *backwards* (a
+ *   rollback), must not move a flag set from a fresher observation.
+ * - otherwise → `present` unpauses, `absent` pauses; stamp, and advance
+ *   `lastObservedRev` to `observedRev` when one was supplied.
+ *
+ * `observedRev` is omitted only when there was no rev to read (a fully-gone
+ * repo). Such an apply is not watermark-gated — pausing is fail-safe — and does
+ * not advance the watermark. `prev.lastObservedRev` absent (never checked, or a
+ * row written before the field existed) is treated as "no floor": any rev
+ * advances.
+ *
+ * RESIDUAL: because a rev-less pause leaves the floor untouched, a later
+ * newer-than-the-stale-floor `present` wake could unpause against it if the PDS
+ * serves stale on that re-fetch. Bounded (the next genuine recheck re-pauses)
+ * and fail-safe (mail stays stored E2E, senders re-verify the declaration
+ * themselves); the real defense against a PDS that serves stale/forged is the
+ * client's monitor cross-check, not this relay-side gate (`spec/trust-model.md`).
  */
 export function reconcileWatchState(
     prev: WatchState,
     outcome: WatchOutcome,
-    nowSeconds: number
+    nowSeconds: number,
+    observedRev?: string
 ): WatchState {
-    switch (outcome) {
-        case "present":
-            return { paused: false, lastCheckAt: nowSeconds }
-        case "absent":
-            return { paused: true, lastCheckAt: nowSeconds }
-        case "unknown":
-            return { paused: prev.paused, lastCheckAt: nowSeconds }
+    if (outcome === "unknown") {
+        return { ...prev, lastCheckAt: nowSeconds }
     }
+    if (
+        observedRev !== undefined &&
+        compareRev(prev.lastObservedRev ?? null, observedRev) !== "advanced"
+    ) {
+        return { ...prev, lastCheckAt: nowSeconds }
+    }
+    const next: WatchState = {
+        paused: outcome === "absent",
+        lastCheckAt: nowSeconds,
+    }
+    const carriedRev = observedRev ?? prev.lastObservedRev
+    if (carriedRev !== undefined) next.lastObservedRev = carriedRev
+    return next
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {

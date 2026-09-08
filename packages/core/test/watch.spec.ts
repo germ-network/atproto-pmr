@@ -101,3 +101,91 @@ describe("reconcileWatchState", () => {
         expect(INITIAL_WATCH_STATE).toEqual({ paused: false, lastCheckAt: 0 })
     })
 })
+
+/**
+ * The monotonic-rev watermark (`spec/storage-consistency.md`'s "last observed
+ * declaration revision"; `spec/trust-model.md`'s monotonic-rev tracking). A
+ * `present`/`absent` outcome is applied only when its observed rev is strictly
+ * newer than the stored one; a reordered/replayed recheck (Cloudflare Queues are
+ * unordered + at-least-once) or a rev that moved backwards (a rollback) is
+ * refused — the flag holds, only the check is stamped. The DECISION is the
+ * outcome (a value comparison); the rev is only for ordering and direction.
+ */
+describe("reconcileWatchState — monotonic-rev watermark", () => {
+    const live: WatchState = { paused: false, lastCheckAt: 1, lastObservedRev: "3m5" }
+    const paused: WatchState = { paused: true, lastCheckAt: 1, lastObservedRev: "3m5" }
+
+    it("a newer rev applies and advances the watermark (absent → pause)", () => {
+        expect(reconcileWatchState(live, "absent", 100, "3m6")).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m6",
+        })
+    })
+
+    it("a newer rev applies and advances the watermark (present → unpause)", () => {
+        expect(reconcileWatchState(paused, "present", 100, "3m6")).toEqual({
+            paused: false,
+            lastCheckAt: 100,
+            lastObservedRev: "3m6",
+        })
+    })
+
+    it("an EQUAL rev is refused — a duplicate redelivery cannot move the flag", () => {
+        // present at the same rev must NOT unpause a mailbox paused from that rev.
+        expect(reconcileWatchState(paused, "present", 100, "3m5")).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m5",
+        })
+    })
+
+    it("an OLDER rev is refused — a reordered/replayed stale wake cannot unpause", () => {
+        expect(reconcileWatchState(paused, "present", 100, "3m4")).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m5",
+        })
+    })
+
+    it("a regressed rev is refused for a pause too (a rollback is not accepted)", () => {
+        expect(reconcileWatchState(live, "absent", 100, "3m4")).toEqual({
+            paused: false,
+            lastCheckAt: 100,
+            lastObservedRev: "3m5",
+        })
+    })
+
+    it("the first rev observed (no prior floor) always advances", () => {
+        const neverChecked: WatchState = { paused: false, lastCheckAt: 0 }
+        expect(reconcileWatchState(neverChecked, "absent", 100, "3m1")).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m1",
+        })
+    })
+
+    it("unknown stamps only and never advances the watermark, whatever the rev", () => {
+        expect(reconcileWatchState(paused, "unknown", 100, "3m9")).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m5",
+        })
+    })
+
+    it("a rev-less apply is NOT watermark-gated (a fully-gone repo pauses, fail-safe) and does not advance", () => {
+        expect(reconcileWatchState(live, "absent", 100)).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+            lastObservedRev: "3m5",
+        })
+    })
+
+    it("a rev-less apply on a never-observed state carries no rev key", () => {
+        const neverChecked: WatchState = { paused: false, lastCheckAt: 0 }
+        expect(reconcileWatchState(neverChecked, "absent", 100)).toEqual({
+            paused: true,
+            lastCheckAt: 100,
+        })
+    })
+})

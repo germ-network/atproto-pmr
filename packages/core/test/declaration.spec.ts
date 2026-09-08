@@ -9,7 +9,7 @@
  * never a test to update.
  */
 import { describe, expect, it } from "vitest"
-import { resolveDeclaration } from "../src/declaration"
+import { resolveDeclaration, resolveDeclarationWithRev } from "../src/declaration"
 
 const DID_PLC = "did:plc:abcdefghijklmnopqrstuvwx"
 const DID_WEB = "did:web:example.com"
@@ -501,5 +501,68 @@ describe("PDS resolution matches @atproto/identity", () => {
         for (const call of calls) {
             expect(call.init?.redirect).toBe("manual")
         }
+    })
+})
+
+/**
+ * `resolveDeclarationWithRev` — the recheck path's variant, which additionally
+ * reads the repo rev (`getLatestCommit`) as the watch's monotonic ordering
+ * token. The DECISION still comes from `resolution`; `headRev` is only the
+ * watermark. Pins that a present resolution with an unreachable rev yields a
+ * null rev (the caller treats that as transient rather than unpausing rev-less).
+ */
+describe("resolveDeclarationWithRev (the watch's rev-carrying resolve)", () => {
+    const LATEST = `${PDS_URL}/xrpc/com.atproto.sync.getLatestCommit`
+
+    it("returns the resolution and the repo head rev together", async () => {
+        const keyBytes = new Uint8Array(32).map((_, i) => i)
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+            [LATEST]: () => jsonResponse({ cid: "bafy...", rev: "3m1abc" }),
+        })
+        const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
+        expect(resolution.found).toBe(true)
+        expect(headRev).toBe("3m1abc")
+    })
+
+    it("returns a null rev when getLatestCommit is unreachable, even though the key resolved", async () => {
+        const keyBytes = new Uint8Array(32).fill(0x42)
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+            [LATEST]: () => jsonResponse({}, 503),
+        })
+        const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
+        expect(resolution.found).toBe(true)
+        expect(headRev).toBeNull()
+    })
+
+    it("carries a rev alongside a confirmed-gone record (repo alive, record deleted)", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(
+                    { error: "RecordNotFound", message: "Could not locate record" },
+                    404
+                ),
+            [LATEST]: () => jsonResponse({ cid: "bafy...", rev: "3m9zzz" }),
+        })
+        const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
+        expect(resolution.found).toBe(false)
+        if (resolution.found) throw new Error("unreachable")
+        expect(resolution.confirmed).toBe(true)
+        expect(headRev).toBe("3m9zzz")
+    })
+
+    it("returns a null rev when the PDS cannot be resolved at all", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse({}, 503),
+        })
+        const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
+        expect(resolution.found).toBe(false)
+        expect(headRev).toBeNull()
     })
 })

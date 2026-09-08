@@ -629,3 +629,36 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
     }
     return null
 }
+
+/**
+ * The repo's current `rev`, from `com.atproto.sync.getLatestCommit` at the PDS
+ * — never taken from a wake signal, which a hostile feed could use to fake or
+ * mask a rollback.
+ *
+ * `getLatestCommit` gives the *repo* rev, which advances on any commit, not
+ * only the record a caller cares about. Both callers use it the same way: as a
+ * monotonic ordering token read authoritatively at fetch time — the monitor's
+ * `rev` index (`fetch-record.ts`) and the relay's own-DID declaration watch
+ * (`declaration.ts`, `resolveDeclarationWithRev`). Advancing on unrelated
+ * activity is harmless for both, because the DECISION is made on content (the
+ * record's bytes / the declaration's `currentKey`), and the rev is only for
+ * ordering and rollback direction (`spec/trust-model.md`).
+ *
+ * Throws on any failure (unreachable, or no rev in the body); a caller that
+ * treats a missing rev as transient wraps this and decides.
+ */
+export async function fetchLatestRev(
+    pdsEndpoint: string,
+    did: string,
+    fetchImpl: typeof fetch
+): Promise<string> {
+    const url = new URL(`${pdsEndpoint}/xrpc/com.atproto.sync.getLatestCommit`)
+    url.searchParams.set("did", did)
+    const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
+        rev?: unknown
+    }
+    if (typeof body.rev !== "string" || body.rev.length === 0) {
+        throw new Error("getLatestCommit returned no rev")
+    }
+    return body.rev
+}
