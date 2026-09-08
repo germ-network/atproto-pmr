@@ -41,8 +41,9 @@ jobs:
       # npm trusted publishing would succeed with no NPM_TOKEN configured.
       # These packages are distributed as git dependencies today, not npm.
       #
-      # This step now only opens a "Prepare next release" PR when changesets
-      # are present, and tags a GitHub release when that PR merges.
+      # Without `publish`, this step only opens a "Prepare next release" PR
+      # when changesets are present; `createGithubReleases` is inert until a
+      # publish runs, so the actual release tag is created by the next step.
       #
       # To enable npm publishing later: add `publish: pnpm release`, add a
       # `release` script (`changeset publish`) to the root package.json,
@@ -58,3 +59,28 @@ jobs:
           version: pnpm version-package
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A single, uniform repo tag `v<version>` per release. These packages are
+      # consumed as git dependencies pinned to a commit, so the meaningful
+      # release artifact is one tag over the whole repo, not per-package tags —
+      # `fixed` versioning (.changeset/config.json) keeps all packages on that
+      # one version, read here from `core`. Runs whenever no changesets remain
+      # (i.e. just after a "Prepare next release" PR merged, and on ordinary
+      # pushes), and is idempotent: it does nothing when the tag already
+      # exists, so only a genuine version bump creates a tag. A tag push does
+      # not re-trigger this workflow (it listens on `main` pushes only).
+      - name: Tag uniform release
+        if: steps.changesets.outputs.hasChangesets == 'false'
+        run: |
+          VERSION="$(node -p "require('./packages/core/package.json').version")"
+          TAG="v${VERSION}"
+          git fetch --tags --quiet
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "${TAG} already exists — nothing to tag."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "atproto-pmr ${TAG}"
+            git push origin "${TAG}"
+            echo "Tagged ${TAG}."
+          fi
