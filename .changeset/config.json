@@ -6,6 +6,14 @@
 	],
 	"access": "restricted",
 	"baseBranch": "main",
+	"fixed": [
+		[
+			"@germ-network/atproto-pmr-core",
+			"@germ-network/atproto-pmr-cloudflare",
+			"@germ-network/atproto-pmr-monitor",
+			"@germ-network/atproto-pmr-monitor-cloudflare"
+		]
+	],
 	"privatePackages": {
 		"version": true,
 		"tag": true
