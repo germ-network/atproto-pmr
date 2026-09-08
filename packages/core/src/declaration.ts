@@ -170,6 +170,7 @@ function isRawDeclarationRecord(value: unknown): value is RawDeclarationRecord {
 }
 
 import {
+    fetchLatestRev,
     guardedFetchJSON,
     RecordNotFoundError,
     resolvePDSEndpoint,
@@ -190,15 +191,34 @@ export async function resolveDeclaration(
     try {
         ;({ endpoint: pdsEndpoint } = await resolvePDSEndpoint(senderDID, fetchImpl))
     } catch (e) {
-        // A PLC tombstone surfaces as `RecordNotFoundError` and is a
-        // confirmed disappearance; any other resolution failure is transient.
-        return {
-            found: false,
-            reason: `PDS resolution failed: ${String(e)}`,
-            confirmed: e instanceof RecordNotFoundError,
-        }
+        return pdsResolutionFailure(e)
     }
+    return fetchDeclarationAt(pdsEndpoint, senderDID, fetchImpl)
+}
 
+/**
+ * A PLC tombstone surfaces as `RecordNotFoundError` and is a confirmed
+ * disappearance; any other resolution failure is transient.
+ */
+function pdsResolutionFailure(e: unknown): DeclarationResolution {
+    return {
+        found: false,
+        reason: `PDS resolution failed: ${String(e)}`,
+        confirmed: e instanceof RecordNotFoundError,
+    }
+}
+
+/**
+ * The declaration read + parse, given an already-resolved PDS endpoint. Split
+ * from `resolveDeclaration` so the recheck path (`resolveDeclarationWithRev`)
+ * can resolve the PDS once and then read both the declaration and the repo rev
+ * from it.
+ */
+async function fetchDeclarationAt(
+    pdsEndpoint: string,
+    senderDID: string,
+    fetchImpl: typeof fetch
+): Promise<DeclarationResolution> {
     let record: unknown
     try {
         const url = new URL(`${pdsEndpoint}/xrpc/com.atproto.repo.getRecord`)
@@ -255,5 +275,61 @@ export async function resolveDeclaration(
             confirmed: true,
         }
     }
+}
+
+/**
+ * A declaration resolution paired with the repo's rev at fetch time — for the
+ * own-DID declaration WATCH (`watch.ts`), not the hot pair-put admission path.
+ *
+ * The watch needs a monotonic ordering token so a reordered/replayed recheck
+ * (Cloudflare Queues are unordered + at-least-once) cannot clobber a fresher
+ * pause decision with a staler one; `headRev` is that token
+ * (`spec/storage-consistency.md`, "the last observed declaration revision";
+ * `spec/trust-model.md`, monotonic-rev tracking). The DECISION is still made on
+ * the `currentKey` value in `resolution` — the rev is used only for ordering and
+ * rollback direction.
+ *
+ * `headRev` is `null` when the PDS could not be resolved, or when the record
+ * resolved but `getLatestCommit` was unreachable. A caller that has a *present*
+ * resolution but a `null` rev should treat the whole recheck as transient (and
+ * retry) rather than unpause without a rev — an unpause must always carry a
+ * monotonic rev for the watermark to be sound.
+ */
+export interface DeclarationWithRev {
+    resolution: DeclarationResolution
+    headRev: string | null
+}
+
+/**
+ * `resolveDeclaration`, plus the repo rev, resolving the PDS once. The rev
+ * fetch (`getLatestCommit`) is deliberately absent from `resolveDeclaration`
+ * itself: that runs on every pair put, and the extra round trip belongs only on
+ * the rarer recheck path (a declaration change, or the client's recency floor).
+ */
+export async function resolveDeclarationWithRev(
+    senderDID: string,
+    fetchImpl: typeof fetch = fetch
+): Promise<DeclarationWithRev> {
+    let pdsEndpoint: string
+    try {
+        ;({ endpoint: pdsEndpoint } = await resolvePDSEndpoint(senderDID, fetchImpl))
+    } catch (e) {
+        return { resolution: pdsResolutionFailure(e), headRev: null }
+    }
+
+    // getRecord before getLatestCommit: the TOCTOU is benign only this way — a
+    // commit landing between the two reads can only make the rev look newer,
+    // never manufacture a false "same rev, different value" (matches the
+    // monitor's `fetch-record.ts`).
+    const resolution = await fetchDeclarationAt(pdsEndpoint, senderDID, fetchImpl)
+    let headRev: string | null = null
+    try {
+        headRev = await fetchLatestRev(pdsEndpoint, senderDID, fetchImpl)
+    } catch {
+        // Unreachable rev read is transient — the caller decides (a present
+        // resolution with no rev is retried, never applied rev-less).
+        headRev = null
+    }
+    return { resolution, headRev }
 }
 

@@ -100,6 +100,18 @@ declaration revision, the last check time, the currently trusted anchor
 key, and the paused flag. That is a relay concern and stays here; serving
 monitoring *to others* is not.
 
+The **last observed declaration revision is a monotonic watermark**
+([`trust-model.md`](trust-model.md), monotonic-`rev` tracking): a re-check
+whose observed repo `rev` is not strictly newer is refused — it neither
+pauses nor unpauses — so a reordered or replayed re-check (an at-least-once,
+unordered delivery), or a `rev` that moved *backwards* (a rollback), cannot
+move the flag away from a fresher observation's verdict. The pause *decision*
+is a value comparison (the declared key against the trusted one); the `rev`
+is only the ordering token that decision is admitted under. Detecting a PDS
+that equivocates — serving one key publicly and another directly — is not a
+relay concern: it needs independent observers, and lives at the client
+([`trust-model.md`](trust-model.md), multiple independent monitors).
+
 ### Mailboxes
 
 Three shapes, distinguished by what routes to them:

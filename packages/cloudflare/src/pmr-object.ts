@@ -3,6 +3,7 @@ import {
     DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR,
     INITIAL_WATCH_STATE,
     buildMessagePushPayload,
+    compareRev,
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
@@ -389,13 +390,32 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * relational adopter would drive it from a cron + `dueForWork` sweep.
      * `unknown` only stamps the check and is a no-op on the flag — a driver
      * typically retries a transient rather than recording it.
+     *
+     * `observedRev` carries the monotonic-rev watermark (`reconcileWatchState`):
+     * an outcome whose rev is not strictly newer than the stored one is refused.
+     * The read-then-write stays atomic because `compareRev` is synchronous — no
+     * await reopens this object's input gate between the read and the write.
      */
     async applyDeclarationOutcome(
         outcome: WatchOutcome,
-        nowSeconds: number
+        nowSeconds: number,
+        observedRev?: string
     ): Promise<void> {
+        const prev = await this.readWatchState()
+        if (
+            observedRev !== undefined &&
+            compareRev(prev.lastObservedRev ?? null, observedRev) === "regressed"
+        ) {
+            // A rev that moved backwards is a rollback (or an equivocating PDS,
+            // `spec/trust-model.md`). It is refused by the watermark below; log
+            // it, since it is not an ordinary reorder.
+            console.warn(
+                "declaration recheck: observed rev regressed",
+                `(stored ${prev.lastObservedRev}, observed ${observedRev}) — refusing`
+            )
+        }
         await this.writeWatchState(
-            reconcileWatchState(await this.readWatchState(), outcome, nowSeconds)
+            reconcileWatchState(prev, outcome, nowSeconds, observedRev)
         )
     }
 
