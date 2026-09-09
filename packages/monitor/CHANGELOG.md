@@ -1,5 +1,12 @@
 # @germ-network/atproto-pmr-monitor
 
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [[`f47481b`](https://github.com/germ-network/atproto-pmr/commit/f47481b01861138be218e5ac3025ea35be10f5e1)]:
+  - @germ-network/atproto-pmr-core@0.1.3
+
 ## 0.1.2
 
 ### Patch Changes
