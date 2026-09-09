@@ -1,6 +1,6 @@
 {
 	"name": "@germ-network/atproto-pmr-cloudflare",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"private": true,
 	"description": "Durable Object and KV storage implementation for the Atproto PMR storage seam",
 	"license": "MIT",

@@ -1,6 +1,6 @@
 {
 	"name": "@germ-network/atproto-pmr-core",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"private": true,
 	"description": "Protocol logic for an Atproto Personal Messaging Relay, parameterized over a storage seam",
 	"license": "MIT",
