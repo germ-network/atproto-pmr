@@ -26,6 +26,9 @@ importers:
       '@noble/ciphers':
         specifier: ^2.3.0
         version: 2.3.0
+      '@noble/curves':
+        specifier: ^2.3.0
+        version: 2.3.0
       typescript:
         specifier: ^5.9.3
         version: 5.9.3

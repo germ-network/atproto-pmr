@@ -52,9 +52,14 @@ function memoryChallenges(): ChallengeStore {
  * real one is (returning the existing locator, untouched), and a store
  * whose `update` merges. If the endpoint stopped writing the key through,
  * this fixture would keep the stale one — which is the bug.
+ *
+ * `deleted` spies on `directory.delete` calls, in order — the deactivate
+ * step the different-key replace path is supposed to take (and the
+ * same-key idempotent path is supposed to skip).
  */
 function world() {
     const rows = new Map<string, RegistrationFields>()
+    const deleted: string[] = []
     const challenges = memoryChallenges()
 
     const directory: Directory = {
@@ -69,6 +74,7 @@ function world() {
             return `loc:${did}`
         },
         async delete(did) {
+            deleted.push(did)
             rows.delete(did)
         },
     }
@@ -83,7 +89,7 @@ function world() {
         } as unknown as PMRStore
     }
 
-    return { rows, challenges, directory, store }
+    return { rows, deleted, challenges, directory, store }
 }
 
 /** The declared key, which the owner controls and can rotate. */
@@ -281,6 +287,112 @@ describe("anchor-key rotation does not lock the owner out", () => {
         // schema migration.
         expect(stored.byteLength).toBeGreaterThan(32)
         expect(parseOkpEd25519Key(stored).x.byteLength).toBe(32)
+    })
+})
+
+describe("deactivate + replace on a different declared key", () => {
+    it("a different declared key deactivates the prior registration before replacing it", async () => {
+        const w = world()
+        const oldKey = ed25519.utils.randomSecretKey()
+        const newKey = ed25519.utils.randomSecretKey()
+
+        declaredKey = ed25519.getPublicKey(oldKey)
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", oldKey, await challengeFor(w, DID)),
+            deps(w)
+        )
+
+        declaredKey = ed25519.getPublicKey(newKey)
+        const again = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", newKey, await challengeFor(w, DID)),
+            deps(w)
+        )
+        expect(again.status).toBe(201)
+
+        // Deactivated exactly once — not zero (that would be the old,
+        // wrong, in-place write-through) and not more than once.
+        expect(w.deleted).toEqual([DID])
+
+        const stored = w.rows.get(DID)!
+        expect([...parseOkpEd25519Key(stored.anchorKey).x]).toEqual([
+            ...ed25519.getPublicKey(newKey),
+        ])
+        expect(
+            (
+                await handleRegistrationRead(
+                    signedRequest(READ_URL, "GET", newKey, await challengeFor(w, DID)),
+                    deps(w)
+                )
+            ).status
+        ).toBe(200)
+    })
+
+    it("a same declared key does not deactivate — stays an idempotent in-place refresh", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        // An out-of-band field the endpoint's own `update` call never
+        // touches on a same-key refresh — if the same-key path deactivated
+        // (delete then re-create), this would be gone afterward.
+        w.rows.set(DID, {
+            ...w.rows.get(DID)!,
+            pushSubscription: {
+                endpoint: "https://push.example/sub/abc",
+                contentKey: new Uint8Array(32).fill(7),
+                keyId: 3,
+            },
+        })
+
+        const again = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        expect(again.status).toBe(201)
+
+        expect(w.deleted).toEqual([])
+        expect(w.rows.get(DID)!.pushSubscription?.endpoint).toBe(
+            "https://push.example/sub/abc"
+        )
+    })
+
+    it("a different-key re-registration with no push body drops the prior subscription", async () => {
+        const w = world()
+        const oldKey = ed25519.utils.randomSecretKey()
+        const newKey = ed25519.utils.randomSecretKey()
+
+        declaredKey = ed25519.getPublicKey(oldKey)
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", oldKey, await challengeFor(w, DID)),
+            deps(w)
+        )
+        w.rows.set(DID, {
+            ...w.rows.get(DID)!,
+            pushSubscription: {
+                endpoint: "https://push.example/sub/abc",
+                contentKey: new Uint8Array(32).fill(7),
+                keyId: 3,
+            },
+        })
+
+        // Re-register under a different key with no body at all — the
+        // replace path must not carry the old subscription forward.
+        declaredKey = ed25519.getPublicKey(newKey)
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", newKey, await challengeFor(w, DID)),
+            deps(w)
+        )
+
+        const response = await handleRegistrationRead(
+            signedRequest(READ_URL, "GET", newKey, await challengeFor(w, DID)),
+            deps(w)
+        )
+        const map = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        expect(map.get("ps")).toBe(false)
     })
 })
 

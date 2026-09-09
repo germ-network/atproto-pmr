@@ -1,5 +1,5 @@
 import { redeemChallenge } from "../challenge.js"
-import { encodeOkpEd25519Key } from "../cose/key.js"
+import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { messageEntryFields } from "../events.js"
 import { deriveGrantAddress } from "../grant.js"
@@ -7,6 +7,7 @@ import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
 import { asMailboxKey, asPairMailboxKey, isPairMailboxKey } from "../mailbox-key.js"
 import { binaryToBase64URL, readBodyCapped, toResponseBody } from "../util.js"
+import { bytesEqual } from "../watch.js"
 import type {
     BodyStore,
     Directory,
@@ -120,6 +121,20 @@ function cbor(entries: [string, CoseValue][], status = 200): Response {
 }
 
 // MARK: - Registration
+
+/**
+ * Compares the stored anchor key (a `COSE_Key` blob) against an incoming raw
+ * key. A malformed stored blob counts as "different" — the safe default,
+ * since it forces a replace rather than an in-place write over unparseable
+ * state.
+ */
+function sameStoredKey(storedBlob: Uint8Array, rawX: Uint8Array): boolean {
+    try {
+        return bytesEqual(parseOkpEd25519Key(storedBlob).x, rawX)
+    } catch {
+        return false
+    }
+}
 
 /**
  * `POST /pmr/v1/registrations` — create.
@@ -244,22 +259,38 @@ export async function handleRegistrationCreate(
         }
     }
 
+    // Deactivate + replace (GER-2448/GER-2449): a re-registration whose declared
+    // key DIFFERS from the one currently stored is NOT a continuity rotation — no
+    // proof ties the new key to the old (continuity proofs are GER-2447, deferred).
+    // Treat it as a fresh registration that deactivates the prior one: unlink it so
+    // `create` allocates a new Durable Object under the new key, dropping the prior
+    // registration's mail, grants, pool, blocks and watch state. Sound to drop —
+    // the old anchor key is gone, so anything queued under it is undecryptable; and
+    // only DoS (fresh empty registration), never takeover of the prior contents, is
+    // reachable by whoever controls the declaration. The continuity path that KEEPS
+    // the registration is gated on GER-2447. The orphaned DO's storage and the prior
+    // registration's global grant-address routing rows are left in place, not purged
+    // — an old grant address routes dead 202 mail to the now-unreachable DO until its
+    // KV TTL lapses; purging both is deferred to GER-2448. Same-key re-registration
+    // stays an idempotent in-place refresh (below). Brief non-atomicity is acceptable: between
+    // the delete and create's re-put the DID resolves to null, so a concurrent owner
+    // request 401s transiently and a crash leaves it deregistered until the client
+    // retries — both benign and self-healing, and forced by create's idempotency
+    // (a fresh DO cannot be allocated while the old routing row exists).
+    const priorLocator = await deps.directory.resolve(did)
+    if (priorLocator !== null) {
+        const prior = await deps.store(priorLocator).load()
+        if (prior !== null && !sameStoredKey(prior.anchorKey, anchorKey)) {
+            await deps.directory.delete(did)
+        }
+    }
+
     const locator = await deps.directory.create(did, fields)
 
     // `create` is idempotent on DID and returns the existing locator
-    // **without touching its fields**, so re-registering an existing DID
-    // would leave a stale anchor key in place. That matters because
-    // re-registration is the recovery path from a key rotation: every owner
-    // endpoint verifies against the STORED key, so an owner who rotated
-    // their declared key would otherwise be locked out of their own
-    // registration — including the ability to delete it — with mail still
-    // arriving.
-    //
-    // Writing through is safe precisely because of what was checked above:
-    // the signature verified against the key in the DID's CURRENT
-    // declaration, which only that DID's controller can change. An attacker
-    // cannot reach this line without already holding the key they would be
-    // installing.
+    // **without touching its fields** — the SAME-key case above, an
+    // idempotent refresh. (A different-key re-registration deactivated the
+    // prior registration above, so `create` always allocates fresh there.)
     //
     // `pushSubscription` is written only when the request carried one, so
     // re-registering to refresh a key does not silently drop push delivery.
