@@ -144,6 +144,12 @@ describe("a different declared key deactivates and replaces the prior registrati
         expect([...parseOkpEd25519Key(stored!.anchorKey).x]).toEqual([
             ...ed25519.getPublicKey(keyB),
         ])
+
+        // The OLD DO (L1) is torn down, not merely unreferenced: its
+        // registration and mail are gone, not just orphaned.
+        expect(await store1.load()).toBeNull()
+        const oldPage = await store1.openMailboxes(null, 100)
+        expect(oldPage.entries).toEqual([])
     })
 })
 

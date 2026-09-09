@@ -121,8 +121,23 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         return locator
     }
 
+    /** Unlinks the DID, then tears down the DO's storage — best-effort. */
     async delete(did: string): Promise<void> {
+        // Capture the locator BEFORE removing the routing row (resolve keys off it).
+        const locator = await this.resolve(did)
+        // Unlink first: this is the authoritative step. A crash between here and the
+        // teardown below degrades to an orphaned-but-intact DO (the prior behavior),
+        // never to a routing row pointing at a half-wiped DO.
         await this.env.pmrDirectory.delete(did)
+        if (locator !== null) {
+            try {
+                await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
+            } catch (err) {
+                // Best-effort reclamation: a failed teardown just leaves the orphan
+                // (the prior behavior), it must not fail the deregistration/replace.
+                console.warn(`KVDirectory.delete: DO teardown failed for ${did}:`, err)
+            }
+        }
     }
 }
 

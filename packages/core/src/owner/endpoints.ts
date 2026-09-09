@@ -268,12 +268,13 @@ export async function handleRegistrationCreate(
     // the old anchor key is gone, so anything queued under it is undecryptable; and
     // only DoS (fresh empty registration), never takeover of the prior contents, is
     // reachable by whoever controls the declaration. The continuity path that KEEPS
-    // the registration is gated on GER-2447. The orphaned DO's storage and the prior
-    // registration's global grant-address routing rows are left in place, not purged
-    // — an old grant address routes dead 202 mail to the now-unreachable DO until its
-    // KV TTL lapses; purging both is deferred to GER-2448. Same-key re-registration
-    // stays an idempotent in-place refresh (below). Brief non-atomicity is acceptable: between
-    // the delete and create's re-put the DID resolves to null, so a concurrent owner
+    // the registration is gated on GER-2447. `directory.delete` now tears down the
+    // prior registration's DO storage too (deregistration and replace alike) — only
+    // its global grant-address routing rows are left, lapsing on their own KV TTL;
+    // until then an old grant address routes dead 202 mail to the now-torn-down DO.
+    // Same-key re-registration stays an idempotent in-place refresh (below). Brief
+    // non-atomicity is acceptable: between the delete and create's re-put the DID
+    // resolves to null, so a concurrent owner
     // request 401s transiently and a crash leaves it deregistered until the client
     // retries — both benign and self-healing, and forced by create's idempotency
     // (a fresh DO cannot be allocated while the old routing row exists).
