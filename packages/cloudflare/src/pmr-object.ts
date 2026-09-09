@@ -915,4 +915,17 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // can cause rather than merely observe.
         await this.broadcastCapabilities()
     }
+
+    // MARK: - Teardown
+
+    /**
+     * Tear down all of this registration's stored state — the deregistration /
+     * replace teardown. `KVDirectory.delete` calls this after unlinking the DID,
+     * so an orphaned DO does not leak its storage forever (nothing else reclaims
+     * it — there is no alarm or sweep). Reached by locator, not by DID: the caller
+     * has already removed the routing row.
+     */
+    async destroy(): Promise<void> {
+        await this.db.deleteAll()
+    }
 }

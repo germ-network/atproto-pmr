@@ -5,7 +5,8 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { KVDirectory } from "../src/directory"
+import { asPairMailboxKey, type RegistrationFields } from "@germ-network/atproto-pmr-core"
+import { KVDirectory, pmrStore } from "../src/directory"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
 
@@ -21,6 +22,12 @@ let counter = 0
 function freshAddress(): string {
     counter += 1
     return `addr-${counter}`
+}
+
+let didCounter = 0
+function freshDID(): string {
+    didCounter += 1
+    return `did:plc:directory-test-${didCounter}`
 }
 
 describe("createGrantAddress / resolveAddress", () => {
@@ -90,5 +97,36 @@ describe("deleteGrantAddress", () => {
     it("is a no-op on an address that does not exist", async () => {
         const dir = directory()
         await dir.deleteGrantAddress(freshAddress())
+    })
+})
+
+describe("delete", () => {
+    it("tears down the registration's Durable Object, not just the routing row", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const fields: RegistrationFields = {
+            did,
+            anchorKey: new Uint8Array(32).fill(1),
+            lastActive: T0,
+        }
+
+        const locator = await dir.create(did, fields)
+        const store = pmrStore(locator, testEnv)
+        const appended = await store.append(
+            asPairMailboxKey("did:plc:some-sender"),
+            { messageId: "m1", byteLength: 42 },
+            new Uint8Array(16).fill(2),
+            T0
+        )
+        expect(appended.outcome).toBe("appended")
+
+        await dir.delete(did)
+
+        // Unlinked: the DID no longer resolves.
+        expect(await dir.resolve(did)).toBeNull()
+        // Torn down, not merely orphaned: the old DO's state is gone too.
+        expect(await store.load()).toBeNull()
+        const page = await store.openMailboxes(null, 100)
+        expect(page.entries).toEqual([])
     })
 })

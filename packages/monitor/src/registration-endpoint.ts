@@ -23,11 +23,14 @@ import type { MonitorRegistration, MonitorRegistrationStore } from "./registrati
  *
  * ## Why a rebind cannot change the anchor key
  *
- * The PMR's own registration deliberately writes a freshly-declared key
- * through on re-registration (`owner/endpoints.ts`,
- * `handleRegistrationCreate`) — safe there because a key rotation would
- * otherwise lock the *owner* out of endpoints that verify against the
- * stored key, including the `DELETE` that would let them clean up.
+ * The PMR's own registration handles a freshly-declared key differently:
+ * re-registering under the SAME stored key is an idempotent in-place
+ * refresh, but a DIFFERENT declared key deactivates and replaces the prior
+ * registration outright — a fresh registration under the new key, not a
+ * rebind (`owner/endpoints.ts`, `handleRegistrationCreate`; GER-2448/GER-2449).
+ * Safe there because a key rotation would otherwise lock the *owner* out of
+ * endpoints that verify against the stored key, including the `DELETE` that
+ * would let them clean up.
  *
  * That argument does not transfer here. This component's adversary is
  * exactly the party that can publish a new declared key — a malicious or
