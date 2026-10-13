@@ -475,10 +475,10 @@ export interface PDSResolution {
  */
 const PLC_TOMBSTONE_MESSAGE_PREFIX = "DID not available: "
 
-export async function resolvePDSEndpoint(
+async function fetchDidDocument(
     did: string,
     fetchImpl: typeof fetch
-): Promise<PDSResolution> {
+): Promise<Record<string, unknown>> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
         doc = await guardedFetchJSON(
@@ -511,14 +511,90 @@ export async function resolvePDSEndpoint(
     ) {
         throw new Error("DID document does not match the requested DID")
     }
+    return doc as Record<string, unknown>
+}
 
-    const service = extractPDSService(doc as Record<string, unknown>)
+export async function resolvePDSEndpoint(
+    did: string,
+    fetchImpl: typeof fetch
+): Promise<PDSResolution> {
+    const doc = await fetchDidDocument(did, fetchImpl)
+    const service = extractPDSService(doc)
     if (service === null) {
         throw new Error("DID document has no #atproto_pds service")
     }
     return {
         endpoint: service,
-        signingKey: extractSigningKey(doc as Record<string, unknown>),
+        signingKey: extractSigningKey(doc),
+    }
+}
+
+/**
+ * The DID document's `#atproto` signing key, from the DID's directory
+ * (plc.directory, or the did:web host) only — never the PDS.
+ */
+export async function resolveSigningKey(
+    did: string,
+    fetchImpl: typeof fetch
+): Promise<string | null> {
+    return extractSigningKey(await fetchDidDocument(did, fetchImpl))
+}
+
+export interface CachedSigningKey {
+    /** `#atproto` multikey, or null when the document carried none. */
+    key: string | null
+    fetchedAtMs: number
+}
+
+/** Freshness is enforced in code from `fetchedAtMs`, not by a platform TTL. */
+export interface SigningKeyCache {
+    get(did: string): Promise<CachedSigningKey | null>
+    put(did: string, entry: CachedSigningKey): Promise<void>
+}
+
+/** Re-fetch from the directory once a cached key is older than this. */
+export const SIGNING_KEY_TTL_MS = 10 * 60 * 1000
+/** On a directory failure, a cached key up to this old is still used. */
+export const SIGNING_KEY_MAX_STALE_MS = 6 * 60 * 60 * 1000
+
+/**
+ * `resolveSigningKey` behind `cache`: fresh within `SIGNING_KEY_TTL_MS`,
+ * otherwise fetched eagerly from the directory, falling back to a cached
+ * key up to `SIGNING_KEY_MAX_STALE_MS` old only when that fetch fails (the
+ * stale path leaves the cache untouched, so an outage retries the directory
+ * on every call). A directory tombstone is an answer, not a failure.
+ * Resolves `null` when there is no usable key.
+ */
+export function cachedSigningKeyResolver(deps: {
+    fetchImpl: typeof fetch
+    cache: SigningKeyCache
+    nowMs: () => number
+}): (did: string) => Promise<string | null> {
+    const { fetchImpl, cache, nowMs } = deps
+    return async (did) => {
+        // The cache is an optimisation: a fault reading or writing it must
+        // not turn into a refusal to verify.
+        const cached = await cache.get(did).catch(() => null)
+        const now = nowMs()
+        if (cached && now - cached.fetchedAtMs < SIGNING_KEY_TTL_MS) {
+            return cached.key
+        }
+        try {
+            const key = await resolveSigningKey(did, fetchImpl)
+            await cache.put(did, { key, fetchedAtMs: now }).catch(() => {})
+            return key
+        } catch (error) {
+            if (error instanceof RecordNotFoundError) {
+                // The directory says the identity is gone: not an outage, so
+                // no stale key, and cache the answer to spare the directory.
+                await cache.put(did, { key: null, fetchedAtMs: now }).catch(() => {})
+                return null
+            }
+            if (cached && now - cached.fetchedAtMs <= SIGNING_KEY_MAX_STALE_MS) {
+                return cached.key
+            }
+            return null
+        }
     }
 }
 
