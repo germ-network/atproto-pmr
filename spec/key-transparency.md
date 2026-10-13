@@ -354,6 +354,52 @@ This is also why the truncation signal is `nextCursor` against
 `sealedThrough` rather than a flag: the same comparison that tells a client
 whether to keep paging tells a cache whether the answer can be kept.
 
+### Keeping the snapshot current
+
+A relay that admits pair puts from a monitor's CAR (see
+[trust-model §P5](trust-model.md#p5--sender-verification)) treats a snapshot
+that has not been confirmed recently as unknown, so a monitor serving that
+role re-confirms every DID it holds on a schedule rather than only when a
+wake signal arrives.
+
+For each held DID that has not been confirmed for a configured interval, the
+monitor reads the repo's current head `rev` from the DID's own PDS
+(re-resolving the DID document each time, so a PDS migration is seen) and
+compares it with the `rev` it holds:
+
+- **Unchanged** — the snapshot is confirmed current as of now.
+- **Advanced, declaration record unchanged** — a repo `rev` moves on any
+  commit, so this is the common case. Unless the monitor runs a verification
+  hook (then every moved head takes the ordinary path), it stores the new CAR
+  and `rev` quietly: no digest-window entry and no own-DID push, because nothing
+  a client holds became stale. It compares record CIDs to decide this and
+  still does not verify signatures.
+- **Advanced, declaration record changed** (or the DID document re-keyed) —
+  the ordinary path: stored, entered in the digest window, pushed.
+- **Regressed** — raised as a regression (once per interval), nothing stored.
+- **Gone at the source** (a repo-level terminal answer, or a signed view
+  holding no record) — the deletion path.
+- **Unreachable** — left due and retried behind the others; never recorded
+  as confirmed.
+
+A confirmation is recorded as a separate `chk:<did>` entry carrying the `rev`
+it confirmed and the time; it is honoured only when that `rev` equals the
+held record's, so a confirmation of an older CAR never makes a newer one look
+fresh, and the CAR is not rewritten. A snapshot's freshness is the later of
+its fetch time and a matching confirmation.
+
+**Capacity.** The relay's cutoff holds only while the whole population is
+confirmed well inside it: population × alarm interval ÷ per-alarm batch,
+plus outage slack, must stay below the cutoff. With the defaults (batch 64
+per 2-minute alarm, a 6-hour cutoff) one full cycle takes about an hour at
+1,754 DIDs, and the bound breaks near 11,000 DIDs. Each refreshed DID costs
+two subrequests for the head `rev` (DID document, then commit) plus its KV
+reads and writes, and a DID whose head advanced costs several more (a record
+fetch, and a second one if the change takes the ordinary path). The batch
+must therefore also fit the platform's per-invocation subrequest limit: the
+even an all-confirmed batch of 64 exceeds the free plan's limit of 50, where
+the batch should be lowered.
+
 ### The record fetch
 
 `GET /records/{did}` — unauthenticated. Returns the monitor's held record

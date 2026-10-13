@@ -2,50 +2,22 @@ import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/k
 import { verifyRecordProof, type VerifiedRecord } from "./repo-proof"
 
 /**
- * Resolves a sender DID to its declared anchor key, for pair-put sender
- * authentication.
+ * Declaration resolution, in two deliberately separate shapes.
  *
- * DIRECT FETCH, NOT CAR — this is the relay's own admission check, not
- * content the relay hands onward to a device. Two independent documents
- * agree on the algorithm, and neither mentions CAR for this specific step:
+ * **`resolveDeclaration` / `resolveDeclarationWithRev`: the PDS, for the
+ * owner's own DID** (registration, the declaration watch). DID → DID
+ * document → PDS → `com.atproto.repo.getRecord`, as JSON, over TLS to the
+ * authoritative host. The result is consumed by the relay and discarded, so
+ * TLS to the PDS is the trust basis, and there is no cache: a direct fetch
+ * per call keeps the work uniform across outcomes.
  *
- *   - atproto-pmr.md §Sender authentication states the algorithm directly:
- *     "Look up the sender's declaration... On a miss, resolve it: sender DID
- *     -> DID document -> PDS -> declaration." No CAR.
- *   - the specification's framing of the CAR requirement is "how does a DEVICE trust a
- *     record A RELAY HANDS IT" — content the relay relays onward. This
- *     module's output never leaves the relay; it is consumed by
- *     verifyPairPut and then discarded.
- *
- * wire-api.md's verification-algorithm section says "CAR-verified" for step
- * 2, but that phrasing describes the DEVICE's algorithm (the one thing a
- * relay-delivered record needs, because provenance is exactly what relay
- * delivery discards). Applying it to the relay's OWN direct-to-PDS fetch
- * conflates two different trust boundaries — TLS-to-the-authoritative-PDS is
- * not "a relay hands it to you." See the implementation plan for the full
- * reasoning; this comment is the load-bearing summary.
- *
- * This is also the only implementable choice today: no CAR/DAG-CBOR/MST
- * library exists anywhere in this repo, and storage-protocol.md frames
- * relay-side CAR parsing as "defense in depth against a lying PDS, added
- * deliberately rather than assumed" — future hardening, not a v1
- * prerequisite (the relay needs signature verification, not a CAR parser).
- *
- * TODO(CAR): add CAR verification of the fetched declaration as defense in
- * depth against a PDS that lies to this relay specifically (distinct from a
- * relay lying to a device, which the CAR requirement already covers). Not required for
- * correctness of THIS relay's own admission decision, which trusts the PDS
- * it is directly, authoritatively talking to over TLS — the same trust basis
- * the client uses today before any relay exists (trust-model.md: "authority
- * comes from provenance: DID -> DID document -> PDS -> the record... over
- * TLS").
- *
- * NO CACHE. A direct fetch runs on every pair put, deliberately: caching is
- * the observation feature's job (storage-protocol.md's observation cache,
- * "deliberately the weakest tier"), which is not built yet, and a
- * half-built cache here would be scope creep ahead of that feature existing.
- * Costing the same fetch on every call also keeps this symmetric across
- * outcomes — nothing about caching can become a timing signal.
+ * **`snapshotDeclarationResolver`: a third party's CAR, for a sender's DID**
+ * (pair-put admission). It verifies the key monitor's stored CAR against the
+ * DID document's signing key and never contacts the sender's PDS: an inline
+ * fetch there would tell the sender's PDS when the sender sends, and the
+ * sender's PDS is the party whose claim is being checked. It returns the
+ * declaration record's CID alongside the anchor key so the delivery hint can
+ * name exactly what was verified.
  */
 
 export type DeclarationResolution =

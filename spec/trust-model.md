@@ -114,6 +114,25 @@ reproduces the gap the algorithm closes. Self-authentication establishes
 is payload → anchor key → declaration → DID, and no link is optional. See
 [`wire-api.md` §The verification algorithm](wire-api.md#the-verification-algorithm).
 
+**The declaration comes from a third party, never from the sender's PDS.**
+The relay verifies the CAR a key monitor holds for the sender — the commit
+signature under the DID document's signing key, and the declaration record's
+path through the commit's tree — and contacts only the monitor's snapshot
+store and the sender's DID directory (the PLC directory, or the `did:web`
+host), with the signing key cached for ten minutes (a DID-document re-key is not
+seen before then, nor for up to six hours if the directory is unreachable,
+when a stale key is used rather than refusing everyone). It does not fetch the
+declaration from the sender's PDS on a put, for two reasons: an inline fetch
+tells the sender's PDS when the sender sends, and a read from the party
+whose claim is being checked is not independent of it. The cost is
+freshness: the relay's view is the monitor's view. It is bounded by the
+monitor's periodic re-confirmation of every held snapshot and by a cutoff
+beyond which the relay treats a snapshot as unknown (a pair put then answers
+`409`, [wire-api.md](wire-api.md#delivery--peer-facing)). A rotation or
+revocation the monitor has not yet observed is accepted until it is. The
+device's defence is its own PLC-verified view of the sender's declaration,
+not the hint.
+
 This verification serves the relay's abuse control and policy tiers, not
 the recipient's end-to-end security — the device authenticates
 independently (see [P8](#p8--the-relays-verdict-is-a-hint)). Keeping that
@@ -159,10 +178,16 @@ rate-limited. It never yields readable content.
 ### P8 — The relay's verdict is a hint
 
 A relay that verified a pair put passes its verdict to the device as a
-hint — "I validated this as DID X under anchor A". **A device MUST
-re-verify the payload before acting on it**, and MUST NOT treat the hint
-as authority. The hint may be used to index and route cheaply; it is an
-index, not evidence.
+hint: the sender DID (`sd`) and the CID of the declaration record it
+verified against (`dc`). `dc` is a freshness cue — the newest declaration
+the relay has seen for that DID — and nothing more: it is not a trust
+signal and not a key identifier, and it changes on any change to the
+declaration, including a key-package rotation under the same anchor key.
+**A device MUST re-verify the payload before acting on it**, and MUST NOT
+treat the hint as authority. A device never trusts the relay: it verifies
+DID → declaration → anchor key from the CAR itself, and uses `dc` only to
+decide whether to re-verify. The hint may be used to index and route
+cheaply; it is an index, not evidence.
 
 Storage-side, the hint is stored *alongside* the body and never inside it.
 An implementation that loses hints degrades performance; one that lets a

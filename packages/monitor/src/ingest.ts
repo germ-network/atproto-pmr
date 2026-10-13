@@ -44,8 +44,10 @@ export interface IngestDeps {
     fetchRecord(did: string): Promise<FetchedRecord>
     /**
      * Optional defense in depth. A monitor that forwards what it fetched
-     * needs no CAR parser — the client verifies against the DID document —
-     * so verification is a seam rather than a dependency.
+     * needs no signature check — the consumer verifies against the DID
+     * document — so verification is a seam rather than a dependency. When
+     * set, the periodic refresh sends every moved head through `settle`
+     * (and so through this hook) instead of storing it quietly.
      */
     verify?(did: string, record: FetchedRecord): Promise<boolean>
     /** Own-DID push, where a registration holds this DID. */

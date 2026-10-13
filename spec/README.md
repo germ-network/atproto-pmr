@@ -66,9 +66,8 @@ puts.
 **Two related components are deliberately not part of a PMR.** The
 **key monitor** — [key transparency](key-transparency.md) for the
 messaging keys this whole system rests on — is a separate, independently
-operable component that a PMR is *encouraged* to run alongside itself,
-because it is nearly free where a relay already resolves and verifies
-counterpart declarations to check pair-put signatures. It is not a
+operable component. A relay reads its senders' declarations from a monitor's
+store, so a PMR that admits pair puts runs a monitor or shares one. It is not a
 one of the relay's mailbox capabilities, and a client chooses its monitors rather than
 resolving them: a device registers with several and cross-checks, which is
 load-bearing rather than decorative, being what detects a PDS that

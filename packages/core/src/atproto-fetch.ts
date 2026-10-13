@@ -7,10 +7,11 @@
  * below are the security boundary for every consumer, and duplicating them
  * per package would be exactly the wrong kind of copy.
  *
- * The relay and the monitor share the resolution and diverge after it: a
- * relay reads the declaration as JSON for its own admission check
- * (`declaration.ts`), while a monitor reads CAR, because its output is
- * relayed onward to a device that must verify it.
+ * The monitor and the relay's owner-DID reads (registration, declaration
+ * watch) share the resolution and read from the PDS. The relay's check of a
+ * *sender's* declaration does not: it verifies the monitor's CAR and uses
+ * only the DID directory (`resolveSigningKey`), so it never tells the
+ * sender's PDS that a message is being sent.
  */
 
 /**
