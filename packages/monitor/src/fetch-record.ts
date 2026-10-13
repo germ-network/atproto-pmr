@@ -76,6 +76,24 @@ const TERMINAL_XRPC_ERRORS = [
  */
 const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
 
+/**
+ * The repo's current head `rev` from the DID's own PDS, for the periodic
+ * refresh. Re-resolves the DID document each time, so a PDS migration shows
+ * up here; a repo-level terminal answer raises `RecordNotFoundError` exactly
+ * as `fetchRecordCar` does.
+ */
+export async function fetchHeadRev(
+    did: string,
+    options: { fetchImpl?: typeof fetch } = {}
+): Promise<string> {
+    const fetchImpl = options.fetchImpl ?? fetch
+    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    return fetchLatestRev(endpoint, did, fetchImpl, {
+        terminalErrorNames: TERMINAL_XRPC_ERRORS,
+        permanentErrorNames: PERMANENT_XRPC_ERRORS,
+    })
+}
+
 export async function fetchRecordCar(
     did: string,
     options: FetchRecordOptions

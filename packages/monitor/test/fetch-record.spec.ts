@@ -7,7 +7,8 @@
  * the `rev` from the PDS rather than from whatever prompted the read.
  */
 import { describe, expect, it } from "vitest"
-import { fetchRecordCar } from "../src/fetch-record"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { fetchHeadRev, fetchRecordCar } from "../src/fetch-record"
 
 const DID = "did:plc:alice"
 const PDS = "https://pds.example"
@@ -198,5 +199,38 @@ describe("fetchRecordCar", () => {
         await expect(
             fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
         ).rejects.toThrow(/does not match/)
+    })
+})
+
+describe("fetchHeadRev", () => {
+    it("reads only the DID document and getLatestCommit, returning the PDS's rev", async () => {
+        const { impl, seen } = fixture()
+        const rev = await fetchHeadRev(DID, { fetchImpl: impl })
+        expect(rev).toBeTruthy()
+        expect(seen.some((u) => u.includes("sync.getRecord"))).toBe(false)
+        expect(seen.filter((u) => u.includes("sync.getLatestCommit"))).toHaveLength(1)
+    })
+
+    it("a repo-level terminal answer raises RecordNotFoundError; reversible states are not permanent", async () => {
+        for (const [name, permanent] of [
+            ["RepoNotFound", true],
+            ["RepoDeactivated", false],
+            ["RepoTakendown", false],
+        ] as const) {
+            const { impl } = fixture({
+                "sync.getLatestCommit": () =>
+                    new Response(JSON.stringify({ error: name }), { status: 400 }),
+            })
+            const err = await fetchHeadRev(DID, { fetchImpl: impl }).catch((e) => e)
+            expect(err).toBeInstanceOf(RecordNotFoundError)
+            expect(err.permanent).toBe(permanent)
+        }
+    })
+
+    it("an unreachable PDS is an ordinary error, not a deletion", async () => {
+        const { impl } = fixture({ "sync.getLatestCommit": () => new Response("x", { status: 503 }) })
+        const err = await fetchHeadRev(DID, { fetchImpl: impl }).catch((e) => e)
+        expect(err).toBeInstanceOf(Error)
+        expect(err).not.toBeInstanceOf(RecordNotFoundError)
     })
 })

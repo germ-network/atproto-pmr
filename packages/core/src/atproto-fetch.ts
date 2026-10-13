@@ -721,16 +721,22 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
  * ordering and rollback direction (`spec/trust-model.md`).
  *
  * Throws on any failure (unreachable, or no rev in the body); a caller that
- * treats a missing rev as transient wraps this and decides.
+ * treats a missing rev as transient wraps this and decides. Pass
+ * `terminalErrorNames` (as `guardedFetchJSON`) to have a repo-level terminal
+ * answer raise `RecordNotFoundError` instead of a generic error.
  */
 export async function fetchLatestRev(
     pdsEndpoint: string,
     did: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    terminal: {
+        terminalErrorNames?: readonly string[]
+        permanentErrorNames?: readonly string[]
+    } = {}
 ): Promise<string> {
     const url = new URL(`${pdsEndpoint}/xrpc/com.atproto.sync.getLatestCommit`)
     url.searchParams.set("did", did)
-    const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
+    const body = (await guardedFetchJSON(url.toString(), fetchImpl, terminal)) as {
         rev?: unknown
     }
     if (typeof body.rev !== "string" || body.rev.length === 0) {

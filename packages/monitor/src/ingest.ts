@@ -130,6 +130,27 @@ export async function intake(
 export type SettleOutcome = "stored" | "rejected" | "deleted"
 
 /**
+ * The source confirmed this DID's declaration is gone. Nothing is left to
+ * verify or index by rev, so this skips straight to disposing of what's
+ * stored. It still reaches the digest window, the same as a stored change
+ * would: `completeDeletion` is `complete`'s deletion-shaped counterpart.
+ * `permanent` decides only whether this ALSO suppresses future reverify
+ * events (see `MonitorIndex.isDeleted`) — a reversible state (an account
+ * takedown/suspension that may lift) still disposes of the stale snapshot
+ * and still pushes, but must stay open to a later event noticing the
+ * reversal.
+ */
+export async function settleDeletion(
+    deps: IngestDeps,
+    did: string,
+    permanent: boolean
+): Promise<void> {
+    await deps.snapshot.deleteRecord(did)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent)
+    await deps.onDelete?.(did)
+}
+
+/**
  * Steps 2 and 3, off the read loop. Safe to call for a DID owed more than
  * once — the fetch is by DID, not by event, so a burst of revs for one DID
  * collapses into a single authoritative read.
@@ -148,20 +169,7 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         record = await deps.fetchRecord(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        // Confirmed gone at the source. Nothing left to verify or index
-        // by rev, so this skips straight to disposing of what's stored —
-        // the checks below (verify, regression, rotation) all assume a
-        // record exists to compare, which there no longer is. It still
-        // reaches the digest window, the same as a stored change would:
-        // `completeDeletion` is `complete`'s deletion-shaped counterpart.
-        // `err.permanent` decides only whether this ALSO suppresses
-        // future reverify events (see `MonitorIndex.isDeleted`) — a
-        // reversible state (an account takedown/suspension that may
-        // lift) still disposes of the stale snapshot and still pushes,
-        // but must stay open to a later event noticing the reversal.
-        await deps.snapshot.deleteRecord(did)
-        await deps.index.completeDeletion(did, deps.nowMs(), err.permanent)
-        await deps.onDelete?.(did)
+        await settleDeletion(deps, did, err.permanent)
         return "deleted"
     }
 
