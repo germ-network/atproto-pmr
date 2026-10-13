@@ -66,7 +66,7 @@ export function decodeFrame(bytes: Uint8Array): DecodedFrame {
 
 /**
  * A queued message's field vocabulary, pair or grant mailbox alike — the
- * socket does not distinguish them, matching `openMailboxes`. `sd`/`kt`
+ * socket does not distinguish them, matching `openMailboxes`. `sd`/`dc`
  * (the relay's verification hint) are present only when the ref carries
  * one, which pair mailboxes do and grant mailboxes never do.
  *
@@ -85,9 +85,11 @@ export function messageEntryFields(
         ["id", ref.messageId],
         ["m", message],
     ]
-    if (ref.hint !== undefined) {
+    // All or none: a stored hint without a declaration CID predates `dc`
+    // and is dropped rather than sent half-formed.
+    if (ref.hint !== undefined && typeof ref.hint.declarationCID === "string") {
         entries.push(["sd", ref.hint.senderDID])
-        entries.push(["kt", ref.hint.anchorKeyThumbprint])
+        entries.push(["dc", ref.hint.declarationCID])
     }
     return new Map(entries)
 }

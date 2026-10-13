@@ -154,7 +154,11 @@ export {
 } from "./owner/endpoints.js"
 
 // The pair-put endpoint.
-export { handlePairPut, type PairPutDeps } from "./pair-put"
+export {
+    handlePairPut,
+    DECLARATION_RETRY_AFTER_SECONDS,
+    type PairPutDeps,
+} from "./pair-put"
 
 // The grant-put endpoint.
 export { handleGrantPut, type GrantPutDeps } from "./grant-put"
@@ -203,7 +207,12 @@ export {
 export {
     resolveDeclaration,
     resolveDeclarationWithRev,
+    snapshotDeclarationResolver,
+    SNAPSHOT_MAX_AGE_MS,
+    type DeclarationSnapshot,
     type DeclarationResolution,
+    type SenderDeclarationResolution,
+    type SnapshotDeclarationDeps,
     type DeclarationWithRev,
 } from "./declaration"
 // Shared with the key monitor: the SSRF guards are the security boundary
@@ -213,6 +222,12 @@ export {
     guardedFetchBytes,
     guardedFetchJSON,
     resolvePDSEndpoint,
+    resolveSigningKey,
+    cachedSigningKeyResolver,
+    SIGNING_KEY_TTL_MS,
+    SIGNING_KEY_MAX_STALE_MS,
+    type CachedSigningKey,
+    type SigningKeyCache,
     RecordNotFoundError,
     type PDSResolution,
 } from "./atproto-fetch"
@@ -255,3 +270,14 @@ export {
     buildPoolPushPayload,
     type BuildMessagePushPayloadOptions,
 } from "./push/payload"
+
+// Single-record repo proofs (CAR + commit signature + MST path).
+export {
+    verifyRecordProof,
+    readRecordFromCar,
+    RepoProofError,
+    type CarRecord,
+    type RepoProofErrorCode,
+    type RecordProofExpectation,
+    type VerifiedRecord,
+} from "./repo-proof"

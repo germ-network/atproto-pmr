@@ -1,6 +1,5 @@
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
-import { thumbprintOkpEd25519 } from "./cose/key.js"
-import { DeclarationResolution } from "./declaration.js"
+import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
@@ -32,7 +31,7 @@ export interface PairPutDeps {
      * call, which a test must be able to replace and a platform may want to
      * route through its own fetch.
      */
-    resolveDeclaration: (senderDID: string) => Promise<DeclarationResolution>
+    resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
     /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.
@@ -43,6 +42,13 @@ export interface PairPutDeps {
      */
     defer: (work: Promise<unknown>) => void
 }
+
+/**
+ * `Retry-After` on the `409` for a put the relay cannot verify under the
+ * sender's current declaration: roughly how long the monitor takes to ingest
+ * a new declaration after its commit.
+ */
+export const DECLARATION_RETRY_AFTER_SECONDS = 60
 
 /**
  * `POST /pmr/v1/inbox/{did}/messages` — `spec/wire-api.md`, "Delivery —
@@ -156,9 +162,7 @@ export async function handlePairPut(
         byteLength: envelope.payload.payload.byteLength,
         hint: {
             senderDID: envelope.payload.senderDID,
-            anchorKeyThumbprint: hex(
-                thumbprintOkpEd25519(declaration.anchorKey)
-            ),
+            declarationCID: declaration.declarationCID,
         },
     }
 
@@ -239,8 +243,4 @@ export async function handlePairPut(
         deps.defer(storeBody())
     }
     return new Response(null, { status: 202 })
-}
-
-function hex(bytes: Uint8Array): string {
-    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
 }

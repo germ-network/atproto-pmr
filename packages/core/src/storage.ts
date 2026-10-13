@@ -68,8 +68,13 @@ export type Nonce = Uint8Array
  */
 export interface VerificationHint {
     senderDID: string
-    /** RFC 9679 thumbprint of the anchor key the payload verified against. */
-    anchorKeyThumbprint: string
+    /**
+     * CID of the sender's declaration record the relay verified the payload
+     * against (CIDv1, dag-cbor, sha2-256, base32-lower: `bafyrei…`). A
+     * freshness cue for the device — the newest declaration this relay has
+     * seen — not a trust signal and not a key identifier.
+     */
+    declarationCID: string
 }
 
 export interface MessageRef {
