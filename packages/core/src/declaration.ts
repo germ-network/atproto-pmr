@@ -1,5 +1,5 @@
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
-import { verifyRecordProof, type VerifiedRecord } from "./repo-proof"
+import { readRecordFromCar, verifyRecordProof, type VerifiedRecord } from "./repo-proof"
 
 /**
  * Declaration resolution, in two deliberately separate shapes.
@@ -13,11 +13,12 @@ import { verifyRecordProof, type VerifiedRecord } from "./repo-proof"
  *
  * **`snapshotDeclarationResolver`: a third party's CAR, for a sender's DID**
  * (pair-put admission). It verifies the key monitor's stored CAR against the
- * DID document's signing key and never contacts the sender's PDS: an inline
- * fetch there would tell the sender's PDS when the sender sends, and the
- * sender's PDS is the party whose claim is being checked. It returns the
- * declaration record's CID alongside the anchor key so the delivery hint can
- * name exactly what was verified.
+ * DID document's signing key and does not take the declaration from the
+ * sender's PDS: an inline fetch there would tell the sender's PDS when the
+ * sender sends, and the sender's PDS is the party whose claim is being
+ * checked. Only a snapshot the monitor has let lapse is checked against the
+ * PDS, for change alone. It returns the declaration record's CID alongside
+ * the anchor key so the delivery hint can name exactly what was verified.
  */
 
 export type DeclarationResolution =
@@ -58,8 +59,14 @@ export interface DeclarationSnapshot {
     freshAtMs: number
 }
 
-/** A snapshot older than this is treated as unknown. */
-export const SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000
+/**
+ * A snapshot not confirmed for this long is checked directly against the
+ * sender's PDS (when the deployment supplies `fetchDirect`) to see whether it
+ * has changed. Generous on purpose: the monitor's refresh keeps snapshots far
+ * fresher than this in normal operation, so reaching it means the monitor has
+ * fallen behind.
+ */
+export const SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 
 export interface SnapshotDeclarationDeps {
     /** Null if none is held. A thrown error is a relay fault and propagates. */
@@ -67,12 +74,24 @@ export interface SnapshotDeclarationDeps {
     /** The DID document's `#atproto` multikey, or null. Never contacts the PDS. */
     resolveSigningKey: (did: string) => Promise<string | null>
     nowMs: () => number
+    /**
+     * Reads the sender's declaration proof CAR straight from its PDS, used
+     * only for a snapshot older than `SNAPSHOT_MAX_AGE_MS`, and only to
+     * compare: the PDS is not trusted for the value. If its record CID equals
+     * the snapshot's, the snapshot stands; if it differs or the record is
+     * gone, the snapshot is out of date and the sender is not found until the
+     * monitor catches up. A failed read falls back to the older snapshot
+     * rather than refusing the sender; omitted, an old snapshot is accepted.
+     */
+    fetchDirect?: (did: string) => Promise<Uint8Array>
 }
 
 /**
  * Resolves a sender's declaration from a third-party snapshot (the monitor's
- * stored CAR), verified against the DID document's signing key. Never
- * fetches inline on a miss: that would tell the sender's PDS when they send.
+ * stored CAR), verified against the DID document's signing key. A miss is
+ * never fetched inline: that would tell the sender's PDS when they send. Only
+ * a held snapshot that has gone unconfirmed past `SNAPSHOT_MAX_AGE_MS`
+ * triggers a direct read, to see whether it is still the current record.
  *
  * `SenderDeclarationResolution` is a distinct type from
  * `DeclarationResolution` to guard against accidental wiring of the PDS
@@ -85,22 +104,46 @@ export function snapshotDeclarationResolver(
     return async (senderDID) => {
         const snapshot = await deps.getSnapshot(senderDID)
         if (!snapshot) return { found: false, reason: "no snapshot held" }
-        if (!(deps.nowMs() - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)) {
-            return { found: false, reason: "snapshot is stale" }
-        }
         const signingKey = await deps.resolveSigningKey(senderDID)
         if (!signingKey) return { found: false, reason: "no signing key" }
 
-        let verified: VerifiedRecord
-        try {
-            verified = verifyRecordProof(snapshot.car, {
+        const verify = (car: Uint8Array) =>
+            verifyRecordProof(car, {
                 did: senderDID,
                 signingKey,
                 collection: DECLARATION_COLLECTION_NSID,
                 rkey: "self",
             })
+
+        let verified: VerifiedRecord
+        try {
+            verified = verify(snapshot.car)
         } catch (error) {
             return { found: false, reason: `snapshot did not verify: ${String(error)}` }
+        }
+
+        if (
+            deps.fetchDirect !== undefined &&
+            !(deps.nowMs() - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)
+        ) {
+            let current: string | null | undefined
+            try {
+                // Not verified: only its record CID is compared, and block
+                // hashes are still checked while reading it.
+                current =
+                    readRecordFromCar(
+                        await deps.fetchDirect(senderDID),
+                        DECLARATION_COLLECTION_NSID,
+                        "self"
+                    )?.cid ?? null
+            } catch (error) {
+                // Gone at the source is an answer; anything else (unreachable,
+                // malformed) says nothing about the snapshot.
+                current = error instanceof RecordNotFoundError ? null : undefined
+            }
+            if (current !== undefined && current !== verified.cid) {
+                return { found: false, reason: "snapshot is out of date" }
+            }
         }
 
         const currentKey = (verified.record as { currentKey?: unknown } | null)

@@ -2,11 +2,13 @@
  * The sender-declaration resolver used by pair put: third-party snapshot
  * only, verified, and never the sender's PDS.
  */
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
+import { RecordNotFoundError } from "../src/atproto-fetch"
 import {
     SIGNING_KEY_MAX_STALE_MS,
     SIGNING_KEY_TTL_MS,
     cachedSigningKeyResolver,
+    fetchRecordProofCar,
     resolveSigningKey,
     type CachedSigningKey,
     type SigningKeyCache,
@@ -212,6 +214,7 @@ describe("snapshotDeclarationResolver", () => {
             freshAtMs?: number
             snapshot?: "none"
             signingKey?: string | null
+            fetchDirect?: (did: string) => Promise<Uint8Array>
         } = {}
     ) {
         const did = options.did ?? PLC_DID
@@ -243,6 +246,7 @@ describe("snapshotDeclarationResolver", () => {
                 nowMs: () => NOW,
             }),
             nowMs: () => NOW,
+            fetchDirect: options.fetchDirect,
         })
         return { resolve, repo, urls: dir.urls }
     }
@@ -277,12 +281,89 @@ describe("snapshotDeclarationResolver", () => {
         expect(t.urls).toEqual([])
     })
 
-    it("a snapshot whose freshAtMs is older than SNAPSHOT_MAX_AGE_MS → found: false", async () => {
-        const edge = setup({ freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS })
-        expect(await edge.resolve(PLC_DID)).toMatchObject({ found: true })
-        const stale = setup({ freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS - 1 })
-        expect(await stale.resolve(PLC_DID)).toMatchObject({ found: false })
-        expect(stale.urls).toEqual([])
+    describe("a snapshot older than SNAPSHOT_MAX_AGE_MS", () => {
+        const OLD = NOW - SNAPSHOT_MAX_AGE_MS - 1
+        const sameKey = makeKey()
+        const carWith = (n: number, signWith?: TestKey) =>
+            buildRepoCar({
+                did: PLC_DID,
+                key: sameKey,
+                signWith,
+                rev: "3kbbbbbbbbbbb",
+                records: { [DECL_PATH]: declaration(Uint8Array.of(3, ...ANCHOR.map((b) => b + n))) },
+            })
+
+        it("stands when the source's record CID is unchanged, and the source's bytes are not used", async () => {
+            // Same record, newer rev and signature: the CID is what is compared.
+            const t = setup({ key: sameKey, freshAtMs: OLD })
+            const unchanged = buildRepoCar({
+                did: PLC_DID,
+                key: sameKey,
+                rev: "3kbbbbbbbbbbb",
+                records: { [DECL_PATH]: declaration(Uint8Array.of(3, ...ANCHOR)) },
+            })
+            const withDirect = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: async () => unchanged.car })
+            expect(unchanged.recordCids[DECL_PATH]).toBe(withDirect.repo.recordCids[DECL_PATH])
+            expect(await withDirect.resolve(PLC_DID)).toMatchObject({
+                found: true,
+                declarationCID: withDirect.repo.recordCids[DECL_PATH],
+            })
+            expect(t.urls).toEqual([])
+        })
+
+        it("is not found when the source's record differs: the snapshot is out of date, and the source's value is not adopted", async () => {
+            const changed = carWith(1)
+            const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: async () => changed.car })
+            expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
+        })
+
+        it("is not found when the source says the declaration is gone", async () => {
+            const absent = buildRepoCar({
+                did: PLC_DID,
+                key: sameKey,
+                records: { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } },
+            })
+            expect(
+                await setup({ key: sameKey, freshAtMs: OLD, fetchDirect: async () => absent.car }).resolve(PLC_DID)
+            ).toMatchObject({ found: false })
+            const gone = setup({
+                key: sameKey,
+                freshAtMs: OLD,
+                fetchDirect: async () => {
+                    throw new RecordNotFoundError("deactivated", false)
+                },
+            })
+            expect(await gone.resolve(PLC_DID)).toMatchObject({ found: false })
+        })
+
+        it("falls back to the older snapshot when the direct read fails or is malformed", async () => {
+            for (const fetchDirect of [
+                async () => {
+                    throw new Error("pds down")
+                },
+                async () => Uint8Array.of(1, 2, 3),
+            ]) {
+                const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect })
+                expect(await t.resolve(PLC_DID)).toMatchObject({
+                    found: true,
+                    declarationCID: t.repo.recordCids[DECL_PATH],
+                })
+            }
+        })
+
+        it("is accepted as is when the deployment supplies no direct read, but still must verify", async () => {
+            expect(await setup({ freshAtMs: OLD }).resolve(PLC_DID)).toMatchObject({ found: true })
+            expect(
+                await setup({ freshAtMs: OLD, signingKey: makeKey().multikey }).resolve(PLC_DID)
+            ).toMatchObject({ found: false })
+        })
+
+        it("is not read directly at exactly the age bound, and a fresh one never is", async () => {
+            const direct = vi.fn(async () => carWith(1).car)
+            await setup({ key: sameKey, freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS, fetchDirect: direct }).resolve(PLC_DID)
+            await setup({ key: sameKey, freshAtMs: NOW, fetchDirect: direct }).resolve(PLC_DID)
+            expect(direct).not.toHaveBeenCalled()
+        })
     })
 
     it("a getSnapshot fault propagates rather than resolving found: false", async () => {
@@ -334,5 +415,34 @@ describe("snapshotDeclarationResolver", () => {
         })
         const out = await resolve(REAL_DID)
         expect(out).toMatchObject({ found: true, declarationCID: REAL_RECORD_CID })
+    })
+})
+
+describe("fetchRecordProofCar", () => {
+    it("reads sync.getRecord at the DID's PDS for the given collection and rkey", async () => {
+        const seen: string[] = []
+        const fetchImpl = (async (input: RequestInfo | URL) => {
+            const url = input.toString()
+            seen.push(url)
+            if (url === PLC_URL) return new Response(JSON.stringify(didDoc(PLC_DID, KEY_A)), { status: 200 })
+            return new Response(Uint8Array.of(1, 2, 3), { status: 200 })
+        }) as typeof fetch
+        const car = await fetchRecordProofCar(PLC_DID, "com.germnetwork.declaration", "self", fetchImpl)
+        expect([...car]).toEqual([1, 2, 3])
+        const record = new URL(seen[1]!)
+        expect(record.origin + record.pathname).toBe("https://pds.example/xrpc/com.atproto.sync.getRecord")
+        expect(record.searchParams.get("did")).toBe(PLC_DID)
+        expect(record.searchParams.get("collection")).toBe("com.germnetwork.declaration")
+        expect(record.searchParams.get("rkey")).toBe("self")
+    })
+
+    it("a repo-level terminal answer raises RecordNotFoundError", async () => {
+        const fetchImpl = (async (input: RequestInfo | URL) =>
+            input.toString() === PLC_URL
+                ? new Response(JSON.stringify(didDoc(PLC_DID, KEY_A)), { status: 200 })
+                : new Response(JSON.stringify({ error: "RepoDeactivated" }), { status: 400 })) as typeof fetch
+        await expect(
+            fetchRecordProofCar(PLC_DID, "com.germnetwork.declaration", "self", fetchImpl)
+        ).rejects.toBeInstanceOf(RecordNotFoundError)
     })
 })

@@ -105,8 +105,9 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /**
      * DIDs whose held snapshot is re-confirmed against its source per
-     * alarm. Population × alarm interval ÷ this, plus outage slack, must
-     * stay under the relay's snapshot age cutoff, or senders go unverifiable.
+     * alarm. Population × alarm interval ÷ this is how stale a quiet
+     * sender's snapshot can get. Past the relay's snapshot age bound (24 h) it
+     * checks the sender's declaration directly instead.
      */
     REFRESH_BATCH: string
 

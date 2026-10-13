@@ -518,8 +518,8 @@ these answers.
 **The `409` is a fact about the sender, not the recipient.** It is decided
 after the sender's declaration is resolved and before any recipient lookup,
 so it cannot vary with anything about the recipient. A sender whose
-declaration the relay's monitor does not yet hold, or holds only stale, is
-the one case a relay cannot tell from a forged put until it catches up; a
+declaration the relay's monitor does not yet hold is the one case a relay
+cannot tell from a forged put until it catches up; a
 `409` says "not yet", and a sender that waits and retries is served. The two
 causes — no usable declaration, and a signature that fails under the one the
 relay holds — are deliberately not distinguished: a sender who has just
@@ -688,8 +688,10 @@ In order, no step optional:
    ([trust](trust-model.md#p2--relayed-repo-records-are-car)). The relay
    verifies a CAR the key monitor holds — the commit signature under the DID
    document's signing key, and the record's path through the commit's
-   tree — and never fetches from the sender's PDS to do so. A sender whose
-   declaration cannot be so resolved gets `409`.
+   tree. It does not take the declaration from the sender's PDS; the one
+   exception is a lapsed snapshot, which it checks against the PDS for
+   change only ([trust model P5](trust-model.md#p5--sender-verification)). A
+   sender whose declaration cannot be so resolved gets `409`.
 3. Verify the `COSE_Sign1` against **that** key — the declaration's, not
    any key or thumbprint carried in the message.
 4. Confirm the signed recipient DID is this recipient, and that the nonce
@@ -1102,7 +1104,8 @@ commit, without verifying signatures.
 A relay resolving a counterpart declaration to check a pair-put signature is
 the opposite case: it parses and verifies the CAR it takes from the monitor
 (commit signature under the DID document's signing key, and the record's
-path through the commit's tree), and does not contact the sender's PDS.
+path through the commit's tree), and does not take the declaration from the
+sender's PDS.
 
 ### Monitoring — a separate component, not a relay surface
 

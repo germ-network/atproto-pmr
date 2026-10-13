@@ -223,6 +223,7 @@ export {
     guardedFetchJSON,
     resolvePDSEndpoint,
     resolveSigningKey,
+    fetchRecordProofCar,
     cachedSigningKeyResolver,
     SIGNING_KEY_TTL_MS,
     SIGNING_KEY_MAX_STALE_MS,

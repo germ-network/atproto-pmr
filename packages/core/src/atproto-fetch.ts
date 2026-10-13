@@ -708,6 +708,34 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
 }
 
 /**
+ * `com.atproto.sync.getRecord` at the DID's own PDS: the single-record proof
+ * CAR, for the caller to verify (`verifyRecordProof`). A repo-level terminal
+ * answer raises `RecordNotFoundError`; a missing record is a 200 whose CAR
+ * proves the absence.
+ */
+export async function fetchRecordProofCar(
+    did: string,
+    collection: string,
+    rkey: string,
+    fetchImpl: typeof fetch
+): Promise<Uint8Array> {
+    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    const url = new URL(`${endpoint}/xrpc/com.atproto.sync.getRecord`)
+    url.searchParams.set("did", did)
+    url.searchParams.set("collection", collection)
+    url.searchParams.set("rkey", rkey)
+    return guardedFetchBytes(url.toString(), fetchImpl, {
+        terminalErrorNames: [
+            "RecordNotFound",
+            "RepoNotFound",
+            "RepoTakendown",
+            "RepoSuspended",
+            "RepoDeactivated",
+        ],
+    })
+}
+
+/**
  * The repo's current `rev`, from `com.atproto.sync.getLatestCommit` at the PDS
  * — never taken from a wake signal, which a hostile feed could use to fake or
  * mask a rollback.

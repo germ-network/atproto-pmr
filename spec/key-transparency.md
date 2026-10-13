@@ -357,10 +357,11 @@ whether to keep paging tells a cache whether the answer can be kept.
 ### Keeping the snapshot current
 
 A relay that admits pair puts from a monitor's CAR (see
-[trust-model §P5](trust-model.md#p5--sender-verification)) treats a snapshot
-that has not been confirmed recently as unknown, so a monitor serving that
-role re-confirms every DID it holds on a schedule rather than only when a
-wake signal arrives.
+[trust-model §P5](trust-model.md#p5--sender-verification)) serves a held snapshot as is
+until it is 24 hours unconfirmed, after which it checks the sender's PDS
+directly to see whether the record changed. A monitor serving that role
+therefore re-confirms every DID it holds on a schedule rather than only when
+a wake signal arrives, so that check is the exception.
 
 For each held DID that has not been confirmed for a configured interval, the
 monitor reads the repo's current head `rev` from the DID's own PDS
@@ -388,11 +389,12 @@ held record's, so a confirmation of an older CAR never makes a newer one look
 fresh, and the CAR is not rewritten. A snapshot's freshness is the later of
 its fetch time and a matching confirmation.
 
-**Capacity.** The relay's cutoff holds only while the whole population is
-confirmed well inside it: population × alarm interval ÷ per-alarm batch,
-plus outage slack, must stay below the cutoff. With the defaults (batch 64
-per 2-minute alarm, a 6-hour cutoff) one full cycle takes about an hour at
-1,754 DIDs, and the bound breaks near 11,000 DIDs. Each refreshed DID costs
+**Capacity.** The worst-case staleness of a quiet sender's snapshot is one
+full cycle: population × alarm interval ÷ per-alarm batch, plus outage slack.
+With the defaults (batch 64 per 2-minute alarm) a cycle takes about an hour
+at 1,754 DIDs and grows linearly with the population; it reaches the relay's
+24-hour bound near 45,000 DIDs, past which relays begin reading the sender's
+PDS directly for the lapsed ones. Each refreshed DID costs
 two subrequests for the head `rev` (DID document, then commit) plus its KV
 reads and writes, and a DID whose head advanced costs several more (a record
 fetch, and a second one if the change takes the ordinary path). The batch
