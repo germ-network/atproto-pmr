@@ -51,6 +51,12 @@ WINDOW_RETENTION_SECONDS = "604800"
 BACKFILL_RELAY_URL = "https://relay1.us-west.bsky.network"
 BACKFILL_BATCH = "100"
 
+# Snapshot refresh: how many held snapshots each alarm re-confirms, and how
+# stale one must be to be due. The relay treats a snapshot older than its
+# age cutoff as unknown, so these must keep every DID confirmed well inside it.
+REFRESH_BATCH = "64"
+REFRESH_STALE_AFTER_MS = "3600000"
+
 # The snapshot and sealed digest windows. Read by plain Workers on the
 # public paths — the community view should scale like the public data it
 # is, rather than funnel through the ingest object.

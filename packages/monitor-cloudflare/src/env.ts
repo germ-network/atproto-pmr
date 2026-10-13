@@ -104,6 +104,16 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     BACKFILL_BATCH: string
 
     /**
+     * DIDs whose held snapshot is re-confirmed against its source per
+     * alarm. Population × alarm interval ÷ this, plus outage slack, must
+     * stay under the relay's snapshot age cutoff, or senders go unverifiable.
+     */
+    REFRESH_BATCH: string
+
+    /** A snapshot not confirmed for this long (ms) is due for re-confirmation. */
+    REFRESH_STALE_AFTER_MS: string
+
+    /**
      * The registration surface: own-DID push. Optional — a deployment that
      * does not bind this serves the monitor with no registration/push
      * capability at all (`onChange` no-ops), matching `webPushSender`'s
