@@ -161,18 +161,20 @@ export function snapshotDeclarationResolver(
  * bytes, with no length prefix and no enclosing structure. The identifiers
  * are assigned in this order:
  *
- *     0  ChaCha20Poly1305
- *     1  Curve25519 key agreement  (X25519)
- *     2  Curve25519 signing        (Ed25519)
- *     3  HPKE encapsulation
+ *     0  AES-GCM-256
+ *     1  ChaCha20-Poly1305
+ *     2  Curve25519 key agreement  (X25519)
+ *     3  Curve25519 signing        (Ed25519)
+ *     4  HPKE encapsulation (Curve25519, SHA-256, ChaCha20-Poly1305)
+ *     5  HMAC-SHA256
  *
- * The anchor key is a **signing** key, so byte **2** — not 1. Byte 1 is
+ * The anchor key is a **signing** key, so byte **3** — not 2. Byte 2 is
  * key *agreement*, a different key entirely, and reading the wrong one
- * would silently accept or reject the wrong field. Byte 2 is the only case
+ * would silently accept or reject the wrong field. Byte 3 is the only case
  * this relay accepts today, per the PQ posture: launch classical,
  * algorithm-agile.
  */
-const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 2
+const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 3
 
 /**
  * The declaration record's collection NSID. A protocol constant rather

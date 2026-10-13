@@ -16,6 +16,12 @@ import {
     snapshotDeclarationResolver,
     type DeclarationSnapshot,
 } from "../src/declaration"
+import {
+    REAL_DID,
+    REAL_RECORD_CID,
+    REAL_SIGNING_KEY,
+    realCar,
+} from "./fixtures/real-monitor-car"
 import { buildRepoCar, makeKey, type TestKey } from "./fixtures/repo-car"
 
 const PLC_DID = "did:plc:alice1234567890123456789012"
@@ -216,7 +222,7 @@ describe("snapshotDeclarationResolver", () => {
             key,
             signWith: options.signWith,
             records: options.records ?? {
-                [DECL_PATH]: options.record ?? declaration(Uint8Array.of(2, ...ANCHOR)),
+                [DECL_PATH]: options.record ?? declaration(Uint8Array.of(3, ...ANCHOR)),
             },
         })
         const snapshot: DeclarationSnapshot | null =
@@ -302,13 +308,13 @@ describe("snapshotDeclarationResolver", () => {
         expect(await setup({ signingKey: null }).resolve(PLC_DID)).toMatchObject({ found: false })
     })
 
-    it("record present but currentKey missing or not alg byte 2 → found: false", async () => {
+    it("record present but currentKey missing or not alg byte 3 → found: false", async () => {
         for (const record of [
             { $type: "com.germnetwork.declaration", version: "1.1.0" },
             declaration("text"),
             declaration({ $bytes: "AgECAw" }),
-            declaration(Uint8Array.of(1, ...ANCHOR)),
-            declaration(Uint8Array.of(2, ...ANCHOR.subarray(1))),
+            declaration(Uint8Array.of(2, ...ANCHOR)),
+            declaration(Uint8Array.of(3, ...ANCHOR.subarray(1))),
         ]) {
             const t = setup({ record })
             expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
@@ -318,5 +324,15 @@ describe("snapshotDeclarationResolver", () => {
     it("record-absent proof → found: false", async () => {
         const t = setup({ records: { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } } })
         expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
+    })
+
+    it("resolves the captured real-world 1.1.0 declaration (currentKey leading byte 0x03) to its record CID", async () => {
+        const resolve = snapshotDeclarationResolver({
+            getSnapshot: async () => ({ car: realCar(), freshAtMs: NOW }),
+            resolveSigningKey: async () => REAL_SIGNING_KEY,
+            nowMs: () => NOW,
+        })
+        const out = await resolve(REAL_DID)
+        expect(out).toMatchObject({ found: true, declarationCID: REAL_RECORD_CID })
     })
 })
