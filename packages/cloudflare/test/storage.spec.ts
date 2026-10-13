@@ -844,3 +844,63 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         })
     })
 })
+
+describe("openMailboxes cursor", () => {
+    it("acking or emptying a mailbox on page N does not change which mailboxes page N+1 returns", async () => {
+        const seed = async (pmr: PMRObject) => {
+            await pmr.append("did:plc:a", ref("a1"), freshNonce(), T0)
+            await pmr.append("did:plc:b", ref("b1"), freshNonce(), T0)
+            await pmr.append("did:plc:c", ref("c1"), freshNonce(), T0)
+            await pmr.append("did:plc:d", ref("d1"), freshNonce(), T0)
+        }
+        // One mailbox per page, so only the cursor decides what comes next.
+        const keysFrom = async (pmr: PMRObject, start: string | null) => {
+            const keys: string[] = []
+            let cursor = start
+            for (let i = 0; i < 10; i++) {
+                const page = await pmr.openMailboxes(cursor, 1)
+                keys.push(...page.entries.map((e) => e.key))
+                if (page.nextCursor === null) break
+                cursor = page.nextCursor
+            }
+            return keys
+        }
+
+        const control = freshStub()
+        const expected = await inPMR(control, async (pmr) => {
+            await seed(pmr)
+            const first = await pmr.openMailboxes(null, 2)
+            return keysFrom(pmr, first.nextCursor)
+        })
+
+        const stub = freshStub()
+        const actual = await inPMR(stub, async (pmr) => {
+            await seed(pmr)
+            const first = await pmr.openMailboxes(null, 2)
+            expect(first.entries.map((e) => e.key)).toEqual(["did:plc:a", "did:plc:b"])
+            // The client acks everything it was just given, emptying both
+            // mailboxes the cursor has already moved past.
+            await pmr.remove("did:plc:a", "a1")
+            await pmr.remove("did:plc:b", "b1")
+            return keysFrom(pmr, first.nextCursor)
+        })
+
+        expect(actual).toEqual(["did:plc:c", "did:plc:d"])
+        expect(actual).toEqual(expected)
+    })
+
+    it("a mailbox appended to behind the cursor is not returned by the continuing pass", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:b", ref("b1"), freshNonce(), T0)
+            await pmr.append("did:plc:c", ref("c1"), freshNonce(), T0)
+            const first = await pmr.openMailboxes(null, 1)
+            await pmr.append("did:plc:a", ref("a1"), freshNonce(), T0)
+            const rest = await pmr.openMailboxes(first.nextCursor, 100)
+            expect(rest.entries.map((e) => e.key)).toEqual(["did:plc:c"])
+            // A fresh pass (or live delivery / push) does see it.
+            const again = await pmr.openMailboxes(null, 100)
+            expect(again.entries.map((e) => e.key)).toEqual(["did:plc:a", "did:plc:b", "did:plc:c"])
+        })
+    })
+})

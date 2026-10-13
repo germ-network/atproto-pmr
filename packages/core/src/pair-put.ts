@@ -1,6 +1,5 @@
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
-import { thumbprintOkpEd25519 } from "./cose/key.js"
-import { DeclarationResolution } from "./declaration.js"
+import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
@@ -32,7 +31,7 @@ export interface PairPutDeps {
      * call, which a test must be able to replace and a platform may want to
      * route through its own fetch.
      */
-    resolveDeclaration: (senderDID: string) => Promise<DeclarationResolution>
+    resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
     /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.
@@ -45,25 +44,37 @@ export interface PairPutDeps {
 }
 
 /**
+ * `Retry-After` on the `409` for a put the relay cannot verify under the
+ * sender's current declaration. The monitor ingests a new declaration within
+ * about this long of its commit, and a KV-backed snapshot or signing-key
+ * cache takes about as long to propagate.
+ */
+export const DECLARATION_RETRY_AFTER_SECONDS = 60
+
+/**
  * `POST /pmr/v1/inbox/{did}/messages` — `spec/wire-api.md`, "Delivery —
  * peer-facing" and "The pair-put payload".
  *
- * RESPONSE CONTRACT, read literally from the specification's error table:
- * "peer, pair put: `202`, or `429` + `Retry-After` when their own
- * reservation is full. Nothing else." Applied here as: every
- * claim-dependent or recipient-dependent outcome — bad signature, wrong
- * recipient, unresolvable sender declaration, unknown recipient relay, a
- * discarded sender, a duplicate — answers `202`. `429` is reserved for
- * exactly one case: *this* sender's own provisioned mailbox being full,
- * the one disclosure per-sender reservation makes self-referential.
+ * RESPONSE CONTRACT: the outcome depends on the request's own bytes and on
+ * the relay's view of the *sender*, plus this sender's own mailbox for `429`.
  *
- * The only distinguishable failures are refusals decided on the request's
- * own bytes and this deployment's advertised limits, answered
- * synchronously: `400` for an undecodable envelope or a non-canonical
- * signature, `413` for a payload over the advertised maximum. Neither
- * reveals anything about the recipient's mailbox — only that the sender's
- * own request was malformed or too big, which the sender already knows and
- * could have checked against a public document.
+ *  - `400` / `413`: decided on the request's own bytes and the advertised
+ *    limits, before any lookup.
+ *  - `409` + `Retry-After`: the relay has no verifiable declaration for the
+ *    sender (none held, out of date, or unverifiable), or the signature fails under
+ *    the one it has. Nothing is stored. The two causes are deliberately not
+ *    distinguished: a sender who has just rotated its key sees the same
+ *    answer as one whose declaration the relay has not yet ingested, and
+ *    both normally clear by waiting; one that persists is the sender's to surface. Decided after sender resolution and before any
+ *    recipient lookup, so it reveals nothing about the recipient. What it
+ *    does reveal — whether the relay's monitor holds the sender's
+ *    declaration — is public already (the monitor serves it per DID).
+ *  - `429` + `Retry-After`: this sender's own provisioned mailbox is full,
+ *    the one recipient-side fact per-sender reservation makes
+ *    self-referential.
+ *  - `202`: everything else — a validly signed put whether or not the
+ *    recipient exists, names another recipient, is blocked, discarded or a
+ *    duplicate. `5xx` is reserved for genuine relay faults.
  *
  * `413` is kept distinct from `400` because the two are differently
  * actionable: `400` says the sender's encoder is wrong, `413` says only
@@ -83,7 +94,7 @@ export async function handlePairPut(
     // The mailbox key is the sender's DID, from the SIGNED headers — the
     // same value verification runs against, never a routing hint. Narrowed
     // here, in request-bytes-only territory, because a non-DID sender is a
-    // malformed envelope and nothing below may answer anything but 202/429.
+    // malformed envelope and nothing below may answer 400.
     let senderKey: PairMailboxKey
     try {
         const bodyBytes = await readBodyCapped(
@@ -108,16 +119,13 @@ export async function handlePairPut(
         })
     }
 
-    // --- Everything below is uniform-202 territory. No branch here may
-    // return anything but 202 or 429. ---
+    // --- Past this point only 409 (sender state), 202 and 429 are possible. ---
 
     // Step 1: sender DID from the SIGNED headers, never from routing.
     // `decodePairPutEnvelope` parsed it out of the protected header map, so
     // there is no routing hint in scope to prefer by construction.
     const declaration = await deps.resolveDeclaration(envelope.payload.senderDID)
-    if (!declaration.found) {
-        return new Response(null, { status: 202 })
-    }
+    if (!declaration.found) return declarationUnverifiable()
 
     // Steps 2–4: verify against the RESOLVED key and confirm the signed
     // recipient. `verifyPairPut` takes the key as a parameter and has no
@@ -128,7 +136,11 @@ export async function handlePairPut(
         recipientDID
     )
     if (!outcome.valid) {
-        return new Response(null, { status: 202 })
+        // A wrong recipient is not declaration state: waiting would not
+        // help, so it stays the uniform 202.
+        return outcome.code === "signature"
+            ? declarationUnverifiable()
+            : new Response(null, { status: 202 })
     }
 
     const locator = await deps.directory.resolve(recipientDID)
@@ -156,9 +168,7 @@ export async function handlePairPut(
         byteLength: envelope.payload.payload.byteLength,
         hint: {
             senderDID: envelope.payload.senderDID,
-            anchorKeyThumbprint: hex(
-                thumbprintOkpEd25519(declaration.anchorKey)
-            ),
+            declarationCID: declaration.declarationCID,
         },
     }
 
@@ -241,6 +251,9 @@ export async function handlePairPut(
     return new Response(null, { status: 202 })
 }
 
-function hex(bytes: Uint8Array): string {
-    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
+function declarationUnverifiable(): Response {
+    return new Response(null, {
+        status: 409,
+        headers: { "Retry-After": String(DECLARATION_RETRY_AFTER_SECONDS) },
+    })
 }

@@ -75,7 +75,7 @@ describe("step 3 — verifies against the resolved key, never a key from the mes
         const attacker = keypair()
         const envelope = decodePairPutEnvelope(bytes)
         const outcome = verifyPairPut(envelope, attacker.publicKey, RECIPIENT_DID)
-        expect(outcome.valid).toBe(false)
+        expect(outcome).toMatchObject({ valid: false, code: "signature" })
     })
 
     it("kid is never consulted by verifyPairPut — an attacker's own kid claim buys nothing", () => {
@@ -101,7 +101,7 @@ describe("step 3 — verifies against the resolved key, never a key from the mes
         // a real declaration lookup would return.
         const victimsRealKey = keypair().publicKey
         const outcome = verifyPairPut(envelope, victimsRealKey, RECIPIENT_DID)
-        expect(outcome.valid).toBe(false)
+        expect(outcome).toMatchObject({ valid: false, code: "signature" })
     })
 })
 
@@ -117,7 +117,7 @@ describe("step 4 — recipient DID binding (cross-relay replay)", () => {
             publicKey,
             "did:plc:carol0000000000000000000000"
         )
-        expect(outcome.valid).toBe(false)
+        expect(outcome).toMatchObject({ valid: false, code: "recipient" })
     })
 })
 

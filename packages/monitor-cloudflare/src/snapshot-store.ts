@@ -1,4 +1,10 @@
-import type { DigestMarker, SnapshotEntry, SnapshotStore } from "@germ-network/atproto-pmr-monitor"
+import type {
+    DigestMarker,
+    RefreshSnapshots,
+    SnapshotCheck,
+    SnapshotEntry,
+    SnapshotStore,
+} from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
 import type { MonitorIngest } from "./ingest-object"
 
@@ -22,6 +28,8 @@ import type { MonitorIngest } from "./ingest-object"
 
 const RECORD_PREFIX = "rec:"
 const WINDOW_PREFIX = "win:"
+/** `chk:<did>` = {@link SnapshotCheck}: the last time `rec:` was confirmed current. */
+const CHECK_PREFIX = "chk:"
 /** Singleton key — one marker for the whole digest, not one per window.
  * Exported so a test can reset it directly: `env.records` is shared across
  * tests in this package's suite (KV, unlike Durable Object storage, is not
@@ -46,7 +54,7 @@ interface StoredMeta {
  */
 export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
-): SnapshotStore {
+): SnapshotStore & RefreshSnapshots {
     return {
         async getRecord(did: string): Promise<SnapshotEntry | null> {
             const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
@@ -78,6 +86,12 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
 
         async deleteRecord(did: string): Promise<void> {
             await env.records.delete(RECORD_PREFIX + did)
+            // A confirmation of a CAR that no longer exists must not outlive it.
+            await env.records.delete(CHECK_PREFIX + did)
+        },
+
+        async putCheck(did: string, check: SnapshotCheck): Promise<void> {
+            await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
         },
 
         async getSealedWindow(windowId: string): Promise<Uint8Array | null> {
@@ -111,5 +125,28 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             // something that should happen quietly under retention.
             await env.records.put(DIGEST_MARKER_KEY, JSON.stringify(marker))
         },
+    }
+}
+
+/**
+ * The relay's read of a sender's declaration snapshot: the `rec:` CAR, fresh
+ * as of the later of its fetch and a `chk:` confirmation at the same rev.
+ * A `chk:` at any other rev is ignored.
+ */
+export function kvDeclarationSnapshots<TIngest extends MonitorIngest = MonitorIngest>(
+    env: MonitorEnv<TIngest>
+): (did: string) => Promise<{ car: Uint8Array; freshAtMs: number } | null> {
+    return async (did) => {
+        const [{ value, metadata }, check] = await Promise.all([
+            env.records.getWithMetadata<StoredMeta>(RECORD_PREFIX + did, "arrayBuffer"),
+            env.records.get<SnapshotCheck>(CHECK_PREFIX + did, "json"),
+        ])
+        if (value === null || metadata === null) return null
+        const confirmedAtMs =
+            check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
+        return {
+            car: new Uint8Array(value),
+            freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+        }
     }
 }

@@ -66,9 +66,8 @@ puts.
 **Two related components are deliberately not part of a PMR.** The
 **key monitor** — [key transparency](key-transparency.md) for the
 messaging keys this whole system rests on — is a separate, independently
-operable component that a PMR is *encouraged* to run alongside itself,
-because it is nearly free where a relay already resolves and verifies
-counterpart declarations to check pair-put signatures. It is not a
+operable component. A relay reads its senders' declarations from a monitor's
+store, so a PMR that admits pair puts runs a monitor or shares one. It is not a
 one of the relay's mailbox capabilities, and a client chooses its monitors rather than
 resolving them: a device registers with several and cross-checks, which is
 load-bearing rather than decorative, being what detects a PDS that
@@ -135,6 +134,7 @@ fingerprint an attacker can test a relay against. See
 | [`storage-consistency.md`](storage-consistency.md) | the **storage consistency contract** an implementation must satisfy, stated backend-neutrally, plus the operation inventory the relay's logic runs against |
 | [`trust-model.md`](trust-model.md) | the **security properties** an implementation must preserve, what a relay necessarily learns, and what a malicious one can do |
 | [`key-transparency.md`](key-transparency.md) | the **key monitor** — key transparency for atproto messaging: the CT-shaped trust structure, the monitor's surfaces (own-DID push, domain deltas, the change digest, the community-view fetch), and the append-only-ledger enhancement |
+| [`proxy-cache.md`](proxy-cache.md) | the **intended** model of a PMR as a verified cache of the records and DID documents of the DIDs it serves — marked, element by element, built or not yet built |
 
 ## Dependencies on a non-atproto record format
 

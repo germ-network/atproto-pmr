@@ -28,16 +28,15 @@ export interface FetchRecordOptions {
 }
 
 /**
- * **CAR, not JSON** — the opposite choice from the relay's own admission
- * check (`declaration.ts`), and for a reason that is about direction: a
- * relay's fetch is consumed and discarded internally, so TLS to the
- * authoritative PDS is the whole trust basis. A monitor's fetch is handed
- * onward to devices, and relay delivery is exactly what discards
- * provenance, so the bytes must carry their own proof.
+ * **CAR, not JSON**: the monitor's fetch is handed onward — to devices and
+ * to a relay admitting a sender's pair put — and handing a record onward is
+ * exactly what discards provenance, so the bytes must carry their own proof.
  *
- * The monitor does not parse the CAR. It stores and serves what it
- * fetched, and the client verifies against the DID document — which is
- * what keeps a monitor light enough that several parties can run one.
+ * The monitor stores and serves what it fetched, and the consumer verifies
+ * it against the DID document, which keeps a monitor light enough that
+ * several parties can run one. The one thing it reads from the CAR is the
+ * declaration record's CID, to tell a real change from an unrelated commit
+ * (`refresh.ts`); it never checks a signature.
  */
 /**
  * `com.atproto.sync.getRecord`'s own lexicon-declared error set — the
@@ -75,6 +74,24 @@ const TERMINAL_XRPC_ERRORS = [
  * atproto itself says will never exist at that identity again.
  */
 const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
+
+/**
+ * The repo's current head `rev` from the DID's own PDS, for the periodic
+ * refresh. Re-resolves the DID document each time, so a PDS migration shows
+ * up here; a repo-level terminal answer raises `RecordNotFoundError` exactly
+ * as `fetchRecordCar` does.
+ */
+export async function fetchHeadRev(
+    did: string,
+    options: { fetchImpl?: typeof fetch } = {}
+): Promise<string> {
+    const fetchImpl = options.fetchImpl ?? fetch
+    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    return fetchLatestRev(endpoint, did, fetchImpl, {
+        terminalErrorNames: TERMINAL_XRPC_ERRORS,
+        permanentErrorNames: PERMANENT_XRPC_ERRORS,
+    })
+}
 
 export async function fetchRecordCar(
     did: string,

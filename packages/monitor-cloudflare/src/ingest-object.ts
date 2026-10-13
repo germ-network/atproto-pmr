@@ -3,7 +3,9 @@ import {
     decodeEvent,
     intake,
     listReposByCollection,
+    fetchHeadRev,
     pushDeclarationChange,
+    refreshDue,
     sealDueWindows,
     settleDue,
     sweepBackfill,
@@ -15,6 +17,7 @@ import {
     type IntakeOutcome,
     type MonitorIndex,
     type PendingFetch,
+    type RefreshIndex,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
@@ -76,7 +79,10 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  * verify the CAR proof) that belongs to a deployment, not to a storage
  * adapter.
  */
-export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorIndex {
+export class MonitorIngest
+    extends DurableObject<MonitorEnv>
+    implements MonitorIndex, RefreshIndex
+{
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
 
@@ -108,6 +114,11 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
                 CREATE TABLE IF NOT EXISTS deleted (
                     did TEXT PRIMARY KEY,
                     deleted_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS checks (
+                    did TEXT PRIMARY KEY,
+                    checked_at INTEGER NOT NULL,
+                    attempted_at INTEGER NOT NULL DEFAULT 0
                 );
             `)
         })
@@ -319,6 +330,67 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         return row?.rev ?? null
     }
 
+    // ---- RefreshIndex -----------------------------------------------------
+
+    /**
+     * Held DIDs not confirmed since `checkedBeforeMs`. A DID counts as
+     * confirmed at its last check or, if never checked, when it was last
+     * stored. Ordered by the later of that and its last failed attempt, so a
+     * DID whose source keeps failing queues behind the healthy ones instead
+     * of occupying the head of every batch. A separate table from `revs` so
+     * recording a check needs no schema change there.
+     */
+    async dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]> {
+        return this.db.sql
+            .exec<{ did: string }>(
+                "SELECT r.did AS did, " +
+                    "MAX(r.observed_at, COALESCE(c.checked_at, 0)) AS confirmed, " +
+                    "MAX(r.observed_at, COALESCE(c.checked_at, 0), COALESCE(c.attempted_at, 0)) AS last " +
+                    "FROM revs r LEFT JOIN checks c ON c.did = r.did " +
+                    "WHERE r.did NOT IN (SELECT did FROM deleted) " +
+                    "AND r.did NOT IN (SELECT did FROM pending) " +
+                    "AND confirmed < ? " +
+                    "ORDER BY last ASC LIMIT ?",
+                checkedBeforeMs,
+                limit
+            )
+            .toArray()
+            .map((r) => r.did)
+    }
+
+    async markChecked(did: string, checkedAtMs: number): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO checks (did, checked_at) VALUES (?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET checked_at = excluded.checked_at",
+            did,
+            checkedAtMs
+        )
+    }
+
+    async markAttempted(did: string, attemptedAtMs: number): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO checks (did, checked_at, attempted_at) VALUES (?, 0, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET attempted_at = excluded.attempted_at",
+            did,
+            attemptedAtMs
+        )
+    }
+
+    /**
+     * Advance the rev for a snapshot whose declaration record did not
+     * change: no digest-window entry, because nothing a client holds became
+     * stale.
+     */
+    async completeQuietly(did: string, rev: string, observedAtMs: number): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, observed_at = excluded.observed_at",
+            did,
+            rev,
+            observedAtMs
+        )
+    }
+
     // ---- ingest -----------------------------------------------------------
 
     /**
@@ -329,6 +401,15 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
         throw new Error(
             "MonitorIngest.fetchRecord is deployment-supplied: subclass and implement it"
         )
+    }
+
+    /**
+     * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
+     * to a real read; a subclass overrides it alongside `fetchRecord` when
+     * the deployment resolves DIDs differently.
+     */
+    protected fetchHeadRev(did: string): Promise<string> {
+        return fetchHeadRev(did)
     }
 
     /**
@@ -559,6 +640,30 @@ export class MonitorIngest extends DurableObject<MonitorEnv> implements MonitorI
             })
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            // After settling (a just-stored snapshot is not yet due) and
+            // before sealing (a change it finds lands in a window that has
+            // not closed).
+            try {
+                const refreshed = await refreshDue(
+                    {
+                        ingest: this.deps(),
+                        refreshIndex: this,
+                        refreshSnapshots: kvSnapshotStore(this.env),
+                        fetchHeadRev: (did) => this.fetchHeadRev(did),
+                        collection: this.env.MONITOR_COLLECTION,
+                        rkey: "self",
+                    },
+                    {
+                        nowMs: Date.now(),
+                        staleAfterMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
+                        limit: this.envInt(this.env.REFRESH_BATCH, 64),
+                    }
+                )
+                console.log("monitor: refresh", refreshed)
+            } catch (err) {
+                // The alarm must still seal and re-arm itself.
+                console.error("monitor: refresh failed", err)
+            }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.
             await sealDueWindows({

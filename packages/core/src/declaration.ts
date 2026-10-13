@@ -1,50 +1,24 @@
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
+import { snapshotRecordReader, type RecordSnapshot } from "./snapshot-read"
 
 /**
- * Resolves a sender DID to its declared anchor key, for pair-put sender
- * authentication.
+ * Declaration resolution, in two deliberately separate shapes.
  *
- * DIRECT FETCH, NOT CAR — this is the relay's own admission check, not
- * content the relay hands onward to a device. Two independent documents
- * agree on the algorithm, and neither mentions CAR for this specific step:
+ * **`resolveDeclaration` / `resolveDeclarationWithRev`: the PDS, for the
+ * owner's own DID** (registration, the declaration watch). DID → DID
+ * document → PDS → `com.atproto.repo.getRecord`, as JSON, over TLS to the
+ * authoritative host. The result is consumed by the relay and discarded, so
+ * TLS to the PDS is the trust basis, and there is no cache: a direct fetch
+ * per call keeps the work uniform across outcomes.
  *
- *   - atproto-pmr.md §Sender authentication states the algorithm directly:
- *     "Look up the sender's declaration... On a miss, resolve it: sender DID
- *     -> DID document -> PDS -> declaration." No CAR.
- *   - the specification's framing of the CAR requirement is "how does a DEVICE trust a
- *     record A RELAY HANDS IT" — content the relay relays onward. This
- *     module's output never leaves the relay; it is consumed by
- *     verifyPairPut and then discarded.
- *
- * wire-api.md's verification-algorithm section says "CAR-verified" for step
- * 2, but that phrasing describes the DEVICE's algorithm (the one thing a
- * relay-delivered record needs, because provenance is exactly what relay
- * delivery discards). Applying it to the relay's OWN direct-to-PDS fetch
- * conflates two different trust boundaries — TLS-to-the-authoritative-PDS is
- * not "a relay hands it to you." See the implementation plan for the full
- * reasoning; this comment is the load-bearing summary.
- *
- * This is also the only implementable choice today: no CAR/DAG-CBOR/MST
- * library exists anywhere in this repo, and storage-protocol.md frames
- * relay-side CAR parsing as "defense in depth against a lying PDS, added
- * deliberately rather than assumed" — future hardening, not a v1
- * prerequisite (the relay needs signature verification, not a CAR parser).
- *
- * TODO(CAR): add CAR verification of the fetched declaration as defense in
- * depth against a PDS that lies to this relay specifically (distinct from a
- * relay lying to a device, which the CAR requirement already covers). Not required for
- * correctness of THIS relay's own admission decision, which trusts the PDS
- * it is directly, authoritatively talking to over TLS — the same trust basis
- * the client uses today before any relay exists (trust-model.md: "authority
- * comes from provenance: DID -> DID document -> PDS -> the record... over
- * TLS").
- *
- * NO CACHE. A direct fetch runs on every pair put, deliberately: caching is
- * the observation feature's job (storage-protocol.md's observation cache,
- * "deliberately the weakest tier"), which is not built yet, and a
- * half-built cache here would be scope creep ahead of that feature existing.
- * Costing the same fetch on every call also keeps this symmetric across
- * outcomes — nothing about caching can become a timing signal.
+ * **`snapshotDeclarationResolver`: a third party's CAR, for a sender's DID**
+ * (pair-put admission). It verifies the key monitor's stored CAR against the
+ * DID document's signing key and does not take the declaration from the
+ * sender's PDS: an inline fetch there would tell the sender's PDS when the
+ * sender sends, and the sender's PDS is the party whose claim is being
+ * checked. Only a snapshot the monitor has let lapse is checked against the
+ * PDS, for change alone. It returns the declaration record's CID alongside
+ * the anchor key so the delivery hint can name exactly what was verified.
  */
 
 export type DeclarationResolution =
@@ -68,6 +42,72 @@ export type DeclarationResolution =
       }
 
 /**
+ * What pair-put admission needs: the anchor key AND the CID of the
+ * declaration record it came from, so the delivery hint can name exactly the
+ * declaration the relay verified against. Kept distinct from
+ * `DeclarationResolution` so the PDS resolver cannot be wired into pair put.
+ */
+export type SenderDeclarationResolution =
+    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string }
+    | { found: false; reason: string }
+
+/** A third party's stored proof of a DID's declaration. */
+export type DeclarationSnapshot = RecordSnapshot
+
+export interface SnapshotDeclarationDeps {
+    /** Null if none is held. A thrown error is a relay fault and propagates. */
+    getSnapshot: (did: string) => Promise<DeclarationSnapshot | null>
+    /** The DID document's `#atproto` multikey, or null. Never contacts the PDS. */
+    resolveSigningKey: (did: string) => Promise<string | null>
+    nowMs: () => number
+    /** As `SnapshotRecordReaderDeps.fetchDirect`; called for the declaration's own path. */
+    fetchDirect: (did: string, collection: string, rkey: string) => Promise<Uint8Array>
+}
+
+/**
+ * Resolves a sender's declaration from a third-party snapshot (the monitor's
+ * stored CAR), verified against the DID document's signing key, through the
+ * generic `snapshotRecordReader` (which holds the 24 h rule and its memo).
+ *
+ * `SenderDeclarationResolution` is a distinct type from
+ * `DeclarationResolution` to guard against accidental wiring of the PDS
+ * resolver into pair put; it does not stop a wrapper from fabricating a
+ * `declarationCID`.
+ */
+export function snapshotDeclarationResolver(
+    deps: SnapshotDeclarationDeps
+): (senderDID: string) => Promise<SenderDeclarationResolution> {
+    const read = snapshotRecordReader({
+        collection: DECLARATION_COLLECTION_NSID,
+        rkey: "self",
+        getSnapshot: deps.getSnapshot,
+        resolveSigningKey: deps.resolveSigningKey,
+        nowMs: deps.nowMs,
+        fetchDirect: deps.fetchDirect,
+    })
+    return async (senderDID) => {
+        const result = await read(senderDID)
+        if (!result.found) return result
+
+        const currentKey = (result.record as { currentKey?: unknown } | null)
+            ?.currentKey
+        if (!(currentKey instanceof Uint8Array)) {
+            return { found: false, reason: "declaration has no currentKey bytes" }
+        }
+        try {
+            const frozen = parseFrozenAnchorKeyField(currentKey)
+            return {
+                found: true,
+                anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
+                declarationCID: result.cid,
+            }
+        } catch (error) {
+            return { found: false, reason: `malformed currentKey: ${String(error)}` }
+        }
+    }
+}
+
+/**
  * The germ declaration's anchor-key field: NOT COSE. One field —
  * an algorithm identifier byte followed by the raw key bytes — because this
  * is the frozen, published record format existing clients already parse
@@ -79,18 +119,20 @@ export type DeclarationResolution =
  * bytes, with no length prefix and no enclosing structure. The identifiers
  * are assigned in this order:
  *
- *     0  ChaCha20Poly1305
- *     1  Curve25519 key agreement  (X25519)
- *     2  Curve25519 signing        (Ed25519)
- *     3  HPKE encapsulation
+ *     0  AES-GCM-256
+ *     1  ChaCha20-Poly1305
+ *     2  Curve25519 key agreement  (X25519)
+ *     3  Curve25519 signing        (Ed25519)
+ *     4  HPKE encapsulation (Curve25519, SHA-256, ChaCha20-Poly1305)
+ *     5  HMAC-SHA256
  *
- * The anchor key is a **signing** key, so byte **2** — not 1. Byte 1 is
+ * The anchor key is a **signing** key, so byte **3** — not 2. Byte 2 is
  * key *agreement*, a different key entirely, and reading the wrong one
- * would silently accept or reject the wrong field. Byte 2 is the only case
+ * would silently accept or reject the wrong field. Byte 3 is the only case
  * this relay accepts today, per the PQ posture: launch classical,
  * algorithm-agile.
  */
-const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 2
+const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 3
 
 /**
  * The declaration record's collection NSID. A protocol constant rather

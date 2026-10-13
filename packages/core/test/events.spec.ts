@@ -25,6 +25,14 @@ import type {
     PoolSender,
 } from "../src/storage"
 
+const DC = "bafyreibnx7iqeihelssyae2kritsro2rylzgs5i6ul4ugtp6ycw5tyft7q"
+// sd/dc fixture agreed with the client lane; the frame hex is this encoder's output, shared so both lanes pin the same bytes.
+const VECTOR_DC = "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e"
+const VECTOR_FRAME_HEX =
+    "a26174692364656c6976657279626f7001a5616b6d6469643a706c633a616c696365616d43010203626463783b62616679726569646a686866337a796e6e76337175676968706d683735376a3775686578646b36326b6d743462676a71777361636a693735643465626964626d3162736478206469643a706c633a73656e646572303030303030303030303030303030303030"
+const bytesToHex = (b: Uint8Array) =>
+    [...b].map((x) => x.toString(16).padStart(2, "0")).join("")
+
 function ref(id: string, hint?: MessageRef["hint"]): MessageRef {
     return { messageId: id, byteLength: 5, hint }
 }
@@ -38,18 +46,18 @@ describe("frame encode/decode", () => {
         expect(decoded.body.get("id")).toBe("m1")
         expect(decoded.body.get("m")).toEqual(new TextEncoder().encode("hi"))
         expect(decoded.body.has("sd")).toBe(false)
-        expect(decoded.body.has("kt")).toBe(false)
+        expect(decoded.body.has("dc")).toBe(false)
     })
 
     it("a delivery frame for a pair-mailbox entry carries the verification hint", () => {
         const frame = encodeDeliveryFrame(
             "did:plc:alice",
-            ref("m1", { senderDID: "did:plc:sender", anchorKeyThumbprint: "abcd" }),
+            ref("m1", { senderDID: "did:plc:sender", declarationCID: DC }),
             new Uint8Array([1])
         )
         const decoded = decodeFrame(frame)
         expect(decoded.body.get("sd")).toBe("did:plc:sender")
-        expect(decoded.body.get("kt")).toBe("abcd")
+        expect(decoded.body.get("dc")).toBe(DC)
     })
 
     it("the pool and caughtUp frames carry empty bodies", () => {
@@ -284,5 +292,50 @@ describe("handleAckFrame", () => {
         )
         await handleAckFrame(deps(w), new Uint8Array([...frame, ...body]))
         expect(w.removed).toEqual([{ key: "did:plc:alice", messageId: "m1" }])
+    })
+})
+
+describe("sender hint on the wire", () => {
+    it("a hinted ref emits exactly sd and dc (the declaration record CID) and no kt", () => {
+        const decoded = decodeFrame(
+            encodeDeliveryFrame(
+                "did:plc:alice",
+                ref("m1", { senderDID: "did:plc:sender000000000000000000", declarationCID: DC }),
+                new Uint8Array([1])
+            )
+        )
+        expect([...decoded.body.keys()].sort()).toEqual(["dc", "id", "k", "m", "sd"])
+        expect(decoded.body.get("dc")).toBe(DC)
+    })
+
+    it("an unhinted ref emits neither sd nor dc", () => {
+        const decoded = decodeFrame(
+            encodeDeliveryFrame("did:plc:alice", ref("m1"), new Uint8Array([1]))
+        )
+        expect(decoded.body.has("sd")).toBe(false)
+        expect(decoded.body.has("dc")).toBe(false)
+    })
+
+    it("a hint without a declarationCID (stored before dc existed) emits no hint at all", () => {
+        const legacy = { senderDID: "did:plc:sender", anchorKeyThumbprint: "abcd" } as never
+        const decoded = decodeFrame(
+            encodeDeliveryFrame("did:plc:alice", ref("m1", legacy), new Uint8Array([1]))
+        )
+        expect([...decoded.body.keys()].sort()).toEqual(["id", "k", "m"])
+    })
+
+    it("pins the delivery frame bytes for the client lane's sd/dc fixture", () => {
+        const frame = encodeDeliveryFrame(
+            "did:plc:alice",
+            ref("m1", { senderDID: "did:plc:sender000000000000000000", declarationCID: VECTOR_DC }),
+            new Uint8Array([1, 2, 3])
+        )
+        const decoded = decodeFrame(frame)
+        expect(decoded.body.get("sd")).toBe("did:plc:sender000000000000000000")
+        expect(decoded.body.get("dc")).toBe(VECTOR_DC)
+        expect(decoded.body.get("k")).toBe("did:plc:alice")
+        expect(decoded.body.get("id")).toBe("m1")
+        expect(decoded.body.get("m")).toEqual(new Uint8Array([1, 2, 3]))
+        expect(bytesToHex(frame)).toBe(VECTOR_FRAME_HEX)
     })
 })

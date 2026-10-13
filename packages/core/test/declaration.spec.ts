@@ -108,9 +108,9 @@ describe("happy path: did:plc -> PLC directory -> PDS -> declaration", () => {
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
-                    // Algorithm 2 is Curve25519 signing (Ed25519). See
+                    // Algorithm 3 is Curve25519 signing (Ed25519). See
                     // the identifier table in src/declaration.ts.
-                    declarationRecord(algorithmPrefixedKey(2, keyBytes))
+                    declarationRecord(algorithmPrefixedKey(3, keyBytes))
                 ),
         })
 
@@ -121,6 +121,23 @@ describe("happy path: did:plc -> PLC directory -> PDS -> declaration", () => {
     })
 })
 
+describe("a live 1.1.0 declaration", () => {
+    it("parses currentKey bytes captured from production (leading byte 0x03)", async () => {
+        const fetchImpl = fixtureFetch({
+            "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
+            [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
+                jsonResponse(
+                    declarationRecord({ $bytes: "A90mZOwHe7PRaZSu9BJ/58nDaCBQwsyz6PqTb7IL1YkC" })
+                ),
+        })
+        const result = await resolveDeclaration(DID_PLC, fetchImpl)
+        expect(result.found).toBe(true)
+        if (!result.found) throw new Error("unreachable")
+        expect(result.anchorKey.x).toHaveLength(32)
+        expect(result.anchorKey.x[0]).toBe(0xdd)
+    })
+})
+
 describe("happy path: did:web -> well-known document -> PDS -> declaration", () => {
     it("resolves via the did:web well-known path", async () => {
         const keyBytes = new Uint8Array(32).fill(0x42)
@@ -128,7 +145,7 @@ describe("happy path: did:web -> well-known document -> PDS -> declaration", () 
             "https://example.com/.well-known/did.json": () =>
                 jsonResponse(didDocument(PDS_URL, DID_WEB)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
         })
 
         const result = await resolveDeclaration(DID_WEB, fetchImpl)
@@ -136,7 +153,7 @@ describe("happy path: did:web -> well-known document -> PDS -> declaration", () 
     })
 })
 
-describe("the algorithm byte matters — Curve25519_Signing (2), never KeyAgreement (1)", () => {
+describe("the algorithm byte matters — Curve25519_Signing (3), never KeyAgreement (2)", () => {
     it("rejects a KeyAgreement (X25519) key presented where a signing key belongs", async () => {
         const keyBytes = new Uint8Array(32).fill(0x11)
         const fetchImpl = fixtureFetch({
@@ -144,7 +161,7 @@ describe("the algorithm byte matters — Curve25519_Signing (2), never KeyAgreem
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
                     // byte 1 = Curve25519_KeyAgreement, a DIFFERENT key type
-                    declarationRecord(algorithmPrefixedKey(1, keyBytes))
+                    declarationRecord(algorithmPrefixedKey(2, keyBytes))
                 ),
         })
 
@@ -173,7 +190,7 @@ describe("malformed input", () => {
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
                 jsonResponse(
-                    declarationRecord(algorithmPrefixedKey(2, new Uint8Array(3))) // way too short
+                    declarationRecord(algorithmPrefixedKey(3, new Uint8Array(3))) // way too short
                 ),
         })
         const result = await resolveDeclaration(DID_PLC, fetchImpl)
@@ -289,7 +306,7 @@ describe("confirmed vs transient absence (declaration watch)", () => {
         const fetchImpl = fixtureFetch({
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, new Uint8Array(3)))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, new Uint8Array(3)))),
         })
         const result = await resolveDeclaration(DID_PLC, fetchImpl)
         expect(result.found).toBe(false)
@@ -363,7 +380,7 @@ describe("PDS resolution matches @atproto/identity", () => {
             "https://plc.directory/": () =>
                 jsonResponse(didDocument(PDS_URL, "did:plc:somebodyelse00000000000")),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
         })
         const result = await resolveDeclaration(DID_PLC, fetchImpl)
         expect(result.found).toBe(false)
@@ -393,7 +410,7 @@ describe("PDS resolution matches @atproto/identity", () => {
             "https://example.com:3000/.well-known/did.json": () =>
                 jsonResponse(didDocument(PDS_URL, did)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
         })
         const result = await resolveDeclaration(did, fetchImpl)
         expect(result.found).toBe(true)
@@ -421,7 +438,7 @@ describe("PDS resolution matches @atproto/identity", () => {
                     ],
                 }),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
             "https://impostor.example": () => {
                 throw new Error("resolved to the wrong service entry")
             },
@@ -445,7 +462,7 @@ describe("PDS resolution matches @atproto/identity", () => {
                     ],
                 }),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
         })
         expect((await resolveDeclaration(DID_PLC, fetchImpl)).found).toBe(true)
     })
@@ -492,7 +509,7 @@ describe("PDS resolution matches @atproto/identity", () => {
         const { impl, calls } = recordingFetch({
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
         })
         expect((await resolveDeclaration(DID_PLC, impl)).found).toBe(true)
 
@@ -519,7 +536,7 @@ describe("resolveDeclarationWithRev (the watch's rev-carrying resolve)", () => {
         const fetchImpl = fixtureFetch({
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
             [LATEST]: () => jsonResponse({ cid: "bafy...", rev: "3m1abc" }),
         })
         const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
@@ -532,7 +549,7 @@ describe("resolveDeclarationWithRev (the watch's rev-carrying resolve)", () => {
         const fetchImpl = fixtureFetch({
             "https://plc.directory/": () => jsonResponse(didDocument(PDS_URL)),
             [`${PDS_URL}/xrpc/com.atproto.repo.getRecord`]: () =>
-                jsonResponse(declarationRecord(algorithmPrefixedKey(2, keyBytes))),
+                jsonResponse(declarationRecord(algorithmPrefixedKey(3, keyBytes))),
             [LATEST]: () => jsonResponse({}, 503),
         })
         const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)

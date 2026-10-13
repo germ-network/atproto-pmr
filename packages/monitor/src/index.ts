@@ -83,7 +83,7 @@ export {
 } from "./notify"
 
 // The authoritative read.
-export { fetchRecordCar, type FetchRecordOptions } from "./fetch-record"
+export { fetchRecordCar, fetchHeadRev, type FetchRecordOptions } from "./fetch-record"
 
 // Ingest orchestration.
 export {
@@ -100,3 +100,12 @@ export {
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
 export { sweepBackfill, type BackfillDeps, type SweepBackfillResult } from "./backfill"
+export {
+    refreshDue,
+    type RefreshDeps,
+    type RefreshIndex,
+    type RefreshSnapshots,
+    type RefreshOutcome,
+    type RefreshResult,
+    type SnapshotCheck,
+} from "./refresh"

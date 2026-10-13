@@ -320,7 +320,7 @@ describe("live push", () => {
                 {
                     messageId: "m1",
                     byteLength: 5,
-                    hint: { senderDID: "did:plc:bob", anchorKeyThumbprint: "th" },
+                    hint: { senderDID: "did:plc:bob", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" },
                 },
                 new TextEncoder().encode("hello")
             )
@@ -333,6 +333,10 @@ describe("live push", () => {
             new TextDecoder().decode(delivered[0].body.get("m") as Uint8Array)
         ).toBe("hello")
         expect(delivered[0].body.get("sd")).toBe("did:plc:bob")
+        expect(delivered[0].body.get("dc")).toBe(
+            "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e"
+        )
+        expect(delivered[0].body.has("kt")).toBe(false)
     })
 
     it("fans out to every attached socket", async () => {
@@ -446,7 +450,7 @@ describe("live push", () => {
         const ref = {
             messageId: "m1",
             byteLength: 5,
-            hint: { senderDID: "did:plc:bob", anchorKeyThumbprint: "th" },
+            hint: { senderDID: "did:plc:bob", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" },
         }
         const body = new TextEncoder().encode("hello")
 
@@ -525,5 +529,30 @@ describe("live push on pool provisioning", () => {
         await inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:nobody", 0))
         await new Promise((r) => setTimeout(r, 10))
         expect(delivered).toHaveLength(0)
+    })
+})
+
+describe("sender hint through the Durable Object", () => {
+    it("a ref appended with a declarationCID hint drains on #delivery with that dc, and no kt", async () => {
+        const stub = freshStub()
+        const dc = "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e"
+        await inPMR(stub, (pmr) =>
+            pmr.append(
+                "did:plc:alice",
+                {
+                    messageId: "m1",
+                    byteLength: 5,
+                    hint: { senderDID: "did:plc:bob", declarationCID: dc },
+                },
+                new Uint8Array([1]),
+                0
+            )
+        )
+        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
+        const { frames } = await connectAndDrain(stub)
+        const delivery = frames.find((f) => f.type === "delivery")!
+        expect(delivery.body.get("sd")).toBe("did:plc:bob")
+        expect(delivery.body.get("dc")).toBe(dc)
+        expect(delivery.body.has("kt")).toBe(false)
     })
 })

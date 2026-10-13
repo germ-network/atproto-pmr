@@ -194,7 +194,7 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         const mailboxes = w.mailboxesFor(locator)
 
         mailboxes.set(did, [
-            ref("m1", { senderDID: "did:plc:sender", anchorKeyThumbprint: "abcd" }),
+            ref("m1", { senderDID: "did:plc:sender", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" }),
         ])
         mailboxes.set("grant:addr", [ref("m2")])
         w.bodies.set("m1", new TextEncoder().encode("hello"))
@@ -213,12 +213,13 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         expect(pairEntry.get("k")).toBe(did)
         expect(pairEntry.get("m")).toEqual(new TextEncoder().encode("hello"))
         expect(pairEntry.get("sd")).toBe("did:plc:sender")
-        expect(pairEntry.get("kt")).toBe("abcd")
+        expect(pairEntry.get("dc")).toBe("bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e")
+        expect(pairEntry.has("kt")).toBe(false)
 
         const grantEntry = ms.find((m) => m.get("id") === "m2")!
         expect(grantEntry.get("k")).toBe("grant:addr")
         expect(grantEntry.has("sd")).toBe(false)
-        expect(grantEntry.has("kt")).toBe(false)
+        expect(grantEntry.has("dc")).toBe(false)
     })
 
     it("pages through more mailboxes than fit on one page, per-mailbox FIFO preserved", async () => {

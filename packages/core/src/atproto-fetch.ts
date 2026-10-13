@@ -7,10 +7,11 @@
  * below are the security boundary for every consumer, and duplicating them
  * per package would be exactly the wrong kind of copy.
  *
- * The relay and the monitor share the resolution and diverge after it: a
- * relay reads the declaration as JSON for its own admission check
- * (`declaration.ts`), while a monitor reads CAR, because its output is
- * relayed onward to a device that must verify it.
+ * The monitor and the relay's owner-DID reads (registration, declaration
+ * watch) share the resolution and read from the PDS. The relay's check of a
+ * *sender's* declaration does not: it verifies the monitor's CAR and uses
+ * only the DID directory (`resolveSigningKey`), so it never tells the
+ * sender's PDS that a message is being sent.
  */
 
 /**
@@ -475,10 +476,10 @@ export interface PDSResolution {
  */
 const PLC_TOMBSTONE_MESSAGE_PREFIX = "DID not available: "
 
-export async function resolvePDSEndpoint(
+async function fetchDidDocument(
     did: string,
     fetchImpl: typeof fetch
-): Promise<PDSResolution> {
+): Promise<Record<string, unknown>> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
         doc = await guardedFetchJSON(
@@ -511,14 +512,90 @@ export async function resolvePDSEndpoint(
     ) {
         throw new Error("DID document does not match the requested DID")
     }
+    return doc as Record<string, unknown>
+}
 
-    const service = extractPDSService(doc as Record<string, unknown>)
+export async function resolvePDSEndpoint(
+    did: string,
+    fetchImpl: typeof fetch
+): Promise<PDSResolution> {
+    const doc = await fetchDidDocument(did, fetchImpl)
+    const service = extractPDSService(doc)
     if (service === null) {
         throw new Error("DID document has no #atproto_pds service")
     }
     return {
         endpoint: service,
-        signingKey: extractSigningKey(doc as Record<string, unknown>),
+        signingKey: extractSigningKey(doc),
+    }
+}
+
+/**
+ * The DID document's `#atproto` signing key, from the DID's directory
+ * (plc.directory, or the did:web host) only — never the PDS.
+ */
+export async function resolveSigningKey(
+    did: string,
+    fetchImpl: typeof fetch
+): Promise<string | null> {
+    return extractSigningKey(await fetchDidDocument(did, fetchImpl))
+}
+
+export interface CachedSigningKey {
+    /** `#atproto` multikey, or null when the document carried none. */
+    key: string | null
+    fetchedAtMs: number
+}
+
+/** Freshness is enforced in code from `fetchedAtMs`, not by a platform TTL. */
+export interface SigningKeyCache {
+    get(did: string): Promise<CachedSigningKey | null>
+    put(did: string, entry: CachedSigningKey): Promise<void>
+}
+
+/** Re-fetch from the directory once a cached key is older than this. */
+export const SIGNING_KEY_TTL_MS = 10 * 60 * 1000
+/** On a directory failure, a cached key up to this old is still used. */
+export const SIGNING_KEY_MAX_STALE_MS = 6 * 60 * 60 * 1000
+
+/**
+ * `resolveSigningKey` behind `cache`: fresh within `SIGNING_KEY_TTL_MS`,
+ * otherwise fetched eagerly from the directory, falling back to a cached
+ * key up to `SIGNING_KEY_MAX_STALE_MS` old only when that fetch fails (the
+ * stale path leaves the cache untouched, so an outage retries the directory
+ * on every call). A directory tombstone is an answer, not a failure.
+ * Resolves `null` when there is no usable key.
+ */
+export function cachedSigningKeyResolver(deps: {
+    fetchImpl: typeof fetch
+    cache: SigningKeyCache
+    nowMs: () => number
+}): (did: string) => Promise<string | null> {
+    const { fetchImpl, cache, nowMs } = deps
+    return async (did) => {
+        // The cache is an optimisation: a fault reading or writing it must
+        // not turn into a refusal to verify.
+        const cached = await cache.get(did).catch(() => null)
+        const now = nowMs()
+        if (cached && now - cached.fetchedAtMs < SIGNING_KEY_TTL_MS) {
+            return cached.key
+        }
+        try {
+            const key = await resolveSigningKey(did, fetchImpl)
+            await cache.put(did, { key, fetchedAtMs: now }).catch(() => {})
+            return key
+        } catch (error) {
+            if (error instanceof RecordNotFoundError) {
+                // The directory says the identity is gone: not an outage, so
+                // no stale key, and cache the answer to spare the directory.
+                await cache.put(did, { key: null, fetchedAtMs: now }).catch(() => {})
+                return null
+            }
+            if (cached && now - cached.fetchedAtMs <= SIGNING_KEY_MAX_STALE_MS) {
+                return cached.key
+            }
+            return null
+        }
     }
 }
 
@@ -631,6 +708,34 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
 }
 
 /**
+ * `com.atproto.sync.getRecord` at the DID's own PDS: the single-record proof
+ * CAR, for the caller to verify (`verifyRecordProof`). A repo-level terminal
+ * answer raises `RecordNotFoundError`; a missing record is a 200 whose CAR
+ * proves the absence.
+ */
+export async function fetchRecordProofCar(
+    did: string,
+    collection: string,
+    rkey: string,
+    fetchImpl: typeof fetch
+): Promise<Uint8Array> {
+    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    const url = new URL(`${endpoint}/xrpc/com.atproto.sync.getRecord`)
+    url.searchParams.set("did", did)
+    url.searchParams.set("collection", collection)
+    url.searchParams.set("rkey", rkey)
+    return guardedFetchBytes(url.toString(), fetchImpl, {
+        terminalErrorNames: [
+            "RecordNotFound",
+            "RepoNotFound",
+            "RepoTakendown",
+            "RepoSuspended",
+            "RepoDeactivated",
+        ],
+    })
+}
+
+/**
  * The repo's current `rev`, from `com.atproto.sync.getLatestCommit` at the PDS
  * — never taken from a wake signal, which a hostile feed could use to fake or
  * mask a rollback.
@@ -645,16 +750,22 @@ function extractSigningKey(doc: Record<string, unknown>): string | null {
  * ordering and rollback direction (`spec/trust-model.md`).
  *
  * Throws on any failure (unreachable, or no rev in the body); a caller that
- * treats a missing rev as transient wraps this and decides.
+ * treats a missing rev as transient wraps this and decides. Pass
+ * `terminalErrorNames` (as `guardedFetchJSON`) to have a repo-level terminal
+ * answer raise `RecordNotFoundError` instead of a generic error.
  */
 export async function fetchLatestRev(
     pdsEndpoint: string,
     did: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    terminal: {
+        terminalErrorNames?: readonly string[]
+        permanentErrorNames?: readonly string[]
+    } = {}
 ): Promise<string> {
     const url = new URL(`${pdsEndpoint}/xrpc/com.atproto.sync.getLatestCommit`)
     url.searchParams.set("did", did)
-    const body = (await guardedFetchJSON(url.toString(), fetchImpl)) as {
+    const body = (await guardedFetchJSON(url.toString(), fetchImpl, terminal)) as {
         rev?: unknown
     }
     if (typeof body.rev !== "string" || body.rev.length === 0) {

@@ -176,7 +176,9 @@ key. Two constraints on what that derivation covers are stated under
 Content addresses are algorithm-prefixed and self-describing: an algorithm
 identifier followed by the digest bytes. They are not multihash and not
 CIDs. CIDs are consumed where atproto owns the bytes — CAR blocks and blob
-references inside repo records — and emitted nowhere.
+references inside repo records — and emitted in exactly one place: the
+delivery hint's `dc`, the CID of a sender's declaration record (see
+[Delivery — owner-facing](#delivery--owner-facing)).
 
 ### Key material
 
@@ -201,6 +203,11 @@ are not COSE. The field an implementer must read has this shape:
 > or array, no framing. The byte identifies the algorithm and therefore
 > the expected key length; for an Ed25519 anchor key the remainder is the
 > 32-byte public key.
+
+The identifiers are numbered 0 AES-GCM-256, 1 ChaCha20-Poly1305,
+2 Curve25519 key agreement (X25519), 3 Curve25519 signing (Ed25519),
+4 HPKE encapsulation, 5 HMAC-SHA256. An anchor key is a signing key, so the
+byte is `3`, and a relay accepts only `3` there.
 
 An implementation MUST convert that field to a `COSE_Key` at ingest, once,
 and MUST NOT propagate the foreign encoding any further. That field is the
@@ -490,17 +497,44 @@ For a pair put, the permitted responses are exhaustive:
 
 - **`202 Accepted`** — for a provisioned sender with room, for an
   unprovisioned sender (accepted into the [recovery pool](#the-recovery-pool)),
-  for a sender inside a discard window, and for a
-  [blocked sender](#blocked-senders) whose synthetic state has room.
+  for a sender inside a discard window, for a
+  [blocked sender](#blocked-senders) whose synthetic state has room, and for
+  a validly signed put whose recipient is unknown to this relay or is not
+  the recipient the sender signed.
+- **`409 Conflict` with `Retry-After`** — when the relay cannot verify the
+  sender: it holds no current, verifiable declaration for the sender DID, or
+  the put's signature does not verify under the anchor key that declaration
+  names. Nothing is stored.
 - **`429 Too Many Requests` with `Retry-After`** — when *the sender's own*
   reservation is full.
 - **`400`** or **`413`**, under the conditions below, for a request refused
   on its own bytes.
 
-Nothing else that depends on the recipient. A pair put MUST NOT disclose
-whether the recipient is active, whether the sender was blocked, whether
-the sender is provisioned, or whether the recipient exists in any state
-other than one that would produce these answers.
+Nothing else. A pair put MUST NOT disclose whether the recipient is active,
+whether the sender was blocked, whether the sender is provisioned, or
+whether the recipient exists in any state other than one that would produce
+these answers.
+
+**The `409` is a fact about the sender, not the recipient.** It is decided
+after the sender's declaration is resolved and before any recipient lookup,
+so it cannot vary with anything about the recipient. A sender whose
+declaration the relay's monitor does not yet hold is the one case a relay
+cannot tell from a forged put until it catches up; a
+`409` says "not yet", and a sender that waits and retries is served. The two
+causes — no usable declaration, and a signature that fails under the one the
+relay holds — are deliberately not distinguished: a sender who has just
+rotated its anchor key sees the same answer as one whose declaration has not
+been observed, and both normally clear on their own. What the answer
+reveals — whether this relay's monitor observes the sender's declaration —
+the monitor already publishes per DID.
+
+A sender that receives `409` SHOULD retry after `Retry-After` with backoff.
+A `409` that persists beyond the monitor's refresh interval means this
+relay's monitor does not observe the sender's declaration (or the sender's
+signing is wrong); the sender SHOULD surface that rather than retry forever.
+
+`5xx` is reserved for genuine relay faults — a store the relay cannot reach
+— and is never used for a state the sender can wait out.
 
 Two narrow exceptions, and one shared condition is what keeps both safe:
 
@@ -509,14 +543,14 @@ Two narrow exceptions, and one shared condition is what keeps both safe:
 - A payload **over the maximum the enabler document advertises** MAY be
   refused with `413 Content Too Large`.
 
-Every such check MUST be evaluated **before any recipient- or
-sender-dependent lookup**, so its outcome is a function of the request bytes
-and the deployment's own advertised limits alone. A sender already knows
+Every such check MUST be evaluated **before any lookup at all**, so its
+outcome is a function of the request bytes and the deployment's own
+advertised limits alone. A sender already knows
 whether their own request is well-formed and how large their own payload is,
 and can read the limit it exceeded from a public document, so neither answer
 tells them anything they did not supply or could not already fetch. An
-implementation that cannot decide either without consulting recipient state
-MUST answer `202` instead.
+implementation that cannot decide either without a lookup MUST answer `202`
+(or, where the sender cannot be verified, `409`) instead.
 
 **`413` is separated from `400` because the two are differently
 actionable.** A `400` says the sender's encoder is wrong and the same bytes
@@ -610,7 +644,7 @@ content-addressed and deduplicated** — which is sufficient here because
 
 **The response contract is stricter than a pair put's, not just
 uniform.** A pair put resolves and verifies before answering, and
-achieves uniformity by answering `202` on every branch. A grant put has no
+achieves uniformity by answering `202` on every recipient-dependent branch (a `409` or `429` is about the sender alone). A grant put has no
 self-referential disclosure to permit at all, so it goes further: **no
 address-dependent step runs before the response.** The only synchronous,
 pre-response work is refusing a request on its own bytes — an undecodable
@@ -651,7 +685,13 @@ In order, no step optional:
 1. Take the **sender DID from the signed headers** — never from the
    relay's routing hint, which the trust model does not trust.
 2. Resolve that DID → declaration → anchor key, **CAR-verified**
-   ([trust](trust-model.md#p2--relayed-repo-records-are-car)).
+   ([trust](trust-model.md#p2--relayed-repo-records-are-car)). The relay
+   verifies a CAR the key monitor holds — the commit signature under the DID
+   document's signing key, and the record's path through the commit's
+   tree. It does not take the declaration from the sender's PDS; the one
+   exception is a lapsed snapshot, which it checks against the PDS for
+   change only ([trust model P5](trust-model.md#p5--sender-verification)). A
+   sender whose declaration cannot be so resolved gets `409`.
 3. Verify the `COSE_Sign1` against **that** key — the declaration's, not
    any key or thumbprint carried in the message.
 4. Confirm the signed recipient DID is this recipient, and that the nonce
@@ -880,11 +920,34 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
 
-A pair-mailbox delivery carries the relay's **verification hint** — the DID
-and anchor key it validated the payload against. The hint is an index and
-a convenience, not evidence, and a device MUST re-verify the payload
-before acting on it; see
-[`trust-model.md`](trust-model.md#p8--the-relays-verdict-is-a-hint).
+A pair-mailbox delivery carries the relay's **verification hint**: `sd`, the
+sender DID, and `dc`, the CID of the sender's declaration record as the relay
+last saw it. `dc` is a freshness cue — the newest declaration this relay has
+seen for that DID — not a trust signal and not a key identifier; it changes
+on any change to the declaration, including a key-package rotation under the
+same anchor key. A device never trusts it: the device verifies DID →
+declaration → anchor key from the CAR itself, and uses `dc` only to decide
+whether to re-verify. A device MUST re-verify the payload before acting on
+it; see [`trust-model.md`](trust-model.md#p8--the-relays-verdict-is-a-hint).
+
+`dc` is the record CID, not the commit's: CIDv1, dag-cbor (`0x71`),
+sha2-256, rendered as a CBOR text string in multibase base32 lower-case
+unpadded — `b` followed by the RFC 4648 §6 base32 alphabet rendered lower-case and unpadded (multibase `b`),
+of `01 71 12 20 ‖ <32-byte SHA-256 of the record block>` (so it begins
+`bafyrei`). `sd` and `dc` are both present or both absent: a hint without a
+`dc` is not emitted at all. The same two fields appear in `#delivery`, in a
+`GET /pmr/v1/messages` entry, and in a full-form push.
+
+#### Catch-up cursor
+
+`GET /pmr/v1/messages?cursor=` pages through mailboxes. The `cursor` is a
+position in mailbox-key order, not an offset: it is stable under concurrent
+acks and under mailboxes emptying or filling, so acking what a page returned
+never changes which mailboxes the next page names. A page MAY be empty while
+`n` (the next cursor) is non-null — a stretch of mailboxes can empty between
+pages — so a client pages until `n` is null. A message appended to a mailbox
+the pass has already moved past arrives by live delivery or push, or on the
+next catch-up pass.
 
 ### The events socket
 
@@ -907,7 +970,7 @@ body   = { ... type-specific fields ... }
 | `t` | direction | body | notes |
 |---|---|---|---|
 | `#capabilities` | server → client | `{gr}` | the grant lifecycle effective *for this registration* — see below |
-| `#delivery` | server → client | `{k, id, m, sd?, kt?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`kt` (the verification hint) are present only for a pair-mailbox entry |
+| `#delivery` | server → client | `{k, id, m, sd?, dc?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`dc` (the verification hint, see [Delivery — owner-facing](#delivery--owner-facing)) are present together, and only for a pair-mailbox entry |
 | `#ack` | client → server | `{k, id}` | acknowledges one message. Idempotent — acking an already-removed message MUST succeed, matching the REST ack endpoint |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
@@ -1031,13 +1094,18 @@ discards the provenance that makes a record authoritative, and without it
 an attacker can mint a well-formed declaration binding their own key to a
 victim's DID.
 
-Anything forwarding repo records is a CAR pass-through: it fetches the
-record, stores the bytes and the `rev`, and forwards them, needing no CAR
-parser and no MST walk. Verifying what it forwards is defense in depth
-against a lying PDS, not a prerequisite. This applies to a relay resolving
-a counterpart declaration to check a pair-put signature, and to a key
-monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface))
-alike.
+A key monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface))
+is a CAR pass-through: it fetches the record, stores the bytes and the
+`rev`, and forwards them, needing no CAR parser and no MST walk. Verifying
+what it forwards is defense in depth against a lying PDS, not a prerequisite.
+It compares record CIDs to tell a real declaration change from an unrelated
+commit, without verifying signatures.
+
+A relay resolving a counterpart declaration to check a pair-put signature is
+the opposite case: it parses and verifies the CAR it takes from the monitor
+(commit signature under the DID document's signing key, and the record's
+path through the commit's tree), and does not take the declaration from the
+sender's PDS.
 
 ### Monitoring — a separate component, not a relay surface
 
@@ -1054,9 +1122,9 @@ that composes with a relay that is resolved rather than chosen. See
 [`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car) for the
 independence rule, a client-side decision this document cannot make.
 
-A PMR is encouraged to run a monitor alongside itself, because the work
-overlaps: a relay already resolves and verifies a counterpart's declaration
-to check a pair-put signature, which is most of monitoring that DID. A host
+A relay reads its senders' declarations from a monitor's store (see
+[`trust-model.md` P5](trust-model.md#p5--sender-verification)), so a PMR
+that admits pair puts runs a monitor or shares one. A host
 that runs one declares the `monitor` capability in its enabler document,
 naming where it lives; a client still chooses its monitor set by
 configuration rather than resolving it from the monitored DID.
@@ -1188,7 +1256,7 @@ socket frames use:
 | `k` | present when `t` is `"m"`: the mailbox key the message landed in |
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
-| `sd` / `kt` | present under the same condition as `m`, for a pair-mailbox entry: the verification hint, identical to `#delivery`'s `sd`/`kt` |
+| `sd` / `dc` | present under the same condition as `m`, for a pair-mailbox entry: the verification hint, identical to `#delivery`'s `sd`/`dc` |
 
 ```json
 { "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }
@@ -1419,7 +1487,7 @@ Three populations, and what each may learn is a security property:
 | audience | answer |
 |---|---|
 | peer, grant put | `202` for every address-dependent outcome — no other code, no timing difference. `400` or `413` only where the refusal is decided on the request bytes and advertised limits alone |
-| peer, pair put | `202`, or `429` + `Retry-After` when their own reservation is full, or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
+| peer, pair put | `202`; `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
 The dividing line is authorization and what per-sender reservation makes

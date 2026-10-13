@@ -25,7 +25,7 @@ import {
     type IngestDeps,
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
-import { DIGEST_MARKER_KEY, kvSnapshotStore } from "../src/snapshot-store"
+import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -993,5 +993,143 @@ describe("own-DID push", () => {
 
             expect(spy).toHaveBeenCalledWith(did)
         })
+    })
+})
+
+describe("snapshot refresh", () => {
+    const HOUR = 3_600_000
+    const entry = (rev: string, observedAtMs: number) => ({
+        rev,
+        car: new Uint8Array([7, 7]),
+        observedAtMs,
+        source: PDS,
+        signingKey: SIGNING_KEY,
+    })
+
+    it("the alarm refreshes due DIDs after settle and before sealing", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        const old = Date.now() - 3 * HOUR
+        await inMonitorObj(stub, async (obj) => {
+            const o = obj as unknown as {
+                fetchRecord: (did: string) => Promise<FetchedRecord>
+                fetchHeadRev: (did: string) => Promise<string>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.fetchRecord = async (did) => {
+                log.push(`fetchRecord ${did}`)
+                return { rev: "3m2", car: new Uint8Array([1]), source: PDS, signingKey: SIGNING_KEY }
+            }
+            o.fetchHeadRev = async (did) => {
+                log.push(`fetchHeadRev ${did}`)
+                return "3m1"
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:refresh-b", "3m1", old)
+            await kvSnapshotStore(testEnv).putRecord("did:plc:refresh-b", entry("3m1", old))
+            await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, "1")
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+
+        expect(log.filter((l) => !l.startsWith("seal"))).toEqual([
+            "fetchRecord did:plc:refresh-a",
+            "fetchHeadRev did:plc:refresh-b",
+        ])
+        expect(log.indexOf("seal")).toBeGreaterThan(log.indexOf("fetchHeadRev did:plc:refresh-b"))
+        const fresh = await kvDeclarationSnapshots(testEnv)("did:plc:refresh-b")
+        expect(fresh!.freshAtMs).toBeGreaterThan(old)
+        await inMonitorObj(stub, async (obj) => {
+            expect(await obj.dueRefresh(Date.now() - HOUR, 10)).toEqual([])
+        })
+    })
+
+    it("dueRefresh skips deleted and pending DIDs and orders by last check", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:r1", "3m1", 1_000)
+            await obj.complete("did:plc:r2", "3m1", 2_000)
+            await obj.complete("did:plc:r3", "3m1", 3_000)
+            await obj.complete("did:plc:r-deleted", "3m1", 100)
+            await obj.completeDeletion("did:plc:r-deleted", 200, true)
+            await obj.complete("did:plc:r-pending", "3m1", 100)
+            await obj.owe("did:plc:r-pending", "3m2")
+            await obj.complete("did:plc:r-fresh", "3m1", 90_000)
+
+            expect(await obj.dueRefresh(50_000, 10)).toEqual([
+                "did:plc:r1",
+                "did:plc:r2",
+                "did:plc:r3",
+            ])
+            // A check counts as the DID's last confirmation, in either direction.
+            await obj.markChecked("did:plc:r1", 60_000)
+            await obj.markChecked("did:plc:r3", 10)
+            expect(await obj.dueRefresh(50_000, 10)).toEqual(["did:plc:r2", "did:plc:r3"])
+            expect(await obj.dueRefresh(50_000, 1)).toEqual(["did:plc:r2"])
+            // A stale check never makes a recently stored DID due.
+            await obj.markChecked("did:plc:r-fresh", 10)
+            expect(await obj.dueRefresh(50_000, 10)).not.toContain("did:plc:r-fresh")
+            // A failed attempt keeps the DID due but queues it behind the rest.
+            await obj.markAttempted("did:plc:r2", 40_000)
+            expect(await obj.dueRefresh(50_000, 1)).toEqual(["did:plc:r3"])
+            expect(await obj.dueRefresh(50_000, 10)).toEqual(["did:plc:r3", "did:plc:r2"])
+            // Quiet completion advances the rev without a digest-window entry.
+            await obj.completeQuietly("did:plc:r2", "3m9", 1_300_000)
+            expect(await obj.revOf("did:plc:r2")).toBe("3m9")
+            expect(await obj.windowMembers(Math.floor(1_300_000 / 600_000))).toEqual([])
+        })
+    })
+
+    it("kvDeclarationSnapshots: freshAtMs is the chk: time when its rev matches rec:, else observedAtMs", async () => {
+        const store = kvSnapshotStore(testEnv)
+        const read = kvDeclarationSnapshots(testEnv)
+        await store.putRecord("did:plc:fresh", entry("3m1", 1_000))
+        expect((await read("did:plc:fresh"))!.freshAtMs).toBe(1_000)
+
+        await store.putCheck("did:plc:fresh", { rev: "3m1", checkedAtMs: 5_000 })
+        const back = await read("did:plc:fresh")
+        expect(back!.freshAtMs).toBe(5_000)
+        expect([...back!.car]).toEqual([7, 7])
+
+        // A confirmation of an older rev says nothing about this CAR.
+        await store.putCheck("did:plc:fresh", { rev: "3m0", checkedAtMs: 9_000 })
+        expect((await read("did:plc:fresh"))!.freshAtMs).toBe(1_000)
+
+        // A check older than the fetch never lowers freshness.
+        await store.putCheck("did:plc:fresh", { rev: "3m1", checkedAtMs: 500 })
+        expect((await read("did:plc:fresh"))!.freshAtMs).toBe(1_000)
+    })
+
+    it("kvDeclarationSnapshots: no rec: → null", async () => {
+        const store = kvSnapshotStore(testEnv)
+        const read = kvDeclarationSnapshots(testEnv)
+        expect(await read("did:plc:nothing")).toBeNull()
+        await store.putCheck("did:plc:orphan-check", { rev: "3m1", checkedAtMs: 5_000 })
+        expect(await read("did:plc:orphan-check")).toBeNull()
+
+        await store.putRecord("did:plc:deleted-rec", entry("3m1", 1_000))
+        await store.putCheck("did:plc:deleted-rec", { rev: "3m1", checkedAtMs: 5_000 })
+        await store.deleteRecord("did:plc:deleted-rec")
+        expect(await read("did:plc:deleted-rec")).toBeNull()
+        await store.putRecord("did:plc:deleted-rec", entry("3m1", 2_000))
+        expect((await read("did:plc:deleted-rec"))!.freshAtMs).toBe(2_000)
     })
 })

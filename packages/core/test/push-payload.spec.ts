@@ -13,11 +13,11 @@ const REF: MessageRef = { messageId: "m1", byteLength: 5 }
 const REF_WITH_HINT: MessageRef = {
     messageId: "m1",
     byteLength: 5,
-    hint: { senderDID: "did:plc:bob", anchorKeyThumbprint: "th" },
+    hint: { senderDID: "did:plc:bob", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" },
 }
 
 describe("buildMessagePushPayload — fits", () => {
-    it("includes m, sd, kt when the sealed total fits", () => {
+    it("includes m, sd, dc when the sealed total fits", () => {
         const message = new TextEncoder().encode("hello")
         const bytes = buildMessagePushPayload({
             key: KEY,
@@ -31,10 +31,11 @@ describe("buildMessagePushPayload — fits", () => {
         expect(map.get("id")).toBe("m1")
         expect(new TextDecoder().decode(map.get("m") as Uint8Array)).toBe("hello")
         expect(map.get("sd")).toBe("did:plc:bob")
-        expect(map.get("kt")).toBe("th")
+        expect(map.get("dc")).toBe("bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e")
+        expect(map.has("kt")).toBe(false)
     })
 
-    it("omits sd/kt for a grant-mailbox ref (no hint)", () => {
+    it("omits sd/dc for a grant-mailbox ref (no hint)", () => {
         const message = new TextEncoder().encode("hello")
         const bytes = buildMessagePushPayload({
             key: "grant:abc",
@@ -44,12 +45,12 @@ describe("buildMessagePushPayload — fits", () => {
         })
         const map = decodeCoseMap(bytes)
         expect(map.has("sd")).toBe(false)
-        expect(map.has("kt")).toBe(false)
+        expect(map.has("dc")).toBe(false)
     })
 })
 
 describe("buildMessagePushPayload — falls back to pointer-only when it doesn't fit", () => {
-    it("drops m/sd/kt and keeps only t/k/id when the full form would exceed maxSealedBytes", () => {
+    it("drops m/sd/dc and keeps only t/k/id when the full form would exceed maxSealedBytes", () => {
         const message = new Uint8Array(5000).fill(65) // way over any reasonable ceiling
         const bytes = buildMessagePushPayload({
             key: KEY,
@@ -63,7 +64,7 @@ describe("buildMessagePushPayload — falls back to pointer-only when it doesn't
         expect(map.get("id")).toBe("m1")
         expect(map.has("m")).toBe(false)
         expect(map.has("sd")).toBe(false)
-        expect(map.has("kt")).toBe(false)
+        expect(map.has("dc")).toBe(false)
     })
 
     it("the fallback form itself fits within maxSealedBytes once sealed", () => {

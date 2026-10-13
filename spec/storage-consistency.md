@@ -167,7 +167,8 @@ the interface keeps them separate so the queue stays small regardless of
 body size.
 
 A pair-mailbox entry also carries the relay's **verification hint** — the
-DID and anchor key it validated the payload against. Store it *alongside*
+sender DID and the CID of the declaration record it validated the payload
+against. Store it *alongside*
 the body, never inside it: the body is self-authenticating and the device
 re-verifies it, so the hint is an index and a convenience, not evidence. An
 adapter that loses or corrupts hints degrades performance; one that lets a
