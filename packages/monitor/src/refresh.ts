@@ -1,6 +1,6 @@
 /**
- * The periodic re-check that keeps every held snapshot under the relay's
- * staleness the relay tolerates: confirm each DID's head rev at its source, re-fetch on a move,
+ * The periodic re-check that keeps every held snapshot within the staleness
+ * the relay tolerates: confirm each DID's head rev at its source, re-fetch on a move,
  * and record when the snapshot was last confirmed current.
  *
  * A repo rev moves on any commit, so a move whose declaration record CID is

@@ -61,7 +61,7 @@ export const DECLARATION_RETRY_AFTER_SECONDS = 60
  *  - `400` / `413`: decided on the request's own bytes and the advertised
  *    limits, before any lookup.
  *  - `409` + `Retry-After`: the relay has no verifiable declaration for the
- *    sender (none held, or unverifiable), or the signature fails under
+ *    sender (none held, out of date, or unverifiable), or the signature fails under
  *    the one it has. Nothing is stored. The two causes are deliberately not
  *    distinguished: a sender who has just rotated its key sees the same
  *    answer as one whose declaration the relay has not yet ingested, and

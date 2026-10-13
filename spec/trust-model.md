@@ -117,7 +117,7 @@ is payload → anchor key → declaration → DID, and no link is optional. See
 **The declaration comes from a third party, never from the sender's PDS.**
 The relay verifies the CAR a key monitor holds for the sender — the commit
 signature under the DID document's signing key, and the declaration record's
-path through the commit's tree — and contacts only the monitor's snapshot
+path through the commit's tree — and, on an ordinary put, contacts only the monitor's snapshot
 store and the sender's DID directory (the PLC directory, or the `did:web`
 host), with the signing key cached for ten minutes (a DID-document re-key is not
 seen before then, nor for up to six hours if the directory is unreachable,
@@ -131,13 +131,15 @@ the monitor has not yet observed is accepted until it is.
 
 **One bounded exception.** A held snapshot the monitor has not confirmed for
 24 hours means the monitor has fallen behind. The relay then reads the
-sender's PDS once to check whether the declaration record is still the same
+sender's PDS to check whether the declaration record is still the same
 — it compares the record CID and nothing else, and never takes the PDS's
 bytes as the declaration. Unchanged, the snapshot stands. Changed or gone,
 the snapshot is out of date and the put answers `409` until the monitor
 catches up. If the PDS cannot be read, the older snapshot stands rather than
-refusing the sender. That read does tell the sender's PDS a message is being
-sent, but only for senders whose monitor snapshot has already lapsed. A pair
+refusing the sender. The answer is remembered for ten minutes, so repeated or
+forged puts naming a lapsed DID do not each cost a read. That read does tell
+that DID's PDS that a put naming it arrived (anyone can send one), but only
+for senders whose monitor snapshot has already lapsed. A pair
 put with no held snapshot at all answers `409`,
 [wire-api.md](wire-api.md#delivery--peer-facing). The
 device's defence is its own PLC-verified view of the sender's declaration,

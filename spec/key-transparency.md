@@ -393,7 +393,7 @@ its fetch time and a matching confirmation.
 full cycle: population × alarm interval ÷ per-alarm batch, plus outage slack.
 With the defaults (batch 64 per 2-minute alarm) a cycle takes about an hour
 at 1,754 DIDs and grows linearly with the population; it reaches the relay's
-24-hour bound near 45,000 DIDs, past which relays begin reading the sender's
+24-hour bound near 46,000 DIDs (fewer with outage slack), past which relays begin reading the sender's
 PDS directly for the lapsed ones. Each refreshed DID costs
 two subrequests for the head `rev` (DID document, then commit) plus its KV
 reads and writes, and a DID whose head advanced costs several more (a record

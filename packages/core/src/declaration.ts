@@ -81,9 +81,10 @@ export interface SnapshotDeclarationDeps {
      * the snapshot's, the snapshot stands; if it differs or the record is
      * gone, the snapshot is out of date and the sender is not found until the
      * monitor catches up. A failed read falls back to the older snapshot
-     * rather than refusing the sender; omitted, an old snapshot is accepted.
+     * rather than refusing the sender. A definite answer is remembered for
+     * `SIGNING_KEY_TTL_MS`, so puts naming a lapsed DID do not each cost a read.
      */
-    fetchDirect?: (did: string) => Promise<Uint8Array>
+    fetchDirect: (did: string) => Promise<Uint8Array>
 }
 
 /**
@@ -101,6 +102,10 @@ export interface SnapshotDeclarationDeps {
 export function snapshotDeclarationResolver(
     deps: SnapshotDeclarationDeps
 ): (senderDID: string) => Promise<SenderDeclarationResolution> {
+    // Per isolate, bounded: a repeated or forged put naming a lapsed DID must
+    // not become a read of its PDS each time.
+    const verdicts = new Map<string, { cid: string | null; atMs: number }>()
+    const DIRECT_VERDICTS_MAX = 1024
     return async (senderDID) => {
         const snapshot = await deps.getSnapshot(senderDID)
         if (!snapshot) return { found: false, reason: "no snapshot held" }
@@ -122,24 +127,33 @@ export function snapshotDeclarationResolver(
             return { found: false, reason: `snapshot did not verify: ${String(error)}` }
         }
 
-        if (
-            deps.fetchDirect !== undefined &&
-            !(deps.nowMs() - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)
-        ) {
+        const now = deps.nowMs()
+        if (!(now - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)) {
             let current: string | null | undefined
-            try {
-                // Not verified: only its record CID is compared, and block
-                // hashes are still checked while reading it.
-                current =
-                    readRecordFromCar(
-                        await deps.fetchDirect(senderDID),
-                        DECLARATION_COLLECTION_NSID,
-                        "self"
-                    )?.cid ?? null
-            } catch (error) {
-                // Gone at the source is an answer; anything else (unreachable,
-                // malformed) says nothing about the snapshot.
-                current = error instanceof RecordNotFoundError ? null : undefined
+            const remembered = verdicts.get(senderDID)
+            if (remembered !== undefined && now - remembered.atMs < SIGNING_KEY_TTL_MS) {
+                current = remembered.cid
+            } else {
+                try {
+                    // Not verified: only its record CID is compared, and block
+                    // hashes are still checked while reading it.
+                    current =
+                        readRecordFromCar(
+                            await deps.fetchDirect(senderDID),
+                            DECLARATION_COLLECTION_NSID,
+                            "self"
+                        )?.cid ?? null
+                } catch (error) {
+                    // Gone at the source is an answer; anything else
+                    // (unreachable, malformed) says nothing about the snapshot.
+                    current = error instanceof RecordNotFoundError ? null : undefined
+                }
+                if (current !== undefined) {
+                    if (verdicts.size >= DIRECT_VERDICTS_MAX) {
+                        verdicts.delete(verdicts.keys().next().value!)
+                    }
+                    verdicts.set(senderDID, { cid: current, atMs: now })
+                }
             }
             if (current !== undefined && current !== verified.cid) {
                 return { found: false, reason: "snapshot is out of date" }
@@ -273,6 +287,7 @@ import {
     guardedFetchJSON,
     RecordNotFoundError,
     resolvePDSEndpoint,
+    SIGNING_KEY_TTL_MS,
 } from "./atproto-fetch"
 
 /**

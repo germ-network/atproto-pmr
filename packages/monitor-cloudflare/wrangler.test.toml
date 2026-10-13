@@ -38,8 +38,8 @@ BACKFILL_RELAY_URL = "https://relay.invalid"
 BACKFILL_BATCH = "100"
 
 # Snapshot refresh: how many held snapshots each alarm re-confirms, and how
-# stale one must be to be due. The relay treats a snapshot older than its
-# age cutoff as unknown, so these must keep every DID confirmed well inside it.
+# stale one must be to be due. Past the relay's 24 h bound a lapsed snapshot is
+# checked against the sender's PDS on puts naming it; these keep that rare.
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
 
