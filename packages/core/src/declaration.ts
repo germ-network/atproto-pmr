@@ -1,4 +1,5 @@
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
+import { verifyRecordProof, type VerifiedRecord } from "./repo-proof"
 
 /**
  * Resolves a sender DID to its declared anchor key, for pair-put sender
@@ -66,6 +67,87 @@ export type DeclarationResolution =
            */
           confirmed?: boolean
       }
+
+/**
+ * What pair-put admission needs: the anchor key AND the CID of the
+ * declaration record it came from, so the delivery hint can name exactly the
+ * declaration the relay verified against. Kept distinct from
+ * `DeclarationResolution` so the PDS resolver cannot be wired into pair put.
+ */
+export type SenderDeclarationResolution =
+    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string }
+    | { found: false; reason: string }
+
+/** A third party's stored proof of a DID's declaration. */
+export interface DeclarationSnapshot {
+    /** The single-record proof CAR (`com.atproto.sync.getRecord`). */
+    car: Uint8Array
+    /** When the holder last confirmed this CAR is still the repo's current view. */
+    freshAtMs: number
+}
+
+/** A snapshot older than this is treated as unknown. */
+export const SNAPSHOT_MAX_AGE_MS = 6 * 60 * 60 * 1000
+
+export interface SnapshotDeclarationDeps {
+    /** Null if none is held. A thrown error is a relay fault and propagates. */
+    getSnapshot: (did: string) => Promise<DeclarationSnapshot | null>
+    /** The DID document's `#atproto` multikey, or null. Never contacts the PDS. */
+    resolveSigningKey: (did: string) => Promise<string | null>
+    nowMs: () => number
+}
+
+/**
+ * Resolves a sender's declaration from a third-party snapshot (the monitor's
+ * stored CAR), verified against the DID document's signing key. Never
+ * fetches inline on a miss: that would tell the sender's PDS when they send.
+ *
+ * `SenderDeclarationResolution` is a distinct type from
+ * `DeclarationResolution` to guard against accidental wiring of the PDS
+ * resolver into pair put; it does not stop a wrapper from fabricating a
+ * `declarationCID`.
+ */
+export function snapshotDeclarationResolver(
+    deps: SnapshotDeclarationDeps
+): (senderDID: string) => Promise<SenderDeclarationResolution> {
+    return async (senderDID) => {
+        const snapshot = await deps.getSnapshot(senderDID)
+        if (!snapshot) return { found: false, reason: "no snapshot held" }
+        if (!(deps.nowMs() - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)) {
+            return { found: false, reason: "snapshot is stale" }
+        }
+        const signingKey = await deps.resolveSigningKey(senderDID)
+        if (!signingKey) return { found: false, reason: "no signing key" }
+
+        let verified: VerifiedRecord
+        try {
+            verified = verifyRecordProof(snapshot.car, {
+                did: senderDID,
+                signingKey,
+                collection: DECLARATION_COLLECTION_NSID,
+                rkey: "self",
+            })
+        } catch (error) {
+            return { found: false, reason: `snapshot did not verify: ${String(error)}` }
+        }
+
+        const currentKey = (verified.record as { currentKey?: unknown } | null)
+            ?.currentKey
+        if (!(currentKey instanceof Uint8Array)) {
+            return { found: false, reason: "declaration has no currentKey bytes" }
+        }
+        try {
+            const frozen = parseFrozenAnchorKeyField(currentKey)
+            return {
+                found: true,
+                anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
+                declarationCID: verified.cid,
+            }
+        } catch (error) {
+            return { found: false, reason: `malformed currentKey: ${String(error)}` }
+        }
+    }
+}
 
 /**
  * The germ declaration's anchor-key field: NOT COSE. One field —

@@ -11,18 +11,12 @@ import {
     type CachedSigningKey,
     type SigningKeyCache,
 } from "../src/atproto-fetch"
-
-describe("snapshotDeclarationResolver", () => {
-    it.todo("resolves the anchor key and the declaration record CID from a verified snapshot CAR")
-    it.todo("never contacts the sender's PDS: a fetch double that throws on any non-directory host is never hit")
-    it.todo("no snapshot for the DID → found: false, without fetching anything inline")
-    it.todo("a snapshot whose freshAtMs is older than SNAPSHOT_MAX_AGE_MS → found: false")
-    it.todo("a getSnapshot fault propagates rather than resolving found: false")
-    it.todo("snapshot fails verification under the DID's signing key → found: false")
-    it.todo("no #atproto signing key in the DID document → found: false")
-    it.todo("record present but currentKey missing or not alg byte 2 → found: false")
-    it.todo("record-absent proof → found: false")
-})
+import {
+    SNAPSHOT_MAX_AGE_MS,
+    snapshotDeclarationResolver,
+    type DeclarationSnapshot,
+} from "../src/declaration"
+import { buildRepoCar, makeKey, type TestKey } from "./fixtures/repo-car"
 
 const PLC_DID = "did:plc:alice1234567890123456789012"
 const WEB_DID = "did:web:example.com"
@@ -188,5 +182,141 @@ describe("cachedSigningKeyResolver", () => {
             nowMs: () => 1,
         })
         expect(await resolve(PLC_DID)).toBe(KEY_A)
+    })
+})
+
+describe("snapshotDeclarationResolver", () => {
+    const NOW = 10_000_000_000
+    const ANCHOR = Uint8Array.from({ length: 32 }, (_, i) => i + 1)
+    const DECL_PATH = "com.germnetwork.declaration/self"
+    const declaration = (currentKey: unknown) => ({
+        $type: "com.germnetwork.declaration",
+        version: "1.1.0",
+        currentKey,
+    })
+
+    function setup(
+        options: {
+            did?: string
+            record?: unknown
+            commitDid?: string
+            key?: TestKey
+            signWith?: TestKey
+            records?: Record<string, unknown>
+            freshAtMs?: number
+            snapshot?: "none"
+            signingKey?: string | null
+        } = {}
+    ) {
+        const did = options.did ?? PLC_DID
+        const key = options.key ?? makeKey()
+        const repo = buildRepoCar({
+            did,
+            commitDid: options.commitDid,
+            key,
+            signWith: options.signWith,
+            records: options.records ?? {
+                [DECL_PATH]: options.record ?? declaration(Uint8Array.of(2, ...ANCHOR)),
+            },
+        })
+        const snapshot: DeclarationSnapshot | null =
+            options.snapshot === "none"
+                ? null
+                : { car: repo.car, freshAtMs: options.freshAtMs ?? NOW }
+        const dir = directoryFetch({
+            [did === WEB_DID ? WEB_URL : PLC_URL]: didDoc(
+                did,
+                options.signingKey === undefined ? key.multikey : options.signingKey
+            ),
+        })
+        const resolve = snapshotDeclarationResolver({
+            getSnapshot: async () => snapshot,
+            resolveSigningKey: cachedSigningKeyResolver({
+                fetchImpl: dir.fetchImpl,
+                cache: { get: async () => null, put: async () => {} },
+                nowMs: () => NOW,
+            }),
+            nowMs: () => NOW,
+        })
+        return { resolve, repo, urls: dir.urls }
+    }
+
+    it("resolves the anchor key and the declaration record CID from a verified snapshot CAR", async () => {
+        const t = setup()
+        const out = await t.resolve(PLC_DID)
+        expect(out).toMatchObject({
+            found: true,
+            declarationCID: t.repo.recordCids[DECL_PATH],
+        })
+        if (out.found) expect(Array.from(out.anchorKey.x)).toEqual(Array.from(ANCHOR))
+    })
+
+    it("never contacts the sender's PDS: a fetch double that throws on any non-directory host is never hit", async () => {
+        const t = setup()
+        await t.resolve(PLC_DID)
+        expect(t.urls).toEqual([PLC_URL])
+        const web = setup({ did: WEB_DID })
+        expect(await web.resolve(WEB_DID)).toMatchObject({ found: true })
+        expect(web.urls).toEqual([WEB_URL])
+    })
+
+    it("a snapshot CAR committed by a different DID → found: false", async () => {
+        const t = setup({ commitDid: "did:plc:other00000000000000000000" })
+        expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
+    })
+
+    it("no snapshot for the DID → found: false, without fetching anything inline", async () => {
+        const t = setup({ snapshot: "none" })
+        expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
+        expect(t.urls).toEqual([])
+    })
+
+    it("a snapshot whose freshAtMs is older than SNAPSHOT_MAX_AGE_MS → found: false", async () => {
+        const edge = setup({ freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS })
+        expect(await edge.resolve(PLC_DID)).toMatchObject({ found: true })
+        const stale = setup({ freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS - 1 })
+        expect(await stale.resolve(PLC_DID)).toMatchObject({ found: false })
+        expect(stale.urls).toEqual([])
+    })
+
+    it("a getSnapshot fault propagates rather than resolving found: false", async () => {
+        const resolve = snapshotDeclarationResolver({
+            getSnapshot: async () => {
+                throw new Error("kv down")
+            },
+            resolveSigningKey: async () => KEY_A,
+            nowMs: () => NOW,
+        })
+        await expect(resolve(PLC_DID)).rejects.toThrow("kv down")
+    })
+
+    it("snapshot fails verification under the DID's signing key → found: false", async () => {
+        expect(await setup({ signWith: makeKey() }).resolve(PLC_DID)).toMatchObject({ found: false })
+        // A DID document key that differs from the one that signed the CAR.
+        expect(await setup({ signingKey: makeKey().multikey }).resolve(PLC_DID)).toMatchObject({
+            found: false,
+        })
+    })
+
+    it("no #atproto signing key in the DID document → found: false", async () => {
+        expect(await setup({ signingKey: null }).resolve(PLC_DID)).toMatchObject({ found: false })
+    })
+
+    it("record present but currentKey missing or not alg byte 2 → found: false", async () => {
+        for (const record of [
+            { $type: "com.germnetwork.declaration", version: "1.1.0" },
+            declaration("text"),
+            declaration({ $bytes: "AgECAw" }),
+            declaration(Uint8Array.of(1, ...ANCHOR)),
+            declaration(Uint8Array.of(2, ...ANCHOR.subarray(1))),
+        ]) {
+            const t = setup({ record })
+            expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
+        }
+    })
+
+    it("record-absent proof → found: false", async () => {
+        const t = setup({ records: { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } } })
+        expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
     })
 })
