@@ -1,5 +1,5 @@
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
-import { readRecordFromCar, verifyRecordProof, type VerifiedRecord } from "./repo-proof"
+import { snapshotRecordReader, type RecordSnapshot } from "./snapshot-read"
 
 /**
  * Declaration resolution, in two deliberately separate shapes.
@@ -52,21 +52,7 @@ export type SenderDeclarationResolution =
     | { found: false; reason: string }
 
 /** A third party's stored proof of a DID's declaration. */
-export interface DeclarationSnapshot {
-    /** The single-record proof CAR (`com.atproto.sync.getRecord`). */
-    car: Uint8Array
-    /** When the holder last confirmed this CAR is still the repo's current view. */
-    freshAtMs: number
-}
-
-/**
- * A snapshot not confirmed for this long is checked directly against the
- * sender's PDS (when the deployment supplies `fetchDirect`) to see whether it
- * has changed. Generous on purpose: the monitor's refresh keeps snapshots far
- * fresher than this in normal operation, so reaching it means the monitor has
- * fallen behind.
- */
-export const SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000
+export type DeclarationSnapshot = RecordSnapshot
 
 export interface SnapshotDeclarationDeps {
     /** Null if none is held. A thrown error is a relay fault and propagates. */
@@ -74,25 +60,14 @@ export interface SnapshotDeclarationDeps {
     /** The DID document's `#atproto` multikey, or null. Never contacts the PDS. */
     resolveSigningKey: (did: string) => Promise<string | null>
     nowMs: () => number
-    /**
-     * Reads the sender's declaration proof CAR straight from its PDS, used
-     * only for a snapshot older than `SNAPSHOT_MAX_AGE_MS`, and only to
-     * compare: the PDS is not trusted for the value. If its record CID equals
-     * the snapshot's, the snapshot stands; if it differs or the record is
-     * gone, the snapshot is out of date and the sender is not found until the
-     * monitor catches up. A failed read falls back to the older snapshot
-     * rather than refusing the sender. A definite answer is remembered for
-     * `SIGNING_KEY_TTL_MS`, so puts naming a lapsed DID do not each cost a read.
-     */
-    fetchDirect: (did: string) => Promise<Uint8Array>
+    /** As `SnapshotRecordReaderDeps.fetchDirect`; called for the declaration's own path. */
+    fetchDirect: (did: string, collection: string, rkey: string) => Promise<Uint8Array>
 }
 
 /**
  * Resolves a sender's declaration from a third-party snapshot (the monitor's
- * stored CAR), verified against the DID document's signing key. A miss is
- * never fetched inline: that would tell the sender's PDS when they send. Only
- * a held snapshot that has gone unconfirmed past `SNAPSHOT_MAX_AGE_MS`
- * triggers a direct read, to see whether it is still the current record.
+ * stored CAR), verified against the DID document's signing key, through the
+ * generic `snapshotRecordReader` (which holds the 24 h rule and its memo).
  *
  * `SenderDeclarationResolution` is a distinct type from
  * `DeclarationResolution` to guard against accidental wiring of the PDS
@@ -102,65 +77,19 @@ export interface SnapshotDeclarationDeps {
 export function snapshotDeclarationResolver(
     deps: SnapshotDeclarationDeps
 ): (senderDID: string) => Promise<SenderDeclarationResolution> {
-    // Per isolate, bounded: a repeated or forged put naming a lapsed DID must
-    // not become a read of its PDS each time.
-    const verdicts = new Map<string, { cid: string | null; atMs: number }>()
-    const DIRECT_VERDICTS_MAX = 1024
+    const read = snapshotRecordReader({
+        collection: DECLARATION_COLLECTION_NSID,
+        rkey: "self",
+        getSnapshot: deps.getSnapshot,
+        resolveSigningKey: deps.resolveSigningKey,
+        nowMs: deps.nowMs,
+        fetchDirect: deps.fetchDirect,
+    })
     return async (senderDID) => {
-        const snapshot = await deps.getSnapshot(senderDID)
-        if (!snapshot) return { found: false, reason: "no snapshot held" }
-        const signingKey = await deps.resolveSigningKey(senderDID)
-        if (!signingKey) return { found: false, reason: "no signing key" }
+        const result = await read(senderDID)
+        if (!result.found) return result
 
-        const verify = (car: Uint8Array) =>
-            verifyRecordProof(car, {
-                did: senderDID,
-                signingKey,
-                collection: DECLARATION_COLLECTION_NSID,
-                rkey: "self",
-            })
-
-        let verified: VerifiedRecord
-        try {
-            verified = verify(snapshot.car)
-        } catch (error) {
-            return { found: false, reason: `snapshot did not verify: ${String(error)}` }
-        }
-
-        const now = deps.nowMs()
-        if (!(now - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)) {
-            let current: string | null | undefined
-            const remembered = verdicts.get(senderDID)
-            if (remembered !== undefined && now - remembered.atMs < SIGNING_KEY_TTL_MS) {
-                current = remembered.cid
-            } else {
-                try {
-                    // Not verified: only its record CID is compared, and block
-                    // hashes are still checked while reading it.
-                    current =
-                        readRecordFromCar(
-                            await deps.fetchDirect(senderDID),
-                            DECLARATION_COLLECTION_NSID,
-                            "self"
-                        )?.cid ?? null
-                } catch (error) {
-                    // Gone at the source is an answer; anything else
-                    // (unreachable, malformed) says nothing about the snapshot.
-                    current = error instanceof RecordNotFoundError ? null : undefined
-                }
-                if (current !== undefined) {
-                    if (verdicts.size >= DIRECT_VERDICTS_MAX) {
-                        verdicts.delete(verdicts.keys().next().value!)
-                    }
-                    verdicts.set(senderDID, { cid: current, atMs: now })
-                }
-            }
-            if (current !== undefined && current !== verified.cid) {
-                return { found: false, reason: "snapshot is out of date" }
-            }
-        }
-
-        const currentKey = (verified.record as { currentKey?: unknown } | null)
+        const currentKey = (result.record as { currentKey?: unknown } | null)
             ?.currentKey
         if (!(currentKey instanceof Uint8Array)) {
             return { found: false, reason: "declaration has no currentKey bytes" }
@@ -170,7 +99,7 @@ export function snapshotDeclarationResolver(
             return {
                 found: true,
                 anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
-                declarationCID: verified.cid,
+                declarationCID: result.cid,
             }
         } catch (error) {
             return { found: false, reason: `malformed currentKey: ${String(error)}` }
@@ -287,7 +216,6 @@ import {
     guardedFetchJSON,
     RecordNotFoundError,
     resolvePDSEndpoint,
-    SIGNING_KEY_TTL_MS,
 } from "./atproto-fetch"
 
 /**

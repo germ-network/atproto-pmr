@@ -214,7 +214,7 @@ describe("snapshotDeclarationResolver", () => {
             freshAtMs?: number
             snapshot?: "none"
             signingKey?: string | null
-            fetchDirect?: (did: string) => Promise<Uint8Array>
+            fetchDirect?: (did: string, collection: string, rkey: string) => Promise<Uint8Array>
         } = {}
     ) {
         const did = options.did ?? PLC_DID
@@ -281,122 +281,36 @@ describe("snapshotDeclarationResolver", () => {
         expect(t.urls).toEqual([])
     })
 
-    describe("a snapshot older than SNAPSHOT_MAX_AGE_MS", () => {
+    describe("the 24 h rule is held by one reader per resolver", () => {
         const OLD = NOW - SNAPSHOT_MAX_AGE_MS - 1
-        const sameKey = makeKey()
-        const carWith = (n: number, signWith?: TestKey) =>
-            buildRepoCar({
+
+        it("hands fetchDirect the declaration's own collection and rkey", async () => {
+            let car: Uint8Array = new Uint8Array()
+            const direct = vi.fn(async (_did: string, _collection: string, _rkey: string) => car)
+            const t = setup({ freshAtMs: OLD, fetchDirect: direct })
+            car = t.repo.car
+            await t.resolve(PLC_DID)
+            expect(direct).toHaveBeenCalledWith(PLC_DID, "com.germnetwork.declaration", "self")
+        })
+
+        it("keeps the memo across calls, so a lapsed sender's puts do not each read the PDS", async () => {
+            let car: Uint8Array = new Uint8Array()
+            const direct = vi.fn(async () => car)
+            const t = setup({ freshAtMs: OLD, fetchDirect: direct })
+            car = t.repo.car
+            await t.resolve(PLC_DID)
+            await t.resolve(PLC_DID)
+            expect(direct).toHaveBeenCalledTimes(1)
+        })
+
+        it("a lapsed snapshot whose record changed is not found", async () => {
+            const changed = buildRepoCar({
                 did: PLC_DID,
-                key: sameKey,
-                signWith,
                 rev: "3kbbbbbbbbbbb",
-                records: { [DECL_PATH]: declaration(Uint8Array.of(3, ...ANCHOR.map((b) => b + n))) },
+                records: { [DECL_PATH]: declaration(Uint8Array.of(3, ...ANCHOR.map((b) => b + 1))) },
             })
-
-        it("stands when the source's record CID is unchanged, and the source's CAR is never verified or adopted", async () => {
-            // Same record, but signed by the wrong key: only the CID is compared.
-            const direct = vi.fn(async () =>
-                buildRepoCar({
-                    did: PLC_DID,
-                    key: sameKey,
-                    signWith: makeKey(),
-                    rev: "3kbbbbbbbbbbb",
-                    records: { [DECL_PATH]: declaration(Uint8Array.of(3, ...ANCHOR)) },
-                }).car
-            )
-            const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: direct })
-            expect(await t.resolve(PLC_DID)).toMatchObject({
-                found: true,
-                declarationCID: t.repo.recordCids[DECL_PATH],
-            })
-            expect(direct).toHaveBeenCalledTimes(1)
-        })
-
-        it("remembers a definite answer, so repeated puts do not each read the PDS", async () => {
-            const direct = vi.fn(async () => carWith(1).car)
-            const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: direct })
-            await t.resolve(PLC_DID)
-            await t.resolve(PLC_DID)
-            expect(direct).toHaveBeenCalledTimes(1)
-            const down = vi.fn(async () => {
-                throw new Error("pds down")
-            })
-            const u = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: down })
-            await u.resolve(PLC_DID)
-            await u.resolve(PLC_DID)
-            expect(down).toHaveBeenCalledTimes(2)
-        })
-
-        it("re-reads once the remembered answer is older than SIGNING_KEY_TTL_MS", async () => {
-            const repo = carWith(0)
-            let now = NOW
-            const direct = vi.fn(async () => repo.car)
-            const resolve = snapshotDeclarationResolver({
-                getSnapshot: async () => ({ car: repo.car, freshAtMs: OLD }),
-                resolveSigningKey: async () => sameKey.multikey,
-                nowMs: () => now,
-                fetchDirect: direct,
-            })
-            await resolve(PLC_DID)
-            now += SIGNING_KEY_TTL_MS - 1
-            await resolve(PLC_DID)
-            expect(direct).toHaveBeenCalledTimes(1)
-            now += 1
-            await resolve(PLC_DID)
-            expect(direct).toHaveBeenCalledTimes(2)
-        })
-
-        it("is not read when the snapshot itself does not verify", async () => {
-            const direct = vi.fn(async () => carWith(1).car)
-            await setup({ freshAtMs: OLD, signingKey: makeKey().multikey, fetchDirect: direct }).resolve(PLC_DID)
-            expect(direct).not.toHaveBeenCalled()
-        })
-
-        it("is not found when the source's record differs: the snapshot is out of date, and the source's value is not adopted", async () => {
-            const changed = carWith(1)
-            const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect: async () => changed.car })
+            const t = setup({ freshAtMs: OLD, fetchDirect: async () => changed.car })
             expect(await t.resolve(PLC_DID)).toMatchObject({ found: false })
-        })
-
-        it("is not found when the source says the declaration is gone", async () => {
-            const absent = buildRepoCar({
-                did: PLC_DID,
-                key: sameKey,
-                records: { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } },
-            })
-            expect(
-                await setup({ key: sameKey, freshAtMs: OLD, fetchDirect: async () => absent.car }).resolve(PLC_DID)
-            ).toMatchObject({ found: false })
-            const gone = setup({
-                key: sameKey,
-                freshAtMs: OLD,
-                fetchDirect: async () => {
-                    throw new RecordNotFoundError("deactivated", false)
-                },
-            })
-            expect(await gone.resolve(PLC_DID)).toMatchObject({ found: false })
-        })
-
-        it("falls back to the older snapshot when the direct read fails or is malformed", async () => {
-            for (const fetchDirect of [
-                async () => {
-                    throw new Error("pds down")
-                },
-                async () => Uint8Array.of(1, 2, 3),
-            ]) {
-                const t = setup({ key: sameKey, freshAtMs: OLD, fetchDirect })
-                expect(await t.resolve(PLC_DID)).toMatchObject({
-                    found: true,
-                    declarationCID: t.repo.recordCids[DECL_PATH],
-                })
-            }
-        })
-
-        it("is not read directly at exactly the age bound, and a fresh one never is", async () => {
-            const direct = vi.fn(async () => carWith(1).car)
-            await setup({ key: sameKey, freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS, fetchDirect: direct }).resolve(PLC_DID)
-            await setup({ key: sameKey, freshAtMs: NOW, fetchDirect: direct }).resolve(PLC_DID)
-            expect(direct).not.toHaveBeenCalled()
         })
     })
 

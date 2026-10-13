@@ -134,6 +134,7 @@ fingerprint an attacker can test a relay against. See
 | [`storage-consistency.md`](storage-consistency.md) | the **storage consistency contract** an implementation must satisfy, stated backend-neutrally, plus the operation inventory the relay's logic runs against |
 | [`trust-model.md`](trust-model.md) | the **security properties** an implementation must preserve, what a relay necessarily learns, and what a malicious one can do |
 | [`key-transparency.md`](key-transparency.md) | the **key monitor** — key transparency for atproto messaging: the CT-shaped trust structure, the monitor's surfaces (own-DID push, domain deltas, the change digest, the community-view fetch), and the append-only-ledger enhancement |
+| [`proxy-cache.md`](proxy-cache.md) | the **intended** model of a PMR as a verified cache of the records and DID documents of the DIDs it serves — marked, element by element, built or not yet built |
 
 ## Dependencies on a non-atproto record format
 

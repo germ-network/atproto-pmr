@@ -208,7 +208,6 @@ export {
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,
-    SNAPSHOT_MAX_AGE_MS,
     type DeclarationSnapshot,
     type DeclarationResolution,
     type SenderDeclarationResolution,
@@ -282,3 +281,12 @@ export {
     type RecordProofExpectation,
     type VerifiedRecord,
 } from "./repo-proof"
+
+// A verified read of one record from a third party's snapshot (24 h rule included).
+export {
+    snapshotRecordReader,
+    SNAPSHOT_MAX_AGE_MS,
+    type RecordSnapshot,
+    type SnapshotRecordRead,
+    type SnapshotRecordReaderDeps,
+} from "./snapshot-read"
