@@ -185,7 +185,7 @@ export function decodePairPutEnvelope(bytes: Uint8Array): {
 
 export type VerifyOutcome =
     | { valid: true }
-    | { valid: false; reason: string }
+    | { valid: false; code: "signature" | "recipient"; reason: string }
 
 /**
  * The verification algorithm (wire-api.md §The pair-put payload). Four
@@ -219,7 +219,11 @@ export function verifyPairPut(
         zip215: false,
     })
     if (!ok) {
-        return { valid: false, reason: "signature verification failed" }
+        return {
+            valid: false,
+            code: "signature",
+            reason: "signature verification failed",
+        }
     }
 
     // Step 4 (recipient half): binds this message to its destination, so a
@@ -228,7 +232,11 @@ export function verifyPairPut(
     // that would otherwise carry this dies at the relay; only the payload's
     // own signature is durable).
     if (envelope.payload.recipientDID !== thisRecipientDID) {
-        return { valid: false, reason: "recipient DID mismatch" }
+        return {
+            valid: false,
+            code: "recipient",
+            reason: "recipient DID mismatch",
+        }
     }
 
     return { valid: true }
