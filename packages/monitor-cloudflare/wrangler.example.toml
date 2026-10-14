@@ -6,8 +6,9 @@ main = "src/worker.ts"
 compatibility_date = "2026-07-01"
 
 # THE INGEST OBJECT IS A SINGLETON. Address it by a fixed name — one
-# stream, one cursor, one rev index for the whole coverage. Addressing it
-# per user would open one socket per user and interleave writers.
+# Jetstream stream (and the optional PLC export stream), each with its own
+# cursor, and one rev index for the whole coverage. Addressing it per user
+# would open sockets per user and interleave writers.
 [durable_objects]
 bindings = [{ name = "ingest", class_name = "MonitorIngest" }]
 

@@ -20,10 +20,10 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     records: KVNamespace
 
     /**
-     * **A singleton.** One socket, one cursor, one `rev` index for the
-     * whole coverage. Address it by a fixed name, never per user: the
-     * consumer is network-wide where a relay's objects are per
-     * registration.
+     * **A singleton.** One Jetstream socket and cursor (plus the optional
+     * PLC export socket and cursor), one `rev` index for the whole
+     * coverage. Address it by a fixed name, never per user: the consumer is
+     * network-wide where a relay's objects are per registration.
      */
     ingest: DurableObjectNamespace<TIngest>
 

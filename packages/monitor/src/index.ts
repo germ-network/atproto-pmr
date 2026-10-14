@@ -14,6 +14,10 @@
  * several independent parties can run one, the property the redundancy
  * model depends on.
  *
+ * It can also keep a relay's cached did:plc signing keys current from the
+ * PLC directory's export stream (`decodePlcExportFrame`, `intakePlcEvent`,
+ * `drainKeyUpdates`; `spec/key-transparency.md`, "The signing-key cache").
+ *
  * The specification is in `spec/key-transparency.md`. Where this code and
  * the specification disagree, the specification is right and this is a bug.
  */

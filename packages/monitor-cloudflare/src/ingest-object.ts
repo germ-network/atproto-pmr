@@ -82,7 +82,8 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  *
  * **A singleton.** Address it by a fixed name. A relay's objects are per
  * registration; this one is per *network*, because there is one stream and
- * one cursor into it.
+ * one cursor into it. With `PLC_EXPORT_STREAM_URL` set it also holds the
+ * PLC directory's export stream, with its own cursor.
  *
  * An outbound WebSocket does not hibernate — the Hibernation API covers
  * incoming sockets — so this object stays resident while connected and is
