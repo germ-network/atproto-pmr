@@ -2047,7 +2047,8 @@ export class MonitorIngest
      * An ignored event is still accounted for, or a resume would replay every
      * one of them. Written at most once per `IGNORED_CURSOR_PERSIST_MS`, and
      * only ever raised, so it can neither cost a write per event nor move the
-     * cursor behind an event already accepted.
+     * cursor behind an event already accepted. Frames are handled without
+     * awaiting one another, so this relies on the stored cursor's own guard.
      */
     private advanceIgnoredCursor(cursor: string): void {
         const nowMs = Date.now()

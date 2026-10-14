@@ -1350,6 +1350,15 @@ describe("declaration intake by policy", () => {
                 const other = uniqDid()
                 await onFrame(obj, frame(other, "3m6", 8_000_000))
                 expect(await cursor(obj)).toBe("9000000")
+                // Identity events for a DID not followed are ignored events too.
+                now += 6_000
+                await onFrame(
+                    obj,
+                    JSON.stringify({
+                        payload: { $type: "com.atproto.sync.subscribeRepos#identity", did: other, time_us: 11_000_000 },
+                    })
+                )
+                expect(await cursor(obj)).toBe("11000000")
             })
         } finally {
             clock.mockRestore()
