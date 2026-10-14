@@ -248,13 +248,14 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                                 `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1 AND ${flagMoved}`
                         )
                         .bind(...didBind.slice(0, 4)),
-                    // A prune takes the DID's own edges away; a DID no longer served
-                    // already has its served-remove row.
+                    // A prune takes the DID's own edges away: holder subjects read their
+                    // followers differently, unless the fan-out above already said so.
+                    // A DID no longer served already has its served-remove row.
                     db
                         .prepare(
                             CHANGE +
                                 "SELECT DISTINCT f.subject, 'followers', ?2 FROM follows f " +
-                                `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1 AND ${pruning}`
+                                `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1 AND ${pruning} AND NOT ${flagMoved}`
                         )
                         .bind(...didBind),
                     db

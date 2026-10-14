@@ -47,8 +47,12 @@ export interface GraphMirrorDeps {
  * mirrored. A DID whose graph stops being served, or that leaves interest,
  * has its edges pruned in that batch. Returns how many were mirrored.
  */
-export async function mirrorGraph(_deps: GraphMirrorDeps, _limit: number): Promise<number> {
-    throw new Error("not implemented")
+export async function mirrorGraph(deps: GraphMirrorDeps, limit: number): Promise<number> {
+    const transitions = await deps.index.dueMirror(limit)
+    if (transitions.length === 0) return 0
+    await deps.edges.mirror(transitions)
+    await deps.index.markMirrored(transitions.map((t) => t.now))
+    return transitions.length
 }
 
 /** Where the daily reconcile resumes: which side it is paging, and after which DID. */
@@ -66,11 +70,45 @@ export interface MirrorReconcileCursor {
  * one, or null once the pass is done.
  */
 export async function reconcileGraphMirror(
-    _deps: GraphMirrorDeps,
-    _cursor: MirrorReconcileCursor | null,
-    _limit: number
+    deps: GraphMirrorDeps,
+    cursor: MirrorReconcileCursor | null,
+    limit: number
 ): Promise<MirrorReconcileCursor | null> {
-    throw new Error("not implemented")
+    const at = cursor ?? { side: "single-writer" as const, after: null }
+    const transitions: GraphMirrorTransition[] = []
+    let next: MirrorReconcileCursor | null
+    if (at.side === "single-writer") {
+        const page = await deps.index.mirroredPage(at.after, limit)
+        const held = await deps.edges.mirroredOf(page.rows.map((r) => r.did))
+        for (const recorded of page.rows) {
+            const actual = held.get(recorded.did) ?? null
+            if (actual === null || !sameStanding(actual, recorded)) {
+                transitions.push({ now: await deps.index.standingOf(recorded.did), mirrored: actual })
+            }
+        }
+        next = { side: page.cursor === null ? "d1" : "single-writer", after: page.cursor }
+    } else {
+        const page = await deps.edges.listMirrored(at.after, limit)
+        for (const actual of page.rows) {
+            const now = await deps.index.standingOf(actual.did)
+            if (!sameStanding(actual, now)) transitions.push({ now, mirrored: actual })
+        }
+        next = page.cursor === null ? null : { side: "d1", after: page.cursor }
+    }
+    if (transitions.length > 0) {
+        await deps.edges.mirror(transitions)
+        await deps.index.markMirrored(transitions.map((t) => t.now))
+    }
+    return next
+}
+
+function sameStanding(a: GraphMirrorRow, b: GraphMirrorRow): boolean {
+    return (
+        a.owner === b.owner &&
+        a.holder === b.holder &&
+        a.member === b.member &&
+        a.registered === b.registered
+    )
 }
 
 /**
@@ -78,9 +116,9 @@ export async function reconcileGraphMirror(
  * returns how many, so a large backlog is pruned across alarms.
  */
 export async function pruneGraphChanges(
-    _deps: { edges: Pick<FollowEdgeWriter, "pruneChanges">; nowMs(): number },
-    _limit: number,
-    _retentionMs: number = GRAPH_CHANGE_RETENTION_MS
+    deps: { edges: Pick<FollowEdgeWriter, "pruneChanges">; nowMs(): number },
+    limit: number,
+    retentionMs: number = GRAPH_CHANGE_RETENTION_MS
 ): Promise<number> {
-    throw new Error("not implemented")
+    return deps.edges.pruneChanges(deps.nowMs() - retentionMs, limit)
 }
