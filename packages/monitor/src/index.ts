@@ -14,6 +14,10 @@
  * several independent parties can run one, the property the redundancy
  * model depends on.
  *
+ * It can also keep a relay's cached did:plc signing keys current from the
+ * PLC directory's export stream (`decodePlcExportFrame`, `intakePlcEvent`,
+ * `drainKeyUpdates`; `spec/key-transparency.md`, "The signing-key cache").
+ *
  * The specification is in `spec/key-transparency.md`. Where this code and
  * the specification disagree, the specification is right and this is a bug.
  */
@@ -38,13 +42,15 @@ export {
     type DidDocumentSink,
     type DigestMarker,
     type IntakeOutcome,
+    type KeyUpdateIndex,
     type MonitorIndex,
+    type OwedKeyUpdate,
     type Observation,
     type ObservationComparison,
     type PendingFetch,
-    type PlcCursorIndex,
     type RevComparison,
     type SnapshotEntry,
+    type SigningKeyCacheWriter,
     type SnapshotStore,
 } from "./storage"
 
@@ -106,6 +112,21 @@ export {
     type SettleOutcome,
 } from "./ingest"
 
+// The PLC directory's export stream: keeps the relay's signing-key cache and
+// the stored did:plc documents current.
+export {
+    decodePlcExportFrame,
+    drainKeyUpdates,
+    intakePlcEvent,
+    plcCursorAfterClose,
+    type DrainKeyUpdatesDeps,
+    type PlcCursorAction,
+    type PlcDocumentChange,
+    type PlcExportEvent,
+    type PlcIntakeDecision,
+    type SigningKeyUpdate,
+} from "./plc-export"
+
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
 export { sweepBackfill, type BackfillDeps, type SweepBackfillResult } from "./backfill"
@@ -119,14 +140,3 @@ export {
     type SnapshotCheck,
 } from "./refresh"
 
-// The PLC directory's export stream: keeps stored did:plc documents current.
-export {
-    decodePlcExportFrame,
-    intakePlcEvent,
-    plcCursorAfterClose,
-    type PlcCursorAction,
-    type PlcDocumentChange,
-    type PlcExportEvent,
-    type PlcIntakeDecision,
-    type PlcIntakeDeps,
-} from "./plc-export"

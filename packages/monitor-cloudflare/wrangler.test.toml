@@ -17,6 +17,7 @@ new_sqlite_classes = ["MonitorIngest"]
 [vars]
 MONITOR_COLLECTION = "com.example.declaration"
 JETSTREAM_URL = "https://jetstream.invalid/subscribe"
+PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
 WATCHDOG_INTERVAL_MS = "120000"
 SETTLE_BATCH = "32"
 # Changing this requires clearing sealed windows + sealedThrough: an
@@ -42,10 +43,6 @@ BACKFILL_BATCH = "100"
 # checked against the sender's PDS on puts naming it; these keep that rare.
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
-
-# The PLC directory's export stream (https form of wss://plc.directory/export/stream).
-# Optional; unset, the monitor opens no second socket.
-PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
 
 [[kv_namespaces]]
 	binding = "records"

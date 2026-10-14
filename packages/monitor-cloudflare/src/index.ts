@@ -25,6 +25,12 @@
  * relay's objects are per registration — which is also why a monitor
  * cannot simply be folded into a relay object, whatever the packaging.
  *
+ * Set `PLC_EXPORT_STREAM_URL` to also consume the PLC directory's export
+ * stream on a second outbound socket, keeping the relay's cached did:plc
+ * signing keys current. Both sides of that cache go through
+ * `kvSigningKeyCache(env)` (`sk:<did>` in `records`): point the relay's
+ * `cachedSigningKeyResolver` at it so the two agree on key and shape.
+ *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain
  * Worker, so the community view scales and caches like the public data it
@@ -46,4 +52,5 @@ export { kvMonitorRegistrationStore } from "./registration-store"
 export { kvSnapshotStore, kvDeclarationSnapshots } from "./snapshot-store"
 export { kvGraphProjections } from "./graph-projection-store"
 export { kvDidDocuments, kvPlcCoverage } from "./did-document-store"
+export { kvSigningKeyCache } from "./signing-key-store"
 export type { MonitorEnv } from "./env"

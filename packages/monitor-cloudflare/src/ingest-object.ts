@@ -2,10 +2,12 @@ import { DurableObject } from "cloudflare:workers"
 import {
     decodeEvent,
     decodePlcExportFrame,
+    drainKeyUpdates,
     intake,
     intakePlcEvent,
-    plcCursorAfterClose,
     listReposByCollection,
+    plcCursorAfterClose,
+    FETCH_AS_OF_SKEW_MS,
     fetchHeadRev,
     pushDeclarationChange,
     refreshDue,
@@ -13,17 +15,18 @@ import {
     settleDue,
     sweepBackfill,
     windowOf,
-    FETCH_AS_OF_SKEW_MS,
     type BackfillProgress,
-    type Cursor,
     type DidDocumentSink,
+    type Cursor,
     type FetchedRecord,
     type IngestDeps,
     type IntakeOutcome,
+    type KeyUpdateIndex,
     type MonitorIndex,
+    type OwedKeyUpdate,
     type PendingFetch,
-    type PlcCursorIndex,
     type RefreshIndex,
+    type SigningKeyUpdate,
 } from "@germ-network/atproto-pmr-monitor"
 import {
     STORED_DID_DOCUMENT_MAX_AGE_MS,
@@ -38,6 +41,7 @@ import {
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
+import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
 
 /**
@@ -48,6 +52,26 @@ import { kvSnapshotStore } from "./snapshot-store"
  * same hazard.
  */
 const CONNECT_TIMEOUT_MS = 5_000
+
+/** KV puts one alarm may spend on stored DID documents. */
+const DID_DOCUMENT_PUBLISH_BATCH = 64
+
+type PublishRow = {
+    did: string
+    document: string
+    confirmed_at: number
+    version: number
+}
+
+/** Owed key updates applied per drain. */
+const KEY_DRAIN_BATCH = 64
+
+/**
+ * Longest the PLC cursor goes unpersisted while the stream runs. A lost
+ * tail only replays ops, which is idempotent; persisting per frame would
+ * cost a write for every op the directory accepts.
+ */
+const PLC_CURSOR_PERSIST_MS = 5_000
 
 /**
  * Whether `armWatchdog` should replace the stored alarm: absent, OR
@@ -74,26 +98,14 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
     return existingAlarmAt === null || existingAlarmAt <= nowMs
 }
 
-/** How often frames may rewrite the stored cursor; the alarm writes it regardless. */
-const PLC_CURSOR_PERSIST_INTERVAL_MS = 5_000
-
-/** KV puts one alarm may spend on stored DID documents. */
-const DID_DOCUMENT_PUBLISH_BATCH = 64
-
-type PublishRow = {
-    did: string
-    document: string
-    confirmed_at: number
-    version: number
-}
-
 /**
  * The monitor's single writer: it holds the stream, and it is the only
  * thing that advances the cursor or the `rev` index.
  *
  * **A singleton.** Address it by a fixed name. A relay's objects are per
  * registration; this one is per *network*, because there is one stream and
- * one cursor into it.
+ * one cursor into it. With `PLC_EXPORT_STREAM_URL` set it also holds the
+ * PLC directory's export stream, with its own cursor.
  *
  * An outbound WebSocket does not hibernate — the Hibernation API covers
  * incoming sockets — so this object stays resident while connected and is
@@ -110,22 +122,29 @@ type PublishRow = {
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
-    implements MonitorIndex, RefreshIndex, DidDocumentSink, PlcCursorIndex
+    implements MonitorIndex, RefreshIndex, KeyUpdateIndex, DidDocumentSink
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
     private plcSocket: WebSocket | null = null
+    /**
+     * The highest export `seq` seen, shared by every path that advances the
+     * PLC cursor so a lazy flush can never write an older value over a
+     * newer one. Cleared with the stored row on reset.
+     */
+    private plcSeq: number | null = null
+    private plcPersistedAt = 0
     /** Frames and closes of the PLC socket, handled one at a time in arrival order. */
     private plcChain: Promise<void> = Promise.resolve()
-    /** The export stream's high-water mark and the start of its current unbroken run. */
-    private plcHighSeq: number | null = null
+    /** The `createdAt` high-water mark and the start of the stream's current unbroken run. */
     private plcHighCreatedAtMs: number | null = null
     private plcContinuousSinceMs: number | null = null
-    private plcPersistedAtMs = 0
     /** Whether the stored cursor row carries the current run's start. */
     private plcRunPersisted = false
     /** What `plc:coverage` last claimed in this run. */
     private plcCoveredThroughMs: number | null = null
+    private draining: Promise<void> | null = null
+    private drainAgain = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -156,11 +175,6 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     deleted_at INTEGER NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS checks (
-                    did TEXT PRIMARY KEY,
-                    checked_at INTEGER NOT NULL,
-                    attempted_at INTEGER NOT NULL DEFAULT 0
-                );
                 CREATE TABLE IF NOT EXISTS did_documents (
                     did TEXT PRIMARY KEY,
                     document TEXT NOT NULL,
@@ -170,8 +184,170 @@ export class MonitorIngest
                     published_version INTEGER,
                     published_confirmed_at INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS key_updates (
+                    did TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    key TEXT,
+                    as_of INTEGER,
+                    version INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS checks (
+                    did TEXT PRIMARY KEY,
+                    checked_at INTEGER NOT NULL,
+                    attempted_at INTEGER NOT NULL DEFAULT 0
+                );
             `)
         })
+    }
+
+    // ---- KeyUpdateIndex ---------------------------------------------------
+
+    /**
+     * The cursor is per directory host, so one stored for a different
+     * `PLC_EXPORT_STREAM_URL` reads as none, and is dropped. A cursor
+     * stored for this URL also restores the run it belongs to (so an
+     * eviction does not restart the coverage run); a live object already
+     * holds both in memory.
+     */
+    async readPlcCursor(): Promise<number | null> {
+        if (this.plcSeq !== null) return this.plcSeq
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+            .toArray()[0]
+        if (row === undefined) return null
+        try {
+            const stored = JSON.parse(row.v) as {
+                url?: unknown
+                seq?: unknown
+                continuousSinceMs?: unknown
+            }
+            if (stored.url !== this.plcUrl() || typeof stored.seq !== "number") {
+                if (this.plcUrl() !== null) await this.resetPlcCursor()
+                return null
+            }
+            this.plcSeq = stored.seq
+            if (typeof stored.continuousSinceMs === "number") {
+                this.plcContinuousSinceMs = stored.continuousSinceMs
+                this.plcRunPersisted = true
+            }
+            return stored.seq
+        } catch {
+            return null
+        }
+    }
+
+    async advancePlcCursor(seq: number, createdAtMs?: number): Promise<void> {
+        await this.readPlcCursor()
+        this.raisePlcCursor(seq, createdAtMs)
+        if (Date.now() - this.plcPersistedAt >= PLC_CURSOR_PERSIST_MS) this.persistPlcCursor()
+    }
+
+    /**
+     * Clears the stored row and the in-memory cursor together, and ends the
+     * unbroken run: the next frame's `createdAt` starts a new one.
+     */
+    async resetPlcCursor(): Promise<void> {
+        this.plcSeq = null
+        this.plcHighCreatedAtMs = null
+        this.plcContinuousSinceMs = null
+        this.plcPersistedAt = 0
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
+        this.db.sql.exec("DELETE FROM meta WHERE k = 'plc_cursor'")
+    }
+
+    async isWatched(did: string): Promise<boolean> {
+        const row = this.db.sql
+            .exec<{ n: number }>(
+                "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
+                    "OR EXISTS (SELECT 1 FROM pending WHERE did = ?1)) " +
+                    "AND NOT EXISTS (SELECT 1 FROM deleted WHERE did = ?1)",
+                did
+            )
+            .toArray()[0]
+        return row !== undefined
+    }
+
+    /** Replaces any update already owed for `did`, and bumps its version. */
+    async oweKeyUpdate(
+        did: string,
+        update: SigningKeyUpdate,
+        plcSeq?: number,
+        createdAtMs?: number
+    ): Promise<void> {
+        // Load the stored cursor first so the max below cannot start from nothing.
+        if (plcSeq !== undefined) await this.readPlcCursor()
+        this.db.sql.exec(
+            "INSERT INTO key_updates (did, kind, key, as_of, version) VALUES (?, ?, ?, ?, 1) " +
+                "ON CONFLICT(did) DO UPDATE SET kind = excluded.kind, key = excluded.key, " +
+                "as_of = excluded.as_of, version = key_updates.version + 1",
+            did,
+            update.kind,
+            update.kind === "put" ? update.key : null,
+            update.kind === "put" ? update.asOfMs : null
+        )
+        if (plcSeq !== undefined) {
+            this.raisePlcCursor(plcSeq, createdAtMs)
+            this.persistPlcCursor()
+        }
+    }
+
+    async dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                kind: string
+                key: string | null
+                as_of: number | null
+                version: number
+            }>(
+                "SELECT did, kind, key, as_of, version FROM key_updates ORDER BY rowid LIMIT ?",
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                version: r.version,
+                update:
+                    r.kind === "put" && r.as_of !== null
+                        ? { kind: "put" as const, key: r.key, asOfMs: r.as_of }
+                        : { kind: "delete" as const },
+            }))
+    }
+
+    async clearKeyUpdate(did: string, version: number): Promise<void> {
+        this.db.sql.exec("DELETE FROM key_updates WHERE did = ? AND version = ?", did, version)
+    }
+
+    private plcUrl(): string | null {
+        const url = this.env.PLC_EXPORT_STREAM_URL
+        return url === undefined || url === "" ? null : url
+    }
+
+    private raisePlcCursor(seq: number, createdAtMs?: number): void {
+        this.plcSeq = Math.max(this.plcSeq ?? seq, seq)
+        if (createdAtMs === undefined) return
+        this.plcContinuousSinceMs ??= createdAtMs
+        this.plcHighCreatedAtMs = Math.max(this.plcHighCreatedAtMs ?? createdAtMs, createdAtMs)
+    }
+
+    /**
+     * Write the high-water seq and the run's start beside the stream's URL.
+     * The alarm calls it too, so a lazy flush is never what the run waits on.
+     */
+    persistPlcCursor(): void {
+        if (this.plcSeq === null || this.plcUrl() === null) return
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('plc_cursor', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify({
+                url: this.plcUrl(),
+                seq: this.plcSeq,
+                continuousSinceMs: this.plcContinuousSinceMs,
+            })
+        )
+        this.plcPersistedAt = Date.now()
+        this.plcRunPersisted = this.plcContinuousSinceMs !== null
     }
 
     // ---- Stored DID documents ---------------------------------------------
@@ -366,210 +542,6 @@ export class MonitorIngest
             coveredThroughMs: this.plcCoveredThroughMs,
         }
         await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
-    }
-
-    // ---- PLC export cursor ------------------------------------------------
-
-    /**
-     * The DIDs this monitor watches: in the rev index, confirmed deleted
-     * (so a recovery operation is still seen), or owed a fetch.
-     */
-    async isWatched(did: string): Promise<boolean> {
-        return (
-            this.db.sql
-                .exec(
-                    "SELECT 1 FROM revs WHERE did = ?1 UNION ALL " +
-                        "SELECT 1 FROM pending WHERE did = ?1 UNION ALL " +
-                        "SELECT 1 FROM deleted WHERE did = ?1 LIMIT 1",
-                    did
-                )
-                .toArray().length > 0
-        )
-    }
-
-    /**
-     * In memory; persisted at most every 5 s (checked on the next frame, not
-     * by a timer) and on every alarm. Losing the unpersisted tail only replays.
-     */
-    async advancePlcCursor(seq: number, createdAtMs: number): Promise<void> {
-        this.plcContinuousSinceMs ??= createdAtMs
-        if (this.plcHighSeq === null || seq > this.plcHighSeq) this.plcHighSeq = seq
-        if (this.plcHighCreatedAtMs === null || createdAtMs > this.plcHighCreatedAtMs) {
-            this.plcHighCreatedAtMs = createdAtMs
-        }
-        if (Date.now() - this.plcPersistedAtMs >= PLC_CURSOR_PERSIST_INTERVAL_MS) {
-            await this.persistPlcCursor()
-        }
-    }
-
-    /**
-     * Write the in-memory high-water seq and the run's start beside the
-     * stream's URL. Nothing is written without a seq to keep or a configured
-     * stream.
-     */
-    async persistPlcCursor(): Promise<void> {
-        const url = this.env.PLC_EXPORT_STREAM_URL
-        if (url === undefined || url === "" || this.plcHighSeq === null) return
-        this.db.sql.exec(
-            "INSERT INTO meta (k, v) VALUES ('plc_cursor', ?) " +
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            JSON.stringify({
-                url,
-                seq: this.plcHighSeq,
-                continuousSinceMs: this.plcContinuousSinceMs,
-            })
-        )
-        this.plcPersistedAtMs = Date.now()
-        this.plcRunPersisted = this.plcContinuousSinceMs !== null
-    }
-
-    /**
-     * Pick the stored run back up after the object was evicted (an object
-     * still holding a cursor in memory keeps and returns it): when the
-     * stored cursor is for `url`, the high-water seq and the run's start are
-     * restored (so the run is not restarted by the next frame) and its seq is
-     * returned. Null when nothing is stored for `url`, or what is stored is
-     * for another stream or unusable; the stored row and any in-memory run
-     * are dropped, and the next frame starts a new run.
-     */
-    async resumePlcCursor(url: string): Promise<number | null> {
-        // A live object already holds the newest cursor and run in memory;
-        // the stream URL comes from the environment and cannot change under it.
-        if (this.plcHighSeq !== null) return this.plcHighSeq
-        const row = this.db.sql
-            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
-            .toArray()[0]
-        if (row === undefined) return null
-        const stored = JSON.parse(row.v) as {
-            url?: unknown
-            seq?: unknown
-            continuousSinceMs?: unknown
-        }
-        if (
-            stored.url !== url ||
-            typeof stored.seq !== "number" ||
-            typeof stored.continuousSinceMs !== "number"
-        ) {
-            await this.resetPlcCursor()
-            return null
-        }
-        this.plcHighSeq = stored.seq
-        this.plcContinuousSinceMs = stored.continuousSinceMs
-        this.plcRunPersisted = true
-        return stored.seq
-    }
-
-    /** The stored seq, or null when none is stored for `url`. */
-    async readPlcCursor(url: string): Promise<number | null> {
-        const row = this.db.sql
-            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
-            .toArray()[0]
-        if (row === undefined) return null
-        const stored = JSON.parse(row.v) as { url?: unknown; seq?: unknown }
-        return stored.url === url && typeof stored.seq === "number" ? stored.seq : null
-    }
-
-    /**
-     * Clears the stored row and the in-memory high-water seq together, and
-     * ends the unbroken run: the next frame's `createdAt` starts a new one.
-     */
-    async resetPlcCursor(): Promise<void> {
-        this.db.sql.exec("DELETE FROM meta WHERE k = 'plc_cursor'")
-        this.plcHighSeq = null
-        this.plcHighCreatedAtMs = null
-        this.plcContinuousSinceMs = null
-        this.plcPersistedAtMs = 0
-        this.plcRunPersisted = false
-        this.plcCoveredThroughMs = null
-    }
-
-    /**
-     * The second outbound socket, to `PLC_EXPORT_STREAM_URL`, resuming after
-     * the stored seq, or from the tip (starting a new unbroken run) when there
-     * is none for this URL. Same bounded upgrade as `connect`. Frames are
-     * handled strictly in order on one promise chain. A no-op when the
-     * variable is unset or the socket is open.
-     */
-    async connectPlc(): Promise<void> {
-        const streamUrl = this.env.PLC_EXPORT_STREAM_URL
-        if (streamUrl === undefined || streamUrl === "" || this.plcSocket !== null) return
-        const seq = await this.resumePlcCursor(streamUrl)
-        const url = new URL(streamUrl)
-        if (seq !== null) url.searchParams.set("cursor", String(seq))
-
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS)
-        let response: Response
-        try {
-            response = await fetch(url, {
-                headers: { Upgrade: "websocket" },
-                signal: controller.signal,
-            })
-        } finally {
-            clearTimeout(timer)
-        }
-        const ws = response.webSocket
-        if (ws === null) throw new Error("plc export stream did not upgrade")
-        ws.accept()
-        this.plcSocket = ws
-
-        ws.addEventListener("message", (event) => {
-            void this.enqueuePlcFrame(String(event.data))
-        })
-        ws.addEventListener("close", (event) => {
-            void this.onPlcClose(ws, event.reason)
-        })
-        ws.addEventListener("error", () => this.onPlcError(ws))
-    }
-
-    /** A socket error frees the slot for a reconnect, unless a newer socket holds it. */
-    private onPlcError(ws: WebSocket): void {
-        if (this.plcSocket === ws) this.plcSocket = null
-    }
-
-    /**
-     * Append one frame to the chain that handles them in order. A frame that
-     * fails is logged and the chain carries on, but the coverage run ends: an
-     * operation the stored documents never took in must not be vouched for,
-     * so the next frame starts a new run and nothing is claimed until that
-     * run's row is stored. The stored seq is kept.
-     */
-    private enqueuePlcFrame(raw: string): Promise<void> {
-        const next = this.plcChain.then(async () => {
-            const event = decodePlcExportFrame(raw)
-            if (event === null) return
-            await intakePlcEvent({ index: this, didDocuments: this }, event)
-        })
-        this.plcChain = next.catch((err) => {
-            console.error("monitor: PLC frame failed", err)
-            this.endPlcRun()
-        })
-        return this.plcChain
-    }
-
-    /** Stop vouching for the stream's current run; the seq stays. */
-    private endPlcRun(): void {
-        this.plcContinuousSinceMs = null
-        this.plcRunPersisted = false
-        this.plcCoveredThroughMs = null
-    }
-
-    /**
-     * A stream close: drop a cursor that can never resume, then allow a
-     * reconnect. A close from a socket that has since been replaced by a live
-     * one is ignored.
-     */
-    private onPlcClose(ws: WebSocket | null, reason: string): Promise<void> {
-        this.plcChain = this.plcChain
-            .then(async () => {
-                if (this.plcSocket !== null && this.plcSocket !== ws) return
-                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
-                this.plcSocket = null
-            })
-            .catch((err) => {
-                console.error("monitor: PLC close failed", err)
-            })
-        return this.plcChain
     }
 
     // ---- MonitorIndex -----------------------------------------------------
@@ -965,6 +937,15 @@ export class MonitorIngest
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
+            // The export stream is authoritative for did:plc, and a PDS's
+            // identity event follows the directory's op, so once the stream
+            // is consumed its hint would only clobber the fresh key.
+            keyUpdates: {
+                oweKeyUpdate: async (did, update, plcSeq) => {
+                    if (this.plcUrl() !== null && did.startsWith("did:plc:")) return
+                    await this.oweKeyUpdate(did, update, plcSeq)
+                },
+            },
             didDocuments: this,
             nowMs: () => Date.now(),
         }
@@ -982,6 +963,11 @@ export class MonitorIngest
     async start(): Promise<void> {
         await this.armWatchdog()
         if (this.socket === null) await this.connect()
+        try {
+            await this.connectPlc()
+        } catch (err) {
+            console.error("monitor: plc connect failed", err)
+        }
     }
 
     /**
@@ -1007,6 +993,45 @@ export class MonitorIngest
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
 
+        const ws = await this.upgrade(url, "jetstream")
+        this.socket = ws
+
+        ws.addEventListener("message", (event) => {
+            void this.onFrame(String(event.data))
+        })
+        const drop = () => {
+            this.socket = null
+        }
+        ws.addEventListener("close", drop)
+        ws.addEventListener("error", drop)
+        await this.armWatchdog()
+    }
+
+    /**
+     * Open the PLC directory's export stream at the stored `seq`, or at the
+     * tip when there is none. A no-op unless `PLC_EXPORT_STREAM_URL` is set.
+     * Bounded like `connect`, and reconnected only from the alarm.
+     */
+    async connectPlc(): Promise<void> {
+        const base = this.plcUrl()
+        if (base === null || this.plcSocket !== null) return
+        const cursor = await this.readPlcCursor()
+        const url = new URL(base)
+        if (cursor !== null) url.searchParams.set("cursor", String(cursor))
+
+        const ws = await this.upgrade(url, "plc export stream")
+        this.plcSocket = ws
+
+        ws.addEventListener("message", (event) => {
+            void this.enqueuePlcFrame(String(event.data))
+        })
+        ws.addEventListener("close", (event) => {
+            void this.onPlcClose(ws, event.reason)
+        })
+        ws.addEventListener("error", () => this.onPlcError(ws))
+    }
+
+    private async upgrade(url: URL, what: string): Promise<WebSocket> {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS)
         let response: Response
@@ -1019,19 +1044,95 @@ export class MonitorIngest
             clearTimeout(timer)
         }
         const ws = response.webSocket
-        if (ws === null) throw new Error("jetstream did not upgrade")
+        if (ws === null) throw new Error(`${what} did not upgrade`)
         ws.accept()
-        this.socket = ws
+        return ws
+    }
 
-        ws.addEventListener("message", (event) => {
-            void this.onFrame(String(event.data))
+    /**
+     * The export stream's read loop: append one frame to the chain that
+     * handles them in order. Index lookups and the document sink only; the
+     * owed key update is applied off the loop. A frame that fails is logged
+     * and the chain carries on, but the coverage run ends: an operation the
+     * stored documents never took in must not be vouched for, so the next
+     * frame starts a new run and nothing is claimed until that run's row is
+     * stored. The stored seq is kept.
+     */
+    private enqueuePlcFrame(raw: string): Promise<void> {
+        const next = this.plcChain.then(async () => {
+            const event = decodePlcExportFrame(raw)
+            if (event === null) return
+            if ((await intakePlcEvent(this, event, this)) === "owed") this.kickDrain()
         })
-        const drop = () => {
-            this.socket = null
+        this.plcChain = next.catch((err) => {
+            console.error("monitor: plc frame failed", err)
+            this.endPlcRun()
+        })
+        return this.plcChain
+    }
+
+    /** Stop vouching for the stream's current run; the seq stays. */
+    private endPlcRun(): void {
+        this.plcContinuousSinceMs = null
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
+    }
+
+    /**
+     * A stream close: drop a cursor that can never resume, then allow a
+     * reconnect. A close from a socket that has since been replaced by a live
+     * one is ignored.
+     */
+    private onPlcClose(ws: WebSocket | null, reason: string): Promise<void> {
+        this.plcChain = this.plcChain
+            .then(async () => {
+                if (this.plcSocket !== null && this.plcSocket !== ws) return
+                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
+                this.plcSocket = null
+            })
+            .catch((err) => {
+                console.error("monitor: plc close failed", err)
+            })
+        return this.plcChain
+    }
+
+    /** A socket error frees the slot for a reconnect, unless a newer socket holds it. */
+    private onPlcError(ws: WebSocket): void {
+        if (this.plcSocket === ws) this.plcSocket = null
+    }
+
+    private kickDrain(): void {
+        void this.drainKeys()
+    }
+
+    /**
+     * Apply owed key updates to the cache. Single-flight (a call during a
+     * drain makes it run once more), and never throws:
+     * a failure leaves the updates owed for the next alarm.
+     */
+    private drainKeys(): Promise<void> {
+        if (this.draining !== null) {
+            // Owed after the running drain read its batch: go again, rather
+            // than leave it for the next alarm.
+            this.drainAgain = true
+            return this.draining
         }
-        ws.addEventListener("close", drop)
-        ws.addEventListener("error", drop)
-        await this.armWatchdog()
+        this.draining = (async () => {
+            try {
+                do {
+                    this.drainAgain = false
+                    await drainKeyUpdates(
+                        { index: this, cache: kvSigningKeyCache(this.env), nowMs: () => Date.now() },
+                        KEY_DRAIN_BATCH
+                    )
+                } while (this.drainAgain)
+            } catch (err) {
+                console.error("monitor: key drain failed", err)
+            } finally {
+                this.draining = null
+            }
+        })()
+        return this.draining
     }
 
     /**
@@ -1050,12 +1151,13 @@ export class MonitorIngest
             event.timeMs === null
                 ? await this.readCursor()
                 : String(Math.round(event.timeMs * 1000))
-        await intake(
+        const decision = await intake(
             this.deps(),
             { collection: this.env.MONITOR_COLLECTION },
             event,
             cursor ?? ""
         )
+        if (decision === "reverify") this.kickDrain()
     }
 
     protected async armWatchdog(): Promise<void> {
@@ -1080,7 +1182,15 @@ export class MonitorIngest
             try {
                 await this.connectPlc()
             } catch (err) {
-                console.error("monitor: PLC export connect failed", err)
+                console.error("monitor: plc connect failed", err)
+            }
+            // Ahead of the sweep, which throws when its relay is down and
+            // would otherwise strand owed key updates behind it.
+            await this.drainKeys()
+            try {
+                this.persistPlcCursor()
+            } catch (err) {
+                console.error("monitor: plc cursor persist failed", err)
             }
             // Before settling, so a DID this sweep just discovered is
             // eligible for the same tick's settle pass rather than
@@ -1123,11 +1233,6 @@ export class MonitorIngest
                 // The alarm must still seal and re-arm itself.
                 console.error("monitor: refresh failed", err)
             }
-            try {
-                await this.persistPlcCursor()
-            } catch (err) {
-                console.error("monitor: PLC cursor persist failed", err)
-            }
             let coveredThroughMs: number | null = null
             try {
                 const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
@@ -1139,7 +1244,7 @@ export class MonitorIngest
             try {
                 await this.publishPlcCoverage(coveredThroughMs)
             } catch (err) {
-                console.error("monitor: PLC coverage publish failed", err)
+                console.error("monitor: plc coverage publish failed", err)
             }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.

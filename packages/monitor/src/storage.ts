@@ -26,6 +26,7 @@
  */
 
 import type { DidDocument } from "@germ-network/atproto-pmr-core"
+import type { SigningKeyUpdate } from "./plc-export"
 
 /**
  * A position in the upstream stream, in whatever units the stream uses
@@ -420,18 +421,58 @@ export interface DidDocumentSink {
     markDidDocumentStale(did: string, asOfMs: number): Promise<void>
 }
 
-/** The export stream's position, and the watched set it filters against. */
-export interface PlcCursorIndex {
+/** A key update owed to the relay's signing-key cache. */
+export interface OwedKeyUpdate {
+    did: string
+    update: SigningKeyUpdate
+    /** Bumped on every replacement, so a drain never clears a newer update. */
+    version: number
+}
+
+/**
+ * The PLC-export half of the single-writer state: its own cursor, and the
+ * key updates owed to the cache. At most one update is owed per DID; a
+ * newer one replaces it. The cursor may be persisted lazily: losing its
+ * tail only replays ops, which is idempotent.
+ */
+export interface KeyUpdateIndex {
+    /** The last applied export `seq`, or `null` to start at the tip. */
+    readPlcCursor(): Promise<number | null>
     /**
-     * The DIDs this monitor watches: in the rev index (confirmed-deleted DIDs
-     * included, so a recovery operation is still seen) or owed a fetch. The
-     * export stream's intake acts only on these, so this is the one place a
-     * later restriction on which DIDs are kept would apply.
+     * Raise the high-water `seq`, and with it the `createdAt` of the
+     * operation it carries (absent when the op's was unparseable); never
+     * lowers either. Persistence may be deferred.
+     */
+    advancePlcCursor(seq: number, createdAtMs?: number): Promise<void>
+    resetPlcCursor(): Promise<void>
+    /**
+     * The DIDs this monitor watches: in `revs` or `pending`, and not
+     * permanently deleted. The export stream's intake acts only on these (the
+     * owed key update and the stored DID document alike), so this is the one
+     * place a later restriction on which DIDs are kept would apply.
      */
     isWatched(did: string): Promise<boolean>
     /**
-     * Raise the high-water `seq`, and the `createdAt` it carries; never lowers
-     * either. Persistence may be deferred.
+     * Owe `update` for `did`; with `plcSeq`, advance the cursor in the same
+     * batch (and `createdAtMs`, when the op's was parseable, with it).
      */
-    advancePlcCursor(seq: number, createdAtMs: number): Promise<void>
+    oweKeyUpdate(
+        did: string,
+        update: SigningKeyUpdate,
+        plcSeq?: number,
+        createdAtMs?: number
+    ): Promise<void>
+    dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]>
+    /** A no-op when the owed update for `did` is no longer `version`. */
+    clearKeyUpdate(did: string, version: number): Promise<void>
+}
+
+/**
+ * The write side of a relay's per-DID signing-key cache. Entries have the
+ * relay cache's shape: the `#atproto` multikey (or null) and when it was
+ * learned.
+ */
+export interface SigningKeyCacheWriter {
+    put(did: string, entry: { key: string | null; fetchedAtMs: number }): Promise<void>
+    delete(did: string): Promise<void>
 }

@@ -25,6 +25,7 @@ export type {
     MailboxSnapshot,
     MessageId,
     MessageRef,
+    MonitorRegistrationNotify,
     Nonce,
     OpenMailboxesPage,
     PairMailboxKey,

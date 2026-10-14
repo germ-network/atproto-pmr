@@ -354,6 +354,40 @@ This is also why the truncation signal is `nextCursor` against
 `sealedThrough` rather than a flag: the same comparison that tells a client
 whether to keep paging tells a cache whether the answer can be kept.
 
+### The signing-key cache
+
+A relay caches each sender's `#atproto` signing key for a bounded time (see
+[trust-model §P5](trust-model.md#p5--sender-verification)). A monitor that is
+configured with the PLC directory's export stream can keep that cache current
+for `did:plc` senders, so a re-key is acted on when the directory sequences
+it rather than when the cache entry expires. This is an optimization of
+freshness only; the TTL remains the bound, and nothing here is required of a
+conforming monitor.
+
+The monitor reads the directory's export WebSocket (did:plc, "Export
+Streaming WebSocket") from a stored `seq` cursor, or from the tip when it has
+none or the directory closes the stream with `OutdatedCursor` or
+`FutureCursor`. A gap therefore costs at most one TTL of staleness; no replay
+or purge is needed. The cursor is kept per directory host, since `seq` is
+assigned by each directory.
+
+The monitor acts only on DIDs it holds or has owed. For one of those, a
+current-format `plc_operation` writes the `verificationMethods.atproto` key
+(or records that there is none) to the cache, stamped with the `createdAt` the
+directory assigned the operation (never later than the
+time of the write, so a replayed operation does not look fresh). A legacy
+`create`, a tombstone, an operation of unknown type, an unreadable `createdAt`
+or a malformed key value deletes the entry, so the next resolve reads the directory. When the monitor already holds the DID's snapshot, the same
+operation also owes a re-fetch of it, which is how a re-key under an
+unchanged record is noticed. Writes to the cache happen outside the
+stream's read loop and are retried until applied.
+
+For a DID the stream does not cover — `did:web`, or any DID when no stream is
+configured — an identity, account or sync event for a held DID deletes its
+cached key as a hint. With the stream configured, `did:plc` DIDs are left to
+the stream: a PDS emits its identity event after the directory's operation,
+and the delete would discard the key just written.
+
 ### Keeping the snapshot current
 
 A relay that admits pair puts from a monitor's CAR (see

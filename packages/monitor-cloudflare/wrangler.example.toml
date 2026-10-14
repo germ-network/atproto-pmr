@@ -6,8 +6,9 @@ main = "src/worker.ts"
 compatibility_date = "2026-07-01"
 
 # THE INGEST OBJECT IS A SINGLETON. Address it by a fixed name — one
-# stream, one cursor, one rev index for the whole coverage. Addressing it
-# per user would open one socket per user and interleave writers.
+# Jetstream stream (and the optional PLC export stream), each with its own
+# cursor, and one rev index for the whole coverage. Addressing it per user
+# would open sockets per user and interleave writers.
 [durable_objects]
 bindings = [{ name = "ingest", class_name = "MonitorIngest" }]
 
@@ -23,6 +24,14 @@ MONITOR_COLLECTION = "com.germnetwork.declaration"
 # instance to take a third party out of the noticing path; the trust model
 # never depended on this feed being honest, only on it being timely.
 JETSTREAM_URL = "https://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents"
+# Optional. The PLC directory's export stream (the https form of
+# wss://plc.directory/export/stream), one socket for both caches: the relay's
+# cached did:plc signing keys follow a rotation as soon as it lands, and a
+# stored did:plc document follows a change as soon as the directory accepts it
+# and is trusted by a relay for 24 h while the stream is caught up. Leave unset
+# to rely on the cache TTLs alone (no second socket). Keep it the same directory
+# the monitor's fetches and the relay's fallback read.
+PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 
 # An outbound socket does not hibernate, so this object is evicted on the
 # platform's schedule whatever this value is. The alarm is what reconnects
@@ -56,14 +65,6 @@ BACKFILL_BATCH = "100"
 # checked against the sender's PDS on puts naming it; these keep that rare.
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
-
-# Optional. The PLC directory's export stream (the https form of
-# wss://plc.directory/export/stream). With it set, a stored did:plc document
-# follows a change as soon as the directory accepts it, and a relay trusts it
-# for 24 h while the stream is caught up. Unset, no second socket is opened and
-# stored did:plc documents are trusted only for the direct-fetch TTL. Keep it the
-# same directory the monitor's fetches and the relay's fallback read.
-# PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 
 # The snapshot and sealed digest windows. Read by plain Workers on the
 # public paths — the community view should scale like the public data it
