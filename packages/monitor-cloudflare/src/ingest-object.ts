@@ -50,7 +50,17 @@ import {
     type SigningKeyUpdate,
     type VerifiedWrite,
     type VerifyOutcome,
+    type GraphMirrorDeps,
+    type GraphMirrorIndex,
+    type GraphMirrorRow,
+    type GraphMirrorTransition,
+    type MirrorReconcileCursor,
+    mirrorGraph,
+    pruneGraphChanges,
+    reconcileGraphMirror,
 } from "@germ-network/atproto-pmr-monitor"
+import type { StatementBudget } from "@germ-network/atproto-pmr-monitor"
+import { d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
 import {
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
@@ -105,6 +115,33 @@ const IGNORED_CURSOR_PERSIST_MS = 5_000
 
 /** How often the registered set is re-listed from the directory. */
 const RECONCILE_INTERVAL_MS = 86_400_000
+/** How often the D1 graph mirror is checked against the single writer's state, both ways. */
+const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
+/** D1 statements the writer spends per mirrored DID. */
+const MIRROR_STATEMENTS_PER_DID = 10
+
+interface MirrorSqlRow extends Record<string, SqlStorageValue> {
+    did: string
+    owner: number
+    holder: number
+    member: number
+    registered: number
+}
+interface PriorSqlRow extends Record<string, SqlStorageValue> {
+    m_did: string | null
+    m_owner: number
+    m_holder: number
+    m_member: number
+    m_registered: number
+}
+
+const mirrorRow = (r: MirrorSqlRow): GraphMirrorRow => ({
+    did: r.did,
+    owner: r.owner === 1,
+    holder: r.holder === 1,
+    member: r.member === 1,
+    registered: r.registered === 1,
+})
 
 /**
  * Whether `armWatchdog` should replace the stored alarm: absent, OR
@@ -168,6 +205,7 @@ export class MonitorIngest
         SecondaryIndex,
         SecondaryIntakeIndex,
         FollowStreamIndex,
+        GraphMirrorIndex,
         MonitorRegistrationNotify
 {
     private readonly db: DurableObjectStorage
@@ -296,6 +334,14 @@ export class MonitorIngest
                 CREATE TABLE IF NOT EXISTS listing_requeue (
                     did TEXT PRIMARY KEY,
                     queued_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS graph_mirrored (
+                    did TEXT PRIMARY KEY,
+                    owner INTEGER NOT NULL,
+                    holder INTEGER NOT NULL,
+                    member INTEGER NOT NULL,
+                    registered INTEGER NOT NULL,
+                    inflight INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
@@ -1173,11 +1219,15 @@ export class MonitorIngest
 
     /**
      * Startup check: an unknown `INTEREST_POLICY` throws, and so does
-     * `registered` without the `pmrDirectory` it reconciles against.
+     * `registered` without the `pmrDirectory` it reconciles against, or any
+     * policy without the `graph` D1 binding.
      */
     assertConfig(): void {
         if (this.interestPolicy() === "registered" && this.env.pmrDirectory === undefined) {
             throw new Error("INTEREST_POLICY=registered requires a pmrDirectory binding")
+        }
+        if (this.env.graph === undefined) {
+            throw new Error("the graph D1 binding is required")
         }
     }
 
@@ -1729,6 +1779,195 @@ export class MonitorIngest
             String(nowMs)
         )
         this.followConnectedAt = nowMs
+    }
+
+    // ---- GraphMirrorIndex -----------------------------------------------
+
+    /**
+     * Every DID's standing now, as the DO's tables have it. `owner` is the
+     * served flag: no listing sets it yet, so no graph is served.
+     */
+    private static readonly STANDING =
+        "SELECT c.did AS did, 0 AS owner, " +
+        "COALESCE(h.state = 'held', 0) AS holder, " +
+        "COALESCE(i.member, 0) AS member, COALESCE(i.registered, 0) AS registered " +
+        "FROM (SELECT did FROM interest UNION SELECT did FROM holder_state " +
+        "UNION SELECT did FROM graph_mirrored) c " +
+        "LEFT JOIN holder_state h ON h.did = c.did " +
+        "LEFT JOIN interest i ON i.did = c.did "
+
+    /**
+     * Scans every DID in `interest`, `holder_state` and `graph_mirrored` on
+     * each call: the same order of rows as the refresh scan, once per alarm.
+     */
+    async dueMirror(limit: number): Promise<GraphMirrorTransition[]> {
+        const rows = this.db.sql
+            .exec<MirrorSqlRow & PriorSqlRow>(
+                "SELECT s.*, m.did AS m_did, m.owner AS m_owner, m.holder AS m_holder, " +
+                    "m.member AS m_member, m.registered AS m_registered FROM (" +
+                    MonitorIngest.STANDING +
+                    ") s LEFT JOIN graph_mirrored m ON m.did = s.did " +
+                    "WHERE COALESCE(m.inflight, 0) = 1 OR s.owner <> COALESCE(m.owner, 0) " +
+                    "OR s.holder <> COALESCE(m.holder, 0) " +
+                    "OR s.member <> COALESCE(m.member, 0) OR s.registered <> COALESCE(m.registered, 0) " +
+                    "ORDER BY s.did LIMIT ?",
+                limit
+            )
+            .toArray()
+        // Sent rows stay due until `markMirrored` records them, so a batch that
+        // commits in D1 but is never recorded is re-sent even if the standing
+        // flips back to what was last recorded.
+        this.ctx.storage.transactionSync(() => {
+            for (const r of rows) {
+                this.db.sql.exec(
+                    "INSERT INTO graph_mirrored (did, owner, holder, member, registered, inflight) " +
+                        "VALUES (?, 0, 0, 0, 0, 1) ON CONFLICT (did) DO UPDATE SET inflight = 1",
+                    r.did
+                )
+            }
+        })
+        return rows.map((r) => ({
+            now: mirrorRow(r),
+            mirrored:
+                r.m_did === null
+                    ? null
+                    : mirrorRow({
+                          did: r.m_did,
+                          owner: r.m_owner,
+                          holder: r.m_holder,
+                          member: r.m_member,
+                          registered: r.m_registered,
+                      }),
+        }))
+    }
+
+    async markMirrored(rows: readonly GraphMirrorRow[]): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            for (const r of rows) {
+                if (!r.owner && !r.holder && !r.member && !r.registered) {
+                    this.db.sql.exec("DELETE FROM graph_mirrored WHERE did = ?", r.did)
+                    continue
+                }
+                this.db.sql.exec(
+                    "INSERT INTO graph_mirrored (did, owner, holder, member, registered, inflight) " +
+                        "VALUES (?1, ?2, ?3, ?4, ?5, 0) ON CONFLICT (did) DO UPDATE SET " +
+                        "owner = ?2, holder = ?3, member = ?4, registered = ?5, inflight = 0",
+                    r.did,
+                    r.owner ? 1 : 0,
+                    r.holder ? 1 : 0,
+                    r.member ? 1 : 0,
+                    r.registered ? 1 : 0
+                )
+            }
+        })
+    }
+
+    async standingOf(did: string): Promise<GraphMirrorRow> {
+        const found = this.db.sql
+            .exec<MirrorSqlRow>(
+                "SELECT * FROM (" + MonitorIngest.STANDING + ") WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        return found === undefined
+            ? { did, owner: false, holder: false, member: false, registered: false }
+            : mirrorRow(found)
+    }
+
+    async mirroredPage(
+        cursor: string | null,
+        limit: number
+    ): Promise<{ rows: GraphMirrorRow[]; cursor: string | null }> {
+        const rows = this.db.sql
+            .exec<MirrorSqlRow>(
+                "SELECT * FROM graph_mirrored WHERE (?1 IS NULL OR did > ?1) ORDER BY did LIMIT ?2",
+                cursor,
+                limit + 1
+            )
+            .toArray()
+        const page = rows.slice(0, limit)
+        return {
+            rows: page.map(mirrorRow),
+            cursor: rows.length > limit ? page[page.length - 1]!.did : null,
+        }
+    }
+
+    /**
+     * The graph mirror, change-log prune and daily reconcile, sharing one
+     * D1 statement budget. Each runs alone: a D1 outage costs neither the
+     * other steps nor the alarm's re-arm.
+     */
+    private async runGraphSteps(): Promise<void> {
+        const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
+        const deps = {
+            index: this,
+            edges: d1FollowEdgeWriter(this.env.graph!, budget),
+            nowMs: () => Date.now(),
+            budget,
+        }
+        for (const [name, step] of [
+            [
+                "graph mirror",
+                () =>
+                    mirrorGraph(
+                        deps,
+                        Math.min(
+                            this.envInt(this.env.GRAPH_MIRROR_BATCH, 50),
+                            Math.floor(budget.remaining / MIRROR_STATEMENTS_PER_DID)
+                        )
+                    ),
+            ],
+            [
+                "graph change prune",
+                () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
+            ],
+            ["graph reconcile", () => this.reconcileGraph(deps)],
+        ] as const) {
+            try {
+                await step()
+            } catch (err) {
+                console.error(`monitor: ${name} failed`, err)
+            }
+        }
+    }
+
+    /** One page of the daily two-way reconcile; the cursor persists until a pass completes. */
+    private async reconcileGraph(deps: GraphMirrorDeps & { budget: StatementBudget }): Promise<void> {
+        const metaOf = (k: string) =>
+            this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
+        const setMeta = (k: string, v: string | null) =>
+            v === null
+                ? this.db.sql.exec("DELETE FROM meta WHERE k = ?", k)
+                : this.db.sql.exec(
+                      "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = ?2",
+                      k,
+                      v
+                  )
+        const stored = metaOf("graph_reconcile_cursor")
+        const lastDone = Number(metaOf("graph_reconcile_done") ?? 0)
+        if (stored === undefined && deps.nowMs() - lastDone < GRAPH_RECONCILE_INTERVAL_MS) return
+        let cursor: MirrorReconcileCursor | null = null
+        if (stored !== undefined) {
+            try {
+                cursor = JSON.parse(stored) as MirrorReconcileCursor
+            } catch {
+                // A corrupt cursor restarts the pass rather than wedging it.
+            }
+        }
+        const next = await reconcileGraphMirror(
+            deps,
+            cursor,
+            Math.min(
+                this.envInt(this.env.GRAPH_RECONCILE_BATCH, 25),
+                Math.floor(deps.budget.remaining / (MIRROR_STATEMENTS_PER_DID + 2))
+            )
+        )
+        if (next === null) {
+            setMeta("graph_reconcile_cursor", null)
+            setMeta("graph_reconcile_done", String(deps.nowMs()))
+        } else {
+            setMeta("graph_reconcile_cursor", JSON.stringify(next))
+        }
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -2418,6 +2657,11 @@ export class MonitorIngest
                     this.envInt(this.env.WINDOW_RETENTION_SECONDS, 604_800) * 1000,
                 nowMs: () => Date.now(),
             })
+            try {
+                await this.runGraphSteps()
+            } catch (err) {
+                console.error("monitor: graph steps failed", err)
+            }
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
             if (Number.isFinite(interval) && interval > 0) {
                 await this.db.setAlarm(Date.now() + interval)

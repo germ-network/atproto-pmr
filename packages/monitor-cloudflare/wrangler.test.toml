@@ -66,3 +66,9 @@ REFRESH_STALE_AFTER_MS = "3600000"
 [[kv_namespaces]]
 	binding = "pmrDirectory"
 	id = "test-pmr-directory"
+
+[[d1_databases]]
+	binding = "graph"
+	database_name = "atproto-pmr-graph-test"
+	database_id = "test-graph"
+	migrations_dir = "migrations"

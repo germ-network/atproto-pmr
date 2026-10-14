@@ -25,7 +25,12 @@
  * is a serving copy, not a truth.
  */
 
-import type { DidDocument, InterestPolicy, WatchedRecord } from "@germ-network/atproto-pmr-core"
+import type {
+    DidDocument,
+    FollowEdge,
+    InterestPolicy,
+    WatchedRecord,
+} from "@germ-network/atproto-pmr-core"
 import type { SigningKeyUpdate } from "./plc-export"
 import type { SnapshotCheck } from "./refresh"
 
@@ -718,4 +723,120 @@ export interface SecondarySnapshotStore {
     /** Removes the record and its confirmation together. */
     deleteSecondary(ref: RecordRef): Promise<void>
     putSecondaryCheck(ref: RecordRef, check: SnapshotCheck): Promise<void>
+}
+
+/**
+ * Rows per bound-value D1 `INSERT`: 25 rows of `follows` (4 columns) is
+ * exactly D1's 100 bound parameters. Change rows that follow from rows
+ * already in D1 are never bound this way (see `FollowEdgeWriter`).
+ */
+export const D1_ROWS_PER_STATEMENT = 25
+
+/**
+ * The D1 statements one alarm may still spend. Every edge-index write and read
+ * draws on one budget, so the alarm stays inside the platform's per-invocation
+ * query limit whatever mix of listings, flushes and mirroring it runs.
+ */
+export interface StatementBudget {
+    readonly remaining: number
+    /** Spend `count` statements; false, spending nothing, when fewer remain. */
+    take(count: number): boolean
+}
+
+/** One follow, identified the way the stream identifies it. */
+export interface EdgeRef {
+    follower: string
+    rkey: string
+}
+
+/**
+ * What a committed edge write touched: the subjects whose follower counts
+ * may have moved, for the `owner_followers` re-count.
+ */
+export interface EdgeWriteResult {
+    subjects: string[]
+}
+
+/** One DID's standing in the edge index's mirrored tables. */
+export interface GraphMirrorRow {
+    did: string
+    /**
+     * Its graph is served: the D1 `graph_owners` row. Only for a graph owner
+     * whose first listing has completed, so a served graph is never an empty
+     * one still being backfilled.
+     */
+    owner: boolean
+    /** It holds a declaration: the D1 `graph_holders` row. */
+    holder: boolean
+    /** It is in interest: the D1 `interest` row. */
+    member: boolean
+    registered: boolean
+}
+
+/**
+ * A DID's standing now, beside the standing last mirrored for it (null if
+ * never). The mirror acts on the difference: a prune when `owner` or `member`
+ * went from true to false, change rows only for flags that moved. Recording
+ * `now` as mirrored happens only after the D1 batch commits, so a retry
+ * re-derives the same transition.
+ */
+export interface GraphMirrorTransition {
+    now: GraphMirrorRow
+    mirrored: GraphMirrorRow | null
+}
+
+/**
+ * The write side of the follow-edge index (D1). The single writer is its
+ * only caller. "Served" means in `graph_owners`.
+ *
+ * Every method commits its rows and their `graph_changes` rows in one
+ * `db.batch`, drawing every statement from the budget the writer was built
+ * with; a write the budget cannot cover throws before anything is sent.
+ * Change rows are derived from the reads they invalidate (`FollowEdgeStore`):
+ * a `following` row for a served follower, a `followers` row only for a
+ * subject that holds a declaration. Bound-value inserts (`putEdges` and its
+ * change rows) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
+ * number of statements per DID. A
+ * change row that depends on rows a delete removes (sweep, prune, the
+ * holder/owner fan-out) is an `INSERT INTO graph_changes … SELECT … FROM
+ * follows`, placed before that delete in the same batch, so a prune costs a
+ * constant number of statements whatever the edge count.
+ */
+export interface FollowEdgeWriter {
+    /**
+     * Put edges at listing generation `gen`. Idempotent on
+     * `(follower, rkey)`: a put replaces the subject and generation.
+     */
+    putEdges(edges: readonly FollowEdge[], gen: number): Promise<EdgeWriteResult>
+    /** Delete by `(follower, rkey)`; an absent edge is a no-op. The subjects come from `DELETE … RETURNING subject`. */
+    deleteEdges(refs: readonly EdgeRef[]): Promise<EdgeWriteResult>
+    /** Delete `follower`'s edges older than generation `gen`: the follows its latest listing no longer has. */
+    sweep(follower: string, gen: number): Promise<EdgeWriteResult>
+    /** Delete every edge of `follower`. */
+    pruneFollower(follower: string): Promise<EdgeWriteResult>
+    /**
+     * Bring the mirrored `graph_owners`, `graph_holders` and `interest`
+     * rows from each transition's `mirrored` to its `now`, in one batch:
+     * `served-add`/`served-remove` and `holder-add`/`holder-remove` rows with
+     * their per-affected-DID fan-out (`following` for each follower,
+     * `followers` for each holder subject) on add and on remove, and the
+     * edges of a DID that stopped being served or left interest pruned.
+     * A flag unchanged between the two writes no change row, so re-mirroring
+     * an unchanged DID is a no-op. Returns the pruned edges' subjects.
+     */
+    mirror(transitions: readonly GraphMirrorTransition[]): Promise<EdgeWriteResult>
+    /** The mirrored DIDs, paged by DID, for the daily reconcile. */
+    listMirrored(
+        cursor: string | null,
+        limit: number
+    ): Promise<{ rows: GraphMirrorRow[]; cursor: string | null }>
+    /** The mirrored standing of each of `dids`, absent for a DID D1 has no row for. */
+    mirroredOf(dids: readonly string[]): Promise<Map<string, GraphMirrorRow>>
+    /** The followers of each subject, for the `owner_followers` re-count. */
+    followersOf(subjects: readonly string[]): Promise<Map<string, string[]>>
+    /**
+     * Delete up to `limit` `graph_changes` rows written before `beforeMs`,
+     * oldest first; returns how many, so the caller can resume next alarm.
+     */
+    pruneChanges(beforeMs: number, limit: number): Promise<number>
 }

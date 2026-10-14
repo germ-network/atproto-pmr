@@ -69,6 +69,23 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     INTEREST_BATCH?: string
 
     /**
+     * The follow-edge index (D1, schema in `migrations/`): written only by
+     * this object, read by the graph routes through `d1FollowEdgeStore`,
+     * `d1GraphChangeLog` and `d1InterestReader`. Required: the object fails
+     * at startup without it, as it does for `pmrDirectory` under `registered`.
+     */
+    graph?: D1Database
+
+    /** D1 statements one alarm may spend on the graph index, default 1000. */
+    GRAPH_STATEMENT_BUDGET?: string
+    /** DIDs mirrored to D1 per alarm, default 50. */
+    GRAPH_MIRROR_BATCH?: string
+    /** `graph_changes` rows pruned per alarm, default 1000. */
+    GRAPH_PRUNE_BATCH?: string
+    /** DIDs checked per page of the daily mirror reconcile, default 25. */
+    GRAPH_RECONCILE_BATCH?: string
+
+    /**
      * The relay's directory of registered DIDs (bare `<did>` keys), read only:
      * the daily reconcile lists it to repair a missed register or unregister.
      * Required under `registered` (the object fails at startup without it);
