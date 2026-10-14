@@ -66,6 +66,7 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
      * that authorizes a delivery.
      */
     VAPID_PUBLIC_KEY?: string
+
     /**
      * Secret binding. The raw 32-byte P-256 scalar, base64url — the private
      * half of `VAPID_PUBLIC_KEY`; signs delivery JWTs. Set via
@@ -81,4 +82,13 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     PUSH_MAX_SEALED_BYTES?: string
     /** RFC 8030 `TTL`, seconds. */
     PUSH_TTL_SECONDS?: string
+
+    /**
+     * The monitor's ingest Durable Object, reached across Workers
+     * (`script_name`). Absent means no monitor is told about registrations.
+     * Typed by shape, so this package does not depend on the monitor's.
+     */
+    MONITOR_INGEST?: DurableObjectNamespace
+    /** The name the monitor's singleton ingest object is addressed by. */
+    MONITOR_INGEST_NAME?: string
 }

@@ -6,11 +6,18 @@ main = "test/worker.ts"
 compatibility_date = "2026-07-01"
 
 [durable_objects]
-bindings = [{ name = "pmrs", class_name = "PMRObject" }]
+bindings = [
+	{ name = "pmrs", class_name = "PMRObject" },
+	{ name = "MONITOR_INGEST", class_name = "MonitorIngestStub" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PMRObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MonitorIngestStub"]
 
 # Illustrative values, matching wrangler.example.toml. These are
 # implementation-defined; tests read them from env rather than hardcoding,
@@ -22,6 +29,7 @@ POOL_CAP_BYTES = "4000000"
 POOL_DEPTH_PER_SENDER = "3"
 POOL_DEPTH_UNDER_PRESSURE = "1"
 GRANT_LIFECYCLE = "active"
+MONITOR_INGEST_NAME = "monitor-test"
 
 [[kv_namespaces]]
 	binding = "pmrDirectory"

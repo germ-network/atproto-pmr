@@ -267,6 +267,17 @@ export interface GrantSummary {
     closed: boolean
 }
 
+/**
+ * A monitor that keeps its interest set in step with registrations: the
+ * directory tells it when a DID registers or deregisters. Best-effort — the
+ * monitor reconciles against the directory on its own schedule, so a lost
+ * call only delays it.
+ */
+export interface MonitorRegistrationNotify {
+    register(did: string): Promise<void>
+    unregister(did: string): Promise<void>
+}
+
 /** Global, small, read on every inbound request. */
 export interface Directory {
     /** Hot path: routes every pair put and every owner request. */
