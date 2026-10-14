@@ -5,11 +5,17 @@
 import { describe, expect, it } from "vitest"
 import {
     decodePlcExportFrame,
+    drainKeyUpdates,
     intakePlcEvent,
     type PlcExportEvent,
     type SigningKeyUpdate,
 } from "../src/plc-export"
-import type { KeyUpdateIndex, MonitorIndex } from "../src/storage"
+import type {
+    KeyUpdateIndex,
+    MonitorIndex,
+    OwedKeyUpdate,
+    SigningKeyCacheWriter,
+} from "../src/storage"
 
 /** The frame plc.directory's export serves for seq 20000001. */
 const LIVE_FRAME = JSON.stringify({
@@ -192,12 +198,86 @@ describe("intakePlcEvent", () => {
     })
 })
 
-describe("drainKeyUpdates (S3)", () => {
-    it.todo("put → cache.put with the key and fetchedAtMs = min(asOfMs, nowMs()), then cleared")
-    it.todo("delete → cache.delete, then cleared")
-    it.todo("respects limit")
-    it.todo("a cache failure leaves the update owed and resolves the count applied so far")
-    it.todo("an update replaced during the drain is not cleared")
+describe("drainKeyUpdates", () => {
+    function rig(initial: OwedKeyUpdate[], opts: { failOn?: string; onPut?: () => void } = {}) {
+        const owed = new Map(initial.map((o) => [o.did, o]))
+        const cleared: string[] = []
+        const writes: string[] = []
+        const stored = new Map<string, { key: string | null; fetchedAtMs: number }>()
+        const index = {
+            dueKeyUpdates: async (limit: number) => [...owed.values()].slice(0, limit),
+            clearKeyUpdate: async (did: string, version: number) => {
+                if (owed.get(did)?.version === version) {
+                    owed.delete(did)
+                    cleared.push(did)
+                }
+            },
+        } as unknown as KeyUpdateIndex
+        const cache: SigningKeyCacheWriter = {
+            put: async (did, entry) => {
+                if (did === opts.failOn) throw new Error("kv down")
+                opts.onPut?.()
+                writes.push(`put ${did}`)
+                stored.set(did, entry)
+            },
+            delete: async (did) => {
+                if (did === opts.failOn) throw new Error("kv down")
+                writes.push(`delete ${did}`)
+                stored.delete(did)
+            },
+        }
+        return { owed, cleared, writes, stored, deps: { index, cache, nowMs: () => 1_000 } }
+    }
+    const put = (did: string, asOfMs: number, version = 1): OwedKeyUpdate => ({
+        did,
+        update: { kind: "put", key: "zK", asOfMs },
+        version,
+    })
+    const del = (did: string, version = 1): OwedKeyUpdate => ({
+        did,
+        update: { kind: "delete" },
+        version,
+    })
+
+    it("put → cache.put with the key and fetchedAtMs = min(asOfMs, nowMs()), then cleared", async () => {
+        const r = rig([put("did:plc:a", 400), put("did:plc:b", 5_000)])
+        expect(await drainKeyUpdates(r.deps, 10)).toBe(2)
+        expect(r.stored.get("did:plc:a")).toEqual({ key: "zK", fetchedAtMs: 400 })
+        expect(r.stored.get("did:plc:b")).toEqual({ key: "zK", fetchedAtMs: 1_000 })
+        expect(r.owed.size).toBe(0)
+    })
+
+    it("delete → cache.delete, then cleared", async () => {
+        const r = rig([del("did:plc:a")])
+        r.stored.set("did:plc:a", { key: "zOld", fetchedAtMs: 1 })
+        expect(await drainKeyUpdates(r.deps, 10)).toBe(1)
+        expect(r.writes).toEqual(["delete did:plc:a"])
+        expect(r.stored.has("did:plc:a")).toBe(false)
+        expect(r.cleared).toEqual(["did:plc:a"])
+    })
+
+    it("respects limit", async () => {
+        const r = rig([put("did:plc:a", 1), put("did:plc:b", 1), put("did:plc:c", 1)])
+        expect(await drainKeyUpdates(r.deps, 2)).toBe(2)
+        expect([...r.owed.keys()]).toEqual(["did:plc:c"])
+    })
+
+    it("a cache failure leaves the update owed and resolves the count applied so far", async () => {
+        const r = rig([put("did:plc:a", 1), put("did:plc:b", 1), put("did:plc:c", 1)], {
+            failOn: "did:plc:b",
+        })
+        expect(await drainKeyUpdates(r.deps, 10)).toBe(1)
+        expect([...r.owed.keys()]).toEqual(["did:plc:b", "did:plc:c"])
+        expect(r.writes).toEqual(["put did:plc:a"])
+    })
+
+    it("an update replaced during the drain is not cleared", async () => {
+        const r = rig([put("did:plc:a", 1)], {
+            onPut: () => r.owed.set("did:plc:a", del("did:plc:a", 2)),
+        })
+        await drainKeyUpdates(r.deps, 10)
+        expect(r.owed.get("did:plc:a")).toEqual(del("did:plc:a", 2))
+    })
 })
 
 describe("plcCursorAfterClose (S4)", () => {

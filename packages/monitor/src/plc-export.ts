@@ -130,7 +130,23 @@ export async function drainKeyUpdates(
     deps: DrainKeyUpdatesDeps,
     limit: number
 ): Promise<number> {
-    void deps
-    void limit
-    throw new Error("not implemented")
+    const due = await deps.index.dueKeyUpdates(limit)
+    let applied = 0
+    for (const { did, update, version } of due) {
+        try {
+            if (update.kind === "put") {
+                await deps.cache.put(did, {
+                    key: update.key,
+                    fetchedAtMs: Math.min(update.asOfMs, deps.nowMs()),
+                })
+            } else {
+                await deps.cache.delete(did)
+            }
+        } catch {
+            return applied
+        }
+        await deps.index.clearKeyUpdate(did, version)
+        applied++
+    }
+    return applied
 }
