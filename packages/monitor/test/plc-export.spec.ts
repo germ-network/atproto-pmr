@@ -7,6 +7,7 @@ import {
     decodePlcExportFrame,
     drainKeyUpdates,
     intakePlcEvent,
+    plcCursorAfterClose,
     type PlcExportEvent,
     type SigningKeyUpdate,
 } from "../src/plc-export"
@@ -280,7 +281,15 @@ describe("drainKeyUpdates", () => {
     })
 })
 
-describe("plcCursorAfterClose (S4)", () => {
-    it.todo("OutdatedCursor and FutureCursor → reset")
-    it.todo("ConsumerTooSlow, an empty reason, or anything else → keep")
+describe("plcCursorAfterClose", () => {
+    it("OutdatedCursor and FutureCursor → reset", () => {
+        expect(plcCursorAfterClose("OutdatedCursor")).toBe("reset")
+        expect(plcCursorAfterClose("FutureCursor")).toBe("reset")
+    })
+
+    it("ConsumerTooSlow, an empty reason, or anything else → keep", () => {
+        for (const reason of ["ConsumerTooSlow", "", "Going Away", "outdatedcursor"]) {
+            expect(plcCursorAfterClose(reason), reason).toBe("keep")
+        }
+    })
 })
