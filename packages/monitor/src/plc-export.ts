@@ -20,7 +20,7 @@
  * operations arrives as a later operation ("Key Rotation & Account Recovery").
  */
 
-import type { DidDocument } from "@germ-network/atproto-pmr-core"
+import { renderPlcDocument, type DidDocument } from "@germ-network/atproto-pmr-core"
 import type { DidDocumentSink, MonitorIndex, PlcCursorIndex } from "./storage"
 
 /** What one sequenced operation means for its DID's stored document. */
@@ -45,8 +45,37 @@ export interface PlcExportEvent {
  * must not break the stream.
  */
 export function decodePlcExportFrame(raw: string): PlcExportEvent | null {
-    void raw
-    throw new Error("not implemented")
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(raw)
+    } catch {
+        return null
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null
+    const frame = parsed as Record<string, unknown>
+
+    if (frame.type !== "sequenced_op") return null
+    const { seq, did, createdAt } = frame
+    if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null
+    if (typeof did !== "string" || !did.startsWith("did:plc:")) return null
+    if (typeof createdAt !== "string") return null
+    const createdAtMs = Date.parse(createdAt)
+    if (Number.isNaN(createdAtMs)) return null
+
+    return { seq, did, createdAtMs, change: changeOf(did, frame.operation) }
+}
+
+function changeOf(did: string, operation: unknown): PlcDocumentChange {
+    const type =
+        typeof operation === "object" && operation !== null
+            ? (operation as { type?: unknown }).type
+            : undefined
+    if (type === "plc_tombstone") return { kind: "tombstone" }
+    if (type === "plc_operation") {
+        const document = renderPlcDocument(did, operation)
+        if (document !== null) return { kind: "render", document }
+    }
+    return { kind: "refetch" }
 }
 
 /** What a stream close means for the stored cursor. */
