@@ -640,8 +640,41 @@ describe("compareObservations", () => {
     })
 })
 
-describe("identity events and the signing-key cache (S2)", () => {
-    it.todo("reverify with keyUpdates set → also owes a delete of the DID's cached key")
-    it.todo("reverify without keyUpdates → unchanged behaviour")
-    it.todo("ignored identity event (unwatched or permanently deleted) → no key update owed")
+describe("identity events and the signing-key cache", () => {
+    const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+
+    function withKeyUpdates() {
+        const owed: Array<{ did: string; update: unknown; plcSeq?: number }> = []
+        const keyUpdates = {
+            oweKeyUpdate: async (did: string, update: unknown, plcSeq?: number) => {
+                owed.push({ did, update, plcSeq })
+            },
+        }
+        return { owed, keyUpdates }
+    }
+
+    it("reverify with keyUpdates set → also owes a delete of the DID's cached key", async () => {
+        const { owed, keyUpdates } = withKeyUpdates()
+        const h = harness({ keyUpdates })
+        h.revs.set(DID, "3m1")
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
+    })
+
+    it("reverify without keyUpdates → unchanged behaviour", async () => {
+        const h = harness()
+        h.revs.set(DID, "3m1")
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(h.pending.has(DID)).toBe(true)
+    })
+
+    it("ignored identity event (unwatched or permanently deleted) → no key update owed", async () => {
+        const { owed, keyUpdates } = withKeyUpdates()
+        const h = harness({ keyUpdates })
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        h.revs.set(DID, "3m1")
+        h.deleted.add(DID)
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(owed).toEqual([])
+    })
 })

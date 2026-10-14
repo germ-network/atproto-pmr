@@ -3,7 +3,13 @@
  * read loop, and the drain that reaches the cache.
  */
 import { describe, expect, it } from "vitest"
-import { decodePlcExportFrame } from "../src/plc-export"
+import {
+    decodePlcExportFrame,
+    intakePlcEvent,
+    type PlcExportEvent,
+    type SigningKeyUpdate,
+} from "../src/plc-export"
+import type { KeyUpdateIndex, MonitorIndex } from "../src/storage"
 
 /** The frame plc.directory's export serves for seq 20000001. */
 const LIVE_FRAME = JSON.stringify({
@@ -127,12 +133,63 @@ describe("decodePlcExportFrame", () => {
     })
 })
 
-describe("intakePlcEvent (S2)", () => {
-    it.todo("unwatched DID → ignored, only the cursor advances, nothing owed")
-    it.todo("DID in revs → owes the snapshot re-fetch at its indexed rev and the key update with the cursor")
-    it.todo("DID only in pending → owes the key update with the cursor, no extra owe")
-    it.todo("permanently deleted DID → ignored")
-    it.todo("the re-fetch is owed before the key update and cursor, so a crash between them replays the op")
+describe("intakePlcEvent", () => {
+    function fake(opts: { revs?: Record<string, string>; pending?: string[]; deleted?: string[] } = {}) {
+        const revs = new Map(Object.entries(opts.revs ?? {}))
+        const pending = new Set(opts.pending ?? [])
+        const deleted = new Set(opts.deleted ?? [])
+        const calls: string[] = []
+        const owed: Array<{ did: string; update: SigningKeyUpdate; plcSeq?: number }> = []
+        const index = {
+            isWatched: async (did: string) =>
+                !deleted.has(did) && (revs.has(did) || pending.has(did)),
+            revOf: async (did: string) => revs.get(did) ?? null,
+            owe: async (did: string, rev: string) => void calls.push(`owe ${did} ${rev}`),
+            advancePlcCursor: async (seq: number) => void calls.push(`cursor ${seq}`),
+            oweKeyUpdate: async (did: string, update: SigningKeyUpdate, plcSeq?: number) => {
+                calls.push(`key ${did}`)
+                owed.push({ did, update, plcSeq })
+            },
+        }
+        return { index: index as unknown as MonitorIndex & KeyUpdateIndex, calls, owed }
+    }
+    const update: SigningKeyUpdate = { kind: "put", key: "zK", asOfMs: 5 }
+    const event = (did = "did:plc:abc"): PlcExportEvent => ({ seq: 9, did, update })
+
+    it("unwatched DID → ignored, only the cursor advances, nothing owed", async () => {
+        const f = fake()
+        expect(await intakePlcEvent(f.index, event())).toBe("ignored")
+        expect(f.calls).toEqual(["cursor 9"])
+        expect(f.owed).toEqual([])
+    })
+
+    it("DID in revs → owes the snapshot re-fetch at its indexed rev and the key update with the cursor", async () => {
+        const f = fake({ revs: { "did:plc:abc": "3m1" } })
+        expect(await intakePlcEvent(f.index, event())).toBe("owed")
+        expect(f.owed).toEqual([{ did: "did:plc:abc", update, plcSeq: 9 }])
+        expect(f.calls).toContain("owe did:plc:abc 3m1")
+        expect(f.calls).not.toContain("cursor 9")
+    })
+
+    it("DID only in pending → owes the key update with the cursor, no extra owe", async () => {
+        const f = fake({ pending: ["did:plc:abc"] })
+        expect(await intakePlcEvent(f.index, event())).toBe("owed")
+        expect(f.owed).toEqual([{ did: "did:plc:abc", update, plcSeq: 9 }])
+        expect(f.calls.filter((c) => c.startsWith("owe "))).toEqual([])
+    })
+
+    it("permanently deleted DID → ignored", async () => {
+        const f = fake({ revs: { "did:plc:abc": "3m1" }, deleted: ["did:plc:abc"] })
+        expect(await intakePlcEvent(f.index, event())).toBe("ignored")
+        expect(f.owed).toEqual([])
+        expect(f.calls).toEqual(["cursor 9"])
+    })
+
+    it("the re-fetch is owed before the key update and cursor, so a crash between them replays the op", async () => {
+        const f = fake({ revs: { "did:plc:abc": "3m1" } })
+        await intakePlcEvent(f.index, event())
+        expect(f.calls).toEqual(["owe did:plc:abc 3m1", "key did:plc:abc"])
+    })
 })
 
 describe("drainKeyUpdates (S3)", () => {

@@ -105,9 +105,14 @@ export async function intakePlcEvent(
     index: MonitorIndex & KeyUpdateIndex,
     event: PlcExportEvent
 ): Promise<PlcIntakeDecision> {
-    void index
-    void event
-    throw new Error("not implemented")
+    if (!(await index.isWatched(event.did))) {
+        await index.advancePlcCursor(event.seq)
+        return "ignored"
+    }
+    const rev = await index.revOf(event.did)
+    if (rev !== null) await index.owe(event.did, rev)
+    await index.oweKeyUpdate(event.did, event.update, event.seq)
+    return "owed"
 }
 
 export interface DrainKeyUpdatesDeps {

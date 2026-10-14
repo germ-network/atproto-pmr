@@ -112,6 +112,7 @@ export async function intake(
         // re-push it, once per identity/account/sync event, forever.
         if (await deps.index.isDeleted(event.did)) return "ignored"
         await deps.index.owe(event.did, known)
+        await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
         return "reverify"
     }
 
