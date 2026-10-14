@@ -523,7 +523,16 @@ export async function resolvePDSEndpoint(
     did: string,
     fetchImpl: typeof fetch
 ): Promise<PDSResolution> {
-    const doc = await fetchDidDocument(did, fetchImpl)
+    return pdsResolutionFromDocument(await fetchDidDocument(did, fetchImpl))
+}
+
+/**
+ * `resolvePDSEndpoint`'s answer from a document already in hand, so a caller
+ * that keeps the document does not fetch it twice. Throws when the document
+ * has no `#atproto_pds` service. Does not check that the document belongs to
+ * a DID; the caller vouches for that.
+ */
+export function pdsResolutionFromDocument(doc: Record<string, unknown>): PDSResolution {
     const service = extractPDSService(doc)
     if (service === null) {
         throw new Error("DID document has no #atproto_pds service")
@@ -532,16 +541,6 @@ export async function resolvePDSEndpoint(
         endpoint: service,
         signingKey: extractSigningKey(doc),
     }
-}
-
-/**
- * `resolvePDSEndpoint`'s answer from a document already in hand, so a caller
- * that keeps the document does not fetch it twice. Throws when the document
- * has no `#atproto_pds` service.
- */
-export function pdsResolutionFromDocument(doc: Record<string, unknown>): PDSResolution {
-    void doc
-    throw new Error("not implemented")
 }
 
 /**

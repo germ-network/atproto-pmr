@@ -4,6 +4,7 @@
  * is fresh.
  */
 import { describe, expect, it } from "vitest"
+import { pdsResolutionFromDocument, resolvePDSEndpoint } from "../src/atproto-fetch"
 import { renderPlcDocument } from "../src/did-document"
 
 /**
@@ -197,9 +198,28 @@ describe("renderPlcDocument", () => {
 })
 
 describe("pdsResolutionFromDocument", () => {
-    it.todo("answers the same as resolvePDSEndpoint for the same document")
-    it.todo("takes the signing key from the same document")
-    it.todo("throws when the document has no #atproto_pds service")
+    const DOC = K256_DOC as unknown as Record<string, unknown>
+
+    it("answers the same as resolvePDSEndpoint for the same document", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify(DOC), { status: 200 })) as typeof fetch
+        expect(pdsResolutionFromDocument(DOC)).toEqual(
+            await resolvePDSEndpoint(K256_DID, fetchImpl)
+        )
+    })
+
+    it("takes the signing key from the same document", () => {
+        expect(pdsResolutionFromDocument(DOC)).toEqual({
+            endpoint: "https://phellinus.us-west.host.bsky.network",
+            signingKey: "zQ3shdrX5UZHPdAPDCvCCxGn8mktUByzn2ZrzA24tddqWpQmt",
+        })
+    })
+
+    it("throws when the document has no #atproto_pds service", () => {
+        expect(() => pdsResolutionFromDocument({ ...DOC, service: [] })).toThrow(
+            /no #atproto_pds service/
+        )
+    })
 })
 
 describe("storedSigningKeyResolver", () => {
