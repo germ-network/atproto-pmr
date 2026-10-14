@@ -101,7 +101,24 @@ export {
     type NewEdgeOp,
 } from "./follow-stream"
 
-// The follow-edge index: the mirrored standing.
+// The follow-edge index: the live flush and the mirrored standing.
+export {
+    coalesceEdgeOps,
+    drainRecounts,
+    flushEdgeOps,
+    flushLimit,
+    flushStatements,
+    reconcileOwnerFollowers,
+    recountOwnerFollowers,
+    recountStatements,
+    type CoalescedOps,
+    type EdgeFlushDeps,
+    type EdgeOpsIndex,
+    type OwnerFollowedIndex,
+    type OwnerFollowerDeps,
+    type QueuedRecount,
+    type RecountQueueIndex,
+} from "./follow-flush"
 export {
     GRAPH_CHANGE_RETENTION_MS,
     mirrorGraph,

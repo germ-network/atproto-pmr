@@ -55,9 +55,18 @@ import {
     type GraphMirrorRow,
     type GraphMirrorTransition,
     type MirrorReconcileCursor,
+    type EdgeOp,
+    type EdgeOpsIndex,
+    type OwnerFollowedIndex,
+    type QueuedRecount,
+    type RecountQueueIndex,
+    drainRecounts,
+    flushEdgeOps,
+    flushLimit,
     mirrorGraph,
     pruneGraphChanges,
     reconcileGraphMirror,
+    reconcileOwnerFollowers,
 } from "@germ-network/atproto-pmr-monitor"
 import type { StatementBudget } from "@germ-network/atproto-pmr-monitor"
 import { d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
@@ -119,6 +128,8 @@ const RECONCILE_INTERVAL_MS = 86_400_000
 const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
 /** D1 statements the writer spends per mirrored DID. */
 const MIRROR_STATEMENTS_PER_DID = 10
+const RECOUNT_DRAIN_BATCH = 1000
+const OWNER_RECONCILE_BATCH = 200
 
 interface MirrorSqlRow extends Record<string, SqlStorageValue> {
     did: string
@@ -205,7 +216,10 @@ export class MonitorIngest
         SecondaryIndex,
         SecondaryIntakeIndex,
         FollowStreamIndex,
+        EdgeOpsIndex,
         GraphMirrorIndex,
+        OwnerFollowedIndex,
+        RecountQueueIndex,
         MonitorRegistrationNotify
 {
     private readonly db: DurableObjectStorage
@@ -332,6 +346,10 @@ export class MonitorIngest
                     cursor TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS listing_requeue (
+                    did TEXT PRIMARY KEY,
+                    queued_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recount_queue (
                     did TEXT PRIMARY KEY,
                     queued_at INTEGER NOT NULL
                 );
@@ -1459,6 +1477,12 @@ export class MonitorIngest
 
     async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
         this.ctx.storage.transactionSync(() => {
+            if (
+                count === 0 &&
+                this.db.sql.exec("SELECT 1 FROM interest WHERE did = ?", did).toArray().length === 0
+            ) {
+                return
+            }
             this.db.sql.exec(
                 "INSERT INTO interest (did, owner_followers) VALUES (?1, ?2) " +
                     "ON CONFLICT(did) DO UPDATE SET owner_followers = ?2",
@@ -1781,6 +1805,60 @@ export class MonitorIngest
         this.followConnectedAt = nowMs
     }
 
+    // ---- EdgeOpsIndex -----------------------------------------------------
+
+    async edgeOps(limit: number): Promise<EdgeOp[]> {
+        return this.db.sql
+            .exec<{
+                seq: number
+                kind: "create" | "delete"
+                follower: string
+                rkey: string
+                subject: string | null
+                rev: string
+                cursor: string
+            }>(
+                "SELECT seq, kind, follower, rkey, subject, rev, cursor FROM edge_ops " +
+                    "ORDER BY seq LIMIT ?",
+                limit
+            )
+            .toArray()
+            .map((r) =>
+                r.kind === "create"
+                    ? {
+                          seq: r.seq,
+                          kind: "create" as const,
+                          follower: r.follower,
+                          rkey: r.rkey,
+                          subject: r.subject!,
+                          rev: r.rev,
+                          cursor: r.cursor,
+                      }
+                    : {
+                          seq: r.seq,
+                          kind: "delete" as const,
+                          follower: r.follower,
+                          rkey: r.rkey,
+                          rev: r.rev,
+                          cursor: r.cursor,
+                      }
+            )
+    }
+
+    async dropEdgeOps(throughSeq: number, subjects: readonly string[]): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec("DELETE FROM edge_ops WHERE seq <= ?", throughSeq)
+            this.queueRecountSync(subjects, Date.now())
+        })
+    }
+
+    async currentGen(): Promise<number> {
+        const v = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'listing_gen'")
+            .toArray()[0]?.v
+        return v === undefined ? 0 : Number(v)
+    }
+
     // ---- GraphMirrorIndex -----------------------------------------------
 
     /**
@@ -1841,8 +1919,12 @@ export class MonitorIngest
         }))
     }
 
-    async markMirrored(rows: readonly GraphMirrorRow[]): Promise<void> {
+    async markMirrored(
+        rows: readonly GraphMirrorRow[],
+        prunedSubjects: readonly string[] = []
+    ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
+            this.queueRecountSync(prunedSubjects, Date.now())
             for (const r of rows) {
                 if (!r.owner && !r.holder && !r.member && !r.registered) {
                     this.db.sql.exec("DELETE FROM graph_mirrored WHERE did = ?", r.did)
@@ -1893,18 +1975,16 @@ export class MonitorIngest
     }
 
     /**
-     * The graph mirror, change-log prune and daily reconcile, sharing one
-     * D1 statement budget. Each runs alone: a D1 outage costs neither the
-     * other steps nor the alarm's re-arm.
+     * The graph mirror, edge-log flush, re-count drain, change-log prune and
+     * the daily reconciles, sharing one D1 statement budget. Each runs
+     * alone: a D1 outage costs neither the other steps nor the alarm's
+     * re-arm.
      */
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
-        const deps = {
-            index: this,
-            edges: d1FollowEdgeWriter(this.env.graph!, budget),
-            nowMs: () => Date.now(),
-            budget,
-        }
+        const edges = d1FollowEdgeWriter(this.env.graph!, budget)
+        const deps = { index: this, edges, nowMs: () => Date.now(), budget }
+        const owners = { edges, interest: this, nowMs: deps.nowMs }
         for (const [name, step] of [
             [
                 "graph mirror",
@@ -1918,10 +1998,26 @@ export class MonitorIngest
                     ),
             ],
             [
+                "edge flush",
+                () =>
+                    flushEdgeOps(
+                        { ops: this, edges, budget, interest: this },
+                        flushLimit(Math.floor((budget.remaining * 3) / 4))
+                    ),
+            ],
+            [
+                "recount drain",
+                () => drainRecounts({ ...owners, queue: this, budget }, RECOUNT_DRAIN_BATCH),
+            ],
+            [
                 "graph change prune",
                 () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
             ],
             ["graph reconcile", () => this.reconcileGraph(deps)],
+            [
+                "owner followers reconcile",
+                () => this.reconcileOwnerFollowerCounts({ ...owners, followed: this, budget }),
+            ],
         ] as const) {
             try {
                 await step()
@@ -1931,18 +2027,40 @@ export class MonitorIngest
         }
     }
 
+    private metaOf(k: string): string | undefined {
+        return this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
+    }
+
+    private setMeta(k: string, v: string | null): void {
+        if (v === null) this.db.sql.exec("DELETE FROM meta WHERE k = ?", k)
+        else
+            this.db.sql.exec(
+                "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = ?2",
+                k,
+                v
+            )
+    }
+
+    /** One page of the daily re-count of owner-followed DIDs; the cursor persists until a pass completes. */
+    private async reconcileOwnerFollowerCounts(
+        deps: Parameters<typeof reconcileOwnerFollowers>[0]
+    ): Promise<void> {
+        const stored = this.metaOf("owner_followers_cursor")
+        const lastDone = Number(this.metaOf("owner_followers_done") ?? 0)
+        if (stored === undefined && deps.nowMs() - lastDone < GRAPH_RECONCILE_INTERVAL_MS) return
+        const next = await reconcileOwnerFollowers(deps, stored ?? null, OWNER_RECONCILE_BATCH)
+        if (next === null) {
+            this.setMeta("owner_followers_cursor", null)
+            this.setMeta("owner_followers_done", String(deps.nowMs()))
+        } else {
+            this.setMeta("owner_followers_cursor", next)
+        }
+    }
+
     /** One page of the daily two-way reconcile; the cursor persists until a pass completes. */
     private async reconcileGraph(deps: GraphMirrorDeps & { budget: StatementBudget }): Promise<void> {
-        const metaOf = (k: string) =>
-            this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
-        const setMeta = (k: string, v: string | null) =>
-            v === null
-                ? this.db.sql.exec("DELETE FROM meta WHERE k = ?", k)
-                : this.db.sql.exec(
-                      "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT (k) DO UPDATE SET v = ?2",
-                      k,
-                      v
-                  )
+        const metaOf = (k: string) => this.metaOf(k)
+        const setMeta = (k: string, v: string | null) => this.setMeta(k, v)
         const stored = metaOf("graph_reconcile_cursor")
         const lastDone = Number(metaOf("graph_reconcile_done") ?? 0)
         if (stored === undefined && deps.nowMs() - lastDone < GRAPH_RECONCILE_INTERVAL_MS) return
@@ -1967,6 +2085,70 @@ export class MonitorIngest
             setMeta("graph_reconcile_done", String(deps.nowMs()))
         } else {
             setMeta("graph_reconcile_cursor", JSON.stringify(next))
+        }
+    }
+
+    // ---- RecountQueueIndex ------------------------------------------------
+
+    async queueRecount(subjects: readonly string[], atMs: number): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.queueRecountSync(subjects, atMs))
+    }
+
+    /** Under `everyone` no count is kept, and nothing would drain the queue. */
+    private queueRecountSync(subjects: readonly string[], atMs: number): void {
+        if (this.interestPolicy() === "everyone") return
+        // The stamp always moves forward, though the clock may not between
+        // two queueings, so clearing what a drain read never drops a later one.
+        for (const did of subjects) {
+            this.db.sql.exec(
+                "INSERT INTO recount_queue (did, queued_at) VALUES (?1, ?2) " +
+                    "ON CONFLICT(did) DO UPDATE SET queued_at = MAX(excluded.queued_at, queued_at + 1)",
+                did,
+                atMs
+            )
+        }
+    }
+
+    async dueRecounts(limit: number): Promise<QueuedRecount[]> {
+        return this.db.sql
+            .exec<{ did: string; queued_at: number }>(
+                "SELECT did, queued_at FROM recount_queue ORDER BY queued_at, did LIMIT ?",
+                limit
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, queuedAt: r.queued_at }))
+    }
+
+    async clearRecounts(entries: readonly QueuedRecount[]): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            for (const e of entries) {
+                this.db.sql.exec(
+                    "DELETE FROM recount_queue WHERE did = ? AND queued_at = ?",
+                    e.did,
+                    e.queuedAt
+                )
+            }
+        })
+    }
+
+    // ---- OwnerFollowedIndex -----------------------------------------------
+
+    async ownerFollowed(
+        cursor: string | null,
+        limit: number
+    ): Promise<{ dids: string[]; cursor: string | null }> {
+        const rows = this.db.sql
+            .exec<{ did: string }>(
+                "SELECT did FROM interest WHERE owner_followers > 0 AND (?1 IS NULL OR did > ?1) " +
+                    "ORDER BY did LIMIT ?2",
+                cursor,
+                limit + 1
+            )
+            .toArray()
+        const page = rows.slice(0, limit)
+        return {
+            dids: page.map((r) => r.did),
+            cursor: rows.length > limit ? page[page.length - 1]!.did : null,
         }
     }
 

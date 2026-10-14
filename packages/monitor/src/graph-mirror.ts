@@ -24,9 +24,11 @@ export interface GraphMirrorIndex {
     /**
      * Record `rows` as mirrored, once their batch committed: exactly the rows
      * given, never re-read, so a standing that changed during the D1 await
-     * is still due next time. An all-false row drops the DID.
+     * is still due next time. An all-false row drops the DID. In the same
+     * step, `prunedSubjects` (the subjects of the edges the batch pruned)
+     * are queued for re-count.
      */
-    markMirrored(rows: readonly GraphMirrorRow[]): Promise<void>
+    markMirrored(rows: readonly GraphMirrorRow[], prunedSubjects?: readonly string[]): Promise<void>
     /** `did`'s standing now; all false for a DID the single writer does not know. */
     standingOf(did: string): Promise<GraphMirrorRow>
     /** The last-mirrored rows, paged by DID, for the daily reconcile. */
@@ -45,13 +47,17 @@ export interface GraphMirrorDeps {
 /**
  * Mirror up to `limit` changed DIDs in one writer batch, then record them as
  * mirrored. A DID whose graph stops being served, or that leaves interest,
- * has its edges pruned in that batch. Returns how many were mirrored.
+ * has its edges pruned in that batch; the pruned edges' subjects are queued
+ * for re-count when the rows are recorded. Returns how many were mirrored.
  */
 export async function mirrorGraph(deps: GraphMirrorDeps, limit: number): Promise<number> {
     const transitions = await deps.index.dueMirror(limit)
     if (transitions.length === 0) return 0
-    await deps.edges.mirror(transitions)
-    await deps.index.markMirrored(transitions.map((t) => t.now))
+    const pruned = await deps.edges.mirror(transitions)
+    await deps.index.markMirrored(
+        transitions.map((t) => t.now),
+        pruned.subjects
+    )
     return transitions.length
 }
 
@@ -96,8 +102,11 @@ export async function reconcileGraphMirror(
         next = page.cursor === null ? null : { side: "d1", after: page.cursor }
     }
     if (transitions.length > 0) {
-        await deps.edges.mirror(transitions)
-        await deps.index.markMirrored(transitions.map((t) => t.now))
+        const pruned = await deps.edges.mirror(transitions)
+        await deps.index.markMirrored(
+            transitions.map((t) => t.now),
+            pruned.subjects
+        )
     }
     return next
 }
