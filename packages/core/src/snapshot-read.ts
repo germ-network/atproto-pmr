@@ -15,6 +15,31 @@ export interface RecordSnapshot {
 }
 
 /**
+ * The snapshots a monitor holds, addressed by record. How a record maps to a
+ * storage key is the adapter's: the declaration keeps the key it has always
+ * had, so adding a collection needs no migration of existing snapshots.
+ */
+export interface RecordSnapshotStore {
+    /** Null if none is held. A thrown error is a relay fault and propagates. */
+    get(did: string, collection: string, rkey: string): Promise<StoredRecordSnapshot | null>
+}
+
+/**
+ * A held snapshot with the ingest's verdict on it. A public read serves held
+ * bytes without verifying them per read, so whether they verified is decided
+ * once, when they were stored.
+ */
+export interface StoredRecordSnapshot extends RecordSnapshot {
+    /**
+     * The `#atproto` multikey the CAR's commit signature verified against at
+     * ingest. Null for an entry stored without that record, which reads as
+     * unverifiable. A key the DID document no longer carries makes the
+     * verdict stale.
+     */
+    verifiedWith: string | null
+}
+
+/**
  * A snapshot not confirmed for this long is checked directly against the
  * DID's PDS to see whether the record has changed. Generous on purpose: the
  * monitor's refresh keeps snapshots far fresher than this in normal

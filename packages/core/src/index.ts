@@ -205,6 +205,7 @@ export {
 
 // Declaration resolution and content addressing.
 export {
+    DECLARATION_COLLECTION_NSID,
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,
@@ -287,6 +288,34 @@ export {
     snapshotRecordReader,
     SNAPSHOT_MAX_AGE_MS,
     type RecordSnapshot,
+    type RecordSnapshotStore,
+    type StoredRecordSnapshot,
     type SnapshotRecordRead,
     type SnapshotRecordReaderDeps,
 } from "./snapshot-read"
+
+// The proxy cache's stores, what a monitor watches, and the device read API's bodies.
+export { type FollowEdge, type FollowEdgeStore } from "./follow-edges"
+export {
+    type CachedDidDocument,
+    type DidDocument,
+    type DidDocumentCache,
+    type DidDocumentSource,
+    type DidService,
+    type DidVerificationMethod,
+} from "./did-document"
+export {
+    parseMonitorCollections,
+    type WatchedCollection,
+    type WatchedDidSet,
+    type WatchedRecord,
+} from "./watched"
+export {
+    GRAPH_EDGE_KEYS,
+    GRAPH_READ_KEYS,
+    RECORD_READ_KEYS,
+    type GraphEdge,
+    type GraphReadResponse,
+    type RecordReadMiss,
+    type RecordReadResponse,
+} from "./read-api"
