@@ -18,6 +18,7 @@ import { RecordNotFoundError, type DidDocument } from "@germ-network/atproto-pmr
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
+    FETCH_AS_OF_SKEW_MS,
     type Cursor,
     type DidDocumentSink,
     type MonitorIndex,
@@ -194,6 +195,7 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         await settleDeletion(deps, did, err.permanent)
         return "deleted"
     }
+    await recordFetchedDocument(deps, did, record.didDocument)
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
         // Not evidence of anything the monitor may serve. Terminal, not
@@ -243,6 +245,26 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, record.rev)
     return "stored"
+}
+
+/**
+ * Keeps the DID document a fetch resolved through, ordered by when that
+ * fetch started. A failing sink never costs the caller its fetch: the
+ * stored copy is refreshed again by the next one.
+ */
+export async function recordFetchedDocument(
+    deps: Pick<IngestDeps, "didDocuments">,
+    did: string,
+    fetched: FetchedDidDocument | undefined
+): Promise<void> {
+    if (fetched === undefined || deps.didDocuments === undefined) return
+    try {
+        await deps.didDocuments.recordDidDocument(
+            did,
+            fetched.document,
+            fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
+        )
+    } catch {}
 }
 
 /** Drain what is owed. Called by the same clock that watches the socket. */
