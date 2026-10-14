@@ -10,6 +10,7 @@ import {
     settleDue,
     sweepBackfill,
     windowOf,
+    FETCH_AS_OF_SKEW_MS,
     type BackfillProgress,
     type Cursor,
     type DidDocumentSink,
@@ -61,6 +62,9 @@ const CONNECT_TIMEOUT_MS = 5_000
 export function needsRearm(existingAlarmAt: number | null, nowMs: number): boolean {
     return existingAlarmAt === null || existingAlarmAt <= nowMs
 }
+
+/** KV puts one alarm may spend on stored DID documents. */
+const DID_DOCUMENT_PUBLISH_BATCH = 64
 
 type PublishRow = {
     did: string
@@ -658,11 +662,16 @@ export class MonitorIngest
 
     /**
      * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
-     * to a real read; a subclass overrides it alongside `fetchRecord` when
-     * the deployment resolves DIDs differently.
+     * to a real read that also keeps the DID document it resolved through; a
+     * subclass overrides it alongside `fetchRecord` when the deployment
+     * resolves DIDs differently, and must hand its own document to
+     * `recordDidDocument` to keep that.
      */
     protected fetchHeadRev(did: string): Promise<string> {
-        return fetchHeadRev(did)
+        return fetchHeadRev(did, {
+            onDidDocument: ({ document, fetchedAtMs }) =>
+                this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
+        })
     }
 
     /**
@@ -765,6 +774,7 @@ export class MonitorIngest
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
+            didDocuments: this,
             nowMs: () => Date.now(),
         }
     }
@@ -916,6 +926,12 @@ export class MonitorIngest
             } catch (err) {
                 // The alarm must still seal and re-arm itself.
                 console.error("monitor: refresh failed", err)
+            }
+            try {
+                const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
+                console.log("monitor: did documents", published)
+            } catch (err) {
+                console.error("monitor: did document publish failed", err)
             }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.

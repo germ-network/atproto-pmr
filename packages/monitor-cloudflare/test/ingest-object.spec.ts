@@ -27,6 +27,7 @@ import {
     sealDueWindows,
     settleDue,
     sweepBackfill,
+    FETCH_AS_OF_SKEW_MS,
     type FetchedRecord,
     type IngestDeps,
 } from "@germ-network/atproto-pmr-monitor"
@@ -1530,9 +1531,147 @@ describe("publishing stored DID documents", () => {
 })
 
 describe("wiring stored DID documents into the monitor", () => {
-    it.todo("settle through the real deps records the fetched record's DID document")
-    it.todo("the default fetchHeadRev records the document it resolved through")
-    it.todo("the alarm publishes documents after the refresh pass, and a publish failure does not skip sealing")
+    const rowOf = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<{ document: string; as_of: number; confirmed_at: number }>(
+                    "SELECT document, as_of, confirmed_at FROM did_documents WHERE did = ?",
+                    did
+                )
+                .toArray()[0] ?? null
+        )
+
+    it("settle through the real deps records the fetched record's DID document", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s10settle"
+        const document: DidDocument = { id: did }
+        await inMonitorObj(stub, async (obj) => {
+            await obj.intake({ did, rev: "3m1" }, "1")
+            const realDeps = (obj as unknown as { deps(): IngestDeps }).deps()
+            await settleDue({
+                ...realDeps,
+                fetchRecord: async () => ({
+                    rev: "3m1",
+                    car: new Uint8Array([1]),
+                    source: PDS,
+                    signingKey: SIGNING_KEY,
+                    didDocument: { document, fetchedAtMs: 100_000 },
+                }),
+            })
+        })
+        expect(await rowOf(stub, did)).toEqual({
+            document: canonicalDidDocumentJson(document),
+            as_of: 100_000 - FETCH_AS_OF_SKEW_MS,
+            confirmed_at: 100_000 - FETCH_AS_OF_SKEW_MS,
+        })
+    })
+
+    it("the default fetchHeadRev records the document it resolved through", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s10head"
+        const original = globalThis.fetch
+        const before = Date.now()
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            const url = String(input)
+            if (url.startsWith("https://plc.directory/")) {
+                return Promise.resolve(
+                    Response.json({
+                        id: did,
+                        service: [
+                            {
+                                id: "#atproto_pds",
+                                type: "AtprotoPersonalDataServer",
+                                serviceEndpoint: PDS,
+                            },
+                        ],
+                    })
+                )
+            }
+            if (url.includes("sync.getLatestCommit")) {
+                return Promise.resolve(Response.json({ cid: "bafy", rev: "3m5" }))
+            }
+            return Promise.resolve(new Response(null, { status: 404 }))
+        }) as typeof fetch
+        try {
+            const rev = await inMonitorObj(stub, (obj) =>
+                (obj as unknown as { fetchHeadRev(did: string): Promise<string> }).fetchHeadRev(did)
+            )
+            expect(rev).toBe("3m5")
+        } finally {
+            globalThis.fetch = original
+        }
+        const row = await rowOf(stub, did)
+        expect(row?.document).toContain(`"id":"${did}"`)
+        const after = Date.now()
+        expect(row?.as_of).toBeGreaterThanOrEqual(before - FETCH_AS_OF_SKEW_MS)
+        expect(row?.as_of).toBeLessThanOrEqual(after - FETCH_AS_OF_SKEW_MS)
+    })
+
+    async function alarmWith(publish: () => Promise<unknown>) {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            const o = obj as unknown as {
+                publishDidDocuments: (limit: number) => Promise<unknown>
+                windowMembers: (w: number) => Promise<string[]>
+                fetchHeadRev: (did: string) => Promise<string>
+            }
+            o.fetchHeadRev = async (did) => {
+                log.push(`refresh ${did}`)
+                return "3m1"
+            }
+            o.publishDidDocuments = async (limit) => {
+                log.push(`publish ${limit}`)
+                return publish()
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            // A completion three hours back makes a digest window due, which
+            // is what makes the alarm seal (and so reach `windowMembers`).
+            await obj.complete("did:plc:s10alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await kvSnapshotStore(testEnv).putRecord("did:plc:s10alarm", {
+                rev: "3m1",
+                car: new Uint8Array([7]),
+                observedAtMs: Date.now() - 3 * 3_600_000,
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            })
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        return log
+    }
+
+    it("the alarm publishes documents after the refresh pass, and a publish failure does not skip sealing", async () => {
+        const ok = await alarmWith(async () => ({ published: 0, remaining: 0, coveredThroughMs: null }))
+        const refresh = ok.indexOf("refresh did:plc:s10alarm")
+        expect(refresh).toBeGreaterThanOrEqual(0)
+        expect(ok).toContain("publish 64")
+        expect(ok.indexOf("publish 64")).toBeGreaterThan(refresh)
+        expect(ok.indexOf("seal")).toBeGreaterThan(ok.indexOf("publish 64"))
+
+        const failed = await alarmWith(async () => {
+            throw new Error("kv down")
+        })
+        expect(failed).toContain("publish 64")
+        expect(failed).toContain("seal")
+    })
 })
 
 describe("the PLC export cursor", () => {
