@@ -18,5 +18,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Typecheck
         run: pnpm -r typecheck
-      - name: Test
-        run: pnpm -r test
+      - name: Test with coverage
+        run: pnpm -r test:coverage
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo "## Coverage (report only)" >> "$GITHUB_STEP_SUMMARY"
+          for f in packages/*/coverage/coverage-summary.json; do
+            node -e 'const t=require(process.argv[1]).total;console.log(`- ${process.argv[1].split("/")[2]}: lines ${t.lines.pct}%, branches ${t.branches.pct}%, functions ${t.functions.pct}%`)' "./$f" >> "$GITHUB_STEP_SUMMARY"
+          done

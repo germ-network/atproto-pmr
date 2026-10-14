@@ -11,3 +11,4 @@ worker-configuration.d.ts
 # account's namespace ids; keeping it ignored means copying the example and
 # filling it in cannot accidentally commit them.
 wrangler.toml
+coverage/

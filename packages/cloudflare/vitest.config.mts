@@ -7,5 +7,12 @@ export default defineConfig({
             wrangler: { configPath: "./wrangler.test.toml" },
         }),
     ],
-    test: { include: ["test/**/*.spec.ts"] },
+    test: {
+        include: ["test/**/*.spec.ts"],
+        coverage: {
+            provider: "istanbul",
+            include: ["src/**/*.ts"],
+            reporter: ["text-summary", "json-summary"],
+        },
+    },
 })

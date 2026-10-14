@@ -21,6 +21,7 @@
 		"@germ-network/atproto-pmr-core": "workspace:*",
 		"@germ-network/atproto-pmr-monitor": "workspace:*",
 		"@noble/ciphers": "^2.3.0",
+		"@vitest/coverage-istanbul": "^4.1.11",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10",
 		"wrangler": "^4.11.1"
@@ -28,7 +29,8 @@
 	"scripts": {
 		"pretypecheck": "wrangler types -c wrangler.test.toml",
 		"typecheck": "tsc --noEmit",
-		"test": "vitest run"
+		"test": "vitest run",
+		"test:coverage": "vitest run --coverage"
 	},
 	"peerDependencies": {
 		"@germ-network/atproto-pmr-core": "*",

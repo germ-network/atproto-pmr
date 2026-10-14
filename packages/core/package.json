@@ -23,11 +23,13 @@
 		"cborg": "^6.1.1"
 	},
 	"devDependencies": {
+		"@vitest/coverage-istanbul": "^4.1.11",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.10"
 	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
-		"test": "vitest run"
+		"test": "vitest run",
+		"test:coverage": "vitest run --coverage"
 	}
 }
