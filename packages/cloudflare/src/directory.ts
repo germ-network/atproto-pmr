@@ -3,6 +3,7 @@ import {
     binaryToBase64URL,
     type Directory,
     type Locator,
+    type MonitorRegistrationNotify,
     type PMRStore,
     type RegistrationFields,
     type ResolvedAddress,
@@ -106,18 +107,43 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         await this.env.addresses.delete(address)
     }
 
+    /**
+     * Tells a bound monitor about a directory write, after the write. Never
+     * throws: a registration must not fail because the monitor is down. A
+     * monitor that hangs rather than fails delays the write; there is no timeout.
+     */
+    private async notifyMonitor(
+        call: keyof MonitorRegistrationNotify,
+        did: string
+    ): Promise<void> {
+        const { MONITOR_INGEST, MONITOR_INGEST_NAME } = this.env
+        if (MONITOR_INGEST === undefined || MONITOR_INGEST_NAME === undefined) return
+        try {
+            const monitor = MONITOR_INGEST.get(
+                MONITOR_INGEST.idFromName(MONITOR_INGEST_NAME)
+            ) as unknown as MonitorRegistrationNotify
+            await monitor[call](did)
+        } catch (err) {
+            console.warn(`KVDirectory.${call}: monitor notify failed for ${did}:`, err)
+        }
+    }
+
     /** Idempotent on DID. */
     async create(
         did: string,
         registration: RegistrationFields
     ): Promise<Locator> {
         const existing = await this.resolve(did)
-        if (existing !== null) return existing
+        if (existing !== null) {
+            await this.notifyMonitor("register", did)
+            return existing
+        }
 
         const id = this.env.pmrs.newUniqueId()
         const locator = id.toString()
         await this.env.pmrDirectory.put(did, locator)
         await this.env.pmrs.get(id).update(registration)
+        await this.notifyMonitor("register", did)
         return locator
     }
 
@@ -138,6 +164,7 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
                 console.warn(`KVDirectory.delete: DO teardown failed for ${did}:`, err)
             }
         }
+        await this.notifyMonitor("unregister", did)
     }
 }
 
