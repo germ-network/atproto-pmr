@@ -353,3 +353,9 @@ describe("resolvePDSEndpoint", () => {
         await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
     })
 })
+
+describe("RecordNotFoundError.reason", () => {
+    // A caller tells a missing record from a gone repo by the XRPC error name.
+    it.todo("guardedFetchBytes: a terminal XRPC error carries its error name as reason")
+    it.todo("guardedFetchJSON: a terminal XRPC error name carries through as reason; a message-prefix match has a null reason")
+})

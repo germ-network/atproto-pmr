@@ -30,3 +30,13 @@ describe("snapshotKeys", () => {
         })
     })
 })
+
+describe("kvRecordSnapshots", () => {
+    // One read surface serves the declaration and every secondary, with the
+    // ingest's verdict, and a confirmation counts only at its own record's rev.
+    it.todo("declaration keeps bare rec:/chk: keys")
+    it.todo("secondary round-trips under its collection-scoped keys")
+    it.todo("entry without verified metadata reads verifiedWith null")
+    it.todo("chk: for a secondary is honoured only at that record's rev")
+    it.todo("unset or empty MONITOR_COLLECTIONS watches no secondary")
+})

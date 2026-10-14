@@ -579,3 +579,23 @@ describe("refresh re-verifies", () => {
         expect(h.onChange).not.toHaveBeenCalled()
     })
 })
+
+describe("refresh pushes a re-key", () => {
+    // A re-key whose record does not verify under the new key is still told
+    // to the device, once per key, as settle does.
+    it.todo("an unverifiable re-key found by refresh pushes onChange once")
+    it.todo("an unverifiable re-key found by refresh: a second refresh under the same seen key does not push again")
+})
+
+describe("one head check covers every record", () => {
+    // One getLatestCommit per DID confirms or re-fetches the declaration and
+    // every secondary; a secondary never moves revs or enters the window.
+    it.todo("unchanged head confirms declaration and profile")
+    it.todo("moved head with unchanged profile CID stores it quietly at the signed rev")
+    it.todo("moved head with changed profile CID settles the profile only")
+    it.todo("missing profile is fetched on the next check")
+    it.todo("a profile commit does not lapse the declaration's chk:")
+    it.todo("a non-holder's head check does not fetch the declaration")
+    it.todo("a record-level not-found for a non-holder does not mark it deleted")
+    it.todo("a repo-level answer at a non-holder's head check disposes its profile with no window entry or onDelete")
+})

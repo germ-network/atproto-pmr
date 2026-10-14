@@ -1,7 +1,12 @@
-import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
+import {
+    DECLARATION_COLLECTION_NSID,
+    type RecordSnapshotStore,
+} from "@germ-network/atproto-pmr-core"
 import type {
     DigestMarker,
+    RecordRef,
     RefreshSnapshots,
+    SecondarySnapshotStore,
     SnapshotCheck,
     SnapshotEntry,
     SnapshotStore,
@@ -79,7 +84,7 @@ interface StoredMeta {
  */
 export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
-): SnapshotStore & RefreshSnapshots {
+): SnapshotStore & RefreshSnapshots & SecondarySnapshotStore {
     return {
         async getRecord(did: string): Promise<SnapshotEntry | null> {
             const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
@@ -123,6 +128,22 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
 
         async putCheck(did: string, check: SnapshotCheck): Promise<void> {
             await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
+        },
+
+        async getSecondary(_ref: RecordRef): Promise<SnapshotEntry | null> {
+            throw new Error("not implemented")
+        },
+
+        async putSecondary(_ref: RecordRef, _entry: SnapshotEntry): Promise<void> {
+            throw new Error("not implemented")
+        },
+
+        async deleteSecondary(_ref: RecordRef): Promise<void> {
+            throw new Error("not implemented")
+        },
+
+        async putSecondaryCheck(_ref: RecordRef, _check: SnapshotCheck): Promise<void> {
+            throw new Error("not implemented")
         },
 
         async getSealedWindow(windowId: string): Promise<Uint8Array | null> {
@@ -179,5 +200,22 @@ export function kvDeclarationSnapshots<TIngest extends MonitorIngest = MonitorIn
             car: new Uint8Array(value),
             freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
         }
+    }
+}
+
+/**
+ * The read surface over every kept record, the declaration and the
+ * secondaries alike, keyed by `snapshotKeys`. `freshAtMs` is the later of the
+ * fetch and a `chk:` confirmation at the same rev as that record; a `chk:` at
+ * any other rev is ignored. An entry stored without verified metadata reads
+ * `verifiedWith`, `rev` and `cid` as null.
+ */
+export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): RecordSnapshotStore {
+    return {
+        async get() {
+            throw new Error("not implemented")
+        },
     }
 }

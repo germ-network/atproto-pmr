@@ -74,11 +74,21 @@ const MAX_RESPONSE_BYTES = 64 * 1024
  */
 export class RecordNotFoundError extends Error {
     readonly permanent: boolean
+    /**
+     * The XRPC error name that confirmed the state (`RecordNotFound`,
+     * `RepoNotFound`, `RepoTakendown`, …), so a caller can tell a missing
+     * record from a gone repo without parsing the message. Null when the
+     * state was confirmed some other way (a did:plc tombstone, by message
+     * prefix). Only `RecordNotFound` is record-level; any other value, null
+     * included, means the repo or the DID is gone.
+     */
+    readonly reason: string | null
 
-    constructor(reason: string, permanent: boolean) {
-        super(`confirmed unobtainable: ${reason}`)
+    constructor(message: string, permanent: boolean, reason?: string) {
+        super(`confirmed unobtainable: ${message}`)
         this.name = "RecordNotFoundError"
         this.permanent = permanent
+        this.reason = reason ?? null
     }
 }
 

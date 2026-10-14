@@ -24,6 +24,12 @@ import {
     type IndexedRecord,
     type IngestDeps,
     type IntakeOutcome,
+    type InterestIndex,
+    type InterestTransition,
+    type PendingRecordFetch,
+    type RecordRef,
+    type SecondaryIndex,
+    type SecondaryWriteAnswer,
     type KeyUpdateIndex,
     type MonitorIndex,
     type OwedKeyUpdate,
@@ -38,7 +44,10 @@ import {
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyRecordProofOutcome,
     type DidDocument,
+    type InterestPolicy,
+    type MonitorRegistrationNotify,
     type PlcCoverage,
+    type WatchedRecord,
 } from "@germ-network/atproto-pmr-core"
 import {
     canonicalDidDocumentJson,
@@ -130,7 +139,14 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
-    implements MonitorIndex, RefreshIndex, KeyUpdateIndex, DidDocumentSink
+    implements
+        MonitorIndex,
+        RefreshIndex,
+        KeyUpdateIndex,
+        DidDocumentSink,
+        InterestIndex,
+        SecondaryIndex,
+        MonitorRegistrationNotify
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -957,6 +973,118 @@ export class MonitorIngest
         this.ctx.storage.transactionSync(() => this.writeVerified(did, rev, observedAtMs, verified))
     }
 
+    // ---- Registration (RPC from the relay's directory) ---------------------
+
+    /**
+     * The relay registered `did`: it joins interest, and any unregister
+     * still waiting out `UNREGISTER_GRACE_MS` is cancelled.
+     */
+    async register(_did: string): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    /**
+     * The relay dropped `did`'s registration. Applied by the alarm once
+     * `UNREGISTER_GRACE_MS` has passed with no `register` in between, so a
+     * replace (unregister then register) disposes of nothing.
+     */
+    async unregister(_did: string): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Daily mark-and-sweep of the registered set against a full paged listing
+     * of `pmrDirectory`: one complete pass marks every listed DID with the
+     * pass's generation, then unmarks registrations older than the pass. A DID
+     * registered after the pass began is never removed by it. One that has
+     * never run is due at once. A no-op without the binding, which only
+     * `everyone` allows.
+     */
+    protected async reconcileRegistrations(_nowMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    // ---- InterestIndex ----------------------------------------------------
+
+    interestPolicy(): InterestPolicy {
+        throw new Error("not implemented")
+    }
+
+    async inInterest(_did: string): Promise<boolean> {
+        throw new Error("not implemented")
+    }
+
+    async interestEpoch(_did: string): Promise<number> {
+        throw new Error("not implemented")
+    }
+
+    async isRegistered(_did: string): Promise<boolean> {
+        throw new Error("not implemented")
+    }
+
+    async isGraphOwner(_did: string): Promise<boolean> {
+        throw new Error("not implemented")
+    }
+
+    async setRegistered(_did: string, _registered: boolean, _atMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async setOwnerFollowers(_did: string, _count: number, _atMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async dueTransitions(_limit: number): Promise<InterestTransition[]> {
+        throw new Error("not implemented")
+    }
+
+    async clearTransition(_did: string, _epoch: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async oweJoin(_did: string, _records: readonly WatchedRecord[], _epoch: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async forgetLeft(_did: string, _epoch: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    // ---- SecondaryIndex ---------------------------------------------------
+
+    async dueSecondaries(_nowMs: number, _limit: number): Promise<PendingRecordFetch[]> {
+        throw new Error("not implemented")
+    }
+
+    async deferSecondary(_ref: RecordRef, _notBeforeMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async clearSecondary(_ref: RecordRef): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async completeSecondary(
+        _ref: RecordRef,
+        _rev: string,
+        _verified: VerifiedWrite,
+        _epoch: number
+    ): Promise<SecondaryWriteAnswer | "stored"> {
+        throw new Error("not implemented")
+    }
+
+    async disposeSecondary(
+        _ref: RecordRef,
+        _rev: string,
+        _epoch: number
+    ): Promise<SecondaryWriteAnswer | "disposed"> {
+        throw new Error("not implemented")
+    }
+
+    async secondaryRevOf(_ref: RecordRef): Promise<string | null> {
+        throw new Error("not implemented")
+    }
+
     // ---- ingest -----------------------------------------------------------
 
     /**
@@ -993,6 +1121,19 @@ export class MonitorIngest
             if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
             throw err
         }
+    }
+
+    /**
+     * `com.atproto.sync.getRecord` for a secondary record, through the same
+     * fresh document resolution as the declaration's fetch.
+     */
+    protected fetchRecordAt(_ref: RecordRef): Promise<FetchedRecord> {
+        throw new Error("not implemented")
+    }
+
+    /** `verifyRecord` for a secondary record's own path. */
+    protected verifyRecordAt(_ref: RecordRef, _record: FetchedRecord): Promise<VerifyOutcome> {
+        throw new Error("not implemented")
     }
 
     /**

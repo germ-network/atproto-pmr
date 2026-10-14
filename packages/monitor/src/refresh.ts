@@ -8,9 +8,14 @@
  * key are unchanged is stored quietly — no digest-window entry, no
  * `onChange`. Only a changed record CID or key takes the full `settle` path.
  */
-import { RecordNotFoundError, readRecordFromCar } from "@germ-network/atproto-pmr-core"
+import {
+    RecordNotFoundError,
+    readRecordFromCar,
+    type WatchedRecord,
+} from "@germ-network/atproto-pmr-core"
 import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
 import type { HeadRev } from "./fetch-record"
+import type { SecondaryDeps } from "./secondary"
 import { compareRev, type VerifiedWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
@@ -22,9 +27,16 @@ export interface SnapshotCheck {
 export interface RefreshIndex {
     /**
      * Held, not deleted, not pending, not confirmed or attempted since
-     * `checkedBeforeMs`; least recently checked first.
+     * `checkedBeforeMs`; least recently checked first. With
+     * `nonHolderCheckedBeforeMs`, the queue is the interest set: a DID that
+     * has never held a declaration is due against that older bound instead,
+     * and a reversibly gone holder stays due under `everyone`.
      */
-    dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]>
+    dueRefresh(
+        checkedBeforeMs: number,
+        limit: number,
+        nonHolderCheckedBeforeMs?: number
+    ): Promise<string[]>
     markChecked(did: string, checkedAtMs: number): Promise<void>
     /**
      * An attempt that did not confirm anything. The DID is not due again
@@ -63,6 +75,12 @@ export interface RefreshDeps {
     fetchHeadRev(did: string): Promise<HeadRev>
     collection: string
     rkey: string
+    /**
+     * The secondaries the same head check covers. One indexed at the head's
+     * rev under the current key is confirmed; one behind, missing,
+     * unverified or under another key is fetched and settled quietly.
+     */
+    secondary?: { deps: SecondaryDeps; records: readonly WatchedRecord[] }
 }
 
 export type RefreshOutcome =
@@ -95,7 +113,13 @@ export interface RefreshResult {
  */
 export async function refreshDue(
     deps: RefreshDeps,
-    opts: { nowMs: number; staleAfterMs: number; limit: number }
+    opts: {
+        nowMs: number
+        staleAfterMs: number
+        limit: number
+        /** How stale a never-held DID's snapshots may get; default one day. */
+        nonHolderStaleAfterMs?: number
+    }
 ): Promise<RefreshResult> {
     const dids = await deps.refreshIndex.dueRefresh(
         opts.nowMs - opts.staleAfterMs,

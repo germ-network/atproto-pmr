@@ -1,3 +1,4 @@
+import type { InterestPolicy, WatchedRecord } from "@germ-network/atproto-pmr-core"
 import type { MonitorIngest } from "./ingest-object"
 
 /**
@@ -30,6 +31,37 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /** The collection carrying the published key. */
     MONITOR_COLLECTION: string
+
+    /**
+     * The singleton records kept beside the declaration for every DID in
+     * interest, as comma-separated `<nsid>/<rkey>` (core
+     * `parseMonitorCollections`), e.g. `app.bsky.actor.profile/self`. Unset or
+     * empty keeps none.
+     */
+    MONITOR_COLLECTIONS?: string
+
+    /**
+     * Who is watched (core `parseInterestPolicy`): `registered` (the default)
+     * keeps registered DIDs and every DID they follow; `everyone` keeps every
+     * declaration holder. Anything else fails the object at startup.
+     */
+    INTEREST_POLICY?: string
+
+    /**
+     * How long (ms) an `unregister` waits before it applies, default 10
+     * minutes; a `register` inside it cancels it, so a registration replaced
+     * by delete-then-create disposes of nothing.
+     */
+    UNREGISTER_GRACE_MS?: string
+
+    /**
+     * The relay's directory of registered DIDs (bare `<did>` keys), read only:
+     * the daily reconcile lists it to repair a missed register or unregister.
+     * Required under `registered` (the object fails at startup without it);
+     * under `everyone`, unbound leaves the registration calls alone to keep
+     * the registered set.
+     */
+    pmrDirectory?: KVNamespace
 
     /**
      * The stream to consume. A monitor is not bound to any one provider;
@@ -116,6 +148,13 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     REFRESH_STALE_AFTER_MS: string
 
     /**
+     * The same bound for a DID that holds no declaration (only its secondaries
+     * are kept), default 86_400_000 (a day). Live profile events keep those
+     * current in between.
+     */
+    REFRESH_NONHOLDER_STALE_AFTER_MS?: string
+
+    /**
      * The PLC directory's export stream (`wss://plc.directory/export/stream`,
      * written as https). One socket and cursor feed both caches it keeps
      * current: the relay's cached did:plc signing keys (`sk:` in `records`)
@@ -156,4 +195,18 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     VAPID_SUBJECT?: string
     PUSH_MAX_SEALED_BYTES?: string
     PUSH_TTL_SECONDS?: string
+}
+
+/** The configured secondaries; none when `MONITOR_COLLECTIONS` is unset or empty. */
+export function monitorCollections<TIngest extends MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): WatchedRecord[] {
+    throw new Error("not implemented")
+}
+
+/** The configured interest policy; throws on an unknown value, naming it. */
+export function interestPolicy<TIngest extends MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): InterestPolicy {
+    throw new Error("not implemented")
 }

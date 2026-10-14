@@ -14,13 +14,18 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
-import { RecordNotFoundError, type DidDocument } from "@germ-network/atproto-pmr-core"
+import {
+    RecordNotFoundError,
+    type DidDocument,
+    type InterestPolicy,
+} from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
     FETCH_AS_OF_SKEW_MS,
     type Cursor,
     type DidDocumentSink,
+    type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
     type SnapshotStore,
@@ -95,6 +100,12 @@ export interface IngestDeps {
      * PLC export stream is the authority for did:plc.
      */
     keyUpdates?: Pick<KeyUpdateIndex, "oweKeyUpdate">
+    /**
+     * The allow list. Under `registered`, a declaration commit for a DID
+     * outside it is ignored; and a settle whose DID left interest after the
+     * fetch began (its epoch moved) stores nothing.
+     */
+    interest?: Pick<InterestIndex, "inInterest" | "interestEpoch">
     nowMs(): number
 }
 
@@ -103,6 +114,8 @@ const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
     collection: string
+    /** Unset behaves as `everyone`: every declaration commit is taken in. */
+    policy?: InterestPolicy
 }
 
 export type IntakeDecision =
@@ -209,7 +222,21 @@ export async function settleDeletion(
  * path: retrying an answer that will not change until something happens
  * again accomplishes nothing but leaving the obligation owed forever.
  */
-export async function settle(deps: IngestDeps, did: string): Promise<SettleOutcome> {
+/** How one settle reports what it finds. */
+export interface SettleOptions {
+    /**
+     * Owed by a join, not a change: an advance is stored through
+     * `completeQuietly` with no `onChange`, and a not-found re-asserts
+     * gone-reversible with no window entry and no `onDelete`.
+     */
+    quiet?: boolean
+}
+
+export async function settle(
+    deps: IngestDeps,
+    did: string,
+    _opts: SettleOptions = {}
+): Promise<SettleOutcome> {
     let record: FetchedRecord
     try {
         record = await deps.fetchRecord(did)
