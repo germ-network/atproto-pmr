@@ -93,6 +93,8 @@ const KEY_DRAIN_BATCH = 64
  * cost a write for every op the directory accepts.
  */
 const PLC_CURSOR_PERSIST_MS = 5_000
+/** How often ignored declaration-stream events move the persisted cursor. */
+const IGNORED_CURSOR_PERSIST_MS = 5_000
 
 /** How often the registered set is re-listed from the directory. */
 const RECONCILE_INTERVAL_MS = 86_400_000
@@ -2031,11 +2033,39 @@ export class MonitorIngest
                 : String(Math.round(event.timeMs * 1000))
         const decision = await intake(
             this.deps(),
-            { collection: this.env.MONITOR_COLLECTION },
+            { collection: this.env.MONITOR_COLLECTION, policy: this.interestPolicy() },
             event,
             cursor ?? ""
         )
         if (decision === "reverify") this.kickDrain()
+        if (decision === "ignored" && cursor !== null && cursor !== "") this.advanceIgnoredCursor(cursor)
+    }
+
+    private cursorAdvancedAt = 0
+
+    /**
+     * An ignored event is still accounted for, or a resume would replay every
+     * one of them. Written at most once per `IGNORED_CURSOR_PERSIST_MS`, and
+     * only ever raised, so it can neither cost a write per event nor move the
+     * cursor behind an event already accepted.
+     */
+    private advanceIgnoredCursor(cursor: string): void {
+        const nowMs = Date.now()
+        if (nowMs - this.cursorAdvancedAt < IGNORED_CURSOR_PERSIST_MS) return
+        const stored = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'cursor'")
+            .toArray()[0]
+        try {
+            if (stored !== undefined && BigInt(stored.v) >= BigInt(cursor)) return
+        } catch {
+            return
+        }
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            cursor
+        )
+        this.cursorAdvancedAt = nowMs
     }
 
     protected async armWatchdog(): Promise<void> {

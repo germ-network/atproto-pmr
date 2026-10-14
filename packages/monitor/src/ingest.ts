@@ -120,8 +120,12 @@ const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
     collection: string
-    /** Unset behaves as `everyone`: every declaration commit is taken in. */
-    policy?: InterestPolicy
+    /**
+     * Under `registered`, a declaration commit for a DID outside the allow
+     * list is ignored; under `everyone` every one is taken in, which is how
+     * holders are discovered.
+     */
+    policy: InterestPolicy
 }
 
 export type IntakeDecision =
@@ -163,6 +167,9 @@ export async function intake(
 
     const commit: CommitEvent = event
     if (commit.collection !== config.collection) return "ignored"
+    if (config.policy === "registered" && !(await deps.interest.inInterest(commit.did))) {
+        return "ignored"
+    }
 
     const result = await deps.index.intake(
         { did: commit.did, rev: commit.rev },

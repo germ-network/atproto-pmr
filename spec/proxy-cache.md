@@ -70,6 +70,8 @@ does not extend to a read that has to fall through to the PDS.
 |---|---|
 | A monitor's record snapshot, kept current by Jetstream and backfilled by direct query of the PDS | **built** — [key transparency](key-transparency.md#keeping-the-snapshot-current) (covering every DID that carries the declaration collection, not only the DIDs one PMR serves) |
 | The monitor's periodic re-confirmation of held snapshots | **built** |
+| The monitor's **interest policy**: an allow list of DIDs it keeps records for, `registered` (registered users and, once follow edges are written, the DIDs they follow) or `everyone` (every declaration holder), set by `INTEREST_POLICY` | **built** — DIDs join and leave the list with an epoch check, so nothing is stored for a DID that left while a fetch was in flight; under `registered` the declaration socket ignores commits outside it |
+| The monitor's **profile snapshot**: `app.bsky.actor.profile/self` (more via `MONITOR_COLLECTIONS`), verified and kept quietly beside the declaration for every DID in the allow list | **built** — no digest-window entry and no push. A holder's profile is head-checked hourly with its declaration; a DID that holds no declaration (a followee) is checked every 24 hours (`REFRESH_NONHOLDER_STALE_AFTER_MS`), so its profile is only that current until live profile events are built |
 | A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path only; exposed on no endpoint |
 | The `sd` + `dc` hint on delivered messages | **built** |
 | The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |

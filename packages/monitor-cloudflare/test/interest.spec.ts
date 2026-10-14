@@ -4,7 +4,7 @@
  * everything kept for a DID.
  */
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
@@ -1259,9 +1259,100 @@ describe("head checks follow interest", () => {
     })
 })
 
+const frame = (did: string, rev: string, timeUs: number, collection = testEnv.MONITOR_COLLECTION) =>
+    JSON.stringify({
+        payload: {
+            $type: "com.atproto.sync.subscribeRepos#commit",
+            did,
+            collection,
+            rev,
+            rkey: "self",
+            operation: "update",
+            time_us: timeUs,
+        },
+    })
+const onFrame = (obj: MonitorIngest, raw: string) =>
+    (obj as unknown as { onFrame(raw: string): Promise<void> }).onFrame(raw)
+
 describe("declaration intake by policy", () => {
-    it.todo("registered policy ignores declaration commits outside interest")
-    it.todo("registered policy skips the relay backfill")
-    it.todo("everyone policy discovers new holders")
-    it.todo("ignored declaration events advance the persisted cursor at most once per interval, never lowering it")
+    it("registered policy ignores declaration commits outside interest", async () => {
+        const stub = registeredStub()
+        const inside = uniqDid()
+        const outside = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(inside, true, 1)
+            await onFrame(obj, frame(outside, "3m1", 1_000_000))
+            await onFrame(obj, frame(inside, "3m1", 2_000_000))
+            expect((await obj.duePending(Date.now(), 10)).map((p) => p.did)).toEqual([inside])
+        })
+    })
+
+    it("registered policy skips the relay backfill", async () => {
+        const asked = async (stub: DurableObjectStub<MonitorIngest>) => {
+            await inObj(stub, async (obj) => {
+                withDirectory(obj, directory([]))
+                await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            })
+            const urls: string[] = []
+            const original = globalThis.fetch
+            globalThis.fetch = ((input: RequestInfo | URL) => {
+                urls.push(String(input))
+                return Promise.resolve(Response.json({ repos: [] }))
+            }) as typeof fetch
+            try {
+                await runDurableObjectAlarm(stub)
+            } catch {
+                // connect() has no real socket to open here.
+            } finally {
+                globalThis.fetch = original
+            }
+            return urls.filter((u) => u.includes("listReposByCollection"))
+        }
+        expect(await asked(registeredStub())).toEqual([])
+        expect((await asked(everyoneStub())).length).toBeGreaterThan(0)
+    })
+
+    it("everyone policy discovers new holders", async () => {
+        const did = uniqDid()
+        await inObj(everyoneStub(), async (obj) => {
+            await onFrame(obj, frame(did, "3m1", 1_000_000))
+            expect((await obj.duePending(Date.now(), 10)).map((p) => p.did)).toEqual([did])
+        })
+    })
+
+    it("ignored declaration events advance the persisted cursor at most once per interval, never lowering it", async () => {
+        const stub = registeredStub()
+        const outside = uniqDid()
+        const cursor = (obj: MonitorIngest) => obj.readCursor()
+        let now = 1_000_000
+        const clock = vi.spyOn(Date, "now").mockImplementation(() => now)
+        try {
+            await inObj(stub, async (obj) => {
+                await onFrame(obj, frame(outside, "3m1", 5_000_000))
+                expect(await cursor(obj)).toBe("5000000")
+                // Inside the interval, a later event does not write.
+                now += 1_000
+                await onFrame(obj, frame(outside, "3m2", 6_000_000))
+                expect(await cursor(obj)).toBe("5000000")
+                // After it, the cursor is raised.
+                now += 5_000
+                await onFrame(obj, frame(outside, "3m3", 7_000_000))
+                expect(await cursor(obj)).toBe("7000000")
+                // An older event never lowers it.
+                now += 6_000
+                await onFrame(obj, frame(outside, "3m4", 1_000_000))
+                expect(await cursor(obj)).toBe("7000000")
+                // Nor does one behind a cursor an accepted event moved ahead.
+                await obj.setRegistered(outside, true, 1)
+                await onFrame(obj, frame(outside, "3m5", 9_000_000))
+                expect(await cursor(obj)).toBe("9000000")
+                now += 6_000
+                const other = uniqDid()
+                await onFrame(obj, frame(other, "3m6", 8_000_000))
+                expect(await cursor(obj)).toBe("9000000")
+            })
+        } finally {
+            clock.mockRestore()
+        }
+    })
 })
