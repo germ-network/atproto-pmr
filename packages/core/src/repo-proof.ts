@@ -101,13 +101,13 @@ export function readRecordFromCar(
 // ---------------------------------------------------------------------------
 
 /** A DAG-CBOR CID link (tag 42): the CID's binary form, without the 0x00 prefix. */
-class CidLink {
+export class CidLink {
     constructor(readonly bytes: Uint8Array) {}
 }
 
-const CID_PREFIX = Uint8Array.of(0x01, 0x71, 0x12, 0x20)
-const CID_LENGTH = 36
-const MAX_MST_DEPTH = 128
+export const CID_PREFIX = Uint8Array.of(0x01, 0x71, 0x12, 0x20)
+export const CID_LENGTH = 36
+export const MAX_MST_DEPTH = 128
 
 // cborg's `strict` does not enforce map-key order or minimal floats; that is
 // harmless here because every signed or hashed byte string is checked as given
@@ -137,7 +137,7 @@ const DECODE_OPTIONS = {
     })(),
 }
 
-function decodeCbor(bytes: Uint8Array): unknown {
+export function decodeCbor(bytes: Uint8Array): unknown {
     return decode(bytes, DECODE_OPTIONS)
 }
 
@@ -157,7 +157,7 @@ function encodeDagCbor(value: unknown): Uint8Array {
     })
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
     return (
         typeof value === "object" &&
         value !== null &&
@@ -169,7 +169,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
-function cidToString(cid: Uint8Array): string {
+export function cidToString(cid: Uint8Array): string {
     let out = ""
     let acc = 0
     let bits = 0
@@ -186,13 +186,13 @@ function cidToString(cid: Uint8Array): string {
     return `b${out}`
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a.length !== b.length) return false
     for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
     return true
 }
 
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
+export function compareBytes(a: Uint8Array, b: Uint8Array): number {
     const n = Math.min(a.length, b.length)
     for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i]! - b[i]!
     return a.length - b.length
@@ -210,7 +210,7 @@ function readVarint(bytes: Uint8Array, offset: number): [number, number] {
     throw new RepoProofError("car-malformed", "truncated varint")
 }
 
-interface Commit {
+export interface Commit {
     did: string
     version: number
     data: CidLink
@@ -285,7 +285,7 @@ function parseProof(car: Uint8Array, expectedDID: string | null): ParsedProof {
     return { blocks, commit }
 }
 
-function parseCommit(bytes: Uint8Array): Commit {
+export function parseCommit(bytes: Uint8Array): Commit {
     let value: unknown
     try {
         value = decodeCbor(bytes)
@@ -337,7 +337,7 @@ function base58Decode(text: string): Uint8Array | null {
     return Uint8Array.from(out.reverse())
 }
 
-function verifyCommitSignature(commit: Commit, signingKey: string): void {
+export function verifyCommitSignature(commit: Commit, signingKey: string): void {
     const decoded = signingKey.startsWith("z")
         ? base58Decode(signingKey.slice(1))
         : null
@@ -371,18 +371,18 @@ function verifyCommitSignature(commit: Commit, signingKey: string): void {
     }
 }
 
-interface MstEntry {
+export interface MstEntry {
     key: Uint8Array
     value: CidLink
     right: CidLink | null
 }
 
-interface MstNode {
+export interface MstNode {
     left: CidLink | null
     entries: MstEntry[]
 }
 
-function decodeNode(bytes: Uint8Array): MstNode {
+export function decodeNode(bytes: Uint8Array): MstNode {
     let value: unknown
     try {
         value = decodeCbor(bytes)
