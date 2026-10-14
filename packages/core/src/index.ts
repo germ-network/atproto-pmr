@@ -283,6 +283,18 @@ export {
     type VerifiedRecord,
 } from "./repo-proof"
 
+// Every record of one collection from a whole-repo CAR, under the signing key.
+export {
+    verifyRepoCollection,
+    RepoCollectionError,
+    DEFAULT_MAX_REPO_BYTES,
+    DEFAULT_MAX_MST_NODES,
+    type CollectionRecord,
+    type RepoCollectionErrorCode,
+    type RepoCollectionExpectation,
+    type VerifiedCollection,
+} from "./repo-collection"
+
 // A verified read of one record from a third party's snapshot (24 h rule included).
 export {
     snapshotRecordReader,
