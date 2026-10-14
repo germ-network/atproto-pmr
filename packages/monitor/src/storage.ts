@@ -25,6 +25,7 @@
  * is a serving copy, not a truth.
  */
 
+import type { DidDocument } from "@germ-network/atproto-pmr-core"
 import type { SigningKeyUpdate } from "./plc-export"
 
 /**
@@ -384,6 +385,42 @@ export function compareObservations(
     return a.source === b.source ? "agree" : "different-source"
 }
 
+/**
+ * Subtracted from a fetch's start time to give its `asOfMs`, so clock skew
+ * between the directory (whose `createdAt` orders stream writes) and this
+ * monitor cannot let a fetch that read a pre-operation document outrank the
+ * operation. Losing a tie costs one confirmation, nothing more.
+ */
+export const FETCH_AS_OF_SKEW_MS = 5_000
+
+/**
+ * The monitor's stored DID documents. Writes are ordered by `asOfMs`, not by
+ * arrival: a write whose `asOfMs` is older than the stored one is dropped.
+ * A stream operation's `asOfMs` is its directory `createdAt`; a fetch's is
+ * its start time less {@link FETCH_AS_OF_SKEW_MS}. So a fetch that read the
+ * directory before an operation was accepted never overwrites it, and a
+ * replayed old operation never overwrites a later fetch. (That a fetch
+ * started after acceptance sees the operation is an inference about the
+ * directory, not spec text.)
+ *
+ * Index I/O only — safe on the socket read loop. Publishing to where
+ * readers look is the implementation's own, separate step.
+ */
+export interface DidDocumentSink {
+    /**
+     * `document` null: the directory says the identity is gone. Every
+     * document the monitor keeps comes through here, so it is also the one
+     * place a later restriction on which documents are kept would apply.
+     */
+    recordDidDocument(did: string, document: DidDocument | null, asOfMs: number): Promise<void>
+    /**
+     * The directory accepted a change at `asOfMs` that could not be rendered:
+     * whatever is stored no longer describes the DID, so it must stop being
+     * trusted until a later write (a re-fetch) lands. Ordered like a write.
+     */
+    markDidDocumentStale(did: string, asOfMs: number): Promise<void>
+}
+
 /** A key update owed to the relay's signing-key cache. */
 export interface OwedKeyUpdate {
     did: string
@@ -401,12 +438,30 @@ export interface OwedKeyUpdate {
 export interface KeyUpdateIndex {
     /** The last applied export `seq`, or `null` to start at the tip. */
     readPlcCursor(): Promise<number | null>
-    advancePlcCursor(seq: number): Promise<void>
+    /**
+     * Raise the high-water `seq`, and with it the `createdAt` of the
+     * operation it carries (absent when the op's was unparseable); never
+     * lowers either. Persistence may be deferred.
+     */
+    advancePlcCursor(seq: number, createdAtMs?: number): Promise<void>
     resetPlcCursor(): Promise<void>
-    /** In `revs` or `pending`, and not permanently deleted. */
+    /**
+     * The DIDs this monitor watches: in `revs` or `pending`, and not
+     * permanently deleted. The export stream's intake acts only on these (the
+     * owed key update and the stored DID document alike), so this is the one
+     * place a later restriction on which DIDs are kept would apply.
+     */
     isWatched(did: string): Promise<boolean>
-    /** Owe `update` for `did`; with `plcSeq`, advance the cursor in the same batch. */
-    oweKeyUpdate(did: string, update: SigningKeyUpdate, plcSeq?: number): Promise<void>
+    /**
+     * Owe `update` for `did`; with `plcSeq`, advance the cursor in the same
+     * batch (and `createdAtMs`, when the op's was parseable, with it).
+     */
+    oweKeyUpdate(
+        did: string,
+        update: SigningKeyUpdate,
+        plcSeq?: number,
+        createdAtMs?: number
+    ): Promise<void>
     dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]>
     /** A no-op when the owed update for `did` is no longer `version`. */
     clearKeyUpdate(did: string, version: number): Promise<void>

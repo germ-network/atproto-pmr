@@ -14,11 +14,13 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
-import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { RecordNotFoundError, type DidDocument } from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
+    FETCH_AS_OF_SKEW_MS,
     type Cursor,
+    type DidDocumentSink,
     type KeyUpdateIndex,
     type MonitorIndex,
     type SnapshotStore,
@@ -33,6 +35,19 @@ export interface FetchedRecord {
     /** The atproto signing key resolved at fetch time; `null` if the DID
      * document carried none. See `resolvePDSEndpoint` in core. */
     signingKey: string | null
+    /**
+     * The DID document the PDS was resolved from, when the fetch kept it.
+     * Absent from a deployment fetch that does not; then nothing is stored.
+     */
+    didDocument?: FetchedDidDocument
+}
+
+/** A DID document as fetched from its directory. */
+export interface FetchedDidDocument {
+    document: DidDocument
+    /** Taken before the directory request, so a write ordered by it can never
+     * claim to be newer than what the directory had when asked. */
+    fetchedAtMs: number
 }
 
 export interface IngestDeps {
@@ -65,6 +80,12 @@ export interface IngestDeps {
      * re-checking a reversible one rather than treating it as settled.
      */
     onDelete?(did: string): Promise<void>
+    /**
+     * Where a DID document fetched alongside a record is kept. Recorded on
+     * every successful fetch, whatever the record's own outcome: the
+     * document came from the directory, not from the PDS being judged.
+     */
+    didDocuments?: DidDocumentSink
     /**
      * Where a relay caches signing keys: an identity/account/sync event for
      * a watched DID also owes a delete of its cached key. A hint only — the
@@ -182,10 +203,14 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
         await settleDeletion(deps, did, err.permanent)
         return "deleted"
     }
+    await recordFetchedDocument(deps, did, record.didDocument)
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
         // Not evidence of anything the monitor may serve. Terminal, not
-        // transient: the same bytes will fail again next time.
+        // transient: the same bytes will fail again next time. The DID is
+        // left unwatched, so nothing will keep its document current: stop
+        // vouching for it.
+        await withdrawFetchedDocument(deps, did, record.didDocument)
         await deps.index.clearPending(did)
         return "rejected"
     }
@@ -231,6 +256,44 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, record.rev)
     return "stored"
+}
+
+/**
+ * Keeps the DID document a fetch resolved through, ordered by when that
+ * fetch started. A failing sink never costs the caller its fetch: the
+ * stored copy is refreshed again by the next one.
+ */
+export async function recordFetchedDocument(
+    deps: Pick<IngestDeps, "didDocuments">,
+    did: string,
+    fetched: FetchedDidDocument | undefined
+): Promise<void> {
+    if (fetched === undefined || deps.didDocuments === undefined) return
+    try {
+        await deps.didDocuments.recordDidDocument(
+            did,
+            fetched.document,
+            fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
+        )
+    } catch {}
+}
+
+/**
+ * Withdraws trust in the stored document `fetched` just wrote, ordered with
+ * that write, for a DID no one will keep current.
+ */
+async function withdrawFetchedDocument(
+    deps: Pick<IngestDeps, "didDocuments">,
+    did: string,
+    fetched: FetchedDidDocument | undefined
+): Promise<void> {
+    if (fetched === undefined || deps.didDocuments === undefined) return
+    try {
+        await deps.didDocuments.markDidDocumentStale(
+            did,
+            fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
+        )
+    } catch {}
 }
 
 /** Drain what is owed. Called by the same clock that watches the socket. */

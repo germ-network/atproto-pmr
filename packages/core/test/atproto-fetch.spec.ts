@@ -292,6 +292,26 @@ describe("resolvePDSEndpoint", () => {
     const PLC_DID = "did:plc:alice1234567890123456789012"
     const plcUrl = `https://plc.directory/${encodeURIComponent(PLC_DID)}`
 
+    it("refuses a document that claims a different DID", async () => {
+        const fetchImpl = (async () =>
+            new Response(
+                JSON.stringify({
+                    id: "did:plc:someoneelse",
+                    service: [
+                        {
+                            id: "#atproto_pds",
+                            type: "AtprotoPersonalDataServer",
+                            serviceEndpoint: "https://evil.example",
+                        },
+                    ],
+                }),
+                { status: 200 }
+            )) as typeof fetch
+        await expect(resolvePDSEndpoint(PLC_DID, fetchImpl)).rejects.toThrow(
+            /does not match the requested DID/
+        )
+    })
+
     it("a PLC tombstone (message prefix 'DID not available: ') is a permanent RecordNotFoundError", async () => {
         const fetchImpl = (async (input) => {
             if (input.toString() === plcUrl) {

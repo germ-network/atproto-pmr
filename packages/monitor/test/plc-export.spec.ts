@@ -1,8 +1,10 @@
 /**
- * The PLC export stream as a signing-key cache signal: decode, intake in the
- * read loop, and the drain that reaches the cache.
+ * The PLC export stream as a signal for the signing-key cache and the stored
+ * DID documents: decode, intake in the read loop, and the drain that reaches
+ * the key cache.
  */
 import { describe, expect, it } from "vitest"
+import { renderPlcDocument, type DidDocument } from "@germ-network/atproto-pmr-core"
 import {
     decodePlcExportFrame,
     drainKeyUpdates,
@@ -12,6 +14,7 @@ import {
     type SigningKeyUpdate,
 } from "../src/plc-export"
 import type {
+    DidDocumentSink,
     KeyUpdateIndex,
     MonitorIndex,
     OwedKeyUpdate,
@@ -63,7 +66,7 @@ describe("decodePlcExportFrame", () => {
         })
 
     it("plc_operation → put with verificationMethods.atproto minus the did:key: prefix, asOfMs = createdAt", () => {
-        expect(decodePlcExportFrame(frame())).toEqual({
+        expect(decodePlcExportFrame(frame())).toMatchObject({
             seq: 7,
             did: "did:plc:abc",
             update: { kind: "put", key: "zKey1", asOfMs: Date.parse("2026-10-13T00:00:00.071Z") },
@@ -128,7 +131,7 @@ describe("decodePlcExportFrame", () => {
     })
 
     it("a captured live sequenced_op frame decodes to its seq, did and key", () => {
-        expect(decodePlcExportFrame(LIVE_FRAME)).toEqual({
+        expect(decodePlcExportFrame(LIVE_FRAME)).toMatchObject({
             seq: 20000001,
             did: "did:plc:2sy7cqhmlt4meg23czfj7faa",
             update: {
@@ -161,7 +164,13 @@ describe("intakePlcEvent", () => {
         return { index: index as unknown as MonitorIndex & KeyUpdateIndex, calls, owed }
     }
     const update: SigningKeyUpdate = { kind: "put", key: "zK", asOfMs: 5 }
-    const event = (did = "did:plc:abc"): PlcExportEvent => ({ seq: 9, did, update })
+    const event = (did = "did:plc:abc"): PlcExportEvent => ({
+        seq: 9,
+        did,
+        createdAtMs: 5,
+        update,
+        change: { kind: "refetch" },
+    })
 
     it("unwatched DID → ignored, only the cursor advances, nothing owed", async () => {
         const f = fake()
@@ -291,5 +300,249 @@ describe("plcCursorAfterClose", () => {
         for (const reason of ["ConsumerTooSlow", "", "Going Away", "outdatedcursor"]) {
             expect(plcCursorAfterClose(reason), reason).toBe("keep")
         }
+    })
+})
+
+/** A live `sequenced_op` entry from plc.directory's `/export`, the shape its stream sends. */
+const OP_DID = "did:plc:5jp6kvueqebbcuf77rd5sqtj"
+const OPERATION = {
+    sig: "tJ9NZHpkXQh_iawer2JvrbA-U-kGRshvLKV-_Xi8eOUn-5p7My565C5FbmsjWoCnrRWmE_vjXeJCfOlS6uYABQ",
+    prev: null,
+    type: "plc_operation",
+    services: {
+        atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://bsky.social" },
+    },
+    alsoKnownAs: ["at://iuritg.bsky.social"],
+    rotationKeys: [
+        "did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg",
+        "did:key:zQ3shpKnbdPx3g3CmPf5cRVTPe1HtSwVn5ish3wSnDPQCbLJK",
+    ],
+    verificationMethods: { atproto: "did:key:zQ3shXjHeiBuRCKmM36cuYnm7YEMzhGnCmCyW92sRJ9pribSF" },
+}
+
+function opFrame(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+        did: OP_DID,
+        cid: "bafyreihkl7svnbebaiivbp74i7mue2kqmllc2ygtmlnrnhmf2y5im5qura",
+        seq: 1000001,
+        createdAt: "2023-09-04T02:25:42.341Z",
+        operation: OPERATION,
+        type: "sequenced_op",
+        ...overrides,
+    })
+}
+
+describe("decodePlcExportFrame: the stored document change", () => {
+    it("a plc_operation decodes to render, with the document renderPlcDocument gives for it", () => {
+        const event = decodePlcExportFrame(opFrame())
+        expect(event?.change).toEqual({
+            kind: "render",
+            document: renderPlcDocument(OP_DID, OPERATION),
+        })
+        expect(event?.change.kind === "render" && event.change.document.id).toBe(OP_DID)
+    })
+
+    it("a plc_tombstone decodes to tombstone", () => {
+        const event = decodePlcExportFrame(
+            opFrame({ operation: { type: "plc_tombstone", prev: "bafy", sig: "x" } })
+        )
+        expect(event?.change).toEqual({ kind: "tombstone" })
+    })
+
+    it("a legacy create decodes to refetch", () => {
+        const event = decodePlcExportFrame(opFrame({ operation: { ...OPERATION, type: "create" } }))
+        expect(event?.change).toEqual({ kind: "refetch" })
+    })
+
+    it("an unknown operation type decodes to refetch", () => {
+        const unknown = decodePlcExportFrame(
+            opFrame({ operation: { ...OPERATION, type: "plc_something_new" } })
+        )
+        expect(unknown?.change).toEqual({ kind: "refetch" })
+        expect(decodePlcExportFrame(opFrame({ operation: {} }))?.change).toEqual({ kind: "refetch" })
+        expect(decodePlcExportFrame(opFrame({ operation: "op" }))?.change).toEqual({ kind: "refetch" })
+    })
+
+    it("a plc_operation that does not render decodes to refetch", () => {
+        const event = decodePlcExportFrame(opFrame({ operation: { ...OPERATION, services: {} } }))
+        expect(event?.change).toEqual({ kind: "refetch" })
+    })
+
+    it("keeps createdAt as createdAtMs", () => {
+        expect(decodePlcExportFrame(opFrame())).toMatchObject({
+            seq: 1000001,
+            did: OP_DID,
+            createdAtMs: Date.parse("2023-09-04T02:25:42.341Z"),
+        })
+    })
+
+    it("an unparseable or missing createdAt gives no createdAtMs and a refetch, not a render", () => {
+        for (const createdAt of ["yesterday", "", 5, null]) {
+            const event = decodePlcExportFrame(opFrame({ createdAt }))
+            expect(event, String(createdAt)).toMatchObject({ createdAtMs: null, change: { kind: "refetch" } })
+        }
+        const { createdAt: _, ...none } = JSON.parse(opFrame())
+        expect(decodePlcExportFrame(JSON.stringify(none))).toMatchObject({
+            createdAtMs: null,
+            change: { kind: "refetch" },
+        })
+    })
+})
+
+describe("intakePlcEvent: the stored document", () => {
+    const AT = 1_693_000_000_000
+
+    /** In-memory index and sink that log every call, in order. */
+    function fakes(opts: {
+        watched?: boolean
+        deleted?: boolean
+        rev?: string | null
+        failRecord?: boolean
+        failOwe?: boolean
+        failKey?: boolean
+    } = {}) {
+        const log: string[] = []
+        const calls = {
+            recorded: [] as Array<[string, unknown, number]>,
+            stale: [] as Array<[string, number]>,
+            owed: [] as Array<[string, string]>,
+            key: [] as Array<[string, number | undefined, number | undefined]>,
+            cursor: [] as Array<[number, number | undefined]>,
+        }
+        const index = {
+            isWatched: async () => opts.watched ?? true,
+            isDeleted: async () => opts.deleted ?? false,
+            revOf: async () => (opts.rev === undefined ? "3m1" : opts.rev),
+            owe: async (did: string, rev: string) => {
+                log.push("owe")
+                if (opts.failOwe) throw new Error("sqlite down")
+                calls.owed.push([did, rev])
+            },
+            oweKeyUpdate: async (did: string, _u: unknown, seq?: number, createdAt?: number) => {
+                log.push("key")
+                if (opts.failKey) throw new Error("sqlite down")
+                calls.key.push([did, seq, createdAt])
+            },
+            advancePlcCursor: async (seq: number, createdAt?: number) => {
+                log.push("cursor")
+                calls.cursor.push([seq, createdAt])
+            },
+        } as unknown as MonitorIndex & KeyUpdateIndex
+        const sink: DidDocumentSink = {
+            recordDidDocument: async (did, document, asOfMs) => {
+                log.push("record")
+                if (opts.failRecord) throw new Error("sqlite down")
+                calls.recorded.push([did, document, asOfMs])
+            },
+            markDidDocumentStale: async (did, asOfMs) => {
+                log.push("stale")
+                calls.stale.push([did, asOfMs])
+            },
+        }
+        return { index, sink, calls, log }
+    }
+    const DID_ = "did:plc:abc"
+    const event = (
+        change: PlcExportEvent["change"],
+        createdAtMs: number | null = AT
+    ): PlcExportEvent => ({
+        seq: 42,
+        did: DID_,
+        createdAtMs,
+        update: { kind: "delete" },
+        change,
+    })
+    const document: DidDocument = { id: DID_ }
+    const RENDER = { kind: "render", document } as const
+
+    it("an unwatched DID writes no document and only advances the cursor, with the op's createdAt", async () => {
+        const f = fakes({ watched: false })
+        expect(await intakePlcEvent(f.index, event(RENDER), f.sink)).toBe("ignored")
+        expect(f.log).toEqual(["cursor"])
+        expect(f.calls.cursor).toEqual([[42, AT]])
+    })
+
+    it("a permanently deleted DID's document still follows the stream, but nothing is owed and the cursor advances with its createdAt", async () => {
+        const f = fakes({ watched: false, deleted: true })
+        expect(await intakePlcEvent(f.index, event(RENDER), f.sink)).toBe("ignored")
+        expect(f.calls.recorded).toEqual([[DID_, document, AT]])
+        expect(f.calls.owed).toEqual([])
+        expect(f.calls.key).toEqual([])
+        expect(f.log).toEqual(["record", "cursor"])
+        expect(f.calls.cursor).toEqual([[42, AT]])
+        const g = fakes({ watched: false, deleted: true })
+        await intakePlcEvent(g.index, event({ kind: "refetch" }), g.sink)
+        expect(g.calls.stale).toEqual([[DID_, AT]])
+    })
+
+    it("a DID neither watched nor deleted gets no document write", async () => {
+        const f = fakes({ watched: false, deleted: false })
+        await intakePlcEvent(f.index, event(RENDER), f.sink)
+        expect(f.log).toEqual(["cursor"])
+    })
+
+    it("a watched DID's render is stored as of the op's createdAt", async () => {
+        const f = fakes()
+        expect(await intakePlcEvent(f.index, event(RENDER), f.sink)).toBe("owed")
+        expect(f.calls.recorded).toEqual([[DID_, document, AT]])
+        expect(f.calls.stale).toEqual([])
+    })
+
+    it("a watched DID's tombstone stores a null document", async () => {
+        const f = fakes()
+        await intakePlcEvent(f.index, event({ kind: "tombstone" }), f.sink)
+        expect(f.calls.recorded).toEqual([[DID_, null, AT]])
+    })
+
+    it("a watched DID's refetch marks the stored document stale as of the op's createdAt", async () => {
+        const f = fakes()
+        await intakePlcEvent(f.index, event({ kind: "refetch" }), f.sink)
+        expect(f.calls.stale).toEqual([[DID_, AT]])
+        expect(f.calls.recorded).toEqual([])
+    })
+
+    it("an op with no createdAt marks the document stale as of its arrival", async () => {
+        const f = fakes()
+        const before = Date.now()
+        await intakePlcEvent(f.index, event({ kind: "refetch" }, null), f.sink)
+        const [, asOf] = f.calls.stale[0]!
+        expect(asOf).toBeGreaterThanOrEqual(before)
+        expect(asOf).toBeLessThanOrEqual(Date.now())
+        expect(f.calls.key).toEqual([[DID_, 42, undefined]])
+    })
+
+    it("the document is written before the re-fetch is owed and the key update with the cursor", async () => {
+        const f = fakes()
+        await intakePlcEvent(f.index, event(RENDER), f.sink)
+        expect(f.log).toEqual(["record", "owe", "key"])
+        expect(f.calls.key).toEqual([[DID_, 42, AT]])
+        const g = fakes()
+        await intakePlcEvent(g.index, event({ kind: "refetch" }), g.sink)
+        expect(g.log).toEqual(["stale", "owe", "key"])
+    })
+
+    it("a watched DID that is only owed a fetch stores the document and owes no re-fetch", async () => {
+        const f = fakes({ rev: null })
+        await intakePlcEvent(f.index, event(RENDER), f.sink)
+        expect(f.calls.recorded).toHaveLength(1)
+        expect(f.calls.owed).toEqual([])
+    })
+
+    it("a failed document write owes nothing and leaves the cursor where it was", async () => {
+        const f = fakes({ failRecord: true })
+        await expect(intakePlcEvent(f.index, event(RENDER), f.sink)).rejects.toThrow("sqlite down")
+        expect(f.log).toEqual(["record"])
+    })
+
+    it("a failed re-fetch obligation leaves the key update and the cursor unwritten", async () => {
+        const f = fakes({ failOwe: true })
+        await expect(intakePlcEvent(f.index, event(RENDER), f.sink)).rejects.toThrow("sqlite down")
+        expect(f.calls.key).toEqual([])
+    })
+
+    it("without a document sink the stored documents are left alone", async () => {
+        const f = fakes()
+        expect(await intakePlcEvent(f.index, event(RENDER))).toBe("owed")
+        expect(f.log).toEqual(["owe", "key"])
     })
 })

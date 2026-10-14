@@ -225,6 +225,9 @@ export {
     guardedFetchJSON,
     resolvePDSEndpoint,
     resolveSigningKey,
+    fetchDidDocument,
+    pdsResolutionFromDocument,
+    extractSigningKey,
     fetchRecordProofCar,
     cachedSigningKeyResolver,
     SIGNING_KEY_TTL_MS,
@@ -296,6 +299,16 @@ export {
     type RepoCollectionExpectation,
     type VerifiedCollection,
 } from "./repo-collection"
+
+// The stored DID document a key monitor keeps per watched DID.
+export {
+    renderPlcDocument,
+    storedSigningKeyResolver,
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    PLC_COVERAGE_MAX_LAG_MS,
+    type PlcCoverage,
+    type StoredSigningKeyResolverDeps,
+} from "./did-document"
 
 // A verified read of one record from a third party's snapshot (24 h rule included).
 export {

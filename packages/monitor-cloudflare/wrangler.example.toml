@@ -24,8 +24,13 @@ MONITOR_COLLECTION = "com.germnetwork.declaration"
 # instance to take a third party out of the noticing path; the trust model
 # never depended on this feed being honest, only on it being timely.
 JETSTREAM_URL = "https://jetstream.us-west.bsky.network/xrpc/network.bsky.jetstream.subscribeEvents"
-# Optional: keeps the relay's cached did:plc signing keys current. Leave
-# unset to rely on the cache TTL alone.
+# Optional. The PLC directory's export stream (the https form of
+# wss://plc.directory/export/stream), one socket for both caches: the relay's
+# cached did:plc signing keys follow a rotation as soon as it lands, and a
+# stored did:plc document follows a change as soon as the directory accepts it
+# and is trusted by a relay for 24 h while the stream is caught up. Leave unset
+# to rely on the cache TTLs alone (no second socket). Keep it the same directory
+# the monitor's fetches and the relay's fallback read.
 PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 
 # An outbound socket does not hibernate, so this object is evicted on the

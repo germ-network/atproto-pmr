@@ -7,6 +7,7 @@ import {
     intakePlcEvent,
     listReposByCollection,
     plcCursorAfterClose,
+    FETCH_AS_OF_SKEW_MS,
     fetchHeadRev,
     pushDeclarationChange,
     refreshDue,
@@ -15,6 +16,7 @@ import {
     sweepBackfill,
     windowOf,
     type BackfillProgress,
+    type DidDocumentSink,
     type Cursor,
     type FetchedRecord,
     type IngestDeps,
@@ -26,6 +28,16 @@ import {
     type RefreshIndex,
     type SigningKeyUpdate,
 } from "@germ-network/atproto-pmr-monitor"
+import {
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    type DidDocument,
+    type PlcCoverage,
+} from "@germ-network/atproto-pmr-core"
+import {
+    canonicalDidDocumentJson,
+    kvDidDocumentWriter,
+    PLC_COVERAGE_KEY,
+} from "./did-document-store"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
@@ -40,6 +52,16 @@ import { kvSnapshotStore } from "./snapshot-store"
  * same hazard.
  */
 const CONNECT_TIMEOUT_MS = 5_000
+
+/** KV puts one alarm may spend on stored DID documents. */
+const DID_DOCUMENT_PUBLISH_BATCH = 64
+
+type PublishRow = {
+    did: string
+    document: string
+    confirmed_at: number
+    version: number
+}
 
 /** Owed key updates applied per drain. */
 const KEY_DRAIN_BATCH = 64
@@ -83,7 +105,9 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  * **A singleton.** Address it by a fixed name. A relay's objects are per
  * registration; this one is per *network*, because there is one stream and
  * one cursor into it. With `PLC_EXPORT_STREAM_URL` set it also holds the
- * PLC directory's export stream, with its own cursor.
+ * PLC directory's export stream, with its own cursor and a run of unbroken
+ * coverage (which `plc:coverage` publishes); that one stream feeds both the
+ * owed signing-key updates and the stored DID documents.
  *
  * An outbound WebSocket does not hibernate — the Hibernation API covers
  * incoming sockets — so this object stays resident while connected and is
@@ -100,7 +124,7 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
-    implements MonitorIndex, RefreshIndex, KeyUpdateIndex
+    implements MonitorIndex, RefreshIndex, KeyUpdateIndex, DidDocumentSink
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -112,6 +136,15 @@ export class MonitorIngest
      */
     private plcSeq: number | null = null
     private plcPersistedAt = 0
+    /** Frames and closes of the PLC socket, handled one at a time in arrival order. */
+    private plcChain: Promise<void> = Promise.resolve()
+    /** The `createdAt` high-water mark and the start of the stream's current unbroken run. */
+    private plcHighCreatedAtMs: number | null = null
+    private plcContinuousSinceMs: number | null = null
+    /** Whether the stored cursor row carries the current run's start. */
+    private plcRunPersisted = false
+    /** What `plc:coverage` last claimed in this run. */
+    private plcCoveredThroughMs: number | null = null
     private draining: Promise<void> | null = null
     private drainAgain = false
 
@@ -144,6 +177,15 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     deleted_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS did_documents (
+                    did TEXT PRIMARY KEY,
+                    document TEXT NOT NULL,
+                    as_of INTEGER NOT NULL,
+                    confirmed_at INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    published_version INTEGER,
+                    published_confirmed_at INTEGER
+                );
                 CREATE TABLE IF NOT EXISTS key_updates (
                     did TEXT PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -164,7 +206,10 @@ export class MonitorIngest
 
     /**
      * The cursor is per directory host, so one stored for a different
-     * `PLC_EXPORT_STREAM_URL` reads as none.
+     * `PLC_EXPORT_STREAM_URL` reads as none, and is dropped. A cursor
+     * stored for this URL also restores the run it belongs to (so an
+     * eviction does not restart the coverage run); a live object already
+     * holds both in memory.
      */
     async readPlcCursor(): Promise<number | null> {
         if (this.plcSeq !== null) return this.plcSeq
@@ -173,23 +218,43 @@ export class MonitorIngest
             .toArray()[0]
         if (row === undefined) return null
         try {
-            const stored = JSON.parse(row.v) as { url?: unknown; seq?: unknown }
-            if (stored.url !== this.plcUrl() || typeof stored.seq !== "number") return null
+            const stored = JSON.parse(row.v) as {
+                url?: unknown
+                seq?: unknown
+                continuousSinceMs?: unknown
+            }
+            if (stored.url !== this.plcUrl() || typeof stored.seq !== "number") {
+                if (this.plcUrl() !== null) await this.resetPlcCursor()
+                return null
+            }
             this.plcSeq = stored.seq
+            if (typeof stored.continuousSinceMs === "number") {
+                this.plcContinuousSinceMs = stored.continuousSinceMs
+                this.plcRunPersisted = true
+            }
             return stored.seq
         } catch {
             return null
         }
     }
 
-    async advancePlcCursor(seq: number): Promise<void> {
+    async advancePlcCursor(seq: number, createdAtMs?: number): Promise<void> {
         await this.readPlcCursor()
-        this.raisePlcSeq(seq)
+        this.raisePlcCursor(seq, createdAtMs)
         if (Date.now() - this.plcPersistedAt >= PLC_CURSOR_PERSIST_MS) this.persistPlcCursor()
     }
 
+    /**
+     * Clears the stored row and the in-memory cursor together, and ends the
+     * unbroken run: the next frame's `createdAt` starts a new one.
+     */
     async resetPlcCursor(): Promise<void> {
         this.plcSeq = null
+        this.plcHighCreatedAtMs = null
+        this.plcContinuousSinceMs = null
+        this.plcPersistedAt = 0
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
         this.db.sql.exec("DELETE FROM meta WHERE k = 'plc_cursor'")
     }
 
@@ -206,7 +271,12 @@ export class MonitorIngest
     }
 
     /** Replaces any update already owed for `did`, and bumps its version. */
-    async oweKeyUpdate(did: string, update: SigningKeyUpdate, plcSeq?: number): Promise<void> {
+    async oweKeyUpdate(
+        did: string,
+        update: SigningKeyUpdate,
+        plcSeq?: number,
+        createdAtMs?: number
+    ): Promise<void> {
         // Load the stored cursor first so the max below cannot start from nothing.
         if (plcSeq !== undefined) await this.readPlcCursor()
         this.db.sql.exec(
@@ -219,7 +289,7 @@ export class MonitorIngest
             update.kind === "put" ? update.asOfMs : null
         )
         if (plcSeq !== undefined) {
-            this.raisePlcSeq(plcSeq)
+            this.raisePlcCursor(plcSeq, createdAtMs)
             this.persistPlcCursor()
         }
     }
@@ -256,18 +326,224 @@ export class MonitorIngest
         return url === undefined || url === "" ? null : url
     }
 
-    private raisePlcSeq(seq: number): void {
+    private raisePlcCursor(seq: number, createdAtMs?: number): void {
         this.plcSeq = Math.max(this.plcSeq ?? seq, seq)
+        if (createdAtMs === undefined) return
+        this.plcContinuousSinceMs ??= createdAtMs
+        this.plcHighCreatedAtMs = Math.max(this.plcHighCreatedAtMs ?? createdAtMs, createdAtMs)
     }
 
-    private persistPlcCursor(): void {
-        if (this.plcSeq === null) return
+    /**
+     * Write the high-water seq and the run's start beside the stream's URL.
+     * The alarm calls it too, so a lazy flush is never what the run waits on.
+     */
+    persistPlcCursor(): void {
+        if (this.plcSeq === null || this.plcUrl() === null) return
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('plc_cursor', ?) " +
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            JSON.stringify({ url: this.plcUrl(), seq: this.plcSeq })
+            JSON.stringify({
+                url: this.plcUrl(),
+                seq: this.plcSeq,
+                continuousSinceMs: this.plcContinuousSinceMs,
+            })
         )
         this.plcPersistedAt = Date.now()
+        this.plcRunPersisted = this.plcContinuousSinceMs !== null
+    }
+
+    // ---- Stored DID documents ---------------------------------------------
+
+    /**
+     * Ordered by `asOfMs` (see `DidDocumentSink`). A write equal in content
+     * (`canonicalDidDocumentJson`) to the stored one only advances its
+     * confirmation time; a different one bumps the row's version, and so
+     * does any write onto a stale-marked or placeholder row (confirmation 0),
+     * because the published entry was removed and must be put again. A
+     * confirmation of 0 therefore means "not trusted". The read,
+     * compare and write run with no await between them. SQLite only;
+     * `publishDidDocuments` carries it to KV.
+     */
+    async recordDidDocument(
+        did: string,
+        document: DidDocument | null,
+        asOfMs: number
+    ): Promise<void> {
+        const json = canonicalDidDocumentJson(document)
+        const row = this.didDocumentRow(did)
+        if (row === undefined) {
+            this.db.sql.exec(
+                "INSERT INTO did_documents (did, document, as_of, confirmed_at, version) " +
+                    "VALUES (?, ?, ?, ?, 1)",
+                did,
+                json,
+                asOfMs,
+                asOfMs
+            )
+            return
+        }
+        if (asOfMs < row.as_of) return
+        // Content restored after a stale mark is a change to readers: the
+        // published entry was removed, so it must be put again.
+        const changed = json !== row.document || row.confirmed_at === 0
+        this.db.sql.exec(
+            "UPDATE did_documents SET document = ?, as_of = ?, confirmed_at = ?, " +
+                "version = version + ? WHERE did = ?",
+            json,
+            asOfMs,
+            asOfMs,
+            changed ? 1 : 0,
+            did
+        )
+    }
+
+    private didDocumentRow(
+        did: string
+    ): { document: string; as_of: number; confirmed_at: number } | undefined {
+        return this.db.sql
+            .exec<{ document: string; as_of: number; confirmed_at: number }>(
+                "SELECT document, as_of, confirmed_at FROM did_documents WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+    }
+
+    /**
+     * Ordered like `recordDidDocument`. Bumps the version and zeroes the
+     * confirmation, so the next publish removes `doc:<did>` and every reader
+     * falls back to the directory; a later write restores it. With no row
+     * yet, inserts an untrusted placeholder (document `""`, distinct from
+     * `"null"` = gone) at `asOfMs`, so a fetch that started before the change
+     * cannot land the superseded document as the first row.
+     */
+    async markDidDocumentStale(did: string, asOfMs: number): Promise<void> {
+        const row = this.didDocumentRow(did)
+        if (row === undefined) {
+            this.db.sql.exec(
+                "INSERT INTO did_documents (did, document, as_of, confirmed_at, version) " +
+                    "VALUES (?, '', ?, 0, 1)",
+                did,
+                asOfMs
+            )
+            return
+        }
+        if (asOfMs < row.as_of) return
+        this.db.sql.exec(
+            "UPDATE did_documents SET as_of = ?, confirmed_at = 0, version = version + 1 " +
+                "WHERE did = ?",
+            asOfMs,
+            did
+        )
+    }
+
+    /**
+     * Publish up to `limit` stored documents to KV, content changes first. A
+     * trusted document is put as a `CachedDidDocument`; a tombstone, a stale
+     * mark or a placeholder removes `doc:<did>` instead, so readers ask the
+     * directory. Rows selected:
+     * any whose version differs from the published one; then any confirmed
+     * at least half of `STORED_DID_DOCUMENT_MAX_AGE_MS` after what KV holds
+     * (so an unchanged document costs at most two KV writes a day, plus one
+     * when a new unbroken run begins); then any whose KV confirmation predates
+     * the stream's current unbroken run while its stored one does not. Marks published the version and confirmation
+     * it put, not whatever the row holds by then. A KV failure leaves the row
+     * for the next call. Resolves `{published, remaining, coveredThroughMs}`:
+     * `remaining` counts content changes (staleness included) unpublished
+     * after the last put; `coveredThroughMs` is the high-water `createdAt`
+     * taken before any row was selected, or null when the pass is not drained
+     * or no run has begun — so a change that lands mid-pass is never counted
+     * as covered.
+     */
+    async publishDidDocuments(
+        limit: number
+    ): Promise<{ published: number; remaining: number; coveredThroughMs: number | null }> {
+        const highWater = this.plcHighCreatedAtMs
+        const runStart = this.plcContinuousSinceMs
+        const writer = kvDidDocumentWriter(this.env)
+
+        const changed = this.db.sql
+            .exec<PublishRow>(
+                "SELECT did, document, confirmed_at, version FROM did_documents " +
+                    "WHERE published_version IS NULL OR published_version != version " +
+                    "ORDER BY as_of LIMIT ?",
+                limit
+            )
+            .toArray()
+        const reconfirm =
+            changed.length >= limit
+                ? []
+                : this.db.sql
+                      .exec<PublishRow>(
+                          "SELECT did, document, confirmed_at, version FROM did_documents " +
+                              "WHERE published_version = version AND document NOT IN ('null', '') AND (" +
+                              "confirmed_at - published_confirmed_at >= ? " +
+                              "OR (? IS NOT NULL AND published_confirmed_at < ? AND ? <= confirmed_at)) " +
+                              "ORDER BY confirmed_at - published_confirmed_at DESC LIMIT ?",
+                          STORED_DID_DOCUMENT_MAX_AGE_MS / 2,
+                          runStart,
+                          runStart,
+                          runStart,
+                          limit - changed.length
+                      )
+                      .toArray()
+
+        let published = 0
+        for (const row of [...changed, ...reconfirm]) {
+            try {
+                if (row.confirmed_at > 0 && row.document !== "null" && row.document !== "") {
+                    await writer.put(row.did, {
+                        doc: JSON.parse(row.document) as DidDocument,
+                        fetchedAtMs: row.confirmed_at,
+                        source: row.did.startsWith("did:plc:") ? "plc" : "web",
+                    })
+                } else {
+                    await writer.delete(row.did)
+                }
+            } catch {
+                continue
+            }
+            this.db.sql.exec(
+                "UPDATE did_documents SET published_version = ?, published_confirmed_at = ? " +
+                    "WHERE did = ?",
+                row.version,
+                row.confirmed_at,
+                row.did
+            )
+            published += 1
+        }
+
+        const remaining = this.db.sql
+            .exec<{ n: number }>(
+                "SELECT COUNT(*) AS n FROM did_documents " +
+                    "WHERE published_version IS NULL OR published_version != version"
+            )
+            .one().n
+        return {
+            published,
+            remaining,
+            coveredThroughMs: remaining === 0 ? highWater : null,
+        }
+    }
+
+    /**
+     * Publish `plc:coverage`, advancing `coveredThroughMs` to the given value
+     * (from a drained `publishDidDocuments`) or re-publishing the previous
+     * one when null. Called only after the cursor row holding the run's
+     * `continuousSinceMs` is persisted; a no-op until a run has been
+     * persisted, so KV never claims a run an eviction could lose.
+     */
+    async publishPlcCoverage(coveredThroughMs: number | null): Promise<void> {
+        const url = this.env.PLC_EXPORT_STREAM_URL
+        if (url === undefined || url === "") return
+        if (!this.plcRunPersisted || this.plcContinuousSinceMs === null) return
+        if (coveredThroughMs !== null) this.plcCoveredThroughMs = coveredThroughMs
+        if (this.plcCoveredThroughMs === null) return
+        const coverage: PlcCoverage = {
+            url,
+            continuousSinceMs: this.plcContinuousSinceMs,
+            coveredThroughMs: this.plcCoveredThroughMs,
+        }
+        await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
     }
 
     // ---- MonitorIndex -----------------------------------------------------
@@ -551,11 +827,16 @@ export class MonitorIngest
 
     /**
      * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
-     * to a real read; a subclass overrides it alongside `fetchRecord` when
-     * the deployment resolves DIDs differently.
+     * to a real read that also keeps the DID document it resolved through; a
+     * subclass overrides it alongside `fetchRecord` when the deployment
+     * resolves DIDs differently, and must hand its own document to
+     * `recordDidDocument` to keep that.
      */
     protected fetchHeadRev(did: string): Promise<string> {
-        return fetchHeadRev(did)
+        return fetchHeadRev(did, {
+            onDidDocument: ({ document, fetchedAtMs }) =>
+                this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
+        })
     }
 
     /**
@@ -667,6 +948,7 @@ export class MonitorIngest
                     await this.oweKeyUpdate(did, update, plcSeq)
                 },
             },
+            didDocuments: this,
             nowMs: () => Date.now(),
         }
     }
@@ -743,19 +1025,12 @@ export class MonitorIngest
         this.plcSocket = ws
 
         ws.addEventListener("message", (event) => {
-            void this.onPlcFrame(String(event.data))
+            void this.enqueuePlcFrame(String(event.data))
         })
         ws.addEventListener("close", (event) => {
-            if (this.plcSocket === ws) this.plcSocket = null
-            if (plcCursorAfterClose(event.reason) === "reset") {
-                void this.resetPlcCursor().catch((err) =>
-                    console.error("monitor: plc cursor reset failed", err)
-                )
-            }
+            void this.onPlcClose(ws, event.reason)
         })
-        ws.addEventListener("error", () => {
-            if (this.plcSocket === ws) this.plcSocket = null
-        })
+        ws.addEventListener("error", () => this.onPlcError(ws))
     }
 
     private async upgrade(url: URL, what: string): Promise<WebSocket> {
@@ -777,17 +1052,55 @@ export class MonitorIngest
     }
 
     /**
-     * The export stream's read loop: index lookups only, and the owed update
-     * is applied off the loop. Never throws into the socket.
+     * The export stream's read loop: append one frame to the chain that
+     * handles them in order. Index lookups and the document sink only; the
+     * owed key update is applied off the loop. A frame that fails is logged
+     * and the chain carries on, but the coverage run ends: an operation the
+     * stored documents never took in must not be vouched for, so the next
+     * frame starts a new run and nothing is claimed until that run's row is
+     * stored. The stored seq is kept.
      */
-    private async onPlcFrame(raw: string): Promise<void> {
-        try {
+    private enqueuePlcFrame(raw: string): Promise<void> {
+        const next = this.plcChain.then(async () => {
             const event = decodePlcExportFrame(raw)
             if (event === null) return
-            if ((await intakePlcEvent(this, event)) === "owed") this.kickDrain()
-        } catch (err) {
+            if ((await intakePlcEvent(this, event, this)) === "owed") this.kickDrain()
+        })
+        this.plcChain = next.catch((err) => {
             console.error("monitor: plc frame failed", err)
-        }
+            this.endPlcRun()
+        })
+        return this.plcChain
+    }
+
+    /** Stop vouching for the stream's current run; the seq stays. */
+    private endPlcRun(): void {
+        this.plcContinuousSinceMs = null
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
+    }
+
+    /**
+     * A stream close: drop a cursor that can never resume, then allow a
+     * reconnect. A close from a socket that has since been replaced by a live
+     * one is ignored.
+     */
+    private onPlcClose(ws: WebSocket | null, reason: string): Promise<void> {
+        this.plcChain = this.plcChain
+            .then(async () => {
+                if (this.plcSocket !== null && this.plcSocket !== ws) return
+                this.plcSocket = null
+                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
+            })
+            .catch((err) => {
+                console.error("monitor: plc close failed", err)
+            })
+        return this.plcChain
+    }
+
+    /** A socket error frees the slot for a reconnect, unless a newer socket holds it. */
+    private onPlcError(ws: WebSocket): void {
+        if (this.plcSocket === ws) this.plcSocket = null
     }
 
     private kickDrain(): void {
@@ -876,7 +1189,26 @@ export class MonitorIngest
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
             await this.drainKeys()
-            this.persistPlcCursor()
+            try {
+                this.persistPlcCursor()
+            } catch (err) {
+                console.error("monitor: plc cursor persist failed", err)
+            }
+            // Ahead of the sweep, which throws when its relay is down: stored
+            // documents and the coverage marker must not wait behind it.
+            let coveredThroughMs: number | null = null
+            try {
+                const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
+                coveredThroughMs = published.coveredThroughMs
+                console.log("monitor: did documents", published)
+            } catch (err) {
+                console.error("monitor: did document publish failed", err)
+            }
+            try {
+                await this.publishPlcCoverage(coveredThroughMs)
+            } catch (err) {
+                console.error("monitor: plc coverage publish failed", err)
+            }
             // Before settling, so a DID this sweep just discovered is
             // eligible for the same tick's settle pass rather than
             // waiting a full watchdog interval — `SETTLE_BATCH` still

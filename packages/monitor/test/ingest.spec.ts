@@ -15,6 +15,7 @@ import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
     compareObservations,
     compareRev,
+    FETCH_AS_OF_SKEW_MS,
     type BackfillProgress,
     type DigestMarker,
     type MonitorIndex,
@@ -637,6 +638,98 @@ describe("compareObservations", () => {
         expect(
             compareObservations(observation(), observation({ signingKey: null, rev: "3m2" }))
         ).toBe("skew")
+    })
+})
+
+describe("settle keeps the stored DID document", () => {
+    const FETCHED_AT = 777_000
+    const DOCUMENT = { id: DID, alsoKnownAs: ["at://alice.example"] }
+    const withDocument = () => ({
+        rev: "3m2",
+        car: new Uint8Array([1, 2, 3]),
+        source: PDS,
+        signingKey: SIGNING_KEY,
+        didDocument: { document: DOCUMENT, fetchedAtMs: FETCHED_AT },
+    })
+    function sink() {
+        const writes: Array<{ did: string; document: unknown; asOfMs: number }> = []
+        return {
+            writes,
+            didDocuments: {
+                recordDidDocument: vi.fn(async (did: string, document: unknown, asOfMs: number) => {
+                    writes.push({ did, document, asOfMs })
+                }),
+                markDidDocumentStale: vi.fn(async () => {}),
+            },
+        }
+    }
+
+    it("records the fetched document as of its fetch time less FETCH_AS_OF_SKEW_MS on a stored outcome", async () => {
+        const s = sink()
+        const h = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(s.writes).toEqual([
+            { did: DID, document: DOCUMENT, asOfMs: FETCHED_AT - FETCH_AS_OF_SKEW_MS },
+        ])
+    })
+
+    it("records the fetched document when verification rejects the record, then withdraws trust in it", async () => {
+        const s = sink()
+        const h = harness({
+            fetchRecord: async () => withDocument(),
+            verify: async () => false,
+            didDocuments: s.didDocuments,
+        })
+        expect(await settle(h.deps, DID)).toBe("rejected")
+        expect(s.writes).toHaveLength(1)
+        expect(s.didDocuments.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
+            DID,
+            FETCHED_AT - FETCH_AS_OF_SKEW_MS
+        )
+    })
+
+    it("marks nothing stale when the record settles or the fetch carried no document", async () => {
+        const s = sink()
+        const stored = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
+        await settle(stored.deps, DID)
+        const bare = harness({ verify: async () => false, didDocuments: s.didDocuments })
+        await settle(bare.deps, DID)
+        expect(s.didDocuments.markDidDocumentStale).not.toHaveBeenCalled()
+    })
+
+    it("records the fetched document even when the rev regressed", async () => {
+        const s = sink()
+        const h = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
+        h.revs.set(DID, "3m9")
+        expect(await settle(h.deps, DID)).toBe("rejected")
+        expect(s.writes).toHaveLength(1)
+    })
+
+    it("records nothing when the fetch carried no document", async () => {
+        const s = sink()
+        const h = harness({ didDocuments: s.didDocuments })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(s.writes).toEqual([])
+    })
+
+    it("records nothing when didDocuments is not wired", async () => {
+        const h = harness({ fetchRecord: async () => withDocument() })
+        expect(await settle(h.deps, DID)).toBe("stored")
+    })
+
+    it("a failing document write does not fail the settle", async () => {
+        const h = harness({
+            fetchRecord: async () => withDocument(),
+            didDocuments: {
+                recordDidDocument: async () => {
+                    throw new Error("store down")
+                },
+                markDidDocumentStale: async () => {},
+            },
+        })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(h.records.get(DID)?.rev).toBe("3m2")
     })
 })
 

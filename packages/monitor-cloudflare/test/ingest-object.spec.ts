@@ -14,19 +14,29 @@ import {
 } from "cloudflare:test"
 import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { binaryToBase64URL, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import {
+    binaryToBase64URL,
+    RecordNotFoundError,
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    type CachedDidDocument,
+    type DidDocument,
+} from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
     intake,
     mightHaveChanged,
     sealDueWindows,
+    intakePlcEvent,
     settleDue,
     sweepBackfill,
+    FETCH_AS_OF_SKEW_MS,
     type FetchedRecord,
     type IngestDeps,
+    type PlcExportEvent,
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
+import { canonicalDidDocumentJson, kvDidDocuments, kvPlcCoverage } from "../src/did-document-store"
 import { kvSigningKeyCache } from "../src/signing-key-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -1136,6 +1146,1370 @@ describe("snapshot refresh", () => {
     })
 })
 
+describe("stored DID documents", () => {
+    interface Row {
+        document: string
+        as_of: number
+        confirmed_at: number
+        version: number
+    }
+    const rowOf = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<Row>(
+                    "SELECT document, as_of, confirmed_at, version FROM did_documents WHERE did = ?",
+                    did
+                )
+                .toArray()[0] ?? null
+        )
+    const record = (
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string,
+        document: DidDocument | null,
+        asOf: number
+    ) => inMonitorObj(stub, (obj) => obj.recordDidDocument(did, document, asOf))
+    const stale = (stub: DurableObjectStub<MonitorIngest>, did: string, asOf: number) =>
+        inMonitorObj(stub, (obj) => obj.markDidDocumentStale(did, asOf))
+
+    const docA = (did: string): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: "https://a.example" }],
+    })
+    const docB = (did: string): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: "https://b.example" }],
+    })
+
+    it("a first recordDidDocument stores the document at its asOf", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8first"
+        await record(stub, did, docA(did), 1_000)
+        expect(await rowOf(stub, did)).toEqual({
+            document: canonicalDidDocumentJson(docA(did)),
+            as_of: 1_000,
+            confirmed_at: 1_000,
+            version: 1,
+        })
+    })
+
+    it("a write older than the stored asOf is dropped", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8older"
+        await record(stub, did, docB(did), 2_000)
+        await record(stub, did, docA(did), 1_999)
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            as_of: 2_000,
+            version: 1,
+        })
+    })
+
+    it("a newer write with the same content advances only the confirmation time", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8same"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, docA(did), 5_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 5_000, confirmed_at: 5_000, version: 1 })
+        await record(stub, did, docB(did), 6_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 6_000, version: 2 })
+    })
+
+    it("the directory's document and the render of the same op store as equal content", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8order"
+        const fetched = {
+            "@context": ["a", "b"],
+            id: did,
+            service: [{ type: "P", id: "#atproto_pds", serviceEndpoint: "https://a.example" }],
+        }
+        const rendered = {
+            service: [{ id: "#atproto_pds", serviceEndpoint: "https://a.example", type: "P" }],
+            id: did,
+            "@context": ["a", "b"],
+        }
+        await record(stub, did, fetched as DidDocument, 1_000)
+        await record(stub, did, rendered as DidDocument, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ version: 1, confirmed_at: 2_000 })
+    })
+
+    it("a null document is stored as a tombstone, supersedes an older document, and compares equal to a stored null", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8null"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, null, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null", version: 2 })
+        await record(stub, did, null, 3_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null", version: 2, confirmed_at: 3_000 })
+        await record(stub, did, docA(did), 1_500)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null" })
+    })
+
+    it("two writes for one DID started together land in asOf order", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8race"
+        await Promise.all([
+            record(stub, did, docB(did), 2_000),
+            record(stub, did, docA(did), 1_000),
+        ])
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            as_of: 2_000,
+        })
+    })
+
+    it("a write or stale mark at the stored asOf lands", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8tie"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, docB(did), 1_000)
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            version: 2,
+        })
+        await stale(stub, did, 1_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 0, version: 3 })
+    })
+
+    it("markDidDocumentStale bumps the version and zeroes the confirmation; a later write restores it", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8stale"
+        await record(stub, did, docA(did), 1_000)
+        await stale(stub, did, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 2_000, confirmed_at: 0, version: 2 })
+        await record(stub, did, docA(did), 3_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 3_000, confirmed_at: 3_000, version: 3 })
+    })
+
+    it("markDidDocumentStale older than the stored asOf is dropped", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8staleold"
+        await record(stub, did, docA(did), 5_000)
+        await stale(stub, did, 4_999)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 5_000, version: 1 })
+    })
+
+    it("markDidDocumentStale with no row inserts an untrusted placeholder that drops an older fetch", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8placeholder"
+        await stale(stub, did, 5_000)
+        expect(await rowOf(stub, did)).toEqual({
+            document: "",
+            as_of: 5_000,
+            confirmed_at: 0,
+            version: 1,
+        })
+        await record(stub, did, docA(did), 4_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "", confirmed_at: 0 })
+        await record(stub, did, docA(did), 6_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 6_000, version: 2 })
+    })
+
+    it("canonicalDidDocumentJson sorts keys recursively, keeps array order, and writes null as \"null\"", () => {
+        expect(canonicalDidDocumentJson(null)).toBe("null")
+        expect(
+            canonicalDidDocumentJson({ b: [{ z: 1, a: 2 }, 3], a: { y: "x", c: null } } as unknown as DidDocument)
+        ).toBe('{"a":{"c":null,"y":"x"},"b":[{"a":2,"z":1},3]}')
+        expect(canonicalDidDocumentJson({ a: undefined, b: 1 } as unknown as DidDocument)).toBe('{"b":1}')
+        expect(canonicalDidDocumentJson([undefined] as unknown as DidDocument)).toBe("[null]")
+    })
+})
+
+describe("publishing stored DID documents", () => {
+    const HALF = STORED_DID_DOCUMENT_MAX_AGE_MS / 2
+    const doc = (did: string, endpoint = "https://a.example"): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: endpoint }],
+    })
+    const record = (
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string,
+        document: DidDocument | null,
+        asOf: number
+    ) => inMonitorObj(stub, (obj) => obj.recordDidDocument(did, document, asOf))
+    const publish = (stub: DurableObjectStub<MonitorIngest>, limit = 64) =>
+        inMonitorObj(stub, (obj) => obj.publishDidDocuments(limit))
+    const kvEntry = async (did: string) =>
+        (await kvDidDocuments(testEnv).get(did)) as CachedDidDocument | null
+
+    /** Run `fn` with `records.put` wrapped; the wrapper runs before the real put. */
+    function withPut<R>(
+        stub: DurableObjectStub<MonitorIngest>,
+        before: (obj: MonitorIngest, key: string) => Promise<void>,
+        fn: (obj: MonitorIngest) => Promise<R>
+    ): Promise<R> {
+        return inMonitorObj(stub, async (obj) => {
+            const real = obj.env
+            const records = Object.create(real.records) as KVNamespace
+            records.put = (async (key: string, value: string, opts?: KVNamespacePutOptions) => {
+                await before(obj, key)
+                return real.records.put(key, value, opts)
+            }) as typeof records.put
+            obj.env = { ...real, records }
+            try {
+                return await fn(obj)
+            } finally {
+                obj.env = real
+            }
+        })
+    }
+
+    it("publishDidDocuments writes a changed document to KV and kvDidDocuments reads it back", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9basic"
+        await record(stub, did, doc(did), 1_000)
+        expect(await publish(stub)).toMatchObject({ published: 1, remaining: 0 })
+        expect(await kvEntry(did)).toEqual({ doc: doc(did), fetchedAtMs: 1_000, source: "plc" })
+        expect(await publish(stub)).toMatchObject({ published: 0, remaining: 0 })
+    })
+
+    it("skips an unchanged document confirmed under half the max age after what KV holds", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9skip"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await record(stub, did, doc(did), 1_000 + HALF - 1)
+        expect((await publish(stub)).published).toBe(0)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(1_000)
+    })
+
+    it("re-publishes an unchanged document confirmed half the max age after what KV holds", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9half"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await record(stub, did, doc(did), 1_000 + HALF)
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(1_000 + HALF)
+    })
+
+    it("re-publishes a document whose KV confirmation predates the current unbroken run", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9run"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 5_000))
+        expect((await publish(stub)).published).toBe(0)
+        await record(stub, did, doc(did), 6_000)
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(6_000)
+    })
+
+    it("publishes content changes before re-confirmations", async () => {
+        const stub = freshStub()
+        const aging = "did:plc:s9aging"
+        const changed = "did:plc:s9changed"
+        await record(stub, aging, doc(aging), 1_000)
+        await publish(stub)
+        await record(stub, aging, doc(aging), 1_000 + HALF)
+        await record(stub, changed, doc(changed), 2_000)
+        expect((await publish(stub, 1)).published).toBe(1)
+        expect(await kvEntry(changed)).not.toBeNull()
+        expect((await kvEntry(aging))?.fetchedAtMs).toBe(1_000)
+    })
+
+    it("stops at limit, leaves the rest for the next call, and reports remaining content changes", async () => {
+        const stub = freshStub()
+        const dids = ["did:plc:s9lim1", "did:plc:s9lim2", "did:plc:s9lim3"]
+        for (const did of dids) await record(stub, did, doc(did), 1_000)
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 9_000))
+        expect(await publish(stub, 2)).toEqual({ published: 2, remaining: 1, coveredThroughMs: null })
+        expect(await publish(stub, 2)).toEqual({ published: 1, remaining: 0, coveredThroughMs: 9_000 })
+    })
+
+    it("a document recorded while its publish is in flight is published on the next call", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9flight"
+        await record(stub, did, doc(did, "https://a.example"), 1_000)
+        await withPut(
+            stub,
+            (obj) => obj.recordDidDocument(did, doc(did, "https://b.example"), 2_000),
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect((await kvEntry(did))?.doc).toEqual(doc(did, "https://a.example"))
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.doc).toEqual(doc(did, "https://b.example"))
+    })
+
+    it("a KV failure leaves the document unpublished", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9fail"
+        await record(stub, did, doc(did), 1_000)
+        const failed = await withPut(
+            stub,
+            async () => {
+                throw new Error("kv down")
+            },
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(failed).toMatchObject({ published: 0, remaining: 1, coveredThroughMs: null })
+        expect(await kvEntry(did)).toBeNull()
+        expect((await publish(stub)).published).toBe(1)
+        expect(await kvEntry(did)).not.toBeNull()
+    })
+
+    it("a stale-marked document, a tombstone or a placeholder removes the KV entry", async () => {
+        const stub = freshStub()
+        const staled = "did:plc:s9stale"
+        const gone = "did:plc:s9gone"
+        const fresh = "did:plc:s9placeholder"
+        await record(stub, staled, doc(staled), 1_000)
+        await record(stub, gone, doc(gone), 1_000)
+        await publish(stub)
+        expect(await kvEntry(staled)).not.toBeNull()
+        expect(await kvEntry(gone)).not.toBeNull()
+
+        await inMonitorObj(stub, (obj) => obj.markDidDocumentStale(staled, 2_000))
+        await record(stub, gone, null, 2_000)
+        await inMonitorObj(stub, (obj) => obj.markDidDocumentStale(fresh, 2_000))
+        expect((await publish(stub)).published).toBe(3)
+        expect(await kvEntry(staled)).toBeNull()
+        expect(await kvEntry(gone)).toBeNull()
+        expect(await kvEntry(fresh)).toBeNull()
+
+        await record(stub, staled, doc(staled), 3_000)
+        expect((await publish(stub)).published).toBe(1)
+        expect(await kvEntry(staled)).toMatchObject({ fetchedAtMs: 3_000 })
+    })
+
+    it("a published document carries source plc or web by DID method", async () => {
+        const stub = freshStub()
+        const web = "did:web:s9.example.com"
+        const plc = "did:plc:s9source"
+        await record(stub, web, doc(web), 1_000)
+        await record(stub, plc, doc(plc), 1_000)
+        await publish(stub)
+        expect((await kvEntry(web))?.source).toBe("web")
+        expect((await kvEntry(plc))?.source).toBe("plc")
+    })
+
+    it("coveredThroughMs is the high-water taken before selection; a render injected through a KV put is not counted covered", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9covered"
+        expect((await publish(stub)).coveredThroughMs).toBeNull()
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 7_000))
+        await record(stub, did, doc(did, "https://a.example"), 1_000)
+        const first = await withPut(
+            stub,
+            async (obj) => {
+                await obj.advancePlcCursor(2, 8_000)
+                await obj.recordDidDocument(did, doc(did, "https://b.example"), 8_000)
+            },
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(first).toMatchObject({ remaining: 1, coveredThroughMs: null })
+        expect((await publish(stub)).coveredThroughMs).toBe(8_000)
+    })
+
+    it("a cursor that advances during a pass is not counted covered by it", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9snapshot"
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 7_000))
+        await record(stub, did, doc(did), 1_000)
+        const pass = await withPut(
+            stub,
+            (obj) => obj.advancePlcCursor(2, 8_000),
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(pass).toMatchObject({ remaining: 0, coveredThroughMs: 7_000 })
+    })
+
+    it("kvDidDocuments reads a missing or malformed entry as null", async () => {
+        const read = (did: string) => kvDidDocuments(testEnv).get(did)
+        expect(await read("did:plc:s9missing")).toBeNull()
+        const good = { doc: { id: "did:plc:s9bad" }, fetchedAtMs: 5, source: "plc" }
+        const bad: Record<string, string> = {
+            "did:plc:s9bad1": "not json",
+            "did:plc:s9bad2": JSON.stringify({ ...good, doc: null }),
+            "did:plc:s9bad3": JSON.stringify({ ...good, doc: { id: 7 } }),
+            "did:plc:s9bad4": JSON.stringify({ ...good, fetchedAtMs: "5" }),
+            "did:plc:s9bad5": JSON.stringify({ ...good, source: "other" }),
+            "did:plc:s9bad6": JSON.stringify([good]),
+        }
+        for (const [did, value] of Object.entries(bad)) {
+            await testEnv.records.put(`doc:${did}`, value)
+            expect(await read(did)).toBeNull()
+        }
+        await testEnv.records.put("doc:did:plc:s9ok", JSON.stringify(good))
+        expect(await read("did:plc:s9ok")).toEqual(good)
+    })
+})
+
+describe("wiring stored DID documents into the monitor", () => {
+    const rowOf = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<{ document: string; as_of: number; confirmed_at: number }>(
+                    "SELECT document, as_of, confirmed_at FROM did_documents WHERE did = ?",
+                    did
+                )
+                .toArray()[0] ?? null
+        )
+
+    it("settle through the real deps records the fetched record's DID document", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s10settle"
+        const document: DidDocument = { id: did }
+        await inMonitorObj(stub, async (obj) => {
+            await obj.intake({ did, rev: "3m1" }, "1")
+            const realDeps = (obj as unknown as { deps(): IngestDeps }).deps()
+            await settleDue({
+                ...realDeps,
+                fetchRecord: async () => ({
+                    rev: "3m1",
+                    car: new Uint8Array([1]),
+                    source: PDS,
+                    signingKey: SIGNING_KEY,
+                    didDocument: { document, fetchedAtMs: 100_000 },
+                }),
+            })
+        })
+        expect(await rowOf(stub, did)).toEqual({
+            document: canonicalDidDocumentJson(document),
+            as_of: 100_000 - FETCH_AS_OF_SKEW_MS,
+            confirmed_at: 100_000 - FETCH_AS_OF_SKEW_MS,
+        })
+    })
+
+    it("the default fetchHeadRev records the document it resolved through", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s10head"
+        const original = globalThis.fetch
+        const before = Date.now()
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            const url = String(input)
+            if (url.startsWith("https://plc.directory/")) {
+                return Promise.resolve(
+                    Response.json({
+                        id: did,
+                        service: [
+                            {
+                                id: "#atproto_pds",
+                                type: "AtprotoPersonalDataServer",
+                                serviceEndpoint: PDS,
+                            },
+                        ],
+                    })
+                )
+            }
+            if (url.includes("sync.getLatestCommit")) {
+                return Promise.resolve(Response.json({ cid: "bafy", rev: "3m5" }))
+            }
+            return Promise.resolve(new Response(null, { status: 404 }))
+        }) as typeof fetch
+        try {
+            const rev = await inMonitorObj(stub, (obj) =>
+                (obj as unknown as { fetchHeadRev(did: string): Promise<string> }).fetchHeadRev(did)
+            )
+            expect(rev).toBe("3m5")
+        } finally {
+            globalThis.fetch = original
+        }
+        const row = await rowOf(stub, did)
+        expect(row?.document).toContain(`"id":"${did}"`)
+        const after = Date.now()
+        expect(row?.as_of).toBeGreaterThanOrEqual(before - FETCH_AS_OF_SKEW_MS)
+        expect(row?.as_of).toBeLessThanOrEqual(after - FETCH_AS_OF_SKEW_MS)
+    })
+
+    async function alarmWith(publish: () => Promise<unknown>) {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            const o = obj as unknown as {
+                publishDidDocuments: (limit: number) => Promise<unknown>
+                windowMembers: (w: number) => Promise<string[]>
+                fetchHeadRev: (did: string) => Promise<string>
+            }
+            o.fetchHeadRev = async (did) => {
+                log.push(`refresh ${did}`)
+                return "3m1"
+            }
+            o.publishDidDocuments = async (limit) => {
+                log.push(`publish ${limit}`)
+                return publish()
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            // A completion three hours back makes a digest window due, which
+            // is what makes the alarm seal (and so reach `windowMembers`).
+            await obj.complete("did:plc:s10alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await kvSnapshotStore(testEnv).putRecord("did:plc:s10alarm", {
+                rev: "3m1",
+                car: new Uint8Array([7]),
+                observedAtMs: Date.now() - 3 * 3_600_000,
+                source: PDS,
+                signingKey: SIGNING_KEY,
+            })
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        return log
+    }
+
+    it("the alarm publishes documents ahead of the sweep and the refresh pass, and a publish failure does not skip sealing", async () => {
+        const ok = await alarmWith(async () => ({ published: 0, remaining: 0, coveredThroughMs: null }))
+        const refresh = ok.indexOf("refresh did:plc:s10alarm")
+        expect(refresh).toBeGreaterThanOrEqual(0)
+        expect(ok).toContain("publish 64")
+        expect(ok.indexOf("publish 64")).toBeLessThan(refresh)
+        expect(ok.indexOf("seal")).toBeGreaterThan(refresh)
+
+        const failed = await alarmWith(async () => {
+            throw new Error("kv down")
+        })
+        expect(failed).toContain("publish 64")
+        expect(failed).toContain("seal")
+    })
+})
+
+describe("the PLC export cursor", () => {
+    const URL_A = "https://plc.example/export/stream"
+    const URL_B = "https://other.example/export/stream"
+    const cursorRow = (stub: DurableObjectStub<MonitorIngest>) =>
+        runInDurableObject(stub, (_obj, state) => {
+            const row = state.storage.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                .toArray()[0]
+            return row === undefined ? null : (JSON.parse(row.v) as Record<string, unknown>)
+        })
+    /** Point the object at a stream URL; unset, it persists nothing. */
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+
+    it("isWatched: a DID in revs, or only pending, is watched; an unknown DID is not", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:s11rev", "3m1", 1_000)
+            await obj.intake({ did: "did:plc:s11pend", rev: "3m1" }, "1")
+            expect(await obj.isWatched("did:plc:s11rev")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11pend")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11unknown")).toBe(false)
+        })
+    })
+
+    it("a permanently deleted DID is not watched", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:s11gone", "3m1", 1_000)
+            await obj.completeDeletion("did:plc:s11gone", 2_000, true)
+            expect(await obj.isDeleted("did:plc:s11gone")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11gone")).toBe(false)
+            await obj.completeDeletion("did:plc:s11neverindexed", 2_000, true)
+            expect(await obj.isWatched("did:plc:s11neverindexed")).toBe(false)
+        })
+    })
+
+    it("advancePlcCursor never lowers the high-water seq or createdAt", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(5, 500)
+            await obj.advancePlcCursor(9, 900)
+            await obj.advancePlcCursor(3, 100)
+            await obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_A, seq: 9 })
+        const pass = await inMonitorObj(stub, (obj) => obj.publishDidDocuments(1))
+        expect(pass.coveredThroughMs).toBe(900)
+    })
+
+    it("the cursor is persisted on alarm and read back for the same URL", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.advancePlcCursor(2, 2_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_A, seq: 2 })
+        expect(await inMonitorObj(stub, (obj) => obj.readPlcCursor())).toBe(2)
+    })
+
+    it("persists on the first frame, then at most every 5 s on later frames", async () => {
+        const stub = freshStub()
+        const now = vi.spyOn(Date, "now")
+        try {
+            await inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                now.mockReturnValue(100_000)
+                await obj.advancePlcCursor(1, 1_000)
+                now.mockReturnValue(104_999)
+                await obj.advancePlcCursor(2, 2_000)
+            })
+            expect(await cursorRow(stub)).toMatchObject({ seq: 1 })
+            await inMonitorObj(stub, async (obj) => {
+                now.mockReturnValue(105_000)
+                await obj.advancePlcCursor(3, 3_000)
+            })
+            expect(await cursorRow(stub)).toMatchObject({ seq: 3 })
+        } finally {
+            now.mockRestore()
+        }
+    })
+
+    it("persists nothing while PLC_EXPORT_STREAM_URL is unset", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, undefined)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toBeNull()
+    })
+
+    it("readPlcCursor answers null when the stored cursor was for another URL, and drops it", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(4, 4_000)
+            obj.persistPlcCursor()
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            expect(await obj.readPlcCursor()).toBe(4)
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_B)
+            expect(await obj.readPlcCursor()).toBeNull()
+        })
+        expect(await cursorRow(stub)).toBeNull()
+        const fresh = freshStub()
+        await inMonitorObj(fresh, async (obj) => {
+            withUrl(obj, URL_A)
+            expect(await obj.readPlcCursor()).toBeNull()
+        })
+    })
+
+    it("resetPlcCursor clears the stored row and the in-memory seq, so a later flush cannot restore it", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(7, 7_000)
+            await obj.persistPlcCursor()
+            expect(await obj.readPlcCursor()).toBe(7)
+            await obj.resetPlcCursor()
+            expect((await obj.publishDidDocuments(1)).coveredThroughMs).toBeNull()
+            await obj.persistPlcCursor()
+            expect(await obj.readPlcCursor()).toBeNull()
+            await obj.advancePlcCursor(1, 9_000)
+            expect(await obj.readPlcCursor()).toBe(1)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 1, continuousSinceMs: 9_000 })
+    })
+
+    it("intakePlcEvent through the real object stores a watched DID's render and owes its key update, and ignores an unwatched DID", async () => {
+        const stub = freshStub()
+        const watched = "did:plc:s11watched"
+        const unwatched = "did:plc:s11unwatched"
+        const document: DidDocument = { id: watched }
+        const event = (did: string, seq: number, createdAtMs: number): PlcExportEvent => ({
+            seq,
+            did,
+            createdAtMs,
+            update: { kind: "put", key: "zK", asOfMs: createdAtMs },
+            change: { kind: "render", document: { id: did } },
+        })
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(watched, "3m1", 1_000)
+            expect(await intakePlcEvent(obj, event(unwatched, 10, 5_000), obj)).toBe("ignored")
+            expect(await intakePlcEvent(obj, event(watched, 11, 6_000), obj)).toBe("owed")
+            obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 11, continuousSinceMs: 5_000 })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            docs: state.storage.sql
+                .exec<{ did: string; document: string }>("SELECT did, document FROM did_documents")
+                .toArray(),
+            pending: state.storage.sql
+                .exec<{ did: string; rev: string }>("SELECT did, rev FROM pending")
+                .toArray(),
+            keys: state.storage.sql
+                .exec<{ did: string }>("SELECT did FROM key_updates")
+                .toArray()
+                .map((r) => r.did),
+        }))
+        expect(rows.docs).toEqual([{ did: watched, document: canonicalDidDocumentJson(document) }])
+        expect(rows.pending).toEqual([{ did: watched, rev: "3m1" }])
+        expect(rows.keys).toEqual([watched])
+    })
+})
+
+describe("PLC stream coverage", () => {
+    const URL_A = "https://plc.example/export/stream"
+    const URL_B = "https://other.example/export/stream"
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+    const marker = async () => {
+        const text = await testEnv.records.get("plc:coverage")
+        return text === null ? null : (JSON.parse(text) as Record<string, unknown>)
+    }
+    const cursorRow = (stub: DurableObjectStub<MonitorIngest>) =>
+        runInDurableObject(stub, (_obj, state) => {
+            const row = state.storage.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                .toArray()[0]
+            return row === undefined ? null : (JSON.parse(row.v) as Record<string, unknown>)
+        })
+
+    it("no coverage is published before a run's cursor row is persisted", async () => {
+        await testEnv.records.delete("plc:coverage")
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, undefined)
+            await obj.advancePlcCursor(1, 1_000)
+            withUrl(obj, URL_A)
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toBeNull()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 1_000,
+            coveredThroughMs: 1_000,
+        })
+    })
+
+    it("publishes nothing without a stream URL or without any covered time", async () => {
+        await testEnv.records.delete("plc:coverage")
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(null)
+            withUrl(obj, undefined)
+            await obj.publishPlcCoverage(1_000)
+            withUrl(obj, "")
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toBeNull()
+    })
+
+    it("a drained publish advances coveredThroughMs to the value given, and kvPlcCoverage reads it", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(1_000)
+            await obj.publishPlcCoverage(4_000)
+        })
+        expect(await kvPlcCoverage(testEnv)()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 1_000,
+            coveredThroughMs: 4_000,
+        })
+    })
+
+    it("a null coveredThroughMs re-publishes the previous value", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(3_000)
+            await testEnv.records.delete("plc:coverage")
+            await obj.publishPlcCoverage(null)
+        })
+        expect(await marker()).toMatchObject({ coveredThroughMs: 3_000 })
+    })
+
+    it("a cursor reset starts a new run at the next frame's createdAt", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(2_000)
+            await obj.resetPlcCursor()
+            await testEnv.records.delete("plc:coverage")
+            await obj.publishPlcCoverage(null)
+            expect(await marker()).toBeNull()
+            withUrl(obj, undefined)
+            await obj.advancePlcCursor(2, 5_000)
+            withUrl(obj, URL_A)
+            await obj.publishPlcCoverage(5_000)
+            expect(await marker()).toBeNull()
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(null)
+            expect(await marker()).toBeNull()
+            await obj.publishPlcCoverage(5_000)
+        })
+        expect(await marker()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 5_000,
+            coveredThroughMs: 5_000,
+        })
+    })
+
+    it("a resume from a stored cursor keeps the run's continuousSinceMs", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            expect(await obj.readPlcCursor()).toBe(1)
+            await obj.advancePlcCursor(2, 9_000)
+            await obj.publishPlcCoverage(9_000)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 2, continuousSinceMs: 1_000 })
+        expect(await marker()).toMatchObject({ continuousSinceMs: 1_000, coveredThroughMs: 9_000 })
+    })
+
+    it("a changed PLC_EXPORT_STREAM_URL starts a new run", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_B)
+            expect(await obj.readPlcCursor()).toBeNull()
+            await obj.advancePlcCursor(5, 7_000)
+            await obj.publishPlcCoverage(7_000)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_B, seq: 5, continuousSinceMs: 7_000 })
+        expect(await marker()).toEqual({
+            url: URL_B,
+            continuousSinceMs: 7_000,
+            coveredThroughMs: 7_000,
+        })
+    })
+
+    it("kvPlcCoverage reads a missing or malformed entry as null", async () => {
+        const read = kvPlcCoverage(testEnv)
+        await testEnv.records.delete("plc:coverage")
+        expect(await read()).toBeNull()
+        const good = { url: URL_A, continuousSinceMs: 1, coveredThroughMs: 2 }
+        for (const bad of [
+            "not json",
+            "[1]",
+            JSON.stringify({ ...good, url: 5 }),
+            JSON.stringify({ ...good, continuousSinceMs: "1" }),
+            JSON.stringify({ ...good, coveredThroughMs: null }),
+            JSON.stringify({ url: URL_A }),
+        ]) {
+            await testEnv.records.put("plc:coverage", bad)
+            expect(await read()).toBeNull()
+        }
+        await testEnv.records.put("plc:coverage", JSON.stringify(good))
+        expect(await read()).toEqual(good)
+    })
+})
+
+describe("PLC export consumer: frames, sockets and the alarm", () => {
+    const URL_A = "https://plc.example/export/stream"
+    const WATCHED = "did:plc:s13watched"
+    const OP = {
+        sig: "x",
+        prev: null,
+        type: "plc_operation",
+        services: { atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://pds.example" } },
+        alsoKnownAs: ["at://s13.example"],
+        rotationKeys: ["did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg"],
+        verificationMethods: { atproto: "did:key:zQ3shXjHeiBuRCKmM36cuYnm7YEMzhGnCmCyW92sRJ9pribSF" },
+    }
+    const frame = (did: string, seq: number, createdAt = "2026-01-01T00:00:00.000Z") =>
+        JSON.stringify({ did, cid: "bafy", seq, createdAt, operation: OP, type: "sequenced_op" })
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+    type Internals = {
+        plcSocket: unknown
+        enqueuePlcFrame(raw: string): Promise<void>
+        onPlcClose(ws: WebSocket | null, reason: string): Promise<void>
+        connectPlc(): Promise<void>
+    }
+    const internals = (obj: MonitorIngest) => obj as unknown as Internals
+
+    /** Record the URLs the object asks fetch for while `fn` runs; every request fails to upgrade. */
+    async function recordingFetch(fn: () => Promise<unknown>): Promise<URL[]> {
+        const seen: URL[] = []
+        const original = globalThis.fetch
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            seen.push(new URL(String(input)))
+            return Promise.resolve(new Response(null, { status: 200 }))
+        }) as typeof fetch
+        try {
+            await fn().catch(() => {})
+        } finally {
+            globalThis.fetch = original
+        }
+        return seen
+    }
+
+    it("connectPlc is a no-op when PLC_EXPORT_STREAM_URL is unset", async () => {
+        const stub = freshStub()
+        let outcome = "not run"
+        const seen = await recordingFetch(async () => {
+            outcome = await inMonitorObj(stub, async (obj) => {
+                withUrl(obj, undefined)
+                return internals(obj).connectPlc().then(
+                    () => "resolved",
+                    (err) => String(err)
+                )
+            })
+        })
+        expect(outcome).toBe("resolved")
+        expect(seen).toEqual([])
+    })
+
+    it("connectPlc sends the stored seq as the cursor parameter, and none when there is no cursor for this URL", async () => {
+        const stub = freshStub()
+        const fresh = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(fresh).toHaveLength(1)
+        expect(fresh[0]!.origin + fresh[0]!.pathname).toBe(URL_A)
+        expect(fresh[0]!.searchParams.has("cursor")).toBe(false)
+
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(41, 1_000)
+        })
+        await evictDurableObject(stub)
+        const resumed = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(resumed[0]!.searchParams.get("cursor")).toBe("41")
+
+        await evictDurableObject(stub)
+        const other = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, "https://other.example/export/stream")
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(other[0]!.searchParams.has("cursor")).toBe(false)
+    })
+
+    it("a live object resumes from its newest cursor in memory, not the stored one", async () => {
+        const stub = freshStub()
+        const seen = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await obj.advancePlcCursor(41, 1_000)
+                await obj.advancePlcCursor(50, 2_000)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(seen[0]!.searchParams.get("cursor")).toBe("50")
+    })
+
+    it("a failed PLC connect does not skip the rest of the alarm", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {
+                log.push("connectPlc")
+                throw new Error("plc down")
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: null }
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect(log).toContain("connectPlc")
+        expect(log.indexOf("publish")).toBeGreaterThan(log.indexOf("connectPlc"))
+        expect(log).toContain("seal")
+    })
+
+    async function runAlarm(stub: DurableObjectStub<MonitorIngest>) {
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+    }
+
+    it("the alarm persists the PLC cursor before publishing coverage and before sealing", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                persistPlcCursor: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            const persist = obj.persistPlcCursor.bind(obj)
+            o.persistPlcCursor = async () => {
+                log.push("persist")
+                return persist()
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: 1_234 }
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13order", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["persist", "publish", "coverage 1234", "seal"])
+    })
+
+    it("a publish failure still re-publishes the previous coverage and does not skip sealing", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            o.publishDidDocuments = async () => {
+                throw new Error("kv down")
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13fail", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["coverage null", "seal"])
+    })
+
+    it("a failing cursor persist and a failing coverage publish each leave the rest of the alarm to run", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                persistPlcCursor: () => void
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            o.persistPlcCursor = () => {
+                log.push("persist")
+                throw new Error("sqlite down")
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: null }
+            }
+            o.publishPlcCoverage = async () => {
+                log.push("coverage")
+                throw new Error("kv down")
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13both", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["persist", "publish", "coverage", "seal"])
+    })
+
+    it("frames are handled strictly in order on one chain, and a bad frame does not break it", async () => {
+        const stub = freshStub()
+        const other = "did:plc:s13unwatched"
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(WATCHED, "3m1", 1_000)
+            const advanced: number[] = []
+            const advance = obj.advancePlcCursor.bind(obj)
+            obj.advancePlcCursor = async (seq, createdAtMs) => {
+                advanced.push(seq)
+                return advance(seq, createdAtMs)
+            }
+            const owe = obj.oweKeyUpdate.bind(obj)
+            obj.oweKeyUpdate = async (did, update, seq, createdAtMs) => {
+                if (seq !== undefined) advanced.push(seq)
+                return owe(did, update, seq, createdAtMs)
+            }
+            const real = obj.recordDidDocument.bind(obj)
+            let first = true
+            obj.recordDidDocument = async (did, doc, asOf) => {
+                if (first) {
+                    first = false
+                    await new Promise((resolve) => setTimeout(resolve, 20))
+                }
+                return real(did, doc, asOf)
+            }
+            const chain = internals(obj)
+            await Promise.all([
+                chain.enqueuePlcFrame(frame(WATCHED, 1, "2026-01-01T00:00:01.000Z")),
+                chain.enqueuePlcFrame("not json"),
+                chain.enqueuePlcFrame(frame(other, 2, "2026-01-01T00:00:02.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 3, "2026-01-01T00:00:03.000Z")),
+            ])
+            await obj.persistPlcCursor()
+            expect(advanced).toEqual([1, 2, 3])
+        })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            docs: state.storage.sql
+                .exec<{ did: string; as_of: number }>("SELECT did, as_of FROM did_documents")
+                .toArray(),
+            cursor: JSON.parse(
+                state.storage.sql
+                    .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                    .one().v
+            ) as { seq: number },
+        }))
+        expect(rows.docs).toEqual([{ did: WATCHED, as_of: Date.parse("2026-01-01T00:00:03.000Z") }])
+        expect(rows.cursor.seq).toBe(3)
+    })
+
+    it("a frame that throws in intake does not stop later frames, and ends the coverage run", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(WATCHED, "3m1", 1_000)
+            const real = obj.recordDidDocument.bind(obj)
+            let calls = 0
+            obj.recordDidDocument = async (did, doc, asOf) => {
+                calls += 1
+                if (calls === 2) throw new Error("sqlite down")
+                return real(did, doc, asOf)
+            }
+            const chain = internals(obj)
+            await Promise.all([
+                chain.enqueuePlcFrame(frame(WATCHED, 1, "2026-01-01T00:00:01.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 2, "2026-01-01T00:00:02.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 3, "2026-01-01T00:00:05.000Z")),
+            ])
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(Date.parse("2026-01-01T00:00:05.000Z"))
+        })
+        const docs = await runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql.exec<{ as_of: number }>("SELECT as_of FROM did_documents").toArray()
+        )
+        expect(docs).toEqual([{ as_of: Date.parse("2026-01-01T00:00:05.000Z") }])
+        const marker = JSON.parse((await testEnv.records.get("plc:coverage"))!) as {
+            continuousSinceMs: number
+        }
+        expect(marker.continuousSinceMs).toBe(Date.parse("2026-01-01T00:00:05.000Z"))
+    })
+
+    it("closing with OutdatedCursor or FutureCursor resets the cursor; any other close keeps it; a close re-enables reconnecting", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const chain = internals(obj)
+            const socket = {} as WebSocket
+            const open = () => ((obj as unknown as { plcSocket: unknown }).plcSocket = socket)
+            await obj.advancePlcCursor(8, 8_000)
+            open()
+            await chain.onPlcClose(socket, "ConsumerTooSlow")
+            expect(await obj.readPlcCursor()).toBe(8)
+            expect(chain.plcSocket).toBeNull()
+            open()
+            await chain.onPlcClose(socket, "OutdatedCursor")
+            expect(await obj.readPlcCursor()).toBeNull()
+            expect(chain.plcSocket).toBeNull()
+            await obj.advancePlcCursor(9, 9_000)
+            open()
+            await chain.onPlcClose(socket, "FutureCursor")
+            expect(await obj.readPlcCursor()).toBeNull()
+            expect(chain.plcSocket).toBeNull()
+        })
+    })
+
+    it("a permanently deleted DID's stored document still follows the stream, with nothing owed", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s13deleted"
+        const document: DidDocument = { id: did, alsoKnownAs: ["at://rotated.example"] }
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.recordDidDocument(did, { id: did }, 1_000)
+            await obj.complete(did, "3m1", 1_000)
+            await obj.completeDeletion(did, 2_000, true)
+            const event: PlcExportEvent = {
+                seq: 5,
+                did,
+                createdAtMs: 9_000,
+                update: { kind: "put", key: "zK", asOfMs: 9_000 },
+                change: { kind: "render", document },
+            }
+            expect(await intakePlcEvent(obj, event, obj)).toBe("ignored")
+        })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            doc: state.storage.sql
+                .exec<{ document: string; as_of: number }>("SELECT document, as_of FROM did_documents")
+                .toArray(),
+            keys: state.storage.sql.exec("SELECT did FROM key_updates").toArray(),
+            pending: state.storage.sql.exec("SELECT did FROM pending").toArray(),
+        }))
+        expect(rows.doc).toEqual([{ document: canonicalDidDocumentJson(document), as_of: 9_000 }])
+        expect(rows.keys).toEqual([])
+        expect(rows.pending).toEqual([])
+    })
+
+    it("a failing cursor reset on close still frees the socket slot", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            const internal = obj as unknown as {
+                plcSocket: unknown
+                onPlcClose(ws: WebSocket | null, reason: string): Promise<void>
+            }
+            const socket = {} as WebSocket
+            internal.plcSocket = socket
+            obj.resetPlcCursor = async () => {
+                throw new Error("sqlite down")
+            }
+            await internal.onPlcClose(socket, "OutdatedCursor")
+            expect(internal.plcSocket).toBeNull()
+        })
+    })
+
+    it("a backfill sweep that throws does not stop the documents and coverage from being published", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+            }
+            o.connectPlc = async () => {}
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: 77 }
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            String(url).includes("listReposByCollection")
+                ? Promise.reject(new Error("relay down"))
+                : Promise.resolve(new Response(null, { status: 200 }))) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // The sweep's failure surfaces from the alarm, as it always did.
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(log).toEqual(["publish", "coverage 77"])
+    })
+
+    it("a socket error frees the slot for its own socket only", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            const internal = obj as unknown as { plcSocket: unknown; onPlcError(ws: WebSocket): void }
+            const old = {} as WebSocket
+            const live = {} as WebSocket
+            internal.plcSocket = live
+            internal.onPlcError(old)
+            expect(internal.plcSocket).toBe(live)
+            internal.onPlcError(live)
+            expect(internal.plcSocket).toBeNull()
+        })
+    })
+
+    it("a late close from a replaced socket neither resets the cursor nor drops the live socket", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const chain = internals(obj)
+            const old = {} as WebSocket
+            const live = {} as WebSocket
+            await obj.advancePlcCursor(8, 8_000)
+            ;(obj as unknown as { plcSocket: unknown }).plcSocket = live
+            await chain.onPlcClose(old, "OutdatedCursor")
+            expect(chain.plcSocket).toBe(live)
+            expect(await obj.readPlcCursor()).toBe(8)
+        })
+    })
+})
+
 describe("PLC export consumer", () => {
     const PLC_URL = "https://plc.invalid/export/stream"
     const COLLECTION = testEnv.MONITOR_COLLECTION
@@ -1221,7 +2595,7 @@ describe("PLC export consumer", () => {
             await obj.oweKeyUpdate("did:plc:a", put("zK"), 11)
         })
         await alarmWithFetch(stub)
-        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 11 })
+        expect(await storedCursor(stub)).toMatchObject({ url: PLC_URL, seq: 11 })
 
         // A lazily flushed advance must not drag a newer stored seq back.
         const other = freshStub()
@@ -1230,7 +2604,7 @@ describe("PLC export consumer", () => {
             await obj.advancePlcCursor(10)
         })
         await alarmWithFetch(other)
-        expect(await storedCursor(other)).toEqual({ url: PLC_URL, seq: 11 })
+        expect(await storedCursor(other)).toMatchObject({ url: PLC_URL, seq: 11 })
     })
 
     it("KeyUpdateIndex: an advance inside the persist interval is flushed by the alarm", async () => {
@@ -1239,9 +2613,9 @@ describe("PLC export consumer", () => {
             await obj.advancePlcCursor(10)
             await obj.advancePlcCursor(20)
         })
-        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 10 })
+        expect(await storedCursor(stub)).toMatchObject({ url: PLC_URL, seq: 10 })
         await alarmWithFetch(stub)
-        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 20 })
+        expect(await storedCursor(stub)).toMatchObject({ url: PLC_URL, seq: 20 })
     })
 
     it("KeyUpdateIndex: an advance below the stored cursor on a cold object does not lower it", async () => {
@@ -1252,7 +2626,7 @@ describe("PLC export consumer", () => {
         await evictDurableObject(stub)
         await runInDurableObject(stub, (obj: MonitorIngest) => obj.advancePlcCursor(40))
         await alarmWithFetch(stub)
-        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 50 })
+        expect(await storedCursor(stub)).toMatchObject({ url: PLC_URL, seq: 50 })
     })
 
     it("KeyUpdateIndex: resetPlcCursor then alarm → cursor stays null", async () => {

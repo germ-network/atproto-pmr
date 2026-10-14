@@ -8,7 +8,7 @@
  * Only a changed record CID takes the full `settle` path.
  */
 import { RecordNotFoundError, readRecordFromCar } from "@germ-network/atproto-pmr-core"
-import { settle, settleDeletion, type IngestDeps } from "./ingest"
+import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
 import { compareRev } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
@@ -137,6 +137,7 @@ async function refreshOne(
         if (!(err instanceof RecordNotFoundError)) throw err
         return disposeGone(deps, did, err.permanent, nowMs)
     }
+    await recordFetchedDocument(ingest, did, fetched.didDocument)
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
     if (incoming === null) {
         // A 200 with an exclusion proof: the repo is alive and the record is

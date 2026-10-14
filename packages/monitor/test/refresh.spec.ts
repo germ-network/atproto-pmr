@@ -7,7 +7,7 @@ import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/repo-car"
 import type { IngestDeps, FetchedRecord } from "../src/ingest"
 import { refreshDue, type RefreshDeps, type SnapshotCheck } from "../src/refresh"
-import type { MonitorIndex, SnapshotEntry, SnapshotStore } from "../src/storage"
+import { FETCH_AS_OF_SKEW_MS, type MonitorIndex, type SnapshotEntry, type SnapshotStore } from "../src/storage"
 
 const COLLECTION = "com.germnetwork.declaration"
 const RKEY = "self"
@@ -299,5 +299,82 @@ describe("refreshDue", () => {
         expect(result.checked).toBe(2)
         expect([...h.checks.keys()]).toEqual(["did:plc:a", "did:plc:b"])
         expect(h.dueCalls[0]!.limit).toBe(2)
+    })
+})
+
+describe("refresh keeps the stored DID document", () => {
+    it("a quiet advance records the fetched record's document", async () => {
+        const document = { id: DID }
+        const recordDidDocument = vi.fn(async () => {})
+        const next = {
+            ...fetched("3m2", decl(1), SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            didDocument: { document, fetchedAtMs: 123_456 },
+        }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => "3m2",
+            fetchRecord: async () => next,
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
+        const result = await run(h)
+        expect(result.outcomes["advanced-quiet"]).toBe(1)
+        expect(recordDidDocument).toHaveBeenCalledExactlyOnceWith(DID, document, 123_456 - FETCH_AS_OF_SKEW_MS)
+    })
+
+    it("a fetch that finds the record gone still records the document", async () => {
+        const document = { id: DID }
+        const recordDidDocument = vi.fn(async () => {})
+        const gone = {
+            ...fetched("3m2", null),
+            didDocument: { document, fetchedAtMs: 50_000 },
+        }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => "3m2",
+            fetchRecord: async () => gone,
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
+        await run(h)
+        expect(recordDidDocument).toHaveBeenCalledWith(DID, document, 50_000 - FETCH_AS_OF_SKEW_MS)
+    })
+
+    it("a changed record's document is recorded even when the settle's own fetch fails", async () => {
+        const document = { id: DID }
+        const recordDidDocument = vi.fn(async () => {})
+        let calls = 0
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => "3m2",
+            fetchRecord: async () => {
+                if (++calls > 1) throw new Error("pds down")
+                return { ...fetched("3m2", decl(2)), didDocument: { document, fetchedAtMs: 9_000 } }
+            },
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
+        await run(h).catch(() => {})
+        expect(recordDidDocument).toHaveBeenCalledWith(DID, document, 9_000 - FETCH_AS_OF_SKEW_MS)
+    })
+
+    it("a failing document write does not fail the quiet advance", async () => {
+        const next = {
+            ...fetched("3m2", decl(1), SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            didDocument: { document: { id: DID }, fetchedAtMs: 1 },
+        }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => "3m2",
+            fetchRecord: async () => next,
+        })
+        h.deps.ingest.didDocuments = {
+            recordDidDocument: async () => {
+                throw new Error("store down")
+            },
+            markDidDocumentStale: async () => {},
+        }
+        expect((await run(h)).outcomes["advanced-quiet"]).toBe(1)
     })
 })

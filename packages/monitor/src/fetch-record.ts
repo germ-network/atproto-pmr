@@ -13,11 +13,13 @@
  */
 
 import {
+    fetchDidDocument,
     fetchLatestRev,
     guardedFetchBytes,
-    resolvePDSEndpoint,
+    pdsResolutionFromDocument,
+    type DidDocument,
 } from "@germ-network/atproto-pmr-core"
-import type { FetchedRecord } from "./ingest"
+import type { FetchedDidDocument, FetchedRecord } from "./ingest"
 
 export interface FetchRecordOptions {
     /** The collection carrying the published key. */
@@ -25,6 +27,19 @@ export interface FetchRecordOptions {
     /** Records that carry one key per repo sit at `self`. */
     rkey?: string
     fetchImpl?: typeof fetch
+    /** Stamps the returned `didDocument`. Defaults to `Date.now`. */
+    nowMs?: () => number
+}
+
+export interface FetchHeadRevOptions {
+    fetchImpl?: typeof fetch
+    /**
+     * Handed the DID document the head was resolved through, so the refresh
+     * pass keeps the stored copy current at no extra subrequest.
+     */
+    onDidDocument?: (fetched: FetchedDidDocument) => Promise<void>
+    /** Stamps `onDidDocument`'s argument. Defaults to `Date.now`. */
+    nowMs?: () => number
 }
 
 /**
@@ -83,10 +98,22 @@ const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
  */
 export async function fetchHeadRev(
     did: string,
-    options: { fetchImpl?: typeof fetch } = {}
+    options: FetchHeadRevOptions = {}
 ): Promise<string> {
     const fetchImpl = options.fetchImpl ?? fetch
-    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    const fetchedAtMs = (options.nowMs ?? Date.now)()
+    const document = await fetchDidDocument(did, fetchImpl)
+    try {
+        // Handed over before the PDS is read out of it: a current document
+        // is worth keeping even when it names no PDS.
+        await options.onDidDocument?.({
+            document: document as unknown as DidDocument,
+            fetchedAtMs,
+        })
+    } catch {
+        // Keeping the stored copy current must not cost the refresh its head.
+    }
+    const { endpoint } = pdsResolutionFromDocument(document)
     return fetchLatestRev(endpoint, did, fetchImpl, {
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
@@ -98,7 +125,9 @@ export async function fetchRecordCar(
     options: FetchRecordOptions
 ): Promise<FetchedRecord> {
     const fetchImpl = options.fetchImpl ?? fetch
-    const { endpoint: pds, signingKey } = await resolvePDSEndpoint(did, fetchImpl)
+    const fetchedAtMs = (options.nowMs ?? Date.now)()
+    const document = await fetchDidDocument(did, fetchImpl)
+    const { endpoint: pds, signingKey } = pdsResolutionFromDocument(document)
 
     const recordUrl = new URL(`${pds}/xrpc/com.atproto.sync.getRecord`)
     recordUrl.searchParams.set("did", did)
@@ -114,5 +143,11 @@ export async function fetchRecordCar(
     // with the relay's watch via core — see `fetchLatestRev`. One extra round
     // trip per *changed* record is nothing at a single collection's change rate.
     const rev = await fetchLatestRev(pds, did, fetchImpl)
-    return { rev, car, source: pds, signingKey }
+    return {
+        rev,
+        car,
+        source: pds,
+        signingKey,
+        didDocument: { document: document as unknown as DidDocument, fetchedAtMs },
+    }
 }

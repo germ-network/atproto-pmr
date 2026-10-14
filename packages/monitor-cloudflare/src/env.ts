@@ -21,7 +21,8 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /**
      * **A singleton.** One Jetstream socket and cursor (plus the optional
-     * PLC export socket and cursor), one `rev` index for the whole
+     * PLC export socket and cursor, shared by the signing-key cache and the
+     * stored DID documents), one `rev` index for the whole
      * coverage. Address it by a fixed name, never per user: the consumer is
      * network-wide where a relay's objects are per registration.
      */
@@ -37,14 +38,6 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * view of the network.
      */
     JETSTREAM_URL: string
-
-    /**
-     * The PLC directory's export stream (`…/export/stream`), consumed to
-     * keep the relay's cached did:plc signing keys (`sk:` in `records`)
-     * current. Unset, the consumer does not run and cached keys follow
-     * their TTL alone.
-     */
-    PLC_EXPORT_STREAM_URL?: string
 
     /**
      * Watchdog interval, milliseconds. An outbound socket does not
@@ -121,6 +114,20 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /** A snapshot not confirmed for this long (ms) is due for re-confirmation. */
     REFRESH_STALE_AFTER_MS: string
+
+    /**
+     * The PLC directory's export stream (`wss://plc.directory/export/stream`,
+     * written as https). One socket and cursor feed both caches it keeps
+     * current: the relay's cached did:plc signing keys (`sk:` in `records`)
+     * and the stored DID documents (`doc:`, with `plc:coverage`). Optional:
+     * unset, no second socket is opened, cached keys follow their TTL alone,
+     * and stored did:plc documents follow only the refresh pass and are
+     * trusted only for the direct-fetch TTL. Must be the same directory the
+     * monitor's fetches and the relay's fallback read (plc.directory): a
+     * mirror's coverage says nothing about what they see. The cursor is
+     * stored per URL, because `seq` is per directory host.
+     */
+    PLC_EXPORT_STREAM_URL?: string
 
     /**
      * The registration surface: own-DID push. Optional — a deployment that
