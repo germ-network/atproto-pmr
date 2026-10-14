@@ -72,10 +72,10 @@ export const STORED_DID_DOCUMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000
 export const PLC_COVERAGE_MAX_LAG_MS = 10 * 60 * 1000
 
 /**
- * What the monitor's consumption of the PLC export stream vouches for:
- * every operation accepted by the directory from `continuousSinceMs` through
- * `coveredThroughMs` (directory `createdAt` times) has reached the cached
- * documents readers see.
+ * What the monitor's consumption of the PLC export stream vouches for: every
+ * operation the directory accepted from `continuousSinceMs` through
+ * `coveredThroughMs` (directory `createdAt` times) for a DID whose document
+ * the monitor stores has reached the cached document readers see.
  */
 export interface PlcCoverage {
     /** The export stream consumed, informational: `seq` is per directory host. */

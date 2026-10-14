@@ -105,7 +105,9 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  * **A singleton.** Address it by a fixed name. A relay's objects are per
  * registration; this one is per *network*, because there is one stream and
  * one cursor into it. With `PLC_EXPORT_STREAM_URL` set it also holds the
- * PLC directory's export stream, with its own cursor.
+ * PLC directory's export stream, with its own cursor and a run of unbroken
+ * coverage (which `plc:coverage` publishes); that one stream feeds both the
+ * owed signing-key updates and the stored DID documents.
  *
  * An outbound WebSocket does not hibernate — the Hibernation API covers
  * incoming sockets — so this object stays resident while connected and is
@@ -1087,8 +1089,8 @@ export class MonitorIngest
         this.plcChain = this.plcChain
             .then(async () => {
                 if (this.plcSocket !== null && this.plcSocket !== ws) return
-                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
                 this.plcSocket = null
+                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
             })
             .catch((err) => {
                 console.error("monitor: plc close failed", err)
@@ -1192,6 +1194,21 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: plc cursor persist failed", err)
             }
+            // Ahead of the sweep, which throws when its relay is down: stored
+            // documents and the coverage marker must not wait behind it.
+            let coveredThroughMs: number | null = null
+            try {
+                const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
+                coveredThroughMs = published.coveredThroughMs
+                console.log("monitor: did documents", published)
+            } catch (err) {
+                console.error("monitor: did document publish failed", err)
+            }
+            try {
+                await this.publishPlcCoverage(coveredThroughMs)
+            } catch (err) {
+                console.error("monitor: plc coverage publish failed", err)
+            }
             // Before settling, so a DID this sweep just discovered is
             // eligible for the same tick's settle pass rather than
             // waiting a full watchdog interval — `SETTLE_BATCH` still
@@ -1232,19 +1249,6 @@ export class MonitorIngest
             } catch (err) {
                 // The alarm must still seal and re-arm itself.
                 console.error("monitor: refresh failed", err)
-            }
-            let coveredThroughMs: number | null = null
-            try {
-                const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
-                coveredThroughMs = published.coveredThroughMs
-                console.log("monitor: did documents", published)
-            } catch (err) {
-                console.error("monitor: did document publish failed", err)
-            }
-            try {
-                await this.publishPlcCoverage(coveredThroughMs)
-            } catch (err) {
-                console.error("monitor: plc coverage publish failed", err)
             }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.

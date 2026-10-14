@@ -14,9 +14,12 @@
  * several independent parties can run one, the property the redundancy
  * model depends on.
  *
- * It can also keep a relay's cached did:plc signing keys current from the
- * PLC directory's export stream (`decodePlcExportFrame`, `intakePlcEvent`,
- * `drainKeyUpdates`; `spec/key-transparency.md`, "The signing-key cache").
+ * It can also keep a relay's cached did:plc signing keys, and a stored DID
+ * document per watched DID, current from the PLC directory's export stream
+ * (`decodePlcExportFrame`, `intakePlcEvent`, `drainKeyUpdates`;
+ * `spec/key-transparency.md`, "The signing-key cache" and "The stored DID
+ * document"). Documents reach the stream's intake through `DidDocumentSink`,
+ * and the monitor's own fetches through `IngestDeps.didDocuments`.
  *
  * The specification is in `spec/key-transparency.md`. Where this code and
  * the specification disagree, the specification is right and this is a bug.

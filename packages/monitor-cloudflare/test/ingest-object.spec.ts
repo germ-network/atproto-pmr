@@ -1662,13 +1662,13 @@ describe("wiring stored DID documents into the monitor", () => {
         return log
     }
 
-    it("the alarm publishes documents after the refresh pass, and a publish failure does not skip sealing", async () => {
+    it("the alarm publishes documents ahead of the sweep and the refresh pass, and a publish failure does not skip sealing", async () => {
         const ok = await alarmWith(async () => ({ published: 0, remaining: 0, coveredThroughMs: null }))
         const refresh = ok.indexOf("refresh did:plc:s10alarm")
         expect(refresh).toBeGreaterThanOrEqual(0)
         expect(ok).toContain("publish 64")
-        expect(ok.indexOf("publish 64")).toBeGreaterThan(refresh)
-        expect(ok.indexOf("seal")).toBeGreaterThan(ok.indexOf("publish 64"))
+        expect(ok.indexOf("publish 64")).toBeLessThan(refresh)
+        expect(ok.indexOf("seal")).toBeGreaterThan(refresh)
 
         const failed = await alarmWith(async () => {
             throw new Error("kv down")
@@ -2396,6 +2396,88 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
             expect(await obj.readPlcCursor()).toBeNull()
             expect(chain.plcSocket).toBeNull()
         })
+    })
+
+    it("a permanently deleted DID's stored document still follows the stream, with nothing owed", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s13deleted"
+        const document: DidDocument = { id: did, alsoKnownAs: ["at://rotated.example"] }
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.recordDidDocument(did, { id: did }, 1_000)
+            await obj.complete(did, "3m1", 1_000)
+            await obj.completeDeletion(did, 2_000, true)
+            const event: PlcExportEvent = {
+                seq: 5,
+                did,
+                createdAtMs: 9_000,
+                update: { kind: "put", key: "zK", asOfMs: 9_000 },
+                change: { kind: "render", document },
+            }
+            expect(await intakePlcEvent(obj, event, obj)).toBe("ignored")
+        })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            doc: state.storage.sql
+                .exec<{ document: string; as_of: number }>("SELECT document, as_of FROM did_documents")
+                .toArray(),
+            keys: state.storage.sql.exec("SELECT did FROM key_updates").toArray(),
+            pending: state.storage.sql.exec("SELECT did FROM pending").toArray(),
+        }))
+        expect(rows.doc).toEqual([{ document: canonicalDidDocumentJson(document), as_of: 9_000 }])
+        expect(rows.keys).toEqual([])
+        expect(rows.pending).toEqual([])
+    })
+
+    it("a failing cursor reset on close still frees the socket slot", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            const internal = obj as unknown as {
+                plcSocket: unknown
+                onPlcClose(ws: WebSocket | null, reason: string): Promise<void>
+            }
+            const socket = {} as WebSocket
+            internal.plcSocket = socket
+            obj.resetPlcCursor = async () => {
+                throw new Error("sqlite down")
+            }
+            await internal.onPlcClose(socket, "OutdatedCursor")
+            expect(internal.plcSocket).toBeNull()
+        })
+    })
+
+    it("a backfill sweep that throws does not stop the documents and coverage from being published", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+            }
+            o.connectPlc = async () => {}
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: 77 }
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            String(url).includes("listReposByCollection")
+                ? Promise.reject(new Error("relay down"))
+                : Promise.resolve(new Response(null, { status: 200 }))) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // The sweep's failure surfaces from the alarm, as it always did.
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(log).toEqual(["publish", "coverage 77"])
     })
 
     it("a socket error frees the slot for its own socket only", async () => {

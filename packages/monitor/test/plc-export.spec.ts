@@ -395,6 +395,7 @@ describe("intakePlcEvent: the stored document", () => {
     /** In-memory index and sink that log every call, in order. */
     function fakes(opts: {
         watched?: boolean
+        deleted?: boolean
         rev?: string | null
         failRecord?: boolean
         failOwe?: boolean
@@ -410,6 +411,7 @@ describe("intakePlcEvent: the stored document", () => {
         }
         const index = {
             isWatched: async () => opts.watched ?? true,
+            isDeleted: async () => opts.deleted ?? false,
             revOf: async () => (opts.rev === undefined ? "3m1" : opts.rev),
             owe: async (did: string, rev: string) => {
                 log.push("owe")
@@ -458,6 +460,25 @@ describe("intakePlcEvent: the stored document", () => {
         expect(await intakePlcEvent(f.index, event(RENDER), f.sink)).toBe("ignored")
         expect(f.log).toEqual(["cursor"])
         expect(f.calls.cursor).toEqual([[42, AT]])
+    })
+
+    it("a permanently deleted DID's document still follows the stream, but nothing is owed and the cursor advances with its createdAt", async () => {
+        const f = fakes({ watched: false, deleted: true })
+        expect(await intakePlcEvent(f.index, event(RENDER), f.sink)).toBe("ignored")
+        expect(f.calls.recorded).toEqual([[DID_, document, AT]])
+        expect(f.calls.owed).toEqual([])
+        expect(f.calls.key).toEqual([])
+        expect(f.log).toEqual(["record", "cursor"])
+        expect(f.calls.cursor).toEqual([[42, AT]])
+        const g = fakes({ watched: false, deleted: true })
+        await intakePlcEvent(g.index, event({ kind: "refetch" }), g.sink)
+        expect(g.calls.stale).toEqual([[DID_, AT]])
+    })
+
+    it("a DID neither watched nor deleted gets no document write", async () => {
+        const f = fakes({ watched: false, deleted: false })
+        await intakePlcEvent(f.index, event(RENDER), f.sink)
+        expect(f.log).toEqual(["cursor"])
     })
 
     it("a watched DID's render is stored as of the op's createdAt", async () => {

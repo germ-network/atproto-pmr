@@ -388,6 +388,78 @@ cached key as a hint. With the stream configured, `did:plc` DIDs are left to
 the stream: a PDS emits its identity event after the directory's operation,
 and the delete would discard the key just written.
 
+### The stored DID document
+
+A monitor keeps a DID document for each DID it watches — the DIDs it holds a
+snapshot for or is owed a fetch for, and any confirmed permanently deleted — and
+publishes it where a relay reads it, so that a relay can take
+the sender's signing key from the monitor instead of asking the directory.
+It is kept current by two things: the monitor's own fetches, and, for
+`did:plc` when the export stream is configured, the stream itself.
+
+- **From fetches.** Every DID-document fetch the monitor already makes — the
+  record fetch that settles a wake, the head read that refreshes a snapshot —
+  also stores the document it resolved. That is the only source for `did:web`,
+  and the backstop for `did:plc`.
+- **From the stream.** For a watched DID, a current-format `plc_operation` is
+  rendered into the document the directory serves for it and stored when the
+  directory sequences it. What cannot be rendered — a legacy `create`, an
+  operation of an unknown type, an operation of a shape no live document has
+  been checked against, an unreadable `createdAt` — withdraws trust in the
+  stored document instead, and the next fetch restores it. A tombstone stores
+  that the identity is gone. A DID the monitor does not watch moves only the
+  cursor; no operation, log or rotation key is kept for it.
+
+Writes are ordered by when the directory held the state they describe: a
+stream operation by its `createdAt`, a fetch by the time it started less five
+seconds (for clock skew). A write older than what is stored is dropped, so a
+fetch that read the document before an operation was accepted can never
+overwrite it, and a replayed operation can never overwrite a later fetch.
+Two documents are equal when their JSON is equal with keys sorted, so a
+rendered document and a fetched one of the same state are the same write. (That
+a fetch started after the directory accepted an operation sees it is an
+inference about the directory, not specified text.)
+
+**Publishing.** Each alarm carries what changed to `doc:<did>` in the records
+store: the document, when the monitor last confirmed it current, and whether
+it came from `did:plc` or `did:web`. A document the monitor cannot vouch for —
+a tombstone, or one whose latest operation it could not render — is published
+as the absence of `doc:<did>`, so a reader asks the directory. An unchanged
+document is re-confirmed at most twice a day.
+
+**Coverage.** The export stream cannot say a document is *current*, only that
+no operation was missed: `plc:coverage` records the stream's URL, when its
+current unbroken run began, and the `createdAt` through which every operation
+accepted since that run began has reached the published documents. A run
+begins with the first frame after a start without a usable cursor — first
+configuration, a tip start after `OutdatedCursor` or `FutureCursor`, a changed
+URL, or a frame the monitor failed to take in — and a restart that resumes from
+the stored cursor continues the same run, because the stream replays the gap.
+The marker advances only after a publish pass leaves no unpublished change, and
+is written only once the run is stored with the cursor, so an eviction cannot
+lose a run the marker claims.
+
+**How a relay trusts it.** A stored `did:plc` document is trusted for 24 hours
+from when it was confirmed only if that confirmation falls inside the marker's
+current run and the marker's `coveredThroughMs` is no more than ten minutes
+old. Any other stored document — `did:web`, or `did:plc` without such coverage
+— is trusted for ten minutes, the same as a direct fetch, and past its window
+the relay asks the directory. A missing or unreadable marker is no coverage.
+The staleness bound of the covered case is the stream's lag plus one alarm
+interval plus the records store's propagation delay (about a minute).
+
+A DID confirmed permanently deleted owes no re-fetch and no key update, but its
+stored document still follows the stream, because a relay would otherwise trust
+a superseded key for the rest of the 24 hours.
+
+**Cost.** Per alarm, at most 64 `doc:` writes and one `plc:coverage` write.
+Per day, per watched DID: about two `doc:` writes plus one for each change to
+its document, plus 720 `plc:coverage` writes for the whole monitor; at 1,754
+watched DIDs that is about 3,500 writes a day, which needs a paid plan. The
+export stream is a second outbound socket beside the one to Jetstream. A
+monitor serving many tenants sizes this per tenant's watched DIDs, not for the
+network.
+
 ### Keeping the snapshot current
 
 A relay that admits pair puts from a monitor's CAR (see
@@ -399,7 +471,9 @@ a wake signal arrives, so that check is the exception.
 
 For each held DID that has not been confirmed for a configured interval, the
 monitor reads the repo's current head `rev` from the DID's own PDS
-(re-resolving the DID document each time, so a PDS migration is seen) and
+(re-resolving the DID document each time, so a PDS migration is seen, and
+keeping that document as the DID's
+[stored document](#the-stored-did-document), at no extra subrequest) and
 compares it with the `rev` it holds:
 
 - **Unchanged** — the snapshot is confirmed current as of now.
@@ -432,9 +506,9 @@ PDS directly for the lapsed ones. Each refreshed DID costs
 two subrequests for the head `rev` (DID document, then commit) plus its KV
 reads and writes, and a DID whose head advanced costs several more (a record
 fetch, and a second one if the change takes the ordinary path). The batch
-must therefore also fit the platform's per-invocation subrequest limit: the
-even an all-confirmed batch of 64 exceeds the free plan's limit of 50, where
-the batch should be lowered.
+must therefore also fit the platform's per-invocation subrequest limit: even
+an all-confirmed batch of 64 exceeds the free plan's limit of 50, where the
+batch should be lowered.
 
 ### The record fetch
 

@@ -157,8 +157,10 @@ export type PlcIntakeDecision = "ignored" | "owed"
  * failing); then owe the snapshot re-fetch (when it is in `revs`) and,
  * last, the key update together with the cursor, so a crash in between
  * replays the op rather than losing it — every write is idempotent. For any
- * other DID, only the cursor advances. Without `didDocuments` the stored
- * documents are left alone.
+ * other DID, only the cursor advances. A DID confirmed permanently deleted is
+ * not watched, owes neither, and still has its stored document followed (a
+ * relay trusts any stored did:plc document confirmed inside the coverage run).
+ * Without `didDocuments` the stored documents are left alone.
  */
 export async function intakePlcEvent(
     index: MonitorIndex & KeyUpdateIndex,
@@ -166,11 +168,13 @@ export async function intakePlcEvent(
     didDocuments?: DidDocumentSink
 ): Promise<PlcIntakeDecision> {
     const createdAt = event.createdAtMs ?? undefined
-    if (!(await index.isWatched(event.did))) {
-        await index.advancePlcCursor(event.seq, createdAt)
-        return "ignored"
-    }
-    if (didDocuments !== undefined) {
+    const watched = await index.isWatched(event.did)
+    // A permanently deleted DID owes no key update or re-fetch, but its stored
+    // document must keep following the stream: a relay trusts any stored
+    // did:plc document confirmed inside the coverage run, whoever is watched.
+    const keepsDocument =
+        didDocuments !== undefined && (watched || (await index.isDeleted(event.did)))
+    if (didDocuments !== undefined && keepsDocument) {
         const asOfMs = event.createdAtMs ?? Date.now()
         const { change } = event
         if (change.kind === "refetch") {
@@ -179,6 +183,10 @@ export async function intakePlcEvent(
             const document = change.kind === "render" ? change.document : null
             await didDocuments.recordDidDocument(event.did, document, asOfMs)
         }
+    }
+    if (!watched) {
+        await index.advancePlcCursor(event.seq, createdAt)
+        return "ignored"
     }
     const rev = await index.revOf(event.did)
     if (rev !== null) await index.owe(event.did, rev)
