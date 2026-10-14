@@ -143,6 +143,7 @@ export {
     handleGrantsList,
     handleMessagesAcks,
     handleMessagesList,
+    handleSummaryRead,
     handlePoolAdjudication,
     handlePoolList,
     handleRegistrationCreate,
@@ -319,3 +320,34 @@ export {
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api"
+
+// The device read API: public record and graph reads, and the owner's summary.
+export {
+    decodeGraphReadResponse,
+    decodeRecordReadResponse,
+    dedupedRecheck,
+    encodeGraphReadResponse,
+    encodeRecordReadResponse,
+    handleGraphRead,
+    handleRecordRead,
+    projectGraph,
+    type GraphProjectionStore,
+    type GraphProjectionWriter,
+    type GraphReadDeps,
+    type RecordReadDeps,
+} from "./device-read"
+export {
+    buildSummary,
+    decodeSummaryDelta,
+    diffSummaryIndex,
+    encodeSummaryDelta,
+    SUMMARY_DELTA_KEYS,
+    SUMMARY_RECORD_KEYS,
+    SUMMARY_TOKENS_KEPT,
+    type SummaryDelta,
+    type SummaryDeps,
+    type SummaryIndex,
+    type SummaryIndexEntry,
+    type SummaryRecord,
+    type SummaryRecordRef,
+} from "./summary"

@@ -25,6 +25,7 @@ import {
     type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
+    type SummaryIndex,
     type SyntheticBehavior,
     type SyntheticState,
     type WatchOutcome,
@@ -375,6 +376,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async writeWatchState(state: WatchState): Promise<void> {
         await this.db.put(KEY_WATCH, state)
+    }
+
+    async putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async getSummaryIndex(token: string): Promise<SummaryIndex | null> {
+        throw new Error("not implemented")
     }
 
     /**

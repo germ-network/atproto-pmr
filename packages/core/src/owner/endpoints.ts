@@ -15,6 +15,7 @@ import type {
     RegistrationFields,
 } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
+import type { SummaryDeps } from "../summary.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
     authenticateOwner,
@@ -789,4 +790,22 @@ export async function handleMessagesAcks(
     }
 
     return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
+}
+
+// MARK: - Summary
+
+/**
+ * `GET /pmr/v1/summary?since=<token>` — what changed in the owner's summary
+ * since the state named by `since`, or the whole summary when `since` is
+ * absent or names no state still held (`summary.ts`). The served state is
+ * stored under a fresh token, unless nothing changed since the named state,
+ * when that token is returned again and re-stored as most recent, so polling
+ * devices do not push each other's states out. `409` with `Retry-After` when the owner
+ * has no projection yet. Never requests a re-check.
+ */
+export async function handleSummaryRead(
+    request: Request,
+    deps: OwnerDeps & SummaryDeps & { randomBytes: (n: number) => Uint8Array; nowMs: () => number }
+): Promise<Response> {
+    throw new Error("not implemented")
 }

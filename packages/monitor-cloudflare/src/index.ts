@@ -44,4 +44,5 @@
 export { MonitorIngest } from "./ingest-object"
 export { kvMonitorRegistrationStore } from "./registration-store"
 export { kvSnapshotStore, kvDeclarationSnapshots } from "./snapshot-store"
+export { kvGraphProjections } from "./graph-projection-store"
 export type { MonitorEnv } from "./env"
