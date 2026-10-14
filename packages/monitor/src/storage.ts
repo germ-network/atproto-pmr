@@ -606,7 +606,11 @@ export interface InterestIndex {
     /** Whose follows are kept: registered DIDs under `registered`, held holders under `everyone`. */
     isGraphOwner(did: string): Promise<boolean>
     setRegistered(did: string, registered: boolean, atMs: number): Promise<void>
-    /** How many graph owners follow `did`, as last counted. */
+    /**
+     * How many graph owners follow `did`, as last counted. A count of 0 for a
+     * DID with no `interest` row writes nothing, so subjects nobody follows
+     * leave no rows behind.
+     */
     setOwnerFollowers(did: string, count: number, atMs: number): Promise<void>
     dueTransitions(limit: number): Promise<InterestTransition[]>
     /** A no-op once `did`'s epoch has moved past `epoch`. */
