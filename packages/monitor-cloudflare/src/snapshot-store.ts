@@ -57,6 +57,47 @@ export function snapshotKeys(
     return { record: RECORD_PREFIX + subject, check: CHECK_PREFIX + subject }
 }
 
+async function readEntry(
+    env: { records: KVNamespace },
+    key: string
+): Promise<SnapshotEntry | null> {
+    const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
+        key,
+        "arrayBuffer"
+    )
+    if (value === null || metadata === null) return null
+    return {
+        rev: metadata.rev,
+        car: new Uint8Array(value),
+        observedAtMs: metadata.observedAtMs,
+        source: metadata.source,
+        signingKey: metadata.signingKey,
+        verifiedWith: metadata.verifiedWith ?? null,
+        cid: metadata.cid ?? null,
+        seenKey: metadata.seenKey ?? null,
+    }
+}
+
+async function writeEntry(
+    env: { records: KVNamespace },
+    key: string,
+    entry: SnapshotEntry
+): Promise<void> {
+    // No expirationTtl, deliberately: an unchanged record must stay served
+    // indefinitely.
+    await env.records.put(key, entry.car, {
+        metadata: {
+            rev: entry.rev,
+            observedAtMs: entry.observedAtMs,
+            source: entry.source,
+            signingKey: entry.signingKey,
+            verifiedWith: entry.verifiedWith,
+            cid: entry.cid,
+            seenKey: entry.seenKey ?? null,
+        } satisfies StoredMeta,
+    })
+}
+
 /** Singleton key — one marker for the whole digest, not one per window.
  * Exported so a test can reset it directly: `env.records` is shared across
  * tests in this package's suite (KV, unlike Durable Object storage, is not
@@ -86,39 +127,9 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): SnapshotStore & RefreshSnapshots & SecondarySnapshotStore {
     return {
-        async getRecord(did: string): Promise<SnapshotEntry | null> {
-            const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
-                RECORD_PREFIX + did,
-                "arrayBuffer"
-            )
-            if (value === null || metadata === null) return null
-            return {
-                rev: metadata.rev,
-                car: new Uint8Array(value),
-                observedAtMs: metadata.observedAtMs,
-                source: metadata.source,
-                signingKey: metadata.signingKey,
-                verifiedWith: metadata.verifiedWith ?? null,
-                cid: metadata.cid ?? null,
-                seenKey: metadata.seenKey ?? null,
-            }
-        },
+        getRecord: (did) => readEntry(env, RECORD_PREFIX + did),
 
-        async putRecord(did: string, entry: SnapshotEntry): Promise<void> {
-            // No expirationTtl, deliberately: an unchanged record must stay
-            // served indefinitely.
-            await env.records.put(RECORD_PREFIX + did, entry.car, {
-                metadata: {
-                    rev: entry.rev,
-                    observedAtMs: entry.observedAtMs,
-                    source: entry.source,
-                    signingKey: entry.signingKey,
-                    verifiedWith: entry.verifiedWith,
-                    cid: entry.cid,
-                    seenKey: entry.seenKey ?? null,
-                } satisfies StoredMeta,
-            })
-        },
+        putRecord: (did, entry) => writeEntry(env, RECORD_PREFIX + did, entry),
 
         async deleteRecord(did: string): Promise<void> {
             await env.records.delete(RECORD_PREFIX + did)
@@ -130,20 +141,23 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
         },
 
-        async getSecondary(_ref: RecordRef): Promise<SnapshotEntry | null> {
-            throw new Error("not implemented")
+        getSecondary: (ref) =>
+            readEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record),
+
+        putSecondary: (ref, entry) =>
+            writeEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record, entry),
+
+        async deleteSecondary(ref: RecordRef): Promise<void> {
+            const keys = snapshotKeys(ref.did, ref.collection, ref.rkey)
+            await env.records.delete(keys.record)
+            await env.records.delete(keys.check)
         },
 
-        async putSecondary(_ref: RecordRef, _entry: SnapshotEntry): Promise<void> {
-            throw new Error("not implemented")
-        },
-
-        async deleteSecondary(_ref: RecordRef): Promise<void> {
-            throw new Error("not implemented")
-        },
-
-        async putSecondaryCheck(_ref: RecordRef, _check: SnapshotCheck): Promise<void> {
-            throw new Error("not implemented")
+        async putSecondaryCheck(ref: RecordRef, check: SnapshotCheck): Promise<void> {
+            await env.records.put(
+                snapshotKeys(ref.did, ref.collection, ref.rkey).check,
+                JSON.stringify(check)
+            )
         },
 
         async getSealedWindow(windowId: string): Promise<Uint8Array | null> {
@@ -211,11 +225,27 @@ export function kvDeclarationSnapshots<TIngest extends MonitorIngest = MonitorIn
  * `verifiedWith`, `rev` and `cid` as null.
  */
 export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>(
-    _env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>
 ): RecordSnapshotStore {
     return {
-        async get() {
-            throw new Error("not implemented")
+        async get(did, collection, rkey) {
+            const keys = snapshotKeys(did, collection, rkey)
+            const [{ value, metadata }, check] = await Promise.all([
+                env.records.getWithMetadata<StoredMeta>(keys.record, "arrayBuffer"),
+                env.records.get<SnapshotCheck>(keys.check, "json"),
+            ])
+            if (value === null || metadata === null) return null
+            const verifiedWith = metadata.verifiedWith ?? null
+            const confirmedAtMs =
+                check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
+            return {
+                car: new Uint8Array(value),
+                freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+                verifiedWith,
+                // An entry stored before ingest verified carries an unsigned rev.
+                rev: verifiedWith === null ? null : metadata.rev,
+                cid: verifiedWith === null ? null : (metadata.cid ?? null),
+            }
         },
     }
 }

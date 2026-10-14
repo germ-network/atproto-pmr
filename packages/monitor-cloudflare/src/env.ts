@@ -1,4 +1,8 @@
-import type { InterestPolicy, WatchedRecord } from "@germ-network/atproto-pmr-core"
+import {
+    parseMonitorCollections,
+    type InterestPolicy,
+    type WatchedRecord,
+} from "@germ-network/atproto-pmr-core"
 import type { MonitorIngest } from "./ingest-object"
 
 /**
@@ -199,9 +203,11 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
 /** The configured secondaries; none when `MONITOR_COLLECTIONS` is unset or empty. */
 export function monitorCollections<TIngest extends MonitorIngest>(
-    _env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>
 ): WatchedRecord[] {
-    throw new Error("not implemented")
+    const raw = env.MONITOR_COLLECTIONS
+    if (raw === undefined || raw.trim() === "") return []
+    return parseMonitorCollections(raw)
 }
 
 /** The configured interest policy; throws on an unknown value, naming it. */
