@@ -1976,8 +1976,9 @@ export class MonitorIngest
 
     /**
      * The graph mirror, edge-log flush, re-count drain, change-log prune and
-     * the daily reconciles, sharing one D1 statement budget. Each runs alone: a D1 outage costs neither the
-     * other steps nor the alarm's re-arm.
+     * the daily reconciles, sharing one D1 statement budget. Each runs
+     * alone: a D1 outage costs neither the other steps nor the alarm's
+     * re-arm.
      */
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
@@ -2096,6 +2097,8 @@ export class MonitorIngest
     /** Under `everyone` no count is kept, and nothing would drain the queue. */
     private queueRecountSync(subjects: readonly string[], atMs: number): void {
         if (this.interestPolicy() === "everyone") return
+        // The stamp always moves forward, though the clock may not between
+        // two queueings, so clearing what a drain read never drops a later one.
         for (const did of subjects) {
             this.db.sql.exec(
                 "INSERT INTO recount_queue (did, queued_at) VALUES (?1, ?2) " +

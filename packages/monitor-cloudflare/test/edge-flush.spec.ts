@@ -382,7 +382,7 @@ describe("owner_followers", () => {
         })
     })
 
-    it("a pruned owner's followees are re-counted across alarms when the budget runs out", async () => {
+    it("a pruned owner's followees are re-counted over successive drains when the budget runs out", async () => {
         const s = registeredStub()
         const subjects = Array.from({ length: 120 }, (_, i) => `did:s${String(i).padStart(3, "0")}`)
         await db.prepare("INSERT INTO interest (did, registered) VALUES ('did:o', 0)").run()
@@ -504,8 +504,19 @@ describe("owner_followers", () => {
 
     it("the owner_followers reconcile resumes from its meta cursor", async () => {
         const s = registeredStub()
+        const name = (i: number) => `did:s${String(i).padStart(3, "0")}`
+        // The first page keeps a real owner follower, so a pass that re-paged
+        // it would not find it already at 0.
+        await db.batch(
+            Array.from({ length: 200 }, (_, i) =>
+                db
+                    .prepare("INSERT INTO follows (follower, rkey, subject, gen) VALUES ('did:o', ?, ?, 1)")
+                    .bind(`r${i}`, name(i))
+            )
+        )
         await inObj(s, async (obj) => {
-            for (let i = 0; i < 250; i++) seedFollowee(obj, `did:s${String(i).padStart(3, "0")}`, 1)
+            await obj.setRegistered("did:o", true, 1)
+            for (let i = 0; i < 250; i++) seedFollowee(obj, name(i), 1)
             const budget = statementBudget(1000)
             const step = () =>
                 (
@@ -517,7 +528,7 @@ describe("owner_followers", () => {
                 rowsOf<{ v: string }>(obj, "SELECT v FROM meta WHERE k = ?", k)[0]?.v
             await step()
             expect(meta("owner_followers_cursor")).toBe("did:s199")
-            expect(ownerFollowers(obj, "did:s000")).toBe(0)
+            expect(ownerFollowers(obj, "did:s000")).toBe(1)
             expect(ownerFollowers(obj, "did:s249")).toBe(1)
             await step()
             expect(meta("owner_followers_cursor")).toBeUndefined()
@@ -545,6 +556,42 @@ describe("owner_followers", () => {
             )
             expect(ownerFollowers(obj, "did:s")).toBe(0)
             expect(await obj.inInterest("did:s")).toBe(false)
+        })
+    })
+
+    it("the owner_followers reconcile does not finish a pass it had no budget for", async () => {
+        const s = registeredStub()
+        await inObj(s, async (obj) => {
+            seedFollowee(obj, "did:s", 1)
+            const step = (budget: StatementBudget) =>
+                (
+                    obj as unknown as {
+                        reconcileOwnerFollowerCounts(d: unknown): Promise<void>
+                    }
+                ).reconcileOwnerFollowerCounts({ ...ownerDeps(obj, budget), followed: obj, budget })
+            const done = () =>
+                rowsOf<{ v: string }>(obj, "SELECT v FROM meta WHERE k = 'owner_followers_done'")[0]
+            await expect(step(statementBudget(0))).rejects.toThrow(/budget/)
+            expect(done()).toBeUndefined()
+            await step(statementBudget(1000))
+            expect(ownerFollowers(obj, "did:s")).toBe(0)
+            expect(done()).toBeDefined()
+        })
+    })
+
+    it("a subject re-queued during the drain stays queued", async () => {
+        const s = registeredStub()
+        await inObj(s, async (obj) => {
+            await obj.queueRecount(["did:a"], 1)
+            const budget = statementBudget(1000)
+            const deps = { ...ownerDeps(obj, budget), queue: obj, budget }
+            const followersOf = deps.edges.followersOf.bind(deps.edges)
+            deps.edges.followersOf = async (subjects) => {
+                await obj.queueRecount(["did:a"], 1)
+                return followersOf(subjects)
+            }
+            await drainRecounts(deps, 10)
+            expect(queued(obj)).toEqual(["did:a"])
         })
     })
 })

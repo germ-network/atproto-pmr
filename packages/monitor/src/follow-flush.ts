@@ -229,9 +229,10 @@ export interface OwnerFollowedIndex {
  * writer counts as owner-followed, so a delete, prune or lost ownership
  * whose subjects never reached the queue is corrected. A missed increment
  * from an edge write cannot happen (a put's ops are dropped only with their
- * subjects queued), so D1's subjects are not paged. Resumable through `cursor` (kept in
- * `meta`); returns the next one, or null once the pass is done. A no-op
- * under `everyone`.
+ * subjects queued), so D1's subjects are not paged. Resumable through
+ * `cursor` (kept in `meta`); returns the next one, or null once the pass is
+ * done. Throws when the budget cannot cover a page, so a pass is never
+ * recorded done without having run. A no-op under `everyone`.
  */
 export async function reconcileOwnerFollowers(
     deps: OwnerFollowerDeps & { followed: OwnerFollowedIndex; budget: StatementBudget },
@@ -240,7 +241,7 @@ export async function reconcileOwnerFollowers(
 ): Promise<string | null> {
     if (deps.interest.interestPolicy() === "everyone") return null
     const size = Math.min(limit, recountCapacity(deps.budget.remaining))
-    if (size === 0) return cursor
+    if (size === 0) throw new Error("D1 statement budget exceeded (1 needed)")
     const page = await deps.followed.ownerFollowed(cursor, size)
     await recountOwnerFollowers(deps, page.dids)
     return page.cursor
