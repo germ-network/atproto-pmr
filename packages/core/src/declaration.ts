@@ -139,7 +139,7 @@ const ANCHOR_KEY_ALG_CURVE25519_SIGNING = 3
  * than a deployment tunable, so it lives in code rather than in the
  * caller-supplied `PMRConfig`.
  */
-const DECLARATION_COLLECTION_NSID = "com.germnetwork.declaration"
+export const DECLARATION_COLLECTION_NSID = "com.germnetwork.declaration"
 
 /**
  * `com.atproto.repo.getRecord`'s terminal XRPC errors — a body that confirms

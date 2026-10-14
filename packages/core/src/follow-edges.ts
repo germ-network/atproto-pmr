@@ -1,0 +1,28 @@
+/**
+ * The follow-edge index: who follows whom, among the DIDs carrying a Germ
+ * declaration. Edges come from `app.bsky.graph.follow` records and are hints,
+ * not proof — a device checks one against the follower's signed record
+ * (`follower`/`rkey`) before relying on it.
+ */
+
+/** One `app.bsky.graph.follow` record: `follower` follows `subject`. */
+export interface FollowEdge {
+    follower: string
+    /** The follow record's rkey in the follower's repo. */
+    rkey: string
+    subject: string
+}
+
+/**
+ * The read surface of the index. Every follow of a declaration holder is
+ * stored, so an edge is already in place when its subject gains a
+ * declaration; reads return only edges whose other party holds a
+ * declaration. That filter is the store's, so no caller can serve an edge
+ * outside the declaration set. Writing is the ingest's, behind its own seam.
+ */
+export interface FollowEdgeStore {
+    /** Edges with `follower === did`, subjects restricted to declaration holders. */
+    following(did: string): Promise<FollowEdge[]>
+    /** Edges with `subject === did`, followers restricted to declaration holders. */
+    followers(did: string): Promise<FollowEdge[]>
+}

@@ -1,3 +1,4 @@
+import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import type {
     DigestMarker,
     RefreshSnapshots,
@@ -30,6 +31,27 @@ const RECORD_PREFIX = "rec:"
 const WINDOW_PREFIX = "win:"
 /** `chk:<did>` = {@link SnapshotCheck}: the last time `rec:` was confirmed current. */
 const CHECK_PREFIX = "chk:"
+/**
+ * The KV keys of one record's snapshot and its confirmation. The declaration
+ * keeps the bare `rec:<did>` / `chk:<did>` it has always had, so existing
+ * snapshots need no migration; every other record is
+ * `rec:<collection>/<rkey>:<did>` / `chk:<collection>/<rkey>:<did>`. The two
+ * forms cannot collide: a DID starts `did:`, an NSID never does. Keys are
+ * built, never parsed: an rkey containing `:` would make one ambiguous. KV caps
+ * a key at 512 bytes, so a long collection and rkey can exceed it.
+ */
+export function snapshotKeys(
+    did: string,
+    collection: string,
+    rkey: string
+): { record: string; check: string } {
+    if (collection === DECLARATION_COLLECTION_NSID && rkey === "self") {
+        return { record: RECORD_PREFIX + did, check: CHECK_PREFIX + did }
+    }
+    const subject = `${collection}/${rkey}:${did}`
+    return { record: RECORD_PREFIX + subject, check: CHECK_PREFIX + subject }
+}
+
 /** Singleton key — one marker for the whole digest, not one per window.
  * Exported so a test can reset it directly: `env.records` is shared across
  * tests in this package's suite (KV, unlike Durable Object storage, is not
