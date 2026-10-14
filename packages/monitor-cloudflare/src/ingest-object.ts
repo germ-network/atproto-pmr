@@ -54,7 +54,7 @@ import {
     kvDidDocumentWriter,
     PLC_COVERAGE_KEY,
 } from "./did-document-store"
-import type { MonitorEnv } from "./env"
+import { interestPolicy as policyFromEnv, type MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
@@ -229,6 +229,19 @@ export class MonitorIngest
                     state TEXT NOT NULL CHECK (state IN ('held', 'gone-reversible', 'gone-permanent')),
                     held_at INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS interest (
+                    did TEXT PRIMARY KEY,
+                    registered INTEGER NOT NULL DEFAULT 0,
+                    owner_followers INTEGER NOT NULL DEFAULT 0,
+                    since INTEGER NOT NULL DEFAULT 0,
+                    member INTEGER NOT NULL DEFAULT 0,
+                    epoch INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS interest_transitions (
+                    did TEXT PRIMARY KEY,
+                    change TEXT NOT NULL CHECK (change IN ('join', 'leave')),
+                    epoch INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
                     checked_at INTEGER NOT NULL,
@@ -236,6 +249,7 @@ export class MonitorIngest
                 );
             `)
             this.seedHolderState()
+            this.seedInterest()
         })
     }
 
@@ -298,10 +312,13 @@ export class MonitorIngest
     async isWatched(did: string): Promise<boolean> {
         const row = this.db.sql
             .exec<{ n: number }>(
-                "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
-                    "OR EXISTS (SELECT 1 FROM pending WHERE did = ?1)) " +
+                "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM interest WHERE did = ?1 AND member = 1) " +
+                    "OR EXISTS (SELECT 1 FROM pending WHERE did = ?1) " +
+                    "OR (?2 = 'registered' AND (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
+                    "OR EXISTS (SELECT 1 FROM records WHERE did = ?1)))) " +
                     "AND NOT EXISTS (SELECT 1 FROM deleted WHERE did = ?1)",
-                did
+                did,
+                this.interestPolicy()
             )
             .toArray()[0]
         return row !== undefined
@@ -454,6 +471,10 @@ export class MonitorIngest
      * cannot land the superseded document as the first row.
      */
     async markDidDocumentStale(did: string, asOfMs: number): Promise<void> {
+        this.markDidDocumentStaleSync(did, asOfMs)
+    }
+
+    private markDidDocumentStaleSync(did: string, asOfMs: number): void {
         const row = this.didDocumentRow(did)
         if (row === undefined) {
             this.db.sql.exec(
@@ -672,6 +693,88 @@ export class MonitorIngest
         })
     }
 
+    /**
+     * Under `everyone`, once: every held holder joins interest (queued as a
+     * join, so each is owed its secondaries), in the constructor's step so no
+     * frame or settle ever sees a held DID as unwatched. A holder already
+     * gone-reversible is not in interest and no leave will ever withdraw its
+     * document, so that document is marked stale here.
+     */
+    private seedInterest(): void {
+        if (this.interestPolicy() !== "everyone") return
+        const seeded = this.db.sql
+            .exec("SELECT 1 FROM meta WHERE k = 'interest_seeded'")
+            .toArray()
+        if (seeded.length > 0) return
+        this.ctx.storage.transactionSync(() => {
+            const nowMs = Date.now()
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO interest (did, member, epoch, since) " +
+                    "SELECT did, 1, 1, held_at FROM holder_state WHERE state = 'held'"
+            )
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO interest_transitions (did, change, epoch) " +
+                    "SELECT did, 'join', 1 FROM holder_state WHERE state = 'held'"
+            )
+            const gone = this.db.sql
+                .exec<{ did: string }>(
+                    "SELECT did FROM holder_state WHERE state = 'gone-reversible'"
+                )
+                .toArray()
+            for (const { did } of gone) this.markDidDocumentStaleSync(did, nowMs)
+            this.db.sql.exec("INSERT INTO meta (k, v) VALUES ('interest_seeded', '1')")
+        })
+    }
+
+    /**
+     * Recompute `did`'s membership from the policy and write a change: the
+     * epoch moves and the join or leave is queued, replacing any still-queued
+     * one: the latest change wins, so a leave then a join before the alarm
+     * re-owes the DID's records and disposes of nothing, and a join then a
+     * leave still disposes. Membership is judged under the policy in force, so
+     * the policy must not change for the life of the object.
+     */
+    private reevaluateInterest(did: string, atMs: number): void {
+        const row = this.db.sql
+            .exec<{ registered: number; owner_followers: number; member: number; epoch: number }>(
+                "SELECT registered, owner_followers, member, epoch FROM interest WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        const registered = (row?.registered ?? 0) === 1
+        const want =
+            this.interestPolicy() === "registered"
+                ? registered || (row?.owner_followers ?? 0) > 0
+                : registered || this.holderStateSync(did) === "held"
+        const current = (row?.member ?? 0) === 1
+        if (want === current) return
+        const epoch = (row?.epoch ?? 0) + 1
+        this.db.sql.exec(
+            "INSERT INTO interest (did, member, epoch, since) VALUES (?1, ?2, ?3, ?4) " +
+                "ON CONFLICT(did) DO UPDATE SET member = ?2, epoch = ?3, since = ?4",
+            did,
+            want ? 1 : 0,
+            epoch,
+            atMs
+        )
+        const change = want ? "join" : "leave"
+        this.db.sql.exec(
+            "INSERT INTO interest_transitions (did, change, epoch) VALUES (?, ?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET change = excluded.change, epoch = excluded.epoch",
+            did,
+            change,
+            epoch
+        )
+    }
+
+    private holderStateSync(did: string): HolderState | null {
+        return (
+            this.db.sql
+                .exec<{ state: HolderState }>("SELECT state FROM holder_state WHERE did = ?", did)
+                .toArray()[0]?.state ?? null
+        )
+    }
+
     async recordsOf(did: string): Promise<IndexedRecord[]> {
         return this.db.sql
             .exec<{
@@ -734,6 +837,7 @@ export class MonitorIngest
             did,
             observedAtMs
         )
+        this.reevaluateInterest(did, observedAtMs)
     }
 
     /**
@@ -742,7 +846,7 @@ export class MonitorIngest
      * gone-permanent for a DID with a `deleted` row.
      */
     async markGoneReversible(did: string): Promise<void> {
-        this.setGoneState(did, false)
+        this.ctx.storage.transactionSync(() => this.setGoneState(did, false))
     }
 
     private setGoneState(did: string, permanent: boolean): void {
@@ -755,6 +859,7 @@ export class MonitorIngest
             did,
             permanent ? "gone-permanent" : "gone-reversible"
         )
+        this.reevaluateInterest(did, Date.now())
     }
 
     /**
@@ -1007,39 +1112,77 @@ export class MonitorIngest
     // ---- InterestIndex ----------------------------------------------------
 
     interestPolicy(): InterestPolicy {
-        throw new Error("not implemented")
+        return policyFromEnv(this.env)
     }
 
-    async inInterest(_did: string): Promise<boolean> {
-        throw new Error("not implemented")
+    async inInterest(did: string): Promise<boolean> {
+        return (
+            this.db.sql
+                .exec("SELECT 1 FROM interest WHERE did = ? AND member = 1", did)
+                .toArray().length > 0
+        )
     }
 
-    async interestEpoch(_did: string): Promise<number> {
-        throw new Error("not implemented")
+    async interestEpoch(did: string): Promise<number> {
+        return (
+            this.db.sql
+                .exec<{ epoch: number }>("SELECT epoch FROM interest WHERE did = ?", did)
+                .toArray()[0]?.epoch ?? 0
+        )
     }
 
-    async isRegistered(_did: string): Promise<boolean> {
-        throw new Error("not implemented")
+    async isRegistered(did: string): Promise<boolean> {
+        return (
+            this.db.sql
+                .exec("SELECT 1 FROM interest WHERE did = ? AND registered = 1", did)
+                .toArray().length > 0
+        )
     }
 
-    async isGraphOwner(_did: string): Promise<boolean> {
-        throw new Error("not implemented")
+    async isGraphOwner(did: string): Promise<boolean> {
+        if (this.interestPolicy() === "registered") return this.isRegistered(did)
+        return this.holderStateSync(did) === "held"
     }
 
-    async setRegistered(_did: string, _registered: boolean, _atMs: number): Promise<void> {
-        throw new Error("not implemented")
+    async setRegistered(did: string, registered: boolean, atMs: number): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
+                    "ON CONFLICT(did) DO UPDATE SET registered = ?2",
+                did,
+                registered ? 1 : 0
+            )
+            this.reevaluateInterest(did, atMs)
+        })
     }
 
-    async setOwnerFollowers(_did: string, _count: number, _atMs: number): Promise<void> {
-        throw new Error("not implemented")
+    async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO interest (did, owner_followers) VALUES (?1, ?2) " +
+                    "ON CONFLICT(did) DO UPDATE SET owner_followers = ?2",
+                did,
+                count
+            )
+            this.reevaluateInterest(did, atMs)
+        })
     }
 
-    async dueTransitions(_limit: number): Promise<InterestTransition[]> {
-        throw new Error("not implemented")
+    async dueTransitions(limit: number): Promise<InterestTransition[]> {
+        return this.db.sql
+            .exec<{ did: string; change: "join" | "leave"; epoch: number }>(
+                "SELECT did, change, epoch FROM interest_transitions ORDER BY rowid LIMIT ?",
+                limit
+            )
+            .toArray()
     }
 
-    async clearTransition(_did: string, _epoch: number): Promise<void> {
-        throw new Error("not implemented")
+    async clearTransition(did: string, epoch: number): Promise<void> {
+        this.db.sql.exec(
+            "DELETE FROM interest_transitions WHERE did = ? AND epoch = ?",
+            did,
+            epoch
+        )
     }
 
     async oweJoin(_did: string, _records: readonly WatchedRecord[], _epoch: number): Promise<void> {

@@ -1726,17 +1726,6 @@ describe("the PLC export cursor", () => {
         obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
     }
 
-    it("isWatched: a DID in revs, or only pending, is watched; an unknown DID is not", async () => {
-        const stub = freshStub()
-        await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:s11rev", "3m1", 1_000, STUB_VERIFIED)
-            await obj.intake({ did: "did:plc:s11pend", rev: "3m1" }, "1")
-            expect(await obj.isWatched("did:plc:s11rev")).toBe(true)
-            expect(await obj.isWatched("did:plc:s11pend")).toBe(true)
-            expect(await obj.isWatched("did:plc:s11unknown")).toBe(false)
-        })
-    })
-
     it("a permanently deleted DID is not watched", async () => {
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
@@ -2671,26 +2660,6 @@ describe("PLC export consumer", () => {
         await alarmWithFetch(stub)
         expect(await storedCursor(stub)).toBeNull()
         expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.readPlcCursor())).toBeNull()
-    })
-
-    it("KeyUpdateIndex: isWatched covers revs and pending, excludes permanently deleted", async () => {
-        const stub = freshStub()
-        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete("did:plc:inrevs", "3m1", 1, STUB_VERIFIED)
-            await obj.owe("did:plc:inpending", "3m1")
-            await obj.complete("did:plc:gone", "3m1", 1, STUB_VERIFIED)
-            await obj.completeDeletion("did:plc:gone", 2, true)
-            await obj.complete("did:plc:soft", "3m1", 1, STUB_VERIFIED)
-            await obj.completeDeletion("did:plc:soft", 2, false)
-            return {
-                inrevs: await obj.isWatched("did:plc:inrevs"),
-                inpending: await obj.isWatched("did:plc:inpending"),
-                gone: await obj.isWatched("did:plc:gone"),
-                soft: await obj.isWatched("did:plc:soft"),
-                never: await obj.isWatched("did:plc:never"),
-            }
-        })
-        expect(result).toEqual({ inrevs: true, inpending: true, gone: false, soft: true, never: false })
     })
 
     it("KeyUpdateIndex: oweKeyUpdate replaces and bumps version; clearKeyUpdate with a stale version is a no-op", async () => {

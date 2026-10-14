@@ -1,4 +1,5 @@
 import {
+    parseInterestPolicy,
     parseMonitorCollections,
     type InterestPolicy,
     type WatchedRecord,
@@ -212,7 +213,7 @@ export function monitorCollections<TIngest extends MonitorIngest>(
 
 /** The configured interest policy; throws on an unknown value, naming it. */
 export function interestPolicy<TIngest extends MonitorIngest>(
-    _env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>
 ): InterestPolicy {
-    throw new Error("not implemented")
+    return parseInterestPolicy(env.INTEREST_POLICY)
 }
