@@ -5,7 +5,12 @@
  */
 import { describe, expect, it } from "vitest"
 import { renderPlcDocument } from "@germ-network/atproto-pmr-core"
-import { decodePlcExportFrame } from "../src/plc-export"
+import {
+    decodePlcExportFrame,
+    intakePlcEvent,
+    type PlcExportEvent,
+    type PlcIntakeDeps,
+} from "../src/plc-export"
 
 /** A live `sequenced_op` entry from plc.directory's `/export`, the shape its stream sends. */
 const DID = "did:plc:5jp6kvueqebbcuf77rd5sqtj"
@@ -129,14 +134,134 @@ describe("plcCursorAfterClose", () => {
 })
 
 describe("intakePlcEvent", () => {
-    it.todo("an unwatched DID only advances the cursor, and answers ignored")
-    it.todo("a watched DID's render is stored as of the op's createdAt, and answers stored")
-    it.todo("a watched DID's tombstone stores a null document, and answers stored")
-    it.todo("a watched DID's refetch marks the stored document stale as of the op's createdAt, and answers refetch")
-    it.todo("a confirmed-deleted DID's refetch still marks the stored document stale")
-    it.todo("any change for a DID in the rev index owes a snapshot re-fetch at its indexed rev")
-    it.todo("a confirmed-deleted DID's render is stored but no re-fetch is owed")
-    it.todo("a watched DID that is only owed a fetch is not owed again")
-    it.todo("advances the cursor after the document and the obligation are written")
-    it.todo("a failed document write leaves the cursor where it was")
+    const AT = 1_693_000_000_000
+
+    /** In-memory index and sink that log every call, in order. */
+    function fakes(opts: {
+        watched?: boolean
+        rev?: string | null
+        deleted?: boolean
+        failRecord?: boolean
+        failOwe?: boolean
+    } = {}) {
+        const log: string[] = []
+        const calls = {
+            recorded: [] as Array<[string, unknown, number]>,
+            stale: [] as Array<[string, number]>,
+            owed: [] as Array<[string, string]>,
+            cursor: [] as Array<[number, number]>,
+        }
+        const deps = {
+            index: {
+                isWatched: async () => opts.watched ?? true,
+                revOf: async () => (opts.rev === undefined ? "3m1" : opts.rev),
+                isDeleted: async () => opts.deleted ?? false,
+                owe: async (did: string, rev: string) => {
+                    log.push("owe")
+                    if (opts.failOwe) throw new Error("sqlite down")
+                    calls.owed.push([did, rev])
+                },
+                advancePlcCursor: async (seq: number, createdAtMs: number) => {
+                    log.push("cursor")
+                    calls.cursor.push([seq, createdAtMs])
+                },
+            } as unknown as PlcIntakeDeps["index"],
+            didDocuments: {
+                recordDidDocument: async (did: string, document: unknown, asOfMs: number) => {
+                    log.push("record")
+                    if (opts.failRecord) throw new Error("sqlite down")
+                    calls.recorded.push([did, document, asOfMs])
+                },
+                markDidDocumentStale: async (did: string, asOfMs: number) => {
+                    log.push("stale")
+                    calls.stale.push([did, asOfMs])
+                },
+            },
+        }
+        return { deps, calls, log }
+    }
+    const event = (change: PlcExportEvent["change"], seq = 42): PlcExportEvent => ({
+        seq,
+        did: DID,
+        createdAtMs: AT,
+        change,
+    })
+    const RENDER = { kind: "render", document: { id: DID } } as const
+
+    it("an unwatched DID only advances the cursor, and answers ignored", async () => {
+        const f = fakes({ watched: false })
+        expect(await intakePlcEvent(f.deps, event(RENDER))).toBe("ignored")
+        expect(f.log).toEqual(["cursor"])
+        expect(f.calls.cursor).toEqual([[42, AT]])
+    })
+
+    it("a watched DID's render is stored as of the op's createdAt, and answers stored", async () => {
+        const f = fakes()
+        expect(await intakePlcEvent(f.deps, event(RENDER))).toBe("stored")
+        expect(f.calls.recorded).toEqual([[DID, { id: DID }, AT]])
+        expect(f.calls.stale).toEqual([])
+    })
+
+    it("a watched DID's tombstone stores a null document, and answers stored", async () => {
+        const f = fakes()
+        expect(await intakePlcEvent(f.deps, event({ kind: "tombstone" }))).toBe("stored")
+        expect(f.calls.recorded).toEqual([[DID, null, AT]])
+    })
+
+    it("a watched DID's refetch marks the stored document stale as of the op's createdAt, and answers refetch", async () => {
+        const f = fakes()
+        expect(await intakePlcEvent(f.deps, event({ kind: "refetch" }))).toBe("refetch")
+        expect(f.calls.stale).toEqual([[DID, AT]])
+        expect(f.calls.recorded).toEqual([])
+    })
+
+    it("a confirmed-deleted DID's refetch still marks the stored document stale", async () => {
+        const f = fakes({ deleted: true })
+        expect(await intakePlcEvent(f.deps, event({ kind: "refetch" }))).toBe("refetch")
+        expect(f.calls.stale).toEqual([[DID, AT]])
+    })
+
+    it("any change for a DID in the rev index owes a snapshot re-fetch at its indexed rev", async () => {
+        for (const change of [RENDER, { kind: "tombstone" }, { kind: "refetch" }] as const) {
+            const f = fakes({ rev: "3m7" })
+            await intakePlcEvent(f.deps, event(change))
+            expect(f.calls.owed).toEqual([[DID, "3m7"]])
+        }
+    })
+
+    it("a confirmed-deleted DID's render is stored but no re-fetch is owed", async () => {
+        const f = fakes({ deleted: true })
+        expect(await intakePlcEvent(f.deps, event(RENDER))).toBe("stored")
+        expect(f.calls.recorded).toHaveLength(1)
+        expect(f.calls.owed).toEqual([])
+    })
+
+    it("a watched DID that is only owed a fetch is not owed again", async () => {
+        const f = fakes({ rev: null })
+        await intakePlcEvent(f.deps, event(RENDER))
+        expect(f.calls.recorded).toHaveLength(1)
+        expect(f.calls.owed).toEqual([])
+    })
+
+    it("advances the cursor after the document and the obligation are written", async () => {
+        const f = fakes()
+        await intakePlcEvent(f.deps, event(RENDER))
+        expect(f.log).toEqual(["record", "owe", "cursor"])
+        const g = fakes()
+        await intakePlcEvent(g.deps, event({ kind: "refetch" }))
+        expect(g.log).toEqual(["stale", "owe", "cursor"])
+    })
+
+    it("a failed obligation write leaves the cursor where it was", async () => {
+        const f = fakes({ failOwe: true })
+        await expect(intakePlcEvent(f.deps, event(RENDER))).rejects.toThrow("sqlite down")
+        expect(f.calls.cursor).toEqual([])
+    })
+
+    it("a failed document write leaves the cursor where it was", async () => {
+        const f = fakes({ failRecord: true })
+        await expect(intakePlcEvent(f.deps, event(RENDER))).rejects.toThrow("sqlite down")
+        expect(f.calls.cursor).toEqual([])
+        expect(f.calls.owed).toEqual([])
+    })
 })

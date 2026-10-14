@@ -114,7 +114,25 @@ export async function intakePlcEvent(
     deps: PlcIntakeDeps,
     event: PlcExportEvent
 ): Promise<PlcIntakeDecision> {
-    void deps
-    void event
-    throw new Error("not implemented")
+    const { index, didDocuments } = deps
+    if (!(await index.isWatched(event.did))) {
+        await index.advancePlcCursor(event.seq, event.createdAtMs)
+        return "ignored"
+    }
+
+    const { change } = event
+    if (change.kind === "refetch") {
+        await didDocuments.markDidDocumentStale(event.did, event.createdAtMs)
+    } else {
+        const document = change.kind === "render" ? change.document : null
+        await didDocuments.recordDidDocument(event.did, document, event.createdAtMs)
+    }
+
+    const rev = await index.revOf(event.did)
+    if (rev !== null && !(await index.isDeleted(event.did))) {
+        await index.owe(event.did, rev)
+    }
+
+    await index.advancePlcCursor(event.seq, event.createdAtMs)
+    return change.kind === "refetch" ? "refetch" : "stored"
 }
