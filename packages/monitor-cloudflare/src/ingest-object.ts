@@ -63,6 +63,9 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
     return existingAlarmAt === null || existingAlarmAt <= nowMs
 }
 
+/** How often frames may rewrite the stored cursor; the alarm writes it regardless. */
+const PLC_CURSOR_PERSIST_INTERVAL_MS = 5_000
+
 /** KV puts one alarm may spend on stored DID documents. */
 const DID_DOCUMENT_PUBLISH_BATCH = 64
 
@@ -104,6 +107,7 @@ export class MonitorIngest
     private plcHighSeq: number | null = null
     private plcHighCreatedAtMs: number | null = null
     private plcContinuousSinceMs: number | null = null
+    private plcPersistedAtMs = 0
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -339,9 +343,21 @@ export class MonitorIngest
 
     // ---- PLC export cursor ------------------------------------------------
 
+    /**
+     * The DIDs this monitor watches: in the rev index, confirmed deleted
+     * (so a recovery operation is still seen), or owed a fetch.
+     */
     async isWatched(did: string): Promise<boolean> {
-        void did
-        throw new Error("not implemented")
+        return (
+            this.db.sql
+                .exec(
+                    "SELECT 1 FROM revs WHERE did = ?1 UNION ALL " +
+                        "SELECT 1 FROM pending WHERE did = ?1 UNION ALL " +
+                        "SELECT 1 FROM deleted WHERE did = ?1 LIMIT 1",
+                    did
+                )
+                .toArray().length > 0
+        )
     }
 
     /**
@@ -354,12 +370,39 @@ export class MonitorIngest
         if (this.plcHighCreatedAtMs === null || createdAtMs > this.plcHighCreatedAtMs) {
             this.plcHighCreatedAtMs = createdAtMs
         }
+        if (Date.now() - this.plcPersistedAtMs >= PLC_CURSOR_PERSIST_INTERVAL_MS) {
+            await this.persistPlcCursor()
+        }
+    }
+
+    /**
+     * Write the in-memory high-water seq and the run's start beside the
+     * stream's URL. Nothing is written without a seq to keep or a configured
+     * stream.
+     */
+    async persistPlcCursor(): Promise<void> {
+        const url = this.env.PLC_EXPORT_STREAM_URL
+        if (url === undefined || url === "" || this.plcHighSeq === null) return
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('plc_cursor', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify({
+                url,
+                seq: this.plcHighSeq,
+                continuousSinceMs: this.plcContinuousSinceMs,
+            })
+        )
+        this.plcPersistedAtMs = Date.now()
     }
 
     /** The stored seq, or null when none is stored for `url`. */
     async readPlcCursor(url: string): Promise<number | null> {
-        void url
-        throw new Error("not implemented")
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+            .toArray()[0]
+        if (row === undefined) return null
+        const stored = JSON.parse(row.v) as { url?: unknown; seq?: unknown }
+        return stored.url === url && typeof stored.seq === "number" ? stored.seq : null
     }
 
     /**
@@ -367,7 +410,11 @@ export class MonitorIngest
      * ends the unbroken run: the next frame's `createdAt` starts a new one.
      */
     async resetPlcCursor(): Promise<void> {
-        throw new Error("not implemented")
+        this.db.sql.exec("DELETE FROM meta WHERE k = 'plc_cursor'")
+        this.plcHighSeq = null
+        this.plcHighCreatedAtMs = null
+        this.plcContinuousSinceMs = null
+        this.plcPersistedAtMs = 0
     }
 
     /**
@@ -926,6 +973,11 @@ export class MonitorIngest
             } catch (err) {
                 // The alarm must still seal and re-arm itself.
                 console.error("monitor: refresh failed", err)
+            }
+            try {
+                await this.persistPlcCursor()
+            } catch (err) {
+                console.error("monitor: PLC cursor persist failed", err)
             }
             try {
                 const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)

@@ -406,7 +406,11 @@ export const FETCH_AS_OF_SKEW_MS = 5_000
  * readers look is the implementation's own, separate step.
  */
 export interface DidDocumentSink {
-    /** `document` null: the directory says the identity is gone. */
+    /**
+     * `document` null: the directory says the identity is gone. Every
+     * document the monitor keeps comes through here, so it is also the one
+     * place a later restriction on which documents are kept would apply.
+     */
     recordDidDocument(did: string, document: DidDocument | null, asOfMs: number): Promise<void>
     /**
      * The directory accepted a change at `asOfMs` that could not be rendered:
@@ -419,8 +423,10 @@ export interface DidDocumentSink {
 /** The export stream's position, and the watched set it filters against. */
 export interface PlcCursorIndex {
     /**
-     * In the rev index (confirmed-deleted DIDs included, so a recovery
-     * operation is still seen) or owed a fetch.
+     * The DIDs this monitor watches: in the rev index (confirmed-deleted DIDs
+     * included, so a recovery operation is still seen) or owed a fetch. The
+     * export stream's intake acts only on these, so this is the one place a
+     * later restriction on which DIDs are kept would apply.
      */
     isWatched(did: string): Promise<boolean>
     /**

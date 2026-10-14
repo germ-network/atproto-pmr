@@ -25,6 +25,7 @@ import {
     decodeDigestWindows,
     mightHaveChanged,
     sealDueWindows,
+    intakePlcEvent,
     settleDue,
     sweepBackfill,
     FETCH_AS_OF_SKEW_MS,
@@ -1675,12 +1676,186 @@ describe("wiring stored DID documents into the monitor", () => {
 })
 
 describe("the PLC export cursor", () => {
-    it.todo("isWatched: a DID in revs (deleted included), or only pending, is watched; an unknown DID is not")
-    it.todo("advancePlcCursor never lowers the high-water seq or createdAt")
-    it.todo("the cursor is persisted on alarm and read back for the same URL")
-    it.todo("readPlcCursor answers null when the stored cursor was for another URL")
-    it.todo("resetPlcCursor clears the stored row and the in-memory seq, so a later flush cannot restore it")
-    it.todo("intakePlcEvent through the real object stores a watched DID's render and ignores an unwatched DID")
+    const URL_A = "https://plc.example/export/stream"
+    const URL_B = "https://other.example/export/stream"
+    const cursorRow = (stub: DurableObjectStub<MonitorIngest>) =>
+        runInDurableObject(stub, (_obj, state) => {
+            const row = state.storage.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                .toArray()[0]
+            return row === undefined ? null : (JSON.parse(row.v) as Record<string, unknown>)
+        })
+    /** Point the object at a stream URL; unset, it persists nothing. */
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+
+    it("isWatched: a DID in revs (deleted included), or only pending, is watched; an unknown DID is not", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:s11rev", "3m1", 1_000)
+            await obj.completeDeletion("did:plc:s11del", 1_000, true)
+            await obj.intake({ did: "did:plc:s11pend", rev: "3m1" }, "1")
+            expect(await obj.isWatched("did:plc:s11rev")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11pend")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11unknown")).toBe(false)
+        })
+    })
+
+    it("a permanently deleted DID is still watched, so a recovery operation is seen", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.complete("did:plc:s11gone", "3m1", 1_000)
+            await obj.completeDeletion("did:plc:s11gone", 2_000, true)
+            expect(await obj.isDeleted("did:plc:s11gone")).toBe(true)
+            expect(await obj.isWatched("did:plc:s11gone")).toBe(true)
+            await obj.completeDeletion("did:plc:s11neverindexed", 2_000, true)
+            expect(await obj.isWatched("did:plc:s11neverindexed")).toBe(true)
+        })
+    })
+
+    it("advancePlcCursor never lowers the high-water seq or createdAt", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(5, 500)
+            await obj.advancePlcCursor(9, 900)
+            await obj.advancePlcCursor(3, 100)
+            await obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_A, seq: 9 })
+        const pass = await inMonitorObj(stub, (obj) => obj.publishDidDocuments(1))
+        expect(pass.coveredThroughMs).toBe(900)
+    })
+
+    it("the cursor is persisted on alarm and read back for the same URL", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.advancePlcCursor(2, 2_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_A, seq: 2 })
+        expect(await inMonitorObj(stub, (obj) => obj.readPlcCursor(URL_A))).toBe(2)
+    })
+
+    it("persists on the first frame, then at most every 5 s on later frames", async () => {
+        const stub = freshStub()
+        const now = vi.spyOn(Date, "now")
+        try {
+            await inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                now.mockReturnValue(100_000)
+                await obj.advancePlcCursor(1, 1_000)
+                now.mockReturnValue(104_999)
+                await obj.advancePlcCursor(2, 2_000)
+            })
+            expect(await cursorRow(stub)).toMatchObject({ seq: 1 })
+            await inMonitorObj(stub, async (obj) => {
+                now.mockReturnValue(105_000)
+                await obj.advancePlcCursor(3, 3_000)
+            })
+            expect(await cursorRow(stub)).toMatchObject({ seq: 3 })
+        } finally {
+            now.mockRestore()
+        }
+    })
+
+    it("persists nothing while PLC_EXPORT_STREAM_URL is unset", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, undefined)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toBeNull()
+    })
+
+    it("readPlcCursor answers null when the stored cursor was for another URL", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(4, 4_000)
+            await obj.persistPlcCursor()
+        })
+        expect(await inMonitorObj(stub, (obj) => obj.readPlcCursor(URL_A))).toBe(4)
+        expect(await inMonitorObj(stub, (obj) => obj.readPlcCursor(URL_B))).toBeNull()
+        const fresh = freshStub()
+        expect(await inMonitorObj(fresh, (obj) => obj.readPlcCursor(URL_A))).toBeNull()
+    })
+
+    it("resetPlcCursor clears the stored row and the in-memory seq, so a later flush cannot restore it", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(7, 7_000)
+            await obj.persistPlcCursor()
+            expect(await obj.readPlcCursor(URL_A)).toBe(7)
+            await obj.resetPlcCursor()
+            expect((await obj.publishDidDocuments(1)).coveredThroughMs).toBeNull()
+            await obj.persistPlcCursor()
+            expect(await obj.readPlcCursor(URL_A)).toBeNull()
+            await obj.advancePlcCursor(1, 9_000)
+            expect(await obj.readPlcCursor(URL_A)).toBe(1)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 1, continuousSinceMs: 9_000 })
+    })
+
+    it("intakePlcEvent through the real object stores a watched DID's render and ignores an unwatched DID", async () => {
+        const stub = freshStub()
+        const watched = "did:plc:s11watched"
+        const unwatched = "did:plc:s11unwatched"
+        const document: DidDocument = { id: watched }
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(watched, "3m1", 1_000)
+            const deps = { index: obj, didDocuments: obj }
+            expect(
+                await intakePlcEvent(deps, {
+                    seq: 10,
+                    did: unwatched,
+                    createdAtMs: 5_000,
+                    change: { kind: "render", document: { id: unwatched } },
+                })
+            ).toBe("ignored")
+            expect(
+                await intakePlcEvent(deps, {
+                    seq: 11,
+                    did: watched,
+                    createdAtMs: 6_000,
+                    change: { kind: "render", document },
+                })
+            ).toBe("stored")
+            await obj.persistPlcCursor()
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 11 })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            docs: state.storage.sql
+                .exec<{ did: string }>("SELECT did FROM did_documents")
+                .toArray()
+                .map((r) => r.did),
+            pending: state.storage.sql
+                .exec<{ did: string; rev: string }>("SELECT did, rev FROM pending")
+                .toArray(),
+        }))
+        expect(rows.docs).toEqual([watched])
+        expect(rows.pending).toEqual([{ did: watched, rev: "3m1" }])
+    })
 })
 
 describe("PLC stream coverage", () => {
