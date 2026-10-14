@@ -19,6 +19,7 @@ import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
     type Cursor,
+    type KeyUpdateIndex,
     type MonitorIndex,
     type SnapshotStore,
 } from "./storage"
@@ -64,6 +65,12 @@ export interface IngestDeps {
      * re-checking a reversible one rather than treating it as settled.
      */
     onDelete?(did: string): Promise<void>
+    /**
+     * Where a relay caches signing keys: an identity/account/sync event for
+     * a watched DID also owes a delete of its cached key. A hint only — the
+     * PLC export stream is the authority for did:plc.
+     */
+    keyUpdates?: Pick<KeyUpdateIndex, "oweKeyUpdate">
     nowMs(): number
 }
 

@@ -39,6 +39,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     JETSTREAM_URL: string
 
     /**
+     * The PLC directory's export stream (`…/export/stream`), consumed to
+     * keep the relay's cached did:plc signing keys (`sk:` in `records`)
+     * current. Unset, the consumer does not run and cached keys follow
+     * their TTL alone.
+     */
+    PLC_EXPORT_STREAM_URL?: string
+
+    /**
      * Watchdog interval, milliseconds. An outbound socket does not
      * hibernate, so the object is evicted on the platform's own schedule
      * and the alarm is what brings the connection back. Eviction is

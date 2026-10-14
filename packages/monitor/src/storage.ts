@@ -25,6 +25,8 @@
  * is a serving copy, not a truth.
  */
 
+import type { SigningKeyUpdate } from "./plc-export"
+
 /**
  * A position in the upstream stream, in whatever units the stream uses
  * (Jetstream: microseconds). Opaque: a monitor stores and replays it, and
@@ -380,4 +382,42 @@ export function compareObservations(
         return "equivocation"
     }
     return a.source === b.source ? "agree" : "different-source"
+}
+
+/** A key update owed to the relay's signing-key cache. */
+export interface OwedKeyUpdate {
+    did: string
+    update: SigningKeyUpdate
+    /** Bumped on every replacement, so a drain never clears a newer update. */
+    version: number
+}
+
+/**
+ * The PLC-export half of the single-writer state: its own cursor, and the
+ * key updates owed to the cache. At most one update is owed per DID; a
+ * newer one replaces it. The cursor may be persisted lazily: losing its
+ * tail only replays ops, which is idempotent.
+ */
+export interface KeyUpdateIndex {
+    /** The last applied export `seq`, or `null` to start at the tip. */
+    readPlcCursor(): Promise<number | null>
+    advancePlcCursor(seq: number): Promise<void>
+    resetPlcCursor(): Promise<void>
+    /** In `revs` or `pending`, and not permanently deleted. */
+    isWatched(did: string): Promise<boolean>
+    /** Owe `update` for `did`; with `plcSeq`, advance the cursor in the same batch. */
+    oweKeyUpdate(did: string, update: SigningKeyUpdate, plcSeq?: number): Promise<void>
+    dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]>
+    /** A no-op when the owed update for `did` is no longer `version`. */
+    clearKeyUpdate(did: string, version: number): Promise<void>
+}
+
+/**
+ * The write side of a relay's per-DID signing-key cache. Entries have the
+ * relay cache's shape: the `#atproto` multikey (or null) and when it was
+ * learned.
+ */
+export interface SigningKeyCacheWriter {
+    put(did: string, entry: { key: string | null; fetchedAtMs: number }): Promise<void>
+    delete(did: string): Promise<void>
 }

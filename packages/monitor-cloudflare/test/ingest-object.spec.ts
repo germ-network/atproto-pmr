@@ -1133,3 +1133,18 @@ describe("snapshot refresh", () => {
         expect((await read("did:plc:deleted-rec"))!.freshAtMs).toBe(2_000)
     })
 })
+
+describe("PLC export consumer (S4)", () => {
+    it.todo("KeyUpdateIndex: plc cursor advances with oweKeyUpdate and survives a separate entry")
+    it.todo("KeyUpdateIndex: a cursor stored for a different PLC_EXPORT_STREAM_URL reads as null")
+    it.todo("KeyUpdateIndex: advancePlcCursor(10), oweKeyUpdate(…, 11), alarm → stored cursor 11 (one high-water seq)")
+    it.todo("KeyUpdateIndex: resetPlcCursor then alarm → cursor stays null")
+    it.todo("KeyUpdateIndex: isWatched covers revs and pending, excludes permanently deleted")
+    it.todo("KeyUpdateIndex: oweKeyUpdate replaces and bumps version; clearKeyUpdate with a stale version is a no-op")
+    it.todo("alarm connects to PLC_EXPORT_STREAM_URL with cursor=<plc cursor>, or none at the tip")
+    it.todo("alarm makes no PLC connect when PLC_EXPORT_STREAM_URL is unset")
+    it.todo("a failed PLC connect does not stop the rest of the alarm")
+    it.todo("alarm drains owed key updates into sk:")
+    it.todo("identity event via deps(): a watched did:web owes a key delete; a watched did:plc owes none while the consumer is configured")
+    it.todo("identity event via deps() with the consumer unset: a watched did:plc owes a key delete")
+})

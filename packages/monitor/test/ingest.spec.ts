@@ -639,3 +639,9 @@ describe("compareObservations", () => {
         ).toBe("skew")
     })
 })
+
+describe("identity events and the signing-key cache (S2)", () => {
+    it.todo("reverify with keyUpdates set → also owes a delete of the DID's cached key")
+    it.todo("reverify without keyUpdates → unchanged behaviour")
+    it.todo("ignored identity event (unwatched or permanently deleted) → no key update owed")
+})

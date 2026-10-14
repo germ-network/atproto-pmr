@@ -15,9 +15,12 @@ import {
     type FetchedRecord,
     type IngestDeps,
     type IntakeOutcome,
+    type KeyUpdateIndex,
     type MonitorIndex,
+    type OwedKeyUpdate,
     type PendingFetch,
     type RefreshIndex,
+    type SigningKeyUpdate,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
@@ -81,7 +84,7 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
-    implements MonitorIndex, RefreshIndex
+    implements MonitorIndex, RefreshIndex, KeyUpdateIndex
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -122,6 +125,44 @@ export class MonitorIngest
                 );
             `)
         })
+    }
+
+    // ---- KeyUpdateIndex ---------------------------------------------------
+
+    async readPlcCursor(): Promise<number | null> {
+        throw new Error("not implemented")
+    }
+
+    async advancePlcCursor(seq: number): Promise<void> {
+        void seq
+        throw new Error("not implemented")
+    }
+
+    async resetPlcCursor(): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async isWatched(did: string): Promise<boolean> {
+        void did
+        throw new Error("not implemented")
+    }
+
+    async oweKeyUpdate(did: string, update: SigningKeyUpdate, plcSeq?: number): Promise<void> {
+        void did
+        void update
+        void plcSeq
+        throw new Error("not implemented")
+    }
+
+    async dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]> {
+        void limit
+        throw new Error("not implemented")
+    }
+
+    async clearKeyUpdate(did: string, version: number): Promise<void> {
+        void did
+        void version
+        throw new Error("not implemented")
     }
 
     // ---- MonitorIndex -----------------------------------------------------

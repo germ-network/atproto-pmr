@@ -36,12 +36,15 @@ export {
     type Cursor,
     type DigestMarker,
     type IntakeOutcome,
+    type KeyUpdateIndex,
     type MonitorIndex,
+    type OwedKeyUpdate,
     type Observation,
     type ObservationComparison,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
+    type SigningKeyCacheWriter,
     type SnapshotStore,
 } from "./storage"
 
@@ -96,6 +99,19 @@ export {
     type IntakeDecision,
     type SettleOutcome,
 } from "./ingest"
+
+// Signing-key cache invalidation from the PLC export stream.
+export {
+    decodePlcExportFrame,
+    drainKeyUpdates,
+    intakePlcEvent,
+    plcCursorAfterClose,
+    type DrainKeyUpdatesDeps,
+    type PlcCursorAction,
+    type PlcExportEvent,
+    type PlcIntakeDecision,
+    type SigningKeyUpdate,
+} from "./plc-export"
 
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
