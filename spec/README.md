@@ -1,4 +1,4 @@
-# Atproto Personal Messaging Relay — specification
+# atproto Personal Messaging Relay — specification
 
 **First public draft.**
 
@@ -8,74 +8,83 @@ persistently online, weakly trusted delegate of an
 [atproto](https://atproto.com/) DID that operates end-to-end encrypted
 mailboxes and observes atproto state on that DID's behalf._
 
-## What an Atproto PMR is
+## What is a an Atproto PMR
 
 A **Personal Messaging Relay** is a weakly trusted, persistently online
 delegate of a user's device set, facilitating the sending and receiving of
 end-to-end encrypted (E2EE) messages. "Weakly trusted"
 [means](trust-model.md): **trusted for the availability and ordering of
-opaque bytes, and for nothing that determines a key.**
+opaque ciphertexts**
 
-An **Atproto PMR** is the variant bound to an atproto DID. The delegation
+An **atproto PMR** is the variant bound to a public identity - an atproto DID. The delegation
 is established by publishing a messaging identity key — the **anchor key**
 — in a declaration record in that DID's atproto repository.
 
-**A PMR operates mailboxes.** That is the whole of it, and there is nothing
-to declare: a relay serves both kinds of mailbox or it is not a relay.
+The atproto PMR can operate mailboxes for each sender/receiver pair of DID's, authenticating
+the sender against the delegate anchor key.
 
 | mailbox kind | key | how many a user may have |
 |---|---|---|
-| pair | the counterpart DID, verbatim | **exactly one relay's worth** |
+| pair | the counterpart DID, verbatim | **exactly one relay, designated by the recipient** |
 | grant | `grant:` + an opaque derived address | **any number, across any number of relays** |
 
-Both arrive on one path, `POST /pmr/v1/inbox/{key}/messages`, told apart by
+Both arrive on one path, `POST /pmr/v1/inbox/{key}/messages`, distinguished by
 the key's prefix (§[Delivery — peer-facing](wire-api.md#delivery--peer-facing)).
 The cardinalities differ because the routing does:
 
 - A **grant carries its own host**, and its address is derived under that
   host (§[Grant address and put-tag derivation](wire-api.md#grant-address-and-put-tag-derivation)),
   so a peer holding a grant needs nothing else to route to it. A user may
-  therefore hold grants from several relays at once.
+  hold grants from several relays at once.
 - A **pair put is routed by resolving the recipient's DID**, and that
   resolution yields one relay, so there is exactly one pair mailbox per
-  DID. Its reachability is the one thing here that depends on something
-  this specification does not define — see
+  DID pair. Its reachability is not yet defined — see
   [the discovery hop](#not-yet-specified).
 
-**Grant issuance is the core of it.** A relay is a grant issuer first: it
+**Grant issuance is the core PMR capability** 
+A relay is a grant issuer: it
 vends opaque, unguessable mailbox addresses that name no sender. DID
 addressing is the entry path that runs ahead of them — first contact and
 re-contact arrive on the DID-addressed mailbox, the always-resolvable
 layer, and conversations then move onto grant addresses for steady state.
-Grants are also the only thing a relay vends to third parties, and so the
-only thing whose retirement a peer can observe: a relay winds grant
-issuance down through `draining` before it stops
-(§[Retirement](wire-api.md#retirement)), which is the one lifecycle state
-its [enabler document](wire-api.md#the-enabler-document) publishes.
+Grants have a fixed lifetime at mint, allowing the issuing PMR to wind down
+its lifecycle though migrations
+(§[Retirement](wire-api.md#retirement)).
 
-**A host says what it can do in its enabler document**,
+**A host says what it can do in its capabilities document**,
 `GET /.well-known/private-messaging-enabler.json`
 (§[The enabler document](wire-api.md#the-enabler-document)) — which
 capabilities it serves, at which versions, and under which path prefix. A
 client reads it before constructing any URL; the paths in this
 specification are relative to the prefix declared there.
 
-Outbound relay is **not in this version**; the device performs its own
-puts.
+Outbound relay is not yet in scope, devices put directly to
+recipients' PMR's.
 
-**Two related components are deliberately not part of a PMR.** The
-**key monitor** — [key transparency](key-transparency.md) for the
-messaging keys this whole system rests on — is a separate, independently
-operable component. A relay reads its senders' declarations from a monitor's
-store, so a PMR that admits pair puts runs a monitor or shares one. It is not a
-one of the relay's mailbox capabilities, and a client chooses its monitors rather than
-resolving them: a device registers with several and cross-checks, which is
-load-bearing rather than decorative, being what detects a PDS that
-equivocates about a user's keys
-([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
-**Observation** — the rest of atproto state, profiles and the follow graph
-— is deferred, with no specified surface yet; see
-[Not yet specified](#not-yet-specified).
+###Related capabilities
+A an atproto PMR operating on behalf of a an atproto DID (messaging delegate)
+should operate two other related functions to support messaging:
+
+**key monitor** — [key transparency](key-transparency.md) 
+The delegate keys are published by the PDS, we guard against publisher
+misbehavior by ensuring that users have a consistent view of which keys were issued.
+
+The key monitor does so by by providing an independent cache of the implicit
+key directory that is a union of the published keys across all users' PDS's.
+AT Protocol allows these key records to be [self-certifying](https://atproto.com/specs/repository),
+so the monitor cannot forge keys. Similarly to other key transparency schemes,
+we trust keys not when we fetch them from the issuer, but when they have reached
+an independent monitor. ([`trust-model.md`](trust-model.md#p2--relayed-repo-records-are-car)).
+
+A client isn't bound to only use its own atproto PMR's monitor, it can cross-check several.
+
+The key monitor subscribes to [Jetstream](https://atproto.com/blog/introducing-bluesky-protocol-services#jetstream-v2-network-replay)
+to get real-time updates of published keys. It also subscribes to the PLC's [update stream](https://github.com/bluesky-social/atproto/discussions/4508)
+
+**Observation** 
+If the atproto pmr is already subscribing the jetstream of record updates, it's logical that it also offload caching of
+public data from the client - in effect operating an appview of the data an atproto messenger needs, which so far are
+profiles and social graphs.
 
 ## Where to start
 
@@ -113,13 +122,13 @@ These documents distinguish two kinds of statement:
   blocked sender observes. The operator picks these, and this
   specification says so explicitly wherever it applies.
 
-The test for which is which: **does anything outside this deployment depend
+The distinguishing test: **does anything outside this deployment depend
 on the answer?** If a peer, a client, or another relay can observe it and
 would behave differently, it is normative. If it only shapes local
 behavior — even security-relevant local behavior — it belongs to the
 implementer.
 
-The blocked-sender simulation runs the other way from intuition: the
+The blocked-sender simulation is the one exception: the
 requirement that the behavior be *synthetic* is normative, while its shape
 is deliberately **unpublished**, because a published simulation is a
 fingerprint an attacker can test a relay against. See
