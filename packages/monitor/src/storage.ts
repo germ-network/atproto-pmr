@@ -795,7 +795,8 @@ export interface GraphMirrorTransition {
  * Change rows are derived from the reads they invalidate (`FollowEdgeStore`):
  * a `following` row for a served follower, a `followers` row only for a
  * subject that holds a declaration. Bound-value inserts (`putEdges` and its
- * change rows, the mirror's upserts) chunk at `D1_ROWS_PER_STATEMENT`. A
+ * change rows) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
+ * number of statements per DID. A
  * change row that depends on rows a delete removes (sweep, prune, the
  * holder/owner fan-out) is an `INSERT INTO graph_changes … SELECT … FROM
  * follows`, placed before that delete in the same batch, so a prune costs a

@@ -117,6 +117,31 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
         async putEdges(edges, gen) {
             const now = Date.now()
             const statements: D1PreparedStatement[] = []
+            // A put that re-points an existing follow leaves its old subject's
+            // followers changed too: note that subject before the upsert.
+            const replaced: number[] = []
+            for (const chunk of chunks(edges, D1_ROWS_PER_STATEMENT)) {
+                const binds = chunk.flatMap((e) => [e.follower, e.rkey])
+                const match = `(f.follower, f.rkey) IN (VALUES ${refList(chunk.length, 2)})`
+                statements.push(
+                    db
+                        .prepare(
+                            CHANGE +
+                                "SELECT DISTINCT f.subject, 'followers', ?1 FROM follows f " +
+                                `JOIN graph_holders h ON h.did = f.subject WHERE ${match}`
+                        )
+                        .bind(now, ...binds)
+                )
+                replaced.push(statements.length)
+                statements.push(
+                    db
+                        .prepare(
+                            "SELECT DISTINCT subject FROM follows WHERE (follower, rkey) IN " +
+                                `(VALUES ${refList(chunk.length, 1)})`
+                        )
+                        .bind(...binds)
+                )
+            }
             for (const chunk of chunks(edges, D1_ROWS_PER_STATEMENT)) {
                 const values = chunk.map((_, i) => `(?${4 * i + 1},?${4 * i + 2},?${4 * i + 3},?${4 * i + 4})`)
                 statements.push(
@@ -154,8 +179,9 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                         .bind(now, ...chunk)
                 )
             }
-            await send(statements)
-            return { subjects }
+            const results = await send(statements)
+            const old = replaced.flatMap((i) => subjectsOf(results[i]))
+            return { subjects: [...new Set([...subjects, ...old])] }
         },
 
         async deleteEdges(refs: readonly EdgeRef[]): Promise<EdgeWriteResult> {
@@ -211,6 +237,8 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                 const owner = s.owner ? 1 : 0
                 const holder = s.holder ? 1 : 0
                 const member = s.member ? 1 : 0
+                // Each statement binds up to the highest index it uses, so some
+                // take a prefix; an unused index inside the prefix is harmless.
                 const didBind = [s.did, now, owner, holder, member] as const
                 const ownerNow = "EXISTS (SELECT 1 FROM graph_owners WHERE did = ?1)"
                 const holderNow = "EXISTS (SELECT 1 FROM graph_holders WHERE did = ?1)"
@@ -353,7 +381,8 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
             const result = await db
                 .prepare(
                     "DELETE FROM graph_changes WHERE seq IN (" +
-                        "SELECT seq FROM graph_changes WHERE at_ms < ?1 AND seq < " +
+                        "SELECT seq FROM graph_changes WHERE seq <= " +
+                        "(SELECT MAX(seq) FROM graph_changes WHERE at_ms < ?1) AND seq < " +
                         "(SELECT MAX(seq) FROM graph_changes) ORDER BY seq LIMIT ?2)"
                 )
                 .bind(beforeMs, limit)
@@ -364,7 +393,8 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
 
     async function removeFollowerEdges(follower: string, gen?: number): Promise<EdgeWriteResult> {
         const now = Date.now()
-        // ?1 follower, ?2 now, ?3 the generation to sweep below (sweep only).
+        // The change rows number ?1 follower, ?2 now, ?3 the generation to sweep
+        // below (sweep only); the DELETE numbers its own binds.
         const stale = gen === undefined ? "" : " AND gen < ?3"
         const staleF = gen === undefined ? "" : " AND f.gen < ?3"
         const binds = gen === undefined ? [follower, now] : [follower, now, gen]

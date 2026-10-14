@@ -54,6 +54,8 @@ async function seed(did: string, flags: { owner?: boolean; holder?: boolean }) {
     if (flags.owner) await db.prepare("INSERT INTO graph_owners (did) VALUES (?)").bind(did).run()
     if (flags.holder) await db.prepare("INSERT INTO graph_holders (did) VALUES (?)").bind(did).run()
 }
+const seedInterest = (did: string) =>
+    db.prepare("INSERT OR IGNORE INTO interest (did, registered) VALUES (?, 0)").bind(did).run()
 const edge = (follower: string, rkey: string, subject: string) => ({ follower, rkey, subject })
 
 beforeEach(async () => {
@@ -102,6 +104,48 @@ describe("follow-edge index writer and reads", () => {
             { rkey: "new" },
             { rkey: "other" },
         ])
+    })
+
+    it("sweep and prune write their change rows before deleting", async () => {
+        await seed("did:a", { owner: true })
+        await seed("did:s1", { holder: true })
+        await seed("did:s2", { holder: true })
+        await writer().putEdges([edge("did:a", "1", "did:s1")], 1)
+        await writer().putEdges([edge("did:a", "2", "did:s2")], 2)
+        await db.exec("DELETE FROM graph_changes")
+        await writer().sweep("did:a", 2)
+        expect(await reasonsFor("did:a")).toEqual(["following"])
+        expect(await reasonsFor("did:s1")).toEqual(["followers"])
+        expect(await reasonsFor("did:s2")).toEqual([])
+        // Nothing older is left, so a second sweep writes nothing.
+        await writer().sweep("did:a", 2)
+        expect(await changes()).toHaveLength(2)
+        await writer().pruneFollower("did:a")
+        expect(await reasonsFor("did:a")).toEqual(["following", "following"])
+        expect(await reasonsFor("did:s2")).toEqual(["followers"])
+    })
+
+    it("a put that re-points a follow notes the old subject", async () => {
+        await seed("did:old", { holder: true })
+        await writer().putEdges([edge("did:a", "1", "did:old")], 1)
+        await db.exec("DELETE FROM graph_changes")
+        const result = await writer().putEdges([edge("did:a", "1", "did:new")], 1)
+        expect(result.subjects.sort()).toEqual(["did:new", "did:old"])
+        expect(await reasonsFor("did:old")).toEqual(["followers"])
+    })
+
+    it("deleting more than 25 refs reports every subject and writes every change row", async () => {
+        const ids = Array.from({ length: 30 }, (_, i) => i)
+        await Promise.all(ids.map((i) => seed(`did:h${i}`, { holder: true })))
+        await writer().putEdges(
+            ids.map((i) => edge("did:a", `${i}`, `did:h${i}`)),
+            1
+        )
+        await db.exec("DELETE FROM graph_changes")
+        const result = await writer().deleteEdges(ids.map((i) => ({ follower: "did:a", rkey: `${i}` })))
+        expect(result.subjects).toHaveLength(30)
+        expect(await edgeCount("did:a")).toBe(0)
+        expect((await changes()).filter((c) => c.reason === "followers")).toHaveLength(30)
     })
 
     it("prune removes every edge of a follower", async () => {
@@ -258,14 +302,35 @@ describe("follow-edge index writer and reads", () => {
             return [
                 await cost((w) => w.pruneFollower("did:a")),
                 await cost((w) => w.sweep("did:a", 2)),
-                await cost((w) =>
-                    w.mirror([to(row("did:a", { member: false }), row("did:a", { member: true }))])
-                ),
+                await cost(async (w) => {
+                    await seedInterest("did:a")
+                    await w.mirror([to(row("did:a"), row("did:a", { member: true }))])
+                    expect(await edgeCount("did:a")).toBe(0)
+                }),
             ]
         }
         const small = await spend(2)
         expect(await spend(200)).toEqual(small)
         expect(small.every((c) => c > 0 && c < 15)).toBe(true)
+    })
+
+    it("a removed owner's holder subjects, and a leaving member's edges, are pruned with change rows", async () => {
+        await mirror(to(row("did:h", { holder: true, member: true })))
+        await mirror(to(row("did:f1", { owner: true, member: true })))
+        await writer().putEdges([edge("did:f1", "1", "did:h")], 1)
+        await db.exec("DELETE FROM graph_changes")
+        await mirror(
+            to(row("did:f1", { member: true }), row("did:f1", { owner: true, member: true }))
+        )
+        expect(await edgeCount("did:f1")).toBe(0)
+        expect(await reasonsFor("did:h")).toEqual(["followers"])
+
+        await mirror(to(row("did:m", { member: true })))
+        await writer().putEdges([edge("did:m", "2", "did:h")], 1)
+        await db.exec("DELETE FROM graph_changes")
+        await mirror(to(row("did:m"), row("did:m", { member: true })))
+        expect(await edgeCount("did:m")).toBe(0)
+        expect(await reasonsFor("did:h")).toEqual(["followers"])
     })
 
     it("re-mirroring an unchanged DID writes no change rows", async () => {
@@ -310,8 +375,9 @@ describe("follow-edge index writer and reads", () => {
         const budget = statementBudget(3)
         expect(budget.take(2)).toBe(true)
         expect(budget.remaining).toBe(1)
+        expect(budget.take(1)).toBe(true)
+        expect(budget.remaining).toBe(0)
         expect(budget.take(2)).toBe(false)
-        expect(budget.remaining).toBe(1)
     })
 
     it("the object fails at startup without the graph binding", async () => {
