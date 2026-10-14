@@ -35,12 +35,49 @@ export interface PlcExportEvent {
 }
 
 /**
- * Decode one `sequenced_op` frame. Returns `null` when there is no usable
- * `seq` or `did` — a malformed frame must not break the stream.
+ * Decode one frame. Returns `null` for anything that is not a `sequenced_op`
+ * with a usable `seq` and `did:plc:` DID — a malformed frame must not break
+ * the stream.
  */
 export function decodePlcExportFrame(raw: string): PlcExportEvent | null {
-    void raw
-    throw new Error("not implemented")
+    let payload: unknown
+    try {
+        payload = JSON.parse(raw)
+    } catch {
+        return null
+    }
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null
+    const frame = payload as Record<string, unknown>
+    if (frame.type !== "sequenced_op") return null
+    const { seq, did } = frame
+    if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) return null
+    if (typeof did !== "string" || !did.startsWith("did:plc:")) return null
+    return { seq, did, update: updateOf(frame) }
+}
+
+const DID_KEY_PREFIX = "did:key:"
+
+function updateOf(frame: Record<string, unknown>): SigningKeyUpdate {
+    const op = frame.operation
+    if (typeof op !== "object" || op === null) return { kind: "delete" }
+    const operation = op as Record<string, unknown>
+    if (operation.type !== "plc_operation") return { kind: "delete" }
+    const asOfMs =
+        typeof frame.createdAt === "string" ? Date.parse(frame.createdAt) : Number.NaN
+    if (Number.isNaN(asOfMs)) return { kind: "delete" }
+
+    const methods = operation.verificationMethods
+    if (methods === undefined) return { kind: "put", key: null, asOfMs }
+    if (typeof methods !== "object" || methods === null) return { kind: "delete" }
+    const atproto = (methods as Record<string, unknown>).atproto
+    if (atproto === undefined) return { kind: "put", key: null, asOfMs }
+    if (
+        typeof atproto !== "string" ||
+        !atproto.startsWith(`${DID_KEY_PREFIX}z`)
+    ) {
+        return { kind: "delete" }
+    }
+    return { kind: "put", key: atproto.slice(DID_KEY_PREFIX.length), asOfMs }
 }
 
 /** What a stream close means for the stored cursor. */
