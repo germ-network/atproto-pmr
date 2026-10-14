@@ -25,8 +25,9 @@
  * is a serving copy, not a truth.
  */
 
-import type { DidDocument } from "@germ-network/atproto-pmr-core"
+import type { DidDocument, InterestPolicy, WatchedRecord } from "@germ-network/atproto-pmr-core"
 import type { SigningKeyUpdate } from "./plc-export"
+import type { SnapshotCheck } from "./refresh"
 
 /**
  * A position in the upstream stream, in whatever units the stream uses
@@ -148,6 +149,12 @@ export interface PendingFetch {
     rev: string
     attempts: number
     notBeforeMs: number
+    /**
+     * Owed because the DID joined interest, not because anything changed: its
+     * settle adds no digest-window entry and no push. A real intake for the
+     * DID clears it, so a commit that coalesces into the row still counts.
+     */
+    quiet: boolean
 }
 
 export type IntakeOutcome =
@@ -203,8 +210,12 @@ export interface MonitorIndex {
     markAttempted(did: string, attemptedAtMs: number): Promise<void>
 
     /**
-     * Whether this monitor keeps `did` current: held or owed, and not
-     * permanently deleted. Mirrors `KeyUpdateIndex.isWatched`.
+     * Whether this monitor keeps `did` current: in interest (see
+     * `InterestIndex`) or owed a fetch in `pending`, and not permanently
+     * deleted, under either policy. Under `registered`, a DID that still has
+     * a `revs` or `records` row also counts until its leave is applied, so an
+     * upgrade never stops following a document before it is withdrawn.
+     * Mirrors `KeyUpdateIndex.isWatched`.
      */
     isWatched(did: string): Promise<boolean>
 
@@ -249,7 +260,26 @@ export interface MonitorIndex {
      * way a reversal is ever noticed. `true` marking `isDeleted` is what
      * that suppression is for — see `isDeleted`.
      */
-    completeDeletion(did: string, observedAtMs: number, permanent: boolean): Promise<void>
+    completeDeletion(
+        did: string,
+        observedAtMs: number,
+        permanent: boolean,
+        /** Owed by a join, not a change: no window entry. */
+        quiet?: boolean
+    ): Promise<void>
+
+    /**
+     * `complete` without a digest-window entry: the verified rev and record,
+     * the held mark and the cleared join obligation, for a DID that was owed
+     * because it joined interest, not because anything changed. An obligation
+     * a real commit made stays owed.
+     */
+    completeQuietly(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void>
 
     /**
      * Whether `did`'s declaration is marked *permanently* confirmed-gone
@@ -505,8 +535,11 @@ export interface KeyUpdateIndex {
     advancePlcCursor(seq: number, createdAtMs?: number): Promise<void>
     resetPlcCursor(): Promise<void>
     /**
-     * The DIDs this monitor watches: in `revs` or `pending`, and not
-     * permanently deleted. The export stream's intake acts only on these (the
+     * The DIDs this monitor watches: in interest (see `InterestIndex`) or owed
+     * a fetch in `pending` (or, under `registered`, still holding a `revs` or
+     * `records` row whose leave is not yet applied), and not permanently
+     * deleted. The export stream's
+     * intake acts only on these (the
      * owed key update and the stored DID document alike), so this is the one
      * place a later restriction on which DIDs are kept would apply.
      */
@@ -534,4 +567,126 @@ export interface KeyUpdateIndex {
 export interface SigningKeyCacheWriter {
     put(did: string, entry: { key: string | null; fetchedAtMs: number }): Promise<void>
     delete(did: string): Promise<void>
+}
+
+/** One record of one DID: the unit a secondary snapshot is kept at. */
+export interface RecordRef {
+    did: string
+    collection: string
+    rkey: string
+}
+
+/** A DID entering or leaving the interest set. */
+export interface InterestTransition {
+    did: string
+    change: "join" | "leave"
+    /** The DID's interest epoch once this transition applied. */
+    epoch: number
+}
+
+/**
+ * The monitor's allow list, in the single writer. Membership follows the
+ * policy: under `registered`, a registered DID or one followed by at least
+ * one graph owner; under `everyone`, a held declaration holder or a
+ * registered DID. Every change of membership bumps the DID's epoch and is
+ * queued once as a transition, so a fetch begun under an earlier epoch stores
+ * nothing, and each join and leave is acted on exactly once.
+ */
+export interface InterestIndex {
+    interestPolicy(): InterestPolicy
+    inInterest(did: string): Promise<boolean>
+    /** 0 for a DID that has never been in interest. */
+    interestEpoch(did: string): Promise<number>
+    isRegistered(did: string): Promise<boolean>
+    /** Whose follows are kept: registered DIDs under `registered`, held holders under `everyone`. */
+    isGraphOwner(did: string): Promise<boolean>
+    setRegistered(did: string, registered: boolean, atMs: number): Promise<void>
+    /** How many graph owners follow `did`, as last counted. */
+    setOwnerFollowers(did: string, count: number, atMs: number): Promise<void>
+    dueTransitions(limit: number): Promise<InterestTransition[]>
+    /** A no-op once `did`'s epoch has moved past `epoch`. */
+    clearTransition(did: string, epoch: number): Promise<void>
+    /**
+     * A join: owe every record in `records`, and the declaration unless it is
+     * already indexed, all marked quiet, in one step. A record not yet
+     * indexed is owed at rev `""`; an indexed one at its indexed rev. A no-op
+     * once `did`'s epoch has moved past `epoch`.
+     */
+    oweJoin(did: string, records: readonly WatchedRecord[], epoch: number): Promise<void>
+    /**
+     * A leave, once its snapshots are gone from the store: drop `did`'s
+     * `records`, `rec_pending` and `checks` rows. Under `registered` also its
+     * `pending`, `revs`, `holder_state`, `deleted` and `key_updates` rows;
+     * under `everyone` those stay, so a reactivation or re-publish owed
+     * after a gone settle is still settled. Applies whatever the epoch: the
+     * bytes are already deleted, and a join that raced in re-owes everything
+     * from the now-empty index.
+     */
+    forgetLeft(did: string): Promise<void>
+}
+
+/** A secondary record a commit or a join says to fetch again. */
+export interface OwedRecord extends RecordRef {
+    /** The rev that prompted it; not necessarily the rev finally observed. */
+    rev: string
+}
+
+export interface PendingRecordFetch extends OwedRecord {
+    attempts: number
+    notBeforeMs: number
+    /** The interest epoch it was owed under. */
+    epoch: number
+}
+
+/** Why a secondary index write was refused: a newer rev is indexed, or the DID left interest. */
+export type SecondaryWriteAnswer = "older" | "left"
+
+/**
+ * The single writer's index of secondary records (`MONITOR_COLLECTIONS`).
+ * Secondaries never touch `revs`, the digest window or the holder state:
+ * their rev authority is the `records` row alone.
+ */
+export interface SecondaryIndex {
+    dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
+    deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void>
+    clearSecondary(ref: RecordRef): Promise<void>
+    /**
+     * Index a verified secondary at its signed `rev` and clear its pending
+     * row, after its bytes are in the store. Writes nothing and answers
+     * `older` when the indexed rev is newer, or `left` when `did` has left
+     * the interest `epoch` it was owed under. The caller checks both before
+     * its KV put, so only `left` can follow a put, and only `left` deletes
+     * what the put wrote.
+     */
+    completeSecondary(
+        ref: RecordRef,
+        rev: string,
+        verified: VerifiedWrite,
+        epoch: number
+    ): Promise<SecondaryWriteAnswer | "stored">
+    /** Drop a secondary verified absent at `rev`, under the same rules. */
+    disposeSecondary(
+        ref: RecordRef,
+        rev: string,
+        epoch: number
+    ): Promise<SecondaryWriteAnswer | "disposed">
+    /** The indexed rev of one secondary, for the check before a KV put. */
+    secondaryRevOf(ref: RecordRef): Promise<string | null>
+    /**
+     * Drop every secondary's `records` and `rec_pending` row for `did`, after
+     * their snapshots are deleted: the repo itself is gone.
+     */
+    forgetSecondaries(did: string): Promise<void>
+}
+
+/**
+ * Serving-side storage for secondary records, keyed by record. Like the
+ * declaration's entries, no TTL.
+ */
+export interface SecondarySnapshotStore {
+    getSecondary(ref: RecordRef): Promise<SnapshotEntry | null>
+    putSecondary(ref: RecordRef, entry: SnapshotEntry): Promise<void>
+    /** Removes the record and its confirmation together. */
+    deleteSecondary(ref: RecordRef): Promise<void>
+    putSecondaryCheck(ref: RecordRef, check: SnapshotCheck): Promise<void>
 }

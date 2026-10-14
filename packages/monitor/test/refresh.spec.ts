@@ -5,9 +5,16 @@
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError, verifyRecordProofOutcome } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/repo-car"
-import type { IngestDeps, FetchedRecord } from "../src/ingest"
+import type { IngestDeps, FetchedRecord, VerifyOutcome } from "../src/ingest"
 import { refreshDue, type RefreshDeps, type SnapshotCheck } from "../src/refresh"
-import { FETCH_AS_OF_SKEW_MS, type MonitorIndex, type SnapshotEntry, type SnapshotStore } from "../src/storage"
+import type { SecondaryDeps } from "../src/secondary"
+import {
+    FETCH_AS_OF_SKEW_MS,
+    type IndexedRecord,
+    type MonitorIndex,
+    type SnapshotEntry,
+    type SnapshotStore,
+} from "../src/storage"
 
 const COLLECTION = "com.germnetwork.declaration"
 const RKEY = "self"
@@ -16,6 +23,8 @@ const DID = "did:plc:alice"
 const PDS = "https://pds.example"
 const NOW = 10_000_000
 const STALE = 3_600_000
+const NON_HOLDER_STALE = 86_400_000
+const PROFILE = "app.bsky.actor.profile"
 
 const key: TestKey = makeKey()
 
@@ -54,6 +63,11 @@ function harness(opts: {
     legacy?: string[]
     fetchRecord?: (did: string) => Promise<FetchedRecord>
     due?: string[]
+    /** The profile already indexed for DID, at this rev and under this key. */
+    profile?: { rev: string; cid?: string; verifiedWith?: string }
+    profileFetch?: () => Promise<FetchedRecord>
+    profileVerify?: (record: FetchedRecord) => Promise<VerifyOutcome>
+    watchProfile?: boolean
 }) {
     const revs = new Map(Object.entries(opts.indexed ?? {}))
     const records = new Map<string, SnapshotEntry>(
@@ -80,6 +94,21 @@ function harness(opts: {
     const onDelete = vi.fn(async () => {})
     const dueCalls: Array<{ before: number; limit: number }> = []
 
+    const profileRows = new Map<string, IndexedRecord>()
+    if (opts.profile !== undefined) {
+        profileRows.set(DID, {
+            did: DID,
+            collection: PROFILE,
+            rkey: RKEY,
+            rev: opts.profile.rev,
+            cid: opts.profile.cid ?? "bafyreiprofile",
+            verifiedWith: opts.profile.verifiedWith ?? key.multikey,
+        })
+    }
+    const profileChecks: Array<{ rev: string; checkedAtMs: number }> = []
+    const profileStored: SnapshotEntry[] = []
+    const disposed: string[] = []
+    const deferred: string[] = []
     const index = {
         revOf: async (did: string) => revs.get(did) ?? null,
         complete: async (did: string, rev: string) => {
@@ -98,8 +127,10 @@ function harness(opts: {
             (opts.gone ?? []).includes(did) ? "gone-reversible" : revs.has(did) ? "held" : null,
         recordsOf: async (did: string) => {
             const e = records.get(did)
-            if (e === undefined || e.verifiedWith === null) return []
+            const extra = [...profileRows.values()].filter((r) => r.did === did)
+            if (e === undefined || e.verifiedWith === null) return extra
             return [
+                ...extra,
                 {
                     did,
                     collection: COLLECTION,
@@ -143,12 +174,52 @@ function harness(opts: {
         onChange,
         onRegression,
         onDelete,
+        interest: { inInterest: async () => true, interestEpoch: async () => 0 },
+        secondaries: { dispose: async (did: string) => void disposed.push(did) },
+        nowMs: () => NOW,
+    }
+    const secondary: SecondaryDeps = {
+        index: {
+            dueSecondaries: async () => [],
+            deferSecondary: async () => {},
+            clearSecondary: async () => {},
+            completeSecondary: async (ref, rev, verified) => {
+                profileRows.set(ref.did, {
+                    did: ref.did,
+                    collection: ref.collection,
+                    rkey: ref.rkey,
+                    rev,
+                    cid: verified.cid,
+                    verifiedWith: verified.verifiedWith,
+                })
+                return "stored"
+            },
+            disposeSecondary: async (ref) => {
+                profileRows.delete(ref.did)
+                return "disposed"
+            },
+            secondaryRevOf: async (ref) => profileRows.get(ref.did)?.rev ?? null,
+            forgetSecondaries: async () => {},
+        },
+        interest: ingest.interest,
+        snapshot: {
+            getSecondary: async () => null,
+            putSecondary: async (_r, e) => void profileStored.push(e),
+            deleteSecondary: async () => {},
+            putSecondaryCheck: async (_r, c) => void profileChecks.push(c),
+        },
+        fetchRecord: opts.profileFetch ?? (async () => fetched("3m2", decl(1))),
+        verify: async (_ref, record) =>
+            opts.profileVerify !== undefined
+                ? opts.profileVerify(record)
+                : { kind: "verified", key: key.multikey, rev: "3m2", cid: "bafyreiprofile2" },
+        deferToDeclaration: async (did) => void deferred.push(did),
         nowMs: () => NOW,
     }
     const deps: RefreshDeps = {
         ingest,
         refreshIndex: {
-            dueRefresh: async (before, limit) => {
+            dueRefresh: async (before, limit, _nonHolderBefore) => {
                 dueCalls.push({ before, limit })
                 return (opts.due ?? Object.keys(opts.indexed ?? {}))
                     .filter((did) => (attempted.get(did) ?? 0) < before)
@@ -167,12 +238,21 @@ function harness(opts: {
         fetchHeadRev: opts.head ?? (async () => headAt("3m1")),
         collection: COLLECTION,
         rkey: RKEY,
+        secondary: {
+            deps: secondary,
+            records: opts.watchProfile === true ? [{ collection: PROFILE, rkey: RKEY }] : [],
+        },
     }
-    return { deps, quietVerified, goneReversible, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
+    return { profileRows, profileChecks, profileStored, disposed, deferred, deps, quietVerified, goneReversible, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
 }
 
 const run = (h: ReturnType<typeof harness>, limit = 64) =>
-    refreshDue(h.deps, { nowMs: NOW, staleAfterMs: STALE, limit })
+    refreshDue(h.deps, {
+        nowMs: NOW,
+        staleAfterMs: STALE,
+        limit,
+        nonHolderStaleAfterMs: NON_HOLDER_STALE,
+    })
 
 describe("refreshDue", () => {
     it("an unchanged head rev writes a check at that rev and touches neither the CAR nor the digest window", async () => {
@@ -561,7 +641,7 @@ describe("refresh re-verifies", () => {
         expect((await run(h)).checked).toBe(0)
         expect(fetchRecord).toHaveBeenCalledTimes(1)
 
-        const later = await refreshDue(h.deps, { nowMs: NOW + STALE + 1, staleAfterMs: STALE, limit: 64 })
+        const later = await refreshDue(h.deps, { nowMs: NOW + STALE + 1, staleAfterMs: STALE, limit: 64, nonHolderStaleAfterMs: NON_HOLDER_STALE })
         expect(later.checked).toBe(1)
         expect(fetchRecord).toHaveBeenCalledTimes(2)
     })
@@ -577,5 +657,230 @@ describe("refresh re-verifies", () => {
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.windows).toEqual([])
         expect(h.onChange).not.toHaveBeenCalled()
+    })
+})
+
+describe("refresh pushes a re-key", () => {
+    // A re-key whose record does not verify under the new key is still told
+    // to the device, once per key, as settle does.
+    function rekeyed() {
+        const other = makeKey()
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m1", other.multikey),
+            fetchRecord: async () => fetched("3m1", decl(1), other),
+        })
+        h.deps.ingest.verify = async () => ({ kind: "unverifiable" })
+        return { h, other }
+    }
+
+    it("an unverifiable re-key found by refresh pushes onChange once", async () => {
+        const { h, other } = rekeyed()
+        const result = await run(h)
+        expect(result.outcomes.failed).toBe(1)
+        expect(h.onChange).toHaveBeenCalledTimes(1)
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.records.get(DID)!.seenKey).toBe(other.multikey)
+        expect(h.records.get(DID)!.verifiedWith).toBe(key.multikey)
+    })
+
+    it("an unverifiable re-key found by refresh: a second refresh under the same seen key does not push again", async () => {
+        const { h } = rekeyed()
+        await run(h)
+        const second = await refreshDue(h.deps, {
+            nowMs: NOW + STALE + 1,
+            staleAfterMs: STALE,
+            limit: 64,
+            nonHolderStaleAfterMs: NON_HOLDER_STALE,
+        })
+        expect(second.outcomes.failed).toBe(1)
+        expect(h.onChange).toHaveBeenCalledTimes(1)
+    })
+})
+
+describe("one head check covers every record", () => {
+    // One getLatestCommit per DID confirms or re-fetches the declaration and
+    // every secondary; a secondary never moves revs or enters the window.
+    const hp = (o: Parameters<typeof harness>[0]) => harness({ ...o, watchProfile: true })
+    const profileAt = (rev: string, cid = "bafyreiprofile") => ({ rev, cid })
+    const profileVerifyAt = (rev: string, cid: string) => async (): Promise<VerifyOutcome> => ({
+        kind: "verified",
+        key: key.multikey,
+        rev,
+        cid,
+    })
+    const held = (rev: string) => ({ indexed: { [DID]: rev }, stored: { [DID]: fetched(rev, decl(1)) } })
+
+    it("unchanged head confirms declaration and profile", async () => {
+        const profileFetch = vi.fn(async () => fetched("3m1", decl(1)))
+        const h = hp({ ...held("3m1"), profile: profileAt("3m1"), profileFetch })
+        const result = await run(h)
+        expect(result.outcomes.confirmed).toBe(1)
+        expect(h.checks.get(DID)).toEqual({ rev: "3m1", checkedAtMs: NOW })
+        expect(h.profileChecks).toEqual([{ rev: "3m1", checkedAtMs: NOW }])
+        expect(profileFetch).not.toHaveBeenCalled()
+        expect(h.profileStored).toEqual([])
+    })
+
+    it("moved head with unchanged profile CID stores it quietly at the signed rev", async () => {
+        const h = hp({
+            ...held("3m1"),
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => fetched("3m2", decl(1)),
+            profile: profileAt("3m1", "bafyreisame"),
+            profileVerify: profileVerifyAt("3m2", "bafyreisame"),
+        })
+        const result = await run(h)
+        expect(result.outcomes["advanced-quiet"]).toBe(1)
+        expect(h.profileStored).toHaveLength(1)
+        expect(h.profileStored[0]).toMatchObject({ rev: "3m2", cid: "bafyreisame" })
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m2", cid: "bafyreisame" })
+        expect(h.windows).toEqual([])
+        expect(h.onChange).not.toHaveBeenCalled()
+    })
+
+    it("moved head with changed profile CID settles the profile only", async () => {
+        const h = hp({
+            ...held("3m1"),
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => fetched("3m2", decl(1)),
+            profile: profileAt("3m1", "bafyreiold"),
+            profileVerify: profileVerifyAt("3m2", "bafyreinew"),
+        })
+        await run(h)
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m2", cid: "bafyreinew" })
+        expect(h.windows).toEqual([])
+        expect(h.onChange).not.toHaveBeenCalled()
+        expect(h.onDelete).not.toHaveBeenCalled()
+        expect(h.deleted.size).toBe(0)
+    })
+
+    it("missing profile is fetched on the next check", async () => {
+        const h = hp({
+            ...held("3m1"),
+            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+        })
+        const result = await run(h)
+        expect(result.outcomes["advanced-quiet"]).toBe(1)
+        expect(h.profileStored).toHaveLength(1)
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m1" })
+        expect(h.checks.get(DID)).toEqual({ rev: "3m1", checkedAtMs: NOW })
+    })
+
+    it("a profile commit does not lapse the declaration's chk:", async () => {
+        const h = hp({
+            ...held("3m1"),
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => fetched("3m2", decl(1)),
+            profile: profileAt("3m1"),
+            profileVerify: profileVerifyAt("3m2", "bafyreinew"),
+        })
+        await run(h)
+        expect(h.checks.get(DID)).toEqual({ rev: "3m2", checkedAtMs: NOW })
+        expect(h.records.get(DID)!.rev).toBe("3m2")
+    })
+
+    it("a non-holder's head check does not fetch the declaration", async () => {
+        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1)))
+        const h = hp({
+            due: [DID],
+            head: async () => headAt("3m1"),
+            fetchRecord,
+            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+        })
+        const result = await run(h)
+        expect(fetchRecord).not.toHaveBeenCalled()
+        expect(result.outcomes["advanced-quiet"]).toBe(1)
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m1" })
+        expect(h.checkedAt.get(DID)).toBe(NOW)
+        expect(h.records.has(DID)).toBe(false)
+    })
+
+    it("a record-level not-found for a non-holder does not mark it deleted", async () => {
+        const h = hp({
+            due: [DID],
+            head: async () => headAt("3m1"),
+            profileFetch: async () => {
+                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+            },
+        })
+        const result = await run(h)
+        expect(result.outcomes.failed).toBe(1)
+        expect(h.deleted.size).toBe(0)
+        expect(h.goneReversible).toEqual([])
+        expect(h.attempted.get(DID)).toBe(NOW)
+        expect(h.windows).toEqual([])
+    })
+
+    it("a repo-level answer at a non-holder's head check disposes its profile with no window entry or onDelete", async () => {
+        const h = hp({
+            due: [DID],
+            head: async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            },
+        })
+        const result = await run(h)
+        expect(result.outcomes.deleted).toBe(1)
+        expect(h.disposed).toEqual([DID])
+        expect(h.windows).toEqual([])
+        expect(h.onDelete).not.toHaveBeenCalled()
+        expect(h.deleted.size).toBe(0)
+        // No holder state, so it keeps the daily cadence.
+        expect(h.goneReversible).toEqual([])
+        expect(h.checkedAt.get(DID)).toBe(NOW)
+    })
+
+    it("a secondary under a non-current key is fetched again at an unchanged head", async () => {
+        const profileFetch = vi.fn(async () => fetched("3m1", decl(1)))
+        const h = hp({
+            ...held("3m1"),
+            profile: { rev: "3m1", verifiedWith: "zOldKey" },
+            profileFetch,
+            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+        })
+        await run(h)
+        expect(profileFetch).toHaveBeenCalledTimes(1)
+        expect(h.profileRows.get(DID)).toMatchObject({ verifiedWith: key.multikey })
+    })
+
+    it("a record-level absence of the declaration keeps the profile; a repo-level one disposes it without fetching it again", async () => {
+        const recordLevel = hp({
+            ...held("3m1"),
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+            },
+            profile: profileAt("3m1"),
+        })
+        await run(recordLevel)
+        expect(recordLevel.disposed).toEqual([])
+        expect(recordLevel.profileRows.has(DID)).toBe(true)
+
+        const profileFetch = vi.fn(async () => fetched("3m2", decl(1)))
+        const repoLevel = hp({
+            ...held("3m1"),
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            },
+            profile: profileAt("3m1"),
+            profileFetch,
+        })
+        await run(repoLevel)
+        expect(repoLevel.disposed).toEqual([DID])
+        expect(profileFetch).not.toHaveBeenCalled()
+    })
+
+    it("a repo-level answer at a held DID's head check disposes its profile too", async () => {
+        const h = hp({
+            ...held("3m1"),
+            head: async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            },
+        })
+        await run(h)
+        expect(h.disposed).toEqual([DID])
+        expect(h.onDelete).toHaveBeenCalledWith(DID)
     })
 })

@@ -58,7 +58,24 @@ export {
     type VerifiedWrite,
     type SigningKeyCacheWriter,
     type SnapshotStore,
+    type InterestIndex,
+    type InterestTransition,
+    type OwedRecord,
+    type PendingRecordFetch,
+    type RecordRef,
+    type SecondaryIndex,
+    type SecondarySnapshotStore,
+    type SecondaryWriteAnswer,
 } from "./storage"
+
+// The allow list and the secondary records it keeps.
+export { applyInterestTransitions, type InterestDeps } from "./interest"
+export {
+    settleSecondary,
+    settleSecondaryDue,
+    type SecondaryDeps,
+    type SecondarySettleOutcome,
+} from "./secondary"
 
 // The change digest.
 export {
@@ -110,12 +127,14 @@ export {
 export {
     intake,
     settle,
+    settleDeletion,
     settleDue,
     type FetchedDidDocument,
     type FetchedRecord,
     type IngestConfig,
     type IngestDeps,
     type IntakeDecision,
+    type SettleOptions,
     type SettleOutcome,
     type VerifyOutcome,
 } from "./ingest"

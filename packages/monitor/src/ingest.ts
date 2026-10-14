@@ -14,13 +14,18 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
-import { RecordNotFoundError, type DidDocument } from "@germ-network/atproto-pmr-core"
+import {
+    RecordNotFoundError,
+    type DidDocument,
+    type InterestPolicy,
+} from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
     FETCH_AS_OF_SKEW_MS,
     type Cursor,
     type DidDocumentSink,
+    type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
     type SnapshotStore,
@@ -95,6 +100,18 @@ export interface IngestDeps {
      * PLC export stream is the authority for did:plc.
      */
     keyUpdates?: Pick<KeyUpdateIndex, "oweKeyUpdate">
+    /**
+     * The allow list. Under `registered`, a declaration commit for a DID
+     * outside it is ignored; and a settle whose DID left interest after the
+     * fetch began (its epoch moved) stores nothing.
+     */
+    interest: Pick<InterestIndex, "inInterest" | "interestEpoch">
+    /**
+     * Disposes every secondary snapshot and index row of a DID. Called when
+     * the declaration's fetch finds the repo itself gone, which takes the
+     * secondaries with it. Unset where no secondary is kept.
+     */
+    secondaries?: { dispose(did: string): Promise<void> }
     nowMs(): number
 }
 
@@ -103,6 +120,12 @@ const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
     collection: string
+    /**
+     * Under `registered`, a declaration commit for a DID outside the allow
+     * list is ignored; under `everyone` every one is taken in, which is how
+     * holders are discovered.
+     */
+    policy: InterestPolicy
 }
 
 export type IntakeDecision =
@@ -144,6 +167,9 @@ export async function intake(
 
     const commit: CommitEvent = event
     if (commit.collection !== config.collection) return "ignored"
+    if (config.policy === "registered" && !(await deps.interest.inInterest(commit.did))) {
+        return "ignored"
+    }
 
     const result = await deps.index.intake(
         { did: commit.did, rev: commit.rev },
@@ -163,7 +189,13 @@ export async function intake(
  * a failed verification, there is no record left to have an opinion
  * about — the source confirmed it is gone.
  */
-export type SettleOutcome = "stored" | "rejected" | "deleted" | "unverifiable"
+export type SettleOutcome =
+    | "stored"
+    | "rejected"
+    | "deleted"
+    | "unverifiable"
+    /** The DID's interest changed during the fetch: nothing stored, the obligation untouched. */
+    | "left"
 
 /**
  * What checking a fetched CAR against the signing key of the DID document
@@ -189,11 +221,12 @@ export type VerifyOutcome =
 export async function settleDeletion(
     deps: IngestDeps,
     did: string,
-    permanent: boolean
+    permanent: boolean,
+    quiet = false
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
-    await deps.index.completeDeletion(did, deps.nowMs(), permanent)
-    await deps.onDelete?.(did)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet)
+    if (!quiet) await deps.onDelete?.(did)
 }
 
 /**
@@ -209,18 +242,47 @@ export async function settleDeletion(
  * path: retrying an answer that will not change until something happens
  * again accomplishes nothing but leaving the obligation owed forever.
  */
-export async function settle(deps: IngestDeps, did: string): Promise<SettleOutcome> {
+/** How one settle reports what it finds. */
+export interface SettleOptions {
+    /**
+     * Owed by a join, not a change: an advance is stored through
+     * `completeQuietly` with no `onChange`. A not-found for a DID that held a
+     * declaration is recorded (gone-reversible, or `deleted` if permanent)
+     * with no window entry and no `onDelete`; for a DID that never held one
+     * nothing is recorded.
+     */
+    quiet?: boolean
+}
+
+export async function settle(
+    deps: IngestDeps,
+    did: string,
+    opts: SettleOptions = {}
+): Promise<SettleOutcome> {
+    const quiet = opts.quiet === true
+    const epoch = await deps.interest.interestEpoch(did)
+    const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
         record = await deps.fetchRecord(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        await settleDeletion(deps, did, err.permanent)
+        if (await moved()) return "left"
+        const repoLevel = err.reason !== "RecordNotFound"
+        if (quiet && (await neverHeld(deps, did))) {
+            // A followee with no declaration is the ordinary case: nothing is
+            // recorded for it, so it stays on the non-holder cadence.
+            await deps.index.clearPending(did)
+            if (repoLevel) await deps.secondaries?.dispose(did)
+            return "deleted"
+        }
+        await settleDeletion(deps, did, err.permanent, quiet)
+        if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    const outcome = await settleFetched(deps, did, record)
+    const outcome = await settleFetched(deps, did, record, quiet, moved)
     // A DID left unwatched has nothing keeping its document current: stop
     // vouching for the one this fetch stored.
     if (!(await deps.index.isWatched(did))) {
@@ -229,12 +291,20 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
     return outcome
 }
 
+/** No declaration was ever indexed for `did`, held or gone. */
+async function neverHeld(deps: IngestDeps, did: string): Promise<boolean> {
+    return (await deps.index.revOf(did)) === null && (await deps.index.holderStateOf(did)) === null
+}
+
 async function settleFetched(
     deps: IngestDeps,
     did: string,
-    record: FetchedRecord
+    record: FetchedRecord,
+    quiet: boolean,
+    moved: () => Promise<boolean>
 ): Promise<SettleOutcome> {
     const verified = await deps.verify(did, record)
+    if (await moved()) return "left"
     if (verified.kind === "unverifiable") {
         await settleUnverifiable(deps, did, record)
         return "unverifiable"
@@ -251,7 +321,11 @@ async function settleFetched(
     if (verified.kind === "verified-absent") {
         // The repo is alive and signed to hold no such record. Reversible,
         // because the account may publish it again.
-        await settleDeletion(deps, did, false)
+        if (quiet && (await neverHeld(deps, did))) {
+            await deps.index.clearPending(did)
+            return "deleted"
+        }
+        await settleDeletion(deps, did, false, quiet)
         return "deleted"
     }
 
@@ -283,10 +357,12 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
     })
-    await deps.index.complete(did, verified.rev, observedAtMs, {
-        cid: verified.cid,
-        verifiedWith: verified.key,
-    })
+    const written = { cid: verified.cid, verifiedWith: verified.key }
+    if (quiet) {
+        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written)
+        return "stored"
+    }
+    await deps.index.complete(did, verified.rev, observedAtMs, written)
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"
@@ -322,7 +398,7 @@ async function settleUnverifiable(
  * means a rotation the monitor cannot itself vouch for; the device can
  * verify for itself, so it is told once per newly seen key.
  */
-async function pushNewlySeenKey(
+export async function pushNewlySeenKey(
     deps: IngestDeps,
     did: string,
     fetchedKey: string | null
@@ -387,7 +463,7 @@ export async function settleDue(
     let settled = 0
     for (const p of due) {
         try {
-            if ((await settle(deps, p.did)) === "stored") settled += 1
+            if ((await settle(deps, p.did, { quiet: p.quiet })) === "stored") settled += 1
         } catch {
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only

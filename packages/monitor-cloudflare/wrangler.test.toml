@@ -6,16 +6,27 @@ main = "test/worker.ts"
 compatibility_date = "2026-07-01"
 
 [durable_objects]
-bindings = [{ name = "ingest", class_name = "MonitorIngest" }]
+# `ingestRegistered` is the same object under the `registered` policy; the
+# rest of the suites run under `everyone`, as the existing deployment does.
+bindings = [
+	{ name = "ingest", class_name = "MonitorIngest" },
+	{ name = "ingestRegistered", class_name = "RegisteredMonitorIngest" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["MonitorIngest"]
 
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RegisteredMonitorIngest"]
+
 # Illustrative values, matching wrangler.example.toml. All are
 # implementation-defined; tests read them from env rather than hardcoding.
 [vars]
-MONITOR_COLLECTION = "com.example.declaration"
+MONITOR_COLLECTION = "com.germnetwork.declaration"
+MONITOR_COLLECTIONS = "app.bsky.actor.profile/self"
+INTEREST_POLICY = "everyone"
 JETSTREAM_URL = "https://jetstream.invalid/subscribe"
 PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
 WATCHDOG_INTERVAL_MS = "120000"
@@ -51,3 +62,7 @@ REFRESH_STALE_AFTER_MS = "3600000"
 [[kv_namespaces]]
 	binding = "registrations"
 	id = "test-registrations"
+
+[[kv_namespaces]]
+	binding = "pmrDirectory"
+	id = "test-pmr-directory"

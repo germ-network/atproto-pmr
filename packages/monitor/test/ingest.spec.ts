@@ -52,11 +52,16 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const attempted = new Map<string, number>()
     const completed: Array<{ cid: string; verifiedWith: string }> = []
     const revs = new Map<string, string>()
-    const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
+    const pending = new Map<
+        string,
+        { rev: string; attempts: number; notBeforeMs: number; quiet: boolean }
+    >()
     const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
     const deleted = new Set<string>()
+    const quietDeletions: string[] = []
+    const quietCompletions: string[] = []
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
@@ -71,7 +76,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         readCursor: async () => null,
         intake: async ({ did, rev }) => {
             if (revs.get(did) === rev) return { outcome: "duplicate" }
-            pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
+            pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false })
             return { outcome: "accepted" }
         },
         complete: async (did, rev, observedAtMs, verified) => {
@@ -81,10 +86,18 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             pending.delete(did)
             deleted.delete(did)
         },
-        completeDeletion: async (did, observedAtMs, permanent) => {
+        completeDeletion: async (did, observedAtMs, permanent, quiet) => {
             if (permanent) deleted.add(did)
-            addToWindow(did, observedAtMs)
+            if (quiet !== true) addToWindow(did, observedAtMs)
+            else quietDeletions.push(did)
             pending.delete(did)
+        },
+        completeQuietly: async (did, rev, _at, verified) => {
+            completed.push(verified)
+            revs.set(did, rev)
+            quietCompletions.push(did)
+            pending.delete(did)
+            deleted.delete(did)
         },
         isDeleted: async (did) => deleted.has(did),
         duePending: async (nowMs) =>
@@ -98,7 +111,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
-        owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
+        owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
         clearPending: async (did) => void pending.delete(did),
         markAttempted: async (did, at) => void attempted.set(did, at),
         isWatched: async (did) =>
@@ -131,16 +144,46 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             record.signingKey === null
                 ? { kind: "unverifiable" }
                 : { kind: "verified", key: record.signingKey, rev: fetchedRev, cid: CID },
+        interest: { inInterest: async () => true, interestEpoch: async () => 0 },
         nowMs: () => 1_000_000,
         ...depOverrides,
     }
-    return { deps, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
+    return { deps, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
+
+describe("intake by policy", () => {
+    const registered = { collection: COLLECTION, policy: "registered" as const }
+
+    it("under registered, a declaration commit for a DID outside interest is ignored", async () => {
+        const h = harness({
+            interest: { inInterest: async () => false, interestEpoch: async () => 0 },
+        })
+        expect(await intake(h.deps, registered, commit("3m1"), "c1")).toBe("ignored")
+        expect(h.pending.size).toBe(0)
+    })
+
+    it("under registered, a commit for a DID in interest is accepted", async () => {
+        const h = harness({
+            interest: { inInterest: async (did) => did === DID, interestEpoch: async () => 0 },
+        })
+        expect(await intake(h.deps, registered, commit("3m1"), "c1")).toBe("accepted")
+        expect(h.pending.has(DID)).toBe(true)
+    })
+
+    it("under everyone, a commit for an unknown DID is accepted: that is how holders are found", async () => {
+        const h = harness({
+            interest: { inInterest: async () => false, interestEpoch: async () => 0 },
+        })
+        expect(
+            await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
+        ).toBe("accepted")
+    })
+})
 
 describe("intake", () => {
     it("accepts an unseen rev and owes a fetch for it", async () => {
         const h = harness()
-        expect(await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")).toBe(
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")).toBe(
             "accepted"
         )
         expect(h.pending.has(DID)).toBe(true)
@@ -152,7 +195,7 @@ describe("intake", () => {
         // applied and must cost an index read, not a PDS round trip.
         const h = harness()
         h.revs.set(DID, "3m1")
-        expect(await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")).toBe(
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")).toBe(
             "duplicate"
         )
         expect(h.pending.size).toBe(0)
@@ -161,7 +204,7 @@ describe("intake", () => {
     it("ignores a commit on another collection", async () => {
         const h = harness()
         expect(
-            await intake(h.deps, { collection: COLLECTION }, commit("3m1", "app.bsky.feed.post"), "c1")
+            await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1", "app.bsky.feed.post"), "c1")
         ).toBe("ignored")
         expect(h.pending.size).toBe(0)
     })
@@ -172,11 +215,11 @@ describe("intake", () => {
         // a re-key changes what its record verifies against.
         const h = harness()
         const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(h.pending.size).toBe(0)
 
         h.revs.set(DID, "3m1")
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
         // And it must actually SCHEDULE the re-read it names: a rotation
         // leaves the record unchanged while changing what verifies it, so
         // the dedupe check would otherwise suppress the one fetch needed.
@@ -196,7 +239,7 @@ describe("intake", () => {
         h.deleted.add(DID)
         const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
 
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(h.pending.size).toBe(0)
     })
 })
@@ -333,7 +376,7 @@ describe("settle", () => {
             }),
         })
         h.revs.set(DID, "3m9")
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settle(h.deps, DID)).toBe("rejected")
         expect(onRegression).toHaveBeenCalledWith(DID, "3m9", "3m1")
         expect(h.records.has(DID)).toBe(false)
@@ -346,7 +389,7 @@ describe("settle", () => {
 
     it("stores nothing when verification fails", async () => {
         const h = harness({ verify: async () => ({ kind: "unverifiable" as const }) })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(h.records.size).toBe(0)
         expect(h.revs.size).toBe(0)
@@ -371,7 +414,7 @@ describe("settle", () => {
             verifiedWith: SIGNING_KEY,
             cid: CID,
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m2"), "c1")
 
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(h.records.has(DID)).toBe(false)
@@ -390,7 +433,7 @@ describe("settle", () => {
                 throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
 
         await settle(h.deps, DID)
 
@@ -407,7 +450,7 @@ describe("settle", () => {
                 throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         await expect(settle(h.deps, DID)).resolves.toBe("deleted")
     })
 
@@ -422,7 +465,7 @@ describe("settle", () => {
                 throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         await settle(h.deps, DID)
 
         expect(await h.deps.index.windowMembers(0)).toContain(DID)
@@ -435,7 +478,7 @@ describe("settle", () => {
             },
         })
         h.revs.set(DID, "3m1")
-        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m2"), "c1")
         await settle(h.deps, DID)
 
         expect(await h.deps.index.isDeleted(DID)).toBe(true)
@@ -455,7 +498,7 @@ describe("settle", () => {
             }),
         })
         h.deleted.add(DID)
-        await intake(h.deps, { collection: COLLECTION }, commit("3m9"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m9"), "c1")
 
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(await h.deps.index.isDeleted(DID)).toBe(false)
@@ -480,7 +523,7 @@ describe("settle", () => {
             verifiedWith: SIGNING_KEY,
             cid: CID,
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m2"), "c1")
 
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(h.records.has(DID)).toBe(false)
@@ -502,12 +545,12 @@ describe("settle", () => {
             },
         })
         h.revs.set(DID, "3m1")
-        await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m2"), "c1")
         await settle(h.deps, DID)
         expect(h.pending.has(DID)).toBe(false)
 
         const id = { kind: "account" as const, did: DID, seq: 2, timeMs: null }
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c2")).toBe("reverify")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c2")).toBe("reverify")
         expect(h.pending.has(DID)).toBe(true)
     })
 })
@@ -521,7 +564,7 @@ describe("settleDue", () => {
                 throw new Error("PDS unreachable")
             },
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
 
         const owed = h.pending.get(DID)
@@ -540,14 +583,14 @@ describe("settleDue", () => {
                 signingKey: SIGNING_KEY,
             }),
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
         expect(h.pending.get(DID)?.notBeforeMs).toBeGreaterThan(h.deps.nowMs())
     })
 
     it("clears the obligation once the fetch succeeds", async () => {
         const h = harness()
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(1)
         expect(h.pending.size).toBe(0)
         expect(h.revs.get(DID)).toBe("3m2")
@@ -568,7 +611,7 @@ describe("settleDue", () => {
                 throw new RecordNotFoundError("RepoNotFound", true)
             },
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
 
         expect(await settleDue(h.deps)).toBe(0)
         // The proof: gone from pending entirely, not deferred with a
@@ -685,7 +728,7 @@ describe("settle keeps the stored DID document", () => {
     it("records the fetched document as of its fetch time less FETCH_AS_OF_SKEW_MS on a stored outcome", async () => {
         const s = sink()
         const h = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(s.writes).toEqual([
             { did: DID, document: DOCUMENT, asOfMs: FETCHED_AT - FETCH_AS_OF_SKEW_MS },
@@ -768,24 +811,24 @@ describe("identity events and the signing-key cache", () => {
         const { owed, keyUpdates } = withKeyUpdates()
         const h = harness({ keyUpdates })
         h.revs.set(DID, "3m1")
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
         expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
     })
 
     it("reverify without keyUpdates → unchanged behaviour", async () => {
         const h = harness()
         h.revs.set(DID, "3m1")
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
         expect(h.pending.has(DID)).toBe(true)
     })
 
     it("ignored identity event (unwatched or permanently deleted) → no key update owed", async () => {
         const { owed, keyUpdates } = withKeyUpdates()
         const h = harness({ keyUpdates })
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         h.revs.set(DID, "3m1")
         h.deleted.add(DID)
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(owed).toEqual([])
     })
 })
@@ -861,7 +904,7 @@ describe("settle verifies at ingest", () => {
         const h = harness({ verify: unverifiable, onChange })
         h.revs.set(DID, "3m1")
         h.records.set(DID, storedEntry())
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(h.records.get(DID)?.rev).toBe("3m1")
         expect(h.revs.get(DID)).toBe("3m1")
@@ -904,7 +947,7 @@ describe("settle verifies at ingest", () => {
             fetchRecord: async () => withDocument(),
             didDocuments: s,
         })
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(s.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
             DID,
@@ -914,7 +957,7 @@ describe("settle verifies at ingest", () => {
 
     it("a malformed CAR is unverifiable, not a transient failure", async () => {
         const h = harness({ verify: unverifiable })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
         // Deferred by the retry interval, not by transient-failure backoff.
         const owed = h.pending.get(DID)
@@ -949,7 +992,7 @@ describe("settle verifies at ingest", () => {
             unverifiableRetryMs: 600_000,
             didDocuments: sinkStub,
         })
-        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
         expect(h.pending.has(DID)).toBe(true)
         expect(await h.deps.index.isWatched(DID)).toBe(true)
@@ -980,7 +1023,7 @@ describe("settle verifies at ingest", () => {
         h.revs.set(DID, "3m1")
         h.records.set(DID, storedEntry())
         const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
-        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(verify.mock.calls[0]![1].signingKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)).toMatchObject({ verifiedWith: ROTATED_KEY })

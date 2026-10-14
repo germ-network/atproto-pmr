@@ -87,6 +87,24 @@ const stubVerify: IngestDeps["verify"] = async (_did, record) =>
               cid: "bafyreistub",
           }
 
+/** Answer secondary fetches with a profile at `rev`, signed under `SIGNING_KEY`. */
+function stubSecondaryFetch(obj: MonitorIngest, log: string[] = [], rev = "3m1") {
+    const o = obj as unknown as {
+        fetchRecordAt: (ref: { did: string }) => Promise<StubFetched>
+        verifyRecordAt: (ref: unknown, record: StubFetched) => ReturnType<IngestDeps["verify"]>
+    }
+    o.fetchRecordAt = async (ref) => {
+        log.push(`fetchRecordAt ${ref.did}`)
+        return { rev, car: new Uint8Array([2]), source: PDS, signingKey: SIGNING_KEY }
+    }
+    o.verifyRecordAt = async (_ref, record) => ({
+        kind: "verified",
+        key: SIGNING_KEY,
+        rev: record.rev,
+        cid: "bafyreiprofile",
+    })
+}
+
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
     fetchRecord: (did: string) => Promise<StubFetched>
@@ -95,6 +113,7 @@ function withFetch(
         ;(obj as unknown as { fetchRecord: typeof fetchRecord }).fetchRecord = fetchRecord
         return settleDue({
             index: obj,
+            interest: obj,
             snapshot: kvSnapshotStore(testEnv),
             fetchRecord,
             verify: stubVerify,
@@ -1055,6 +1074,7 @@ describe("snapshot refresh", () => {
                 return { rev: "3m2", car: new Uint8Array([1]), source: PDS, signingKey: SIGNING_KEY }
             }
             o.verifyRecord = stubVerify
+            stubSecondaryFetch(obj, log)
             o.fetchHeadRev = async (did) => {
                 log.push(`fetchHeadRev ${did}`)
                 return { rev: "3m1", signingKey: SIGNING_KEY }
@@ -1087,6 +1107,8 @@ describe("snapshot refresh", () => {
 
         expect(log.filter((l) => !l.startsWith("seal"))).toEqual([
             "fetchRecord did:plc:refresh-a",
+            // refresh-b joined interest at the start of this tick: its profile is owed.
+            "fetchRecordAt did:plc:refresh-b",
             "fetchHeadRev did:plc:refresh-b",
         ])
         expect(log.indexOf("seal")).toBeGreaterThan(log.indexOf("fetchHeadRev did:plc:refresh-b"))
@@ -1651,6 +1673,7 @@ describe("wiring stored DID documents into the monitor", () => {
                 windowMembers: (w: number) => Promise<string[]>
                 fetchHeadRev: (did: string) => Promise<{ rev: string; signingKey: string | null }>
             }
+            stubSecondaryFetch(obj)
             o.fetchHeadRev = async (did) => {
                 log.push(`refresh ${did}`)
                 return { rev: "3m1", signingKey: SIGNING_KEY }
@@ -1725,17 +1748,6 @@ describe("the PLC export cursor", () => {
     const withUrl = (obj: MonitorIngest, url: string | undefined) => {
         obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
     }
-
-    it("isWatched: a DID in revs, or only pending, is watched; an unknown DID is not", async () => {
-        const stub = freshStub()
-        await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:s11rev", "3m1", 1_000, STUB_VERIFIED)
-            await obj.intake({ did: "did:plc:s11pend", rev: "3m1" }, "1")
-            expect(await obj.isWatched("did:plc:s11rev")).toBe(true)
-            expect(await obj.isWatched("did:plc:s11pend")).toBe(true)
-            expect(await obj.isWatched("did:plc:s11unknown")).toBe(false)
-        })
-    })
 
     it("a permanently deleted DID is not watched", async () => {
         const stub = freshStub()
@@ -2671,26 +2683,6 @@ describe("PLC export consumer", () => {
         await alarmWithFetch(stub)
         expect(await storedCursor(stub)).toBeNull()
         expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.readPlcCursor())).toBeNull()
-    })
-
-    it("KeyUpdateIndex: isWatched covers revs and pending, excludes permanently deleted", async () => {
-        const stub = freshStub()
-        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete("did:plc:inrevs", "3m1", 1, STUB_VERIFIED)
-            await obj.owe("did:plc:inpending", "3m1")
-            await obj.complete("did:plc:gone", "3m1", 1, STUB_VERIFIED)
-            await obj.completeDeletion("did:plc:gone", 2, true)
-            await obj.complete("did:plc:soft", "3m1", 1, STUB_VERIFIED)
-            await obj.completeDeletion("did:plc:soft", 2, false)
-            return {
-                inrevs: await obj.isWatched("did:plc:inrevs"),
-                inpending: await obj.isWatched("did:plc:inpending"),
-                gone: await obj.isWatched("did:plc:gone"),
-                soft: await obj.isWatched("did:plc:soft"),
-                never: await obj.isWatched("did:plc:never"),
-            }
-        })
-        expect(result).toEqual({ inrevs: true, inpending: true, gone: false, soft: true, never: false })
     })
 
     it("KeyUpdateIndex: oweKeyUpdate replaces and bumps version; clearKeyUpdate with a stale version is a no-op", async () => {

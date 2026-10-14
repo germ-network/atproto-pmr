@@ -353,3 +353,34 @@ describe("resolvePDSEndpoint", () => {
         await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
     })
 })
+
+describe("RecordNotFoundError.reason", () => {
+    // A caller tells a missing record from a gone repo by the XRPC error name.
+    it("guardedFetchBytes: a terminal XRPC error carries its error name as reason", async () => {
+        for (const name of ["RecordNotFound", "RepoTakendown"]) {
+            const fetchImpl = (async () =>
+                new Response(JSON.stringify({ error: name }), { status: 400 })) as typeof fetch
+            await expect(
+                guardedFetchBytes(URL_, fetchImpl, { terminalErrorNames: [name] })
+            ).rejects.toMatchObject({ reason: name })
+        }
+    })
+
+    it("guardedFetchJSON: a terminal XRPC error name carries through as reason; a message-prefix match has a null reason", async () => {
+        const named = (async () =>
+            new Response(JSON.stringify({ error: "RepoNotFound" }), { status: 400 })) as typeof fetch
+        await expect(
+            guardedFetchJSON(URL_, named, { terminalErrorNames: ["RepoNotFound"] })
+        ).rejects.toMatchObject({ reason: "RepoNotFound" })
+
+        const tombstone = (async () =>
+            new Response(JSON.stringify({ message: "DID not available: did:plc:xyz" }), {
+                status: 404,
+            })) as typeof fetch
+        const rejection = guardedFetchJSON(URL_, tombstone, {
+            terminalMessagePrefixes: ["DID not available: "],
+        })
+        await expect(rejection).rejects.toBeInstanceOf(RecordNotFoundError)
+        await expect(rejection).rejects.toMatchObject({ reason: null })
+    })
+})
