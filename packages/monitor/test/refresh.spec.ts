@@ -583,8 +583,39 @@ describe("refresh re-verifies", () => {
 describe("refresh pushes a re-key", () => {
     // A re-key whose record does not verify under the new key is still told
     // to the device, once per key, as settle does.
-    it.todo("an unverifiable re-key found by refresh pushes onChange once")
-    it.todo("an unverifiable re-key found by refresh: a second refresh under the same seen key does not push again")
+    function rekeyed() {
+        const other = makeKey()
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m1", other.multikey),
+            fetchRecord: async () => fetched("3m1", decl(1), other),
+        })
+        h.deps.ingest.verify = async () => ({ kind: "unverifiable" })
+        return { h, other }
+    }
+
+    it("an unverifiable re-key found by refresh pushes onChange once", async () => {
+        const { h, other } = rekeyed()
+        const result = await run(h)
+        expect(result.outcomes.failed).toBe(1)
+        expect(h.onChange).toHaveBeenCalledTimes(1)
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.records.get(DID)!.seenKey).toBe(other.multikey)
+        expect(h.records.get(DID)!.verifiedWith).toBe(key.multikey)
+    })
+
+    it("an unverifiable re-key found by refresh: a second refresh under the same seen key does not push again", async () => {
+        const { h } = rekeyed()
+        await run(h)
+        const second = await refreshDue(h.deps, {
+            nowMs: NOW + STALE + 1,
+            staleAfterMs: STALE,
+            limit: 64,
+        })
+        expect(second.outcomes.failed).toBe(1)
+        expect(h.onChange).toHaveBeenCalledTimes(1)
+    })
 })
 
 describe("one head check covers every record", () => {

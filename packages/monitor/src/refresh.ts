@@ -13,7 +13,13 @@ import {
     readRecordFromCar,
     type WatchedRecord,
 } from "@germ-network/atproto-pmr-core"
-import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
+import {
+    pushNewlySeenKey,
+    recordFetchedDocument,
+    settle,
+    settleDeletion,
+    type IngestDeps,
+} from "./ingest"
 import type { HeadRev } from "./fetch-record"
 import type { SecondaryDeps } from "./secondary"
 import { compareRev, type VerifiedWrite } from "./storage"
@@ -187,9 +193,10 @@ async function refreshOne(
     await recordFetchedDocument(ingest, did, fetched.didDocument)
     const verified = await ingest.verify(did, fetched)
     if (verified.kind === "unverifiable") {
-        // Not evidence of anything: leave the snapshot as it is and retry
-        // next interval.
+        // Not evidence of anything: the stored record stands and the DID is
+        // retried next interval. Only a newly seen key is recorded and pushed.
         await deps.refreshIndex.markAttempted(did, nowMs)
+        await pushNewlySeenKey(ingest, did, fetched.signingKey)
         return "failed"
     }
     if (verified.kind === "verified-absent") {

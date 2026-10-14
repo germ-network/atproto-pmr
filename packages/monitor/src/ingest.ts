@@ -349,7 +349,7 @@ async function settleUnverifiable(
  * means a rotation the monitor cannot itself vouch for; the device can
  * verify for itself, so it is told once per newly seen key.
  */
-async function pushNewlySeenKey(
+export async function pushNewlySeenKey(
     deps: IngestDeps,
     did: string,
     fetchedKey: string | null
