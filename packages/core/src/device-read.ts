@@ -10,6 +10,8 @@ import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import type { FollowEdge } from "./follow-edges.js"
 import {
+    GRAPH_EDGE_KEYS,
+    GRAPH_READ_KEYS,
     RECORD_READ_KEYS,
     type GraphEdge,
     type GraphReadResponse,
@@ -271,12 +273,52 @@ function compareStrings(a: string, b: string): number {
 }
 
 export function encodeGraphReadResponse(response: GraphReadResponse): Uint8Array {
-    throw new Error("not implemented")
+    const edges = (list: GraphEdge[]): CoseValue[] =>
+        list.map(
+            (e) =>
+                new Map<string, CoseValue>([
+                    [GRAPH_EDGE_KEYS.did, e.did],
+                    [GRAPH_EDGE_KEYS.rkey, e.rkey],
+                    [GRAPH_EDGE_KEYS.mutual, e.mutual],
+                ])
+        )
+    return encodeCose(
+        new Map<string, CoseValue>([
+            [GRAPH_READ_KEYS.did, response.did],
+            [GRAPH_READ_KEYS.following, edges(response.following)],
+            [GRAPH_READ_KEYS.followers, edges(response.followers)],
+        ])
+    )
 }
 
 /** Ignores keys it does not know; throws on a body missing a required field. */
 export function decodeGraphReadResponse(bytes: Uint8Array): GraphReadResponse {
-    throw new Error("not implemented")
+    const map = decodeCoseMap(bytes)
+    const did = map.get(GRAPH_READ_KEYS.did)
+    if (typeof did !== "string") throw new Error("graph read: missing or malformed did")
+    const edges = (key: string): GraphEdge[] => {
+        const list = map.get(key)
+        if (!Array.isArray(list)) throw new Error(`graph read: missing or malformed "${key}"`)
+        return list.map((item) => {
+            if (!(item instanceof Map)) throw new Error("graph read: malformed edge")
+            const edgeDid = item.get(GRAPH_EDGE_KEYS.did)
+            const rkey = item.get(GRAPH_EDGE_KEYS.rkey)
+            const mutual = item.get(GRAPH_EDGE_KEYS.mutual)
+            if (
+                typeof edgeDid !== "string" ||
+                typeof rkey !== "string" ||
+                typeof mutual !== "boolean"
+            ) {
+                throw new Error("graph read: malformed edge")
+            }
+            return { did: edgeDid, rkey, mutual }
+        })
+    }
+    return {
+        did,
+        following: edges(GRAPH_READ_KEYS.following),
+        followers: edges(GRAPH_READ_KEYS.followers),
+    }
 }
 
 /**
@@ -310,5 +352,29 @@ export async function handleGraphRead(
     request: Request,
     deps: GraphReadDeps
 ): Promise<Response> {
-    throw new Error("not implemented")
+    const parts = new URL(request.url).pathname.split("/")
+    // "", "pmr", "v1", "graph", did
+    let did: string | null = null
+    if (parts.length === 5 && parts[1] === "pmr" && parts[2] === "v1" && parts[3] === "graph") {
+        try {
+            const decoded = decodeURIComponent(parts[4])
+            if (DID_SYNTAX.test(decoded)) did = decoded
+        } catch {
+            // malformed escape: same 400 as any other bad path
+        }
+    }
+    if (did === null) {
+        return new Response("Malformed path", {
+            status: 400,
+            headers: { "cache-control": "no-store" },
+        })
+    }
+    const projection = await deps.projections.get(did)
+    if (!projection) {
+        return new Response(null, { status: 404, headers: { "cache-control": "no-store" } })
+    }
+    return new Response(toResponseBody(encodeGraphReadResponse(projection)), {
+        status: 200,
+        headers: { "content-type": "application/cbor", "cache-control": "no-store" },
+    })
 }

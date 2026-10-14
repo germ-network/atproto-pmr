@@ -9,13 +9,23 @@ import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
 import {
     decodeRecordReadResponse,
     dedupedRecheck,
+    decodeGraphReadResponse,
+    encodeGraphReadResponse,
     encodeRecordReadResponse,
+    handleGraphRead,
     handleRecordRead,
+    type GraphReadDeps,
     projectGraph,
     type RecordReadDeps,
 } from "../src/device-read"
 import type { FollowEdge } from "../src/follow-edges"
-import { RECORD_READ_KEYS, type RecordReadResponse } from "../src/read-api"
+import {
+    GRAPH_EDGE_KEYS,
+    GRAPH_READ_KEYS,
+    RECORD_READ_KEYS,
+    type GraphReadResponse,
+    type RecordReadResponse,
+} from "../src/read-api"
 import { SNAPSHOT_MAX_AGE_MS, type StoredRecordSnapshot } from "../src/snapshot-read"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
 
@@ -512,8 +522,123 @@ describe("projectGraph", () => {
 })
 
 describe("graph read", () => {
-    it.todo("serves the held projection as a GraphReadResponse with cache-control no-store")
-    it.todo("a DID with no projection (not served) is 404")
-    it.todo("answers identically whatever headers or credentials the request carries")
-    it.todo("the codec round-trips and ignores unknown keys")
+    const GRAPH_DID = "did:plc:me"
+    const projection: GraphReadResponse = {
+        did: GRAPH_DID,
+        following: [{ did: "did:plc:a", rkey: "r1", mutual: true }],
+        followers: [
+            { did: "did:plc:a", rkey: "r3", mutual: true },
+            { did: "did:plc:b", rkey: "r2", mutual: false },
+        ],
+    }
+    const deps = (held: GraphReadResponse | null, asked: string[] = []): GraphReadDeps => ({
+        projections: {
+            get: async (did) => {
+                asked.push(did)
+                return held
+            },
+        },
+    })
+    const graphGet = (did: string, headers: Record<string, string> = {}) =>
+        get(`/pmr/v1/graph/${did}`, headers)
+
+    it("serves the held projection as a GraphReadResponse with cache-control no-store", async () => {
+        const asked: string[] = []
+        const res = await handleGraphRead(graphGet(GRAPH_DID), deps(projection, asked))
+        expect(res.status).toBe(200)
+        expect(res.headers.get("cache-control")).toBe("no-store")
+        expect(res.headers.get("content-type")).toBe("application/cbor")
+        expect(res.headers.get("etag")).toBeNull()
+        expect(decodeGraphReadResponse(new Uint8Array(await res.arrayBuffer()))).toEqual(projection)
+        expect(asked).toEqual([GRAPH_DID])
+    })
+
+    it("an escaped DID segment reaches the store decoded", async () => {
+        const asked: string[] = []
+        await handleGraphRead(graphGet("did%3Aplc%3Ame"), deps(projection, asked))
+        expect(asked).toEqual([GRAPH_DID])
+    })
+
+    it("a DID with no projection (not served) is 404", async () => {
+        const res = await handleGraphRead(graphGet(GRAPH_DID), deps(null))
+        expect(res.status).toBe(404)
+        expect(res.headers.get("cache-control")).toBe("no-store")
+    })
+
+    it("a malformed path is 400 and never reaches the store", async () => {
+        const asked: string[] = []
+        for (const path of [
+            "/pmr/v1/graph",
+            "/pmr/v1/graph/not-a-did",
+            `/pmr/v1/graph/${GRAPH_DID}/x`,
+            "/pmr/v1/graph/%E0%A4%A",
+        ]) {
+            const res = await handleGraphRead(get(path), deps(projection, asked))
+            expect(res.status).toBe(400)
+        }
+        expect(asked).toEqual([])
+    })
+
+    it("answers identically whatever headers or credentials the request carries", async () => {
+        const plain = await handleGraphRead(graphGet(GRAPH_DID), deps(projection))
+        const decorated = await handleGraphRead(
+            graphGet(GRAPH_DID, {
+                authorization: "Bearer x",
+                signature: "sig1=:AAAA:",
+                "if-none-match": '"anything"',
+                cookie: "a=b",
+            }),
+            deps(projection)
+        )
+        expect(decorated.status).toBe(plain.status)
+        expect([...decorated.headers]).toEqual([...plain.headers])
+        expect(new Uint8Array(await decorated.arrayBuffer())).toEqual(
+            new Uint8Array(await plain.arrayBuffer())
+        )
+    })
+
+    it("the codec round-trips and ignores unknown keys", () => {
+        expect(decodeGraphReadResponse(encodeGraphReadResponse(projection))).toEqual(projection)
+        const withUnknown = encodeCose(
+            new Map<string, CoseValue>([
+                [GRAPH_READ_KEYS.did, GRAPH_DID],
+                [
+                    GRAPH_READ_KEYS.following,
+                    [
+                        new Map<string, CoseValue>([
+                            [GRAPH_EDGE_KEYS.did, "did:plc:a"],
+                            [GRAPH_EDGE_KEYS.rkey, "r1"],
+                            [GRAPH_EDGE_KEYS.mutual, false],
+                            ["zz", 1],
+                        ]),
+                    ],
+                ],
+                [GRAPH_READ_KEYS.followers, []],
+                ["zz", "extra"],
+            ])
+        )
+        expect(decodeGraphReadResponse(withUnknown)).toEqual({
+            did: GRAPH_DID,
+            following: [{ did: "did:plc:a", rkey: "r1", mutual: false }],
+            followers: [],
+        })
+    })
+
+    it("decode rejects a body missing a required field", () => {
+        const noFollowers = encodeCose(
+            new Map<string, CoseValue>([
+                [GRAPH_READ_KEYS.did, GRAPH_DID],
+                [GRAPH_READ_KEYS.following, []],
+            ])
+        )
+        expect(() => decodeGraphReadResponse(noFollowers)).toThrow()
+        const badEdge = encodeCose(
+            new Map<string, CoseValue>([
+                [GRAPH_READ_KEYS.did, GRAPH_DID],
+                [GRAPH_READ_KEYS.following, [new Map<string, CoseValue>([[GRAPH_EDGE_KEYS.did, "x"]])]],
+                [GRAPH_READ_KEYS.followers, []],
+            ])
+        )
+        expect(() => decodeGraphReadResponse(badEdge)).toThrow()
+    })
 })
