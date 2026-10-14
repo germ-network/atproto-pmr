@@ -57,6 +57,14 @@ BACKFILL_BATCH = "100"
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
 
+# Optional. The PLC directory's export stream (the https form of
+# wss://plc.directory/export/stream). With it set, a stored did:plc document
+# follows a change as soon as the directory accepts it, and a relay trusts it
+# for 24 h while the stream is caught up. Unset, no second socket is opened and
+# stored did:plc documents are trusted only for the direct-fetch TTL. Keep it the
+# same directory the monitor's fetches and the relay's fallback read.
+# PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
+
 # The snapshot and sealed digest windows. Read by plain Workers on the
 # public paths — the community view should scale like the public data it
 # is, rather than funnel through the ingest object.

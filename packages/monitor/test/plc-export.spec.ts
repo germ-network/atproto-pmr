@@ -8,6 +8,7 @@ import { renderPlcDocument } from "@germ-network/atproto-pmr-core"
 import {
     decodePlcExportFrame,
     intakePlcEvent,
+    plcCursorAfterClose,
     type PlcExportEvent,
     type PlcIntakeDeps,
 } from "../src/plc-export"
@@ -127,10 +128,23 @@ describe("decodePlcExportFrame", () => {
 })
 
 describe("plcCursorAfterClose", () => {
-    it.todo("OutdatedCursor resets the cursor")
-    it.todo("FutureCursor resets the cursor")
-    it.todo("ConsumerTooSlow keeps the cursor")
-    it.todo("an empty or unknown reason keeps the cursor")
+    it("OutdatedCursor resets the cursor", () => {
+        expect(plcCursorAfterClose("OutdatedCursor")).toBe("reset")
+    })
+
+    it("FutureCursor resets the cursor", () => {
+        expect(plcCursorAfterClose("FutureCursor")).toBe("reset")
+    })
+
+    it("ConsumerTooSlow keeps the cursor", () => {
+        expect(plcCursorAfterClose("ConsumerTooSlow")).toBe("keep")
+    })
+
+    it("an empty or unknown reason keeps the cursor", () => {
+        for (const reason of ["", "going away", "outdatedcursor", "SomethingElse"]) {
+            expect(plcCursorAfterClose(reason)).toBe("keep")
+        }
+    })
 })
 
 describe("intakePlcEvent", () => {

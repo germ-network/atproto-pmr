@@ -43,6 +43,10 @@ BACKFILL_BATCH = "100"
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
 
+# The PLC directory's export stream (https form of wss://plc.directory/export/stream).
+# Optional; unset, the monitor opens no second socket.
+PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
+
 [[kv_namespaces]]
 	binding = "records"
 	id = "test"

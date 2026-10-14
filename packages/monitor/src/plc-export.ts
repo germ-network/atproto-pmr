@@ -87,8 +87,7 @@ export type PlcCursorAction = "keep" | "reset"
  * close resumes from the cursor.
  */
 export function plcCursorAfterClose(reason: string): PlcCursorAction {
-    void reason
-    throw new Error("not implemented")
+    return reason === "OutdatedCursor" || reason === "FutureCursor" ? "reset" : "keep"
 }
 
 export interface PlcIntakeDeps {

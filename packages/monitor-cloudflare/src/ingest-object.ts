@@ -1,7 +1,10 @@
 import { DurableObject } from "cloudflare:workers"
 import {
     decodeEvent,
+    decodePlcExportFrame,
     intake,
+    intakePlcEvent,
+    plcCursorAfterClose,
     listReposByCollection,
     fetchHeadRev,
     pushDeclarationChange,
@@ -111,6 +114,9 @@ export class MonitorIngest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
+    private plcSocket: WebSocket | null = null
+    /** Frames and closes of the PLC socket, handled one at a time in arrival order. */
+    private plcChain: Promise<void> = Promise.resolve()
     /** The export stream's high-water mark and the start of its current unbroken run. */
     private plcHighSeq: number | null = null
     private plcHighCreatedAtMs: number | null = null
@@ -418,7 +424,8 @@ export class MonitorIngest
     }
 
     /**
-     * Pick the stored run back up after the object was evicted: when the
+     * Pick the stored run back up after the object was evicted (an object
+     * still holding a cursor in memory keeps and returns it): when the
      * stored cursor is for `url`, the high-water seq and the run's start are
      * restored (so the run is not restarted by the next frame) and its seq is
      * returned. Null when nothing is stored for `url`, or what is stored is
@@ -426,6 +433,9 @@ export class MonitorIngest
      * are dropped, and the next frame starts a new run.
      */
     async resumePlcCursor(url: string): Promise<number | null> {
+        // A live object already holds the newest cursor and run in memory;
+        // the stream URL comes from the environment and cannot change under it.
+        if (this.plcHighSeq !== null) return this.plcHighSeq
         const row = this.db.sql
             .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
             .toArray()[0]
@@ -481,7 +491,85 @@ export class MonitorIngest
      * variable is unset or the socket is open.
      */
     async connectPlc(): Promise<void> {
-        throw new Error("not implemented")
+        const streamUrl = this.env.PLC_EXPORT_STREAM_URL
+        if (streamUrl === undefined || streamUrl === "" || this.plcSocket !== null) return
+        const seq = await this.resumePlcCursor(streamUrl)
+        const url = new URL(streamUrl)
+        if (seq !== null) url.searchParams.set("cursor", String(seq))
+
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS)
+        let response: Response
+        try {
+            response = await fetch(url, {
+                headers: { Upgrade: "websocket" },
+                signal: controller.signal,
+            })
+        } finally {
+            clearTimeout(timer)
+        }
+        const ws = response.webSocket
+        if (ws === null) throw new Error("plc export stream did not upgrade")
+        ws.accept()
+        this.plcSocket = ws
+
+        ws.addEventListener("message", (event) => {
+            void this.enqueuePlcFrame(String(event.data))
+        })
+        ws.addEventListener("close", (event) => {
+            void this.onPlcClose(ws, event.reason)
+        })
+        ws.addEventListener("error", () => this.onPlcError(ws))
+    }
+
+    /** A socket error frees the slot for a reconnect, unless a newer socket holds it. */
+    private onPlcError(ws: WebSocket): void {
+        if (this.plcSocket === ws) this.plcSocket = null
+    }
+
+    /**
+     * Append one frame to the chain that handles them in order. A frame that
+     * fails is logged and the chain carries on, but the coverage run ends: an
+     * operation the stored documents never took in must not be vouched for,
+     * so the next frame starts a new run and nothing is claimed until that
+     * run's row is stored. The stored seq is kept.
+     */
+    private enqueuePlcFrame(raw: string): Promise<void> {
+        const next = this.plcChain.then(async () => {
+            const event = decodePlcExportFrame(raw)
+            if (event === null) return
+            await intakePlcEvent({ index: this, didDocuments: this }, event)
+        })
+        this.plcChain = next.catch((err) => {
+            console.error("monitor: PLC frame failed", err)
+            this.endPlcRun()
+        })
+        return this.plcChain
+    }
+
+    /** Stop vouching for the stream's current run; the seq stays. */
+    private endPlcRun(): void {
+        this.plcContinuousSinceMs = null
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
+    }
+
+    /**
+     * A stream close: drop a cursor that can never resume, then allow a
+     * reconnect. A close from a socket that has since been replaced by a live
+     * one is ignored.
+     */
+    private onPlcClose(ws: WebSocket | null, reason: string): Promise<void> {
+        this.plcChain = this.plcChain
+            .then(async () => {
+                if (this.plcSocket !== null && this.plcSocket !== ws) return
+                if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
+                this.plcSocket = null
+            })
+            .catch((err) => {
+                console.error("monitor: PLC close failed", err)
+            })
+        return this.plcChain
     }
 
     // ---- MonitorIndex -----------------------------------------------------
@@ -989,6 +1077,11 @@ export class MonitorIngest
         try {
             if (this.socket === null) await this.connect()
         } finally {
+            try {
+                await this.connectPlc()
+            } catch (err) {
+                console.error("monitor: PLC export connect failed", err)
+            }
             // Before settling, so a DID this sweep just discovered is
             // eligible for the same tick's settle pass rather than
             // waiting a full watchdog interval — `SETTLE_BATCH` still
@@ -1035,11 +1128,18 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: PLC cursor persist failed", err)
             }
+            let coveredThroughMs: number | null = null
             try {
                 const published = await this.publishDidDocuments(DID_DOCUMENT_PUBLISH_BATCH)
+                coveredThroughMs = published.coveredThroughMs
                 console.log("monitor: did documents", published)
             } catch (err) {
                 console.error("monitor: did document publish failed", err)
+            }
+            try {
+                await this.publishPlcCoverage(coveredThroughMs)
+            } catch (err) {
+                console.error("monitor: PLC coverage publish failed", err)
             }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.

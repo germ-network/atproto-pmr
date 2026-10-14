@@ -1880,6 +1880,7 @@ describe("PLC stream coverage", () => {
         await testEnv.records.delete("plc:coverage")
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, undefined)
             await obj.advancePlcCursor(1, 1_000)
             withUrl(obj, URL_A)
             await obj.publishPlcCoverage(1_000)
@@ -2026,8 +2027,390 @@ describe("PLC stream coverage", () => {
 })
 
 describe("PLC export consumer", () => {
-    it.todo("connectPlc is a no-op when PLC_EXPORT_STREAM_URL is unset")
-    it.todo("connectPlc sends the stored seq as the cursor parameter, and none when there is no cursor for this URL")
-    it.todo("a failed PLC connect does not skip the rest of the alarm")
-    it.todo("the alarm persists the PLC cursor before publishing coverage and before sealing")
+    const URL_A = "https://plc.example/export/stream"
+    const WATCHED = "did:plc:s13watched"
+    const OP = {
+        sig: "x",
+        prev: null,
+        type: "plc_operation",
+        services: { atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://pds.example" } },
+        alsoKnownAs: ["at://s13.example"],
+        rotationKeys: ["did:key:zQ3shhCGUqDKjStzuDxPkTxN6ujddP4RkEKJJouJGRRkaLGbg"],
+        verificationMethods: { atproto: "did:key:zQ3shXjHeiBuRCKmM36cuYnm7YEMzhGnCmCyW92sRJ9pribSF" },
+    }
+    const frame = (did: string, seq: number, createdAt = "2026-01-01T00:00:00.000Z") =>
+        JSON.stringify({ did, cid: "bafy", seq, createdAt, operation: OP, type: "sequenced_op" })
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+    type Internals = {
+        plcSocket: unknown
+        enqueuePlcFrame(raw: string): Promise<void>
+        onPlcClose(ws: WebSocket | null, reason: string): Promise<void>
+        connectPlc(): Promise<void>
+    }
+    const internals = (obj: MonitorIngest) => obj as unknown as Internals
+
+    /** Record the URLs the object asks fetch for while `fn` runs; every request fails to upgrade. */
+    async function recordingFetch(fn: () => Promise<unknown>): Promise<URL[]> {
+        const seen: URL[] = []
+        const original = globalThis.fetch
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            seen.push(new URL(String(input)))
+            return Promise.resolve(new Response(null, { status: 200 }))
+        }) as typeof fetch
+        try {
+            await fn().catch(() => {})
+        } finally {
+            globalThis.fetch = original
+        }
+        return seen
+    }
+
+    it("connectPlc is a no-op when PLC_EXPORT_STREAM_URL is unset", async () => {
+        const stub = freshStub()
+        let outcome = "not run"
+        const seen = await recordingFetch(async () => {
+            outcome = await inMonitorObj(stub, async (obj) => {
+                withUrl(obj, undefined)
+                return internals(obj).connectPlc().then(
+                    () => "resolved",
+                    (err) => String(err)
+                )
+            })
+        })
+        expect(outcome).toBe("resolved")
+        expect(seen).toEqual([])
+    })
+
+    it("connectPlc sends the stored seq as the cursor parameter, and none when there is no cursor for this URL", async () => {
+        const stub = freshStub()
+        const fresh = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(fresh).toHaveLength(1)
+        expect(fresh[0]!.origin + fresh[0]!.pathname).toBe(URL_A)
+        expect(fresh[0]!.searchParams.has("cursor")).toBe(false)
+
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(41, 1_000)
+        })
+        await evictDurableObject(stub)
+        const resumed = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(resumed[0]!.searchParams.get("cursor")).toBe("41")
+
+        await evictDurableObject(stub)
+        const other = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, "https://other.example/export/stream")
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(other[0]!.searchParams.has("cursor")).toBe(false)
+    })
+
+    it("a live object resumes from its newest cursor in memory, not the stored one", async () => {
+        const stub = freshStub()
+        const seen = await recordingFetch(() =>
+            inMonitorObj(stub, async (obj) => {
+                withUrl(obj, URL_A)
+                await obj.advancePlcCursor(41, 1_000)
+                await obj.advancePlcCursor(50, 2_000)
+                expect(await obj.readPlcCursor(URL_A)).toBe(41)
+                await internals(obj).connectPlc()
+            })
+        )
+        expect(seen[0]!.searchParams.get("cursor")).toBe("50")
+    })
+
+    it("a failed PLC connect does not skip the rest of the alarm", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {
+                log.push("connectPlc")
+                throw new Error("plc down")
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: null }
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect(log).toContain("connectPlc")
+        expect(log.indexOf("publish")).toBeGreaterThan(log.indexOf("connectPlc"))
+        expect(log).toContain("seal")
+    })
+
+    async function runAlarm(stub: DurableObjectStub<MonitorIngest>) {
+        const original = globalThis.fetch
+        globalThis.fetch = ((url: RequestInfo | URL) =>
+            Promise.resolve(
+                String(url).includes("listReposByCollection")
+                    ? Response.json({ repos: [] })
+                    : new Response(null, { status: 200 })
+            )) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+    }
+
+    it("the alarm persists the PLC cursor before publishing coverage and before sealing", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                persistPlcCursor: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            const persist = obj.persistPlcCursor.bind(obj)
+            o.persistPlcCursor = async () => {
+                log.push("persist")
+                return persist()
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: 1_234 }
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13order", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["persist", "publish", "coverage 1234", "seal"])
+    })
+
+    it("a publish failure still re-publishes the previous coverage and does not skip sealing", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            o.publishDidDocuments = async () => {
+                throw new Error("kv down")
+            }
+            o.publishPlcCoverage = async (through) => {
+                log.push(`coverage ${through}`)
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13fail", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["coverage null", "seal"])
+    })
+
+    it("a failing cursor persist and a failing coverage publish each leave the rest of the alarm to run", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const o = obj as unknown as {
+                connectPlc: () => Promise<void>
+                persistPlcCursor: () => Promise<void>
+                publishDidDocuments: (n: number) => Promise<unknown>
+                publishPlcCoverage: (through: number | null) => Promise<void>
+                windowMembers: (w: number) => Promise<string[]>
+            }
+            o.connectPlc = async () => {}
+            o.persistPlcCursor = async () => {
+                log.push("persist")
+                throw new Error("sqlite down")
+            }
+            o.publishDidDocuments = async () => {
+                log.push("publish")
+                return { published: 0, remaining: 0, coveredThroughMs: null }
+            }
+            o.publishPlcCoverage = async () => {
+                log.push("coverage")
+                throw new Error("kv down")
+            }
+            const windowMembers = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w) => {
+                log.push("seal")
+                return windowMembers(w)
+            }
+            await obj.complete("did:plc:s13both", "3m1", Date.now() - 3 * 3_600_000)
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await runAlarm(stub)
+        expect([...new Set(log)]).toEqual(["persist", "publish", "coverage", "seal"])
+    })
+
+    it("frames are handled strictly in order on one chain, and a bad frame does not break it", async () => {
+        const stub = freshStub()
+        const other = "did:plc:s13unwatched"
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(WATCHED, "3m1", 1_000)
+            const advanced: number[] = []
+            const advance = obj.advancePlcCursor.bind(obj)
+            obj.advancePlcCursor = async (seq, createdAtMs) => {
+                advanced.push(seq)
+                return advance(seq, createdAtMs)
+            }
+            const real = obj.recordDidDocument.bind(obj)
+            let first = true
+            obj.recordDidDocument = async (did, doc, asOf) => {
+                if (first) {
+                    first = false
+                    await new Promise((resolve) => setTimeout(resolve, 20))
+                }
+                return real(did, doc, asOf)
+            }
+            const chain = internals(obj)
+            await Promise.all([
+                chain.enqueuePlcFrame(frame(WATCHED, 1, "2026-01-01T00:00:01.000Z")),
+                chain.enqueuePlcFrame("not json"),
+                chain.enqueuePlcFrame(frame(other, 2, "2026-01-01T00:00:02.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 3, "2026-01-01T00:00:03.000Z")),
+            ])
+            await obj.persistPlcCursor()
+            expect(advanced).toEqual([1, 2, 3])
+        })
+        const rows = await runInDurableObject(stub, (_obj, state) => ({
+            docs: state.storage.sql
+                .exec<{ did: string; as_of: number }>("SELECT did, as_of FROM did_documents")
+                .toArray(),
+            cursor: JSON.parse(
+                state.storage.sql
+                    .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                    .one().v
+            ) as { seq: number },
+        }))
+        expect(rows.docs).toEqual([{ did: WATCHED, as_of: Date.parse("2026-01-01T00:00:03.000Z") }])
+        expect(rows.cursor.seq).toBe(3)
+    })
+
+    it("a frame that throws in intake does not stop later frames, and ends the coverage run", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.complete(WATCHED, "3m1", 1_000)
+            const real = obj.recordDidDocument.bind(obj)
+            let calls = 0
+            obj.recordDidDocument = async (did, doc, asOf) => {
+                calls += 1
+                if (calls === 2) throw new Error("sqlite down")
+                return real(did, doc, asOf)
+            }
+            const chain = internals(obj)
+            await Promise.all([
+                chain.enqueuePlcFrame(frame(WATCHED, 1, "2026-01-01T00:00:01.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 2, "2026-01-01T00:00:02.000Z")),
+                chain.enqueuePlcFrame(frame(WATCHED, 3, "2026-01-01T00:00:05.000Z")),
+            ])
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(Date.parse("2026-01-01T00:00:05.000Z"))
+        })
+        const docs = await runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql.exec<{ as_of: number }>("SELECT as_of FROM did_documents").toArray()
+        )
+        expect(docs).toEqual([{ as_of: Date.parse("2026-01-01T00:00:05.000Z") }])
+        const marker = JSON.parse((await testEnv.records.get("plc:coverage"))!) as {
+            continuousSinceMs: number
+        }
+        expect(marker.continuousSinceMs).toBe(Date.parse("2026-01-01T00:00:05.000Z"))
+    })
+
+    it("closing with OutdatedCursor or FutureCursor resets the cursor; any other close keeps it; a close re-enables reconnecting", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const chain = internals(obj)
+            const socket = {} as WebSocket
+            const open = () => ((obj as unknown as { plcSocket: unknown }).plcSocket = socket)
+            await obj.advancePlcCursor(8, 8_000)
+            open()
+            await chain.onPlcClose(socket, "ConsumerTooSlow")
+            expect(await obj.readPlcCursor(URL_A)).toBe(8)
+            expect(chain.plcSocket).toBeNull()
+            open()
+            await chain.onPlcClose(socket, "OutdatedCursor")
+            expect(await obj.readPlcCursor(URL_A)).toBeNull()
+            expect(chain.plcSocket).toBeNull()
+            await obj.advancePlcCursor(9, 9_000)
+            open()
+            await chain.onPlcClose(socket, "FutureCursor")
+            expect(await obj.readPlcCursor(URL_A)).toBeNull()
+            expect(chain.plcSocket).toBeNull()
+        })
+    })
+
+    it("a socket error frees the slot for its own socket only", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            const internal = obj as unknown as { plcSocket: unknown; onPlcError(ws: WebSocket): void }
+            const old = {} as WebSocket
+            const live = {} as WebSocket
+            internal.plcSocket = live
+            internal.onPlcError(old)
+            expect(internal.plcSocket).toBe(live)
+            internal.onPlcError(live)
+            expect(internal.plcSocket).toBeNull()
+        })
+    })
+
+    it("a late close from a replaced socket neither resets the cursor nor drops the live socket", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            const chain = internals(obj)
+            const old = {} as WebSocket
+            const live = {} as WebSocket
+            await obj.advancePlcCursor(8, 8_000)
+            ;(obj as unknown as { plcSocket: unknown }).plcSocket = live
+            await chain.onPlcClose(old, "OutdatedCursor")
+            expect(chain.plcSocket).toBe(live)
+            expect(await obj.readPlcCursor(URL_A)).toBe(8)
+        })
+    })
 })
