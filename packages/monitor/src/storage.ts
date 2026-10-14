@@ -672,6 +672,11 @@ export interface SecondaryIndex {
     ): Promise<SecondaryWriteAnswer | "disposed">
     /** The indexed rev of one secondary, for the check before a KV put. */
     secondaryRevOf(ref: RecordRef): Promise<string | null>
+    /**
+     * Drop every secondary's `records` and `rec_pending` row for `did`, after
+     * their snapshots are deleted: the repo itself is gone.
+     */
+    forgetSecondaries(did: string): Promise<void>
 }
 
 /**

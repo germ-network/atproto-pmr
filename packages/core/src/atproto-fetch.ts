@@ -208,7 +208,7 @@ export async function guardedFetchJSON(
                     const permanent =
                         options.permanentErrorNames === undefined ||
                         options.permanentErrorNames.includes(err.error)
-                    throw new RecordNotFoundError(err.error, permanent)
+                    throw new RecordNotFoundError(err.error, permanent, err.error)
                 }
                 if (
                     options.terminalMessagePrefixes !== undefined &&
@@ -379,7 +379,7 @@ export async function guardedFetchBytes(
                     const permanent =
                         options.permanentErrorNames === undefined ||
                         options.permanentErrorNames.includes(name)
-                    throw new RecordNotFoundError(name, permanent)
+                    throw new RecordNotFoundError(name, permanent, name)
                 }
             }
             throw new Error(`endpoint answered ${response.status}`)

@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers"
 import {
     applyInterestTransitions,
+    compareRev,
     decodeEvent,
+    fetchRecordCar,
     decodePlcExportFrame,
     drainKeyUpdates,
     intake,
@@ -14,6 +16,7 @@ import {
     refreshDue,
     sealDueWindows,
     settleDue,
+    settleSecondaryDue,
     sweepBackfill,
     windowOf,
     type BackfillProgress,
@@ -29,6 +32,7 @@ import {
     type InterestTransition,
     type PendingRecordFetch,
     type RecordRef,
+    type SecondaryDeps,
     type SecondaryIndex,
     type SecondaryWriteAnswer,
     type KeyUpdateIndex,
@@ -140,6 +144,9 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  * implemented here: resolving a DID document and reading from that DID's
  * own PDS is a policy decision (which resolver, which timeouts) that belongs
  * to a deployment, not to a storage adapter; verifying what it returns is not.
+ * The secondary records' fetch (`fetchRecordAt`) and the head read
+ * (`fetchHeadRev`) do have working defaults over the global `fetch`, which a
+ * deployment may override the same way.
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
@@ -1428,37 +1435,148 @@ export class MonitorIngest
 
     // ---- SecondaryIndex ---------------------------------------------------
 
-    async dueSecondaries(_nowMs: number, _limit: number): Promise<PendingRecordFetch[]> {
-        throw new Error("not implemented")
+    async dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                attempts: number
+                not_before: number
+                epoch: number
+            }>(
+                "SELECT did, collection, rkey, rev, attempts, not_before, epoch FROM rec_pending " +
+                    "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
+                nowMs,
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                attempts: r.attempts,
+                notBeforeMs: r.not_before,
+                epoch: r.epoch,
+            }))
     }
 
-    async deferSecondary(_ref: RecordRef, _notBeforeMs: number): Promise<void> {
-        throw new Error("not implemented")
+    async deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void> {
+        this.db.sql.exec(
+            "UPDATE rec_pending SET attempts = attempts + 1, not_before = ? " +
+                "WHERE did = ? AND collection = ? AND rkey = ?",
+            notBeforeMs,
+            ref.did,
+            ref.collection,
+            ref.rkey
+        )
     }
 
-    async clearSecondary(_ref: RecordRef): Promise<void> {
-        throw new Error("not implemented")
+    async clearSecondary(ref: RecordRef): Promise<void> {
+        this.db.sql.exec(
+            "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
+            ref.did,
+            ref.collection,
+            ref.rkey
+        )
     }
 
     async completeSecondary(
-        _ref: RecordRef,
-        _rev: string,
-        _verified: VerifiedWrite,
-        _epoch: number
+        ref: RecordRef,
+        rev: string,
+        verified: VerifiedWrite,
+        epoch: number
     ): Promise<SecondaryWriteAnswer | "stored"> {
-        throw new Error("not implemented")
+        return this.ctx.storage.transactionSync(() => {
+            const refusal = this.secondaryRefusal(ref, rev, epoch)
+            if (refusal !== null) return refusal
+            this.db.sql.exec(
+                "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
+                    "VALUES (?, ?, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did, collection, rkey) DO UPDATE SET rev = excluded.rev, " +
+                    "cid = excluded.cid, verified_with = excluded.verified_with",
+                ref.did,
+                ref.collection,
+                ref.rkey,
+                rev,
+                verified.cid,
+                verified.verifiedWith
+            )
+            this.clearSecondarySync(ref)
+            return "stored" as const
+        })
     }
 
     async disposeSecondary(
-        _ref: RecordRef,
-        _rev: string,
-        _epoch: number
+        ref: RecordRef,
+        rev: string,
+        epoch: number
     ): Promise<SecondaryWriteAnswer | "disposed"> {
-        throw new Error("not implemented")
+        return this.ctx.storage.transactionSync(() => {
+            const refusal = this.secondaryRefusal(ref, rev, epoch)
+            if (refusal !== null) return refusal
+            this.db.sql.exec(
+                "DELETE FROM records WHERE did = ? AND collection = ? AND rkey = ?",
+                ref.did,
+                ref.collection,
+                ref.rkey
+            )
+            this.clearSecondarySync(ref)
+            return "disposed" as const
+        })
     }
 
-    async secondaryRevOf(_ref: RecordRef): Promise<string | null> {
-        throw new Error("not implemented")
+    /** `left` if the DID is out of the interest epoch it was owed under; `older` if a newer rev is indexed. */
+    private secondaryRefusal(ref: RecordRef, rev: string, epoch: number): SecondaryWriteAnswer | null {
+        const interest = this.db.sql
+            .exec<{ member: number; epoch: number }>(
+                "SELECT member, epoch FROM interest WHERE did = ?",
+                ref.did
+            )
+            .toArray()[0]
+        if (interest === undefined || interest.member !== 1 || interest.epoch !== epoch) return "left"
+        const indexed = this.secondaryRevSync(ref)
+        if (indexed !== null && compareRev(indexed, rev) === "regressed") return "older"
+        return null
+    }
+
+    private secondaryRevSync(ref: RecordRef): string | null {
+        return (
+            this.db.sql
+                .exec<{ rev: string }>(
+                    "SELECT rev FROM records WHERE did = ? AND collection = ? AND rkey = ?",
+                    ref.did,
+                    ref.collection,
+                    ref.rkey
+                )
+                .toArray()[0]?.rev ?? null
+        )
+    }
+
+    private clearSecondarySync(ref: RecordRef): void {
+        this.db.sql.exec(
+            "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
+            ref.did,
+            ref.collection,
+            ref.rkey
+        )
+    }
+
+    async secondaryRevOf(ref: RecordRef): Promise<string | null> {
+        return this.secondaryRevSync(ref)
+    }
+
+    async forgetSecondaries(did: string): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "DELETE FROM records WHERE did = ?1 AND NOT (collection = ?2 AND rkey = 'self')",
+                did,
+                this.env.MONITOR_COLLECTION
+            )
+            this.db.sql.exec("DELETE FROM rec_pending WHERE did = ?", did)
+        })
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -1480,13 +1598,17 @@ export class MonitorIngest
      * a test can stand in for placeholder CARs.
      */
     protected verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome> {
+        return this.verifyAt({ did, collection: this.env.MONITOR_COLLECTION, rkey: "self" }, record)
+    }
+
+    private verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
         if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
         try {
             const outcome = verifyRecordProofOutcome(record.car, {
-                did,
+                did: ref.did,
                 signingKey: record.signingKey,
-                collection: this.env.MONITOR_COLLECTION,
-                rkey: "self",
+                collection: ref.collection,
+                rkey: ref.rkey,
             })
             return Promise.resolve(
                 outcome.kind === "present"
@@ -1500,16 +1622,17 @@ export class MonitorIngest
     }
 
     /**
-     * `com.atproto.sync.getRecord` for a secondary record, through the same
-     * fresh document resolution as the declaration's fetch.
+     * `com.atproto.sync.getRecord` for a secondary record. Unlike the
+     * declaration's fetch this has a working default: it resolves the DID
+     * document fresh and reads the record at the PDS it names.
      */
-    protected fetchRecordAt(_ref: RecordRef): Promise<FetchedRecord> {
-        throw new Error("not implemented")
+    protected fetchRecordAt(ref: RecordRef): Promise<FetchedRecord> {
+        return fetchRecordCar(ref.did, { collection: ref.collection, rkey: ref.rkey })
     }
 
     /** `verifyRecord` for a secondary record's own path. */
-    protected verifyRecordAt(_ref: RecordRef, _record: FetchedRecord): Promise<VerifyOutcome> {
-        throw new Error("not implemented")
+    protected verifyRecordAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
+        return this.verifyAt(ref, record)
     }
 
     /**
@@ -1641,6 +1764,49 @@ export class MonitorIngest
             },
             didDocuments: this,
             interest: this,
+            secondaries: { dispose: (did) => this.disposeSecondaries(did) },
+            nowMs: () => Date.now(),
+        }
+    }
+
+    /** Every secondary snapshot and index row of `did`, for a repo found gone. */
+    private async disposeSecondaries(did: string): Promise<void> {
+        const store = kvSnapshotStore(this.env)
+        const refs = new Map<string, RecordRef>()
+        for (const r of await this.recordsOf(did)) {
+            if (r.collection === this.env.MONITOR_COLLECTION && r.rkey === "self") continue
+            refs.set(`${r.collection}/${r.rkey}`, r)
+        }
+        for (const r of monitorCollections(this.env)) {
+            refs.set(`${r.collection}/${r.rkey}`, { did, ...r })
+        }
+        for (const r of refs.values()) {
+            await store.deleteSecondary({ did, collection: r.collection, rkey: r.rkey })
+        }
+        await this.forgetSecondaries(did)
+    }
+
+    private secondaryDeps(): SecondaryDeps {
+        return {
+            index: this,
+            interest: this,
+            snapshot: kvSnapshotStore(this.env),
+            fetchRecord: (ref) => this.fetchRecordAt(ref),
+            verify: (ref, record) => this.verifyRecordAt(ref, record),
+            // Owed quietly for a DID never held, which no one is waiting to hear about.
+            deferToDeclaration: async (did) => {
+                const held = await this.revOf(did)
+                if (held === null) {
+                    this.db.sql.exec(
+                        "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
+                            "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
+                        did
+                    )
+                    return
+                }
+                await this.owe(did, held)
+            },
+            didDocuments: this,
             nowMs: () => Date.now(),
         }
     }
@@ -1952,6 +2118,14 @@ export class MonitorIngest
             }
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            try {
+                await settleSecondaryDue(
+                    this.secondaryDeps(),
+                    Number.isFinite(batch) ? batch : 32
+                )
+            } catch (err) {
+                console.error("monitor: secondary settle failed", err)
+            }
             // After settling (a just-stored snapshot is not yet due) and
             // before sealing (a change it finds lands in a window that has
             // not closed).

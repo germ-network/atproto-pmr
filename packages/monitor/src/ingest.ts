@@ -106,6 +106,12 @@ export interface IngestDeps {
      * fetch began (its epoch moved) stores nothing.
      */
     interest: Pick<InterestIndex, "inInterest" | "interestEpoch">
+    /**
+     * Disposes every secondary snapshot and index row of a DID. Called when
+     * the declaration's fetch finds the repo itself gone, which takes the
+     * secondaries with it. Unset where no secondary is kept.
+     */
+    secondaries?: { dispose(did: string): Promise<void> }
     nowMs(): number
 }
 
@@ -254,6 +260,7 @@ export async function settle(
         if (!(err instanceof RecordNotFoundError)) throw err
         if (await moved()) return "left"
         await settleDeletion(deps, did, err.permanent, quiet)
+        if (err.reason !== "RecordNotFound") await deps.secondaries?.dispose(did)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)

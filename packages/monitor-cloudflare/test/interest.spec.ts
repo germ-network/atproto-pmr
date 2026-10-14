@@ -12,9 +12,12 @@ import {
     settle,
     settleDeletion,
     settleDue,
+    settleSecondaryDue,
     type FetchedRecord,
     type IngestDeps,
     type PlcExportEvent,
+    type RecordRef,
+    type SecondaryDeps,
     type VerifyOutcome,
 } from "@germ-network/atproto-pmr-monitor"
 import { monitorCollections, type MonitorEnv } from "../src/env"
@@ -684,7 +687,180 @@ describe("joining and leaving interest", () => {
         ])
     })
 
-    it.todo("a secondary settle for a DID not in interest stores nothing")
+    type SecondaryInternals = {
+        secondaryDeps(): SecondaryDeps
+        fetchRecordAt: (ref: RecordRef) => Promise<FetchedRecord>
+        verifyRecordAt: (ref: RecordRef, record: FetchedRecord) => Promise<VerifyOutcome>
+    }
+    const driveSecondary = (
+        obj: MonitorIngest,
+        fetch: (ref: RecordRef) => Promise<{ rev: string }>
+    ) => {
+        const o = obj as unknown as SecondaryInternals
+        o.fetchRecordAt = async (ref) => {
+            const { rev } = await fetch(ref)
+            return { car: new Uint8Array([5]), source: "https://pds", signingKey: KEY, rev } as FetchedRecord
+        }
+        o.verifyRecordAt = async (_ref, record) => ({
+            kind: "verified",
+            key: KEY,
+            rev: (record as FetchedRecord & { rev: string }).rev,
+            cid: "bafyreiprofile",
+        })
+        return () => settleSecondaryDue(o.secondaryDeps(), 32)
+    }
+
+    it("a secondary settle stores under its own keys and index row, leaving revs and the window alone", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            const settleSecondaries = driveSecondary(obj, async () => ({ rev: "3m4" }))
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            expect(await settleSecondaries()).toBe(1)
+            const got = await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })
+            expect(got).toMatchObject({ rev: "3m4", verifiedWith: KEY, cid: "bafyreiprofile" })
+            expect(await obj.secondaryRevOf({ did, collection: PROFILE, rkey: "self" })).toBe("3m4")
+            expect(await obj.revOf(did)).toBeNull()
+        })
+        expect(await rows(stub, "SELECT did FROM rec_pending")).toEqual([])
+        expect(await rows(stub, "SELECT did FROM window_members")).toEqual([])
+    })
+
+    it("a secondary settle for a DID not in interest stores nothing", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            const fetches: string[] = []
+            const settleSecondaries = driveSecondary(obj, async (ref) => {
+                fetches.push(ref.did)
+                return { rev: "3m4" }
+            })
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await obj.setRegistered(did, false, 2) // left, leave not yet applied
+            expect(await settleSecondaries()).toBe(0)
+            expect(fetches).toEqual([])
+            expect(await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+        })
+        expect(await rows(stub, "SELECT did FROM rec_pending")).toEqual([])
+    })
+
+    it("the secondary index refuses a write for another epoch or an older rev", async () => {
+        const did = uniqDid()
+        const ref = { did, collection: PROFILE, rkey: "self" }
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            expect(await obj.completeSecondary(ref, "3m5", { cid: "c", verifiedWith: KEY }, 1)).toBe("stored")
+            expect(await obj.completeSecondary(ref, "3m4", { cid: "c", verifiedWith: KEY }, 1)).toBe("older")
+            expect(await obj.disposeSecondary(ref, "3m4", 1)).toBe("older")
+            expect(await obj.completeSecondary(ref, "3m6", { cid: "c", verifiedWith: KEY }, 7)).toBe("left")
+            expect(await obj.secondaryRevOf(ref)).toBe("3m5")
+            await obj.setRegistered(did, false, 2)
+            expect(await obj.disposeSecondary(ref, "3m9", 1)).toBe("left")
+            expect(await obj.secondaryRevOf(ref)).toBe("3m5")
+        })
+    })
+
+    it("a repo-level answer on the declaration disposes the stored profile; a record-level one does not", async () => {
+        for (const reason of ["RepoTakendown", "RecordNotFound"]) {
+            const did = uniqDid()
+            await inObj(registeredStub(), async (obj) => {
+                await obj.setRegistered(did, true, 1)
+                await withSnapshots(obj, did)
+                const { o } = drive(obj, async () => {
+                    throw new RecordNotFoundError("gone", false, reason)
+                })
+                await settle(o.deps(), did)
+                const profile = await kvSnapshotStore(testEnv).getSecondary({
+                    did,
+                    collection: PROFILE,
+                    rkey: "self",
+                })
+                expect(profile === null).toBe(reason === "RepoTakendown")
+                expect((await obj.recordsOf(did)).some((r) => r.collection === PROFILE)).toBe(
+                    reason !== "RepoTakendown"
+                )
+            })
+        }
+    })
+
+    it("a repo-level answer on a secondary of a held DID owes the declaration loudly", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            const settleSecondaries = driveSecondary(obj, async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            })
+            await obj.setRegistered(did, true, 1)
+            await obj.complete(did, "3m1", 1_000, VERIFIED)
+            await applyTransitions(obj)
+            await settleSecondaries()
+            expect(await obj.duePending(Date.now(), 10)).toMatchObject([{ did, rev: "3m1", quiet: false }])
+        })
+    })
+
+    it("the alarm settles owed secondaries after the declarations", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        const log: string[] = []
+        await inObj(stub, async (obj) => {
+            const o = obj as unknown as SecondaryInternals & Internals
+            drive(obj, async (d) => {
+                log.push(`declaration ${d}`)
+                return { rev: "3m1" }
+            })
+            o.fetchRecordAt = async (ref) => {
+                log.push(`secondary ${ref.did}`)
+                return { car: new Uint8Array([5]), source: "s", signingKey: KEY, rev: "3m4" } as FetchedRecord
+            }
+            o.verifyRecordAt = async (_r, record) => ({
+                kind: "verified",
+                key: KEY,
+                rev: (record as FetchedRecord & { rev: string }).rev,
+                cid: "c",
+            })
+            withDirectory(obj, directory([did]))
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await alarm(stub)
+        expect(log).toEqual([`declaration ${did}`, `secondary ${did}`])
+    })
+
+    it("a repo-level answer on a secondary of a never-held DID is judged quietly by the declaration path", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        let pushed: string[] = []
+        await inObj(stub, async (obj) => {
+            pushed = drive(obj, async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            }).pushed
+            const settleSecondaries = driveSecondary(obj, async () => {
+                throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
+            })
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            // Drop the join's declaration obligation so only the deferral owes it.
+            ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec("DELETE FROM pending")
+            const store = kvSnapshotStore(testEnv)
+            await store.putSecondary({ did, collection: PROFILE, rkey: "self" }, {
+                rev: "3m1",
+                car: new Uint8Array([1]),
+                observedAtMs: 1,
+                source: "s",
+                signingKey: KEY,
+                verifiedWith: KEY,
+                cid: "c",
+            })
+            await settleSecondaries()
+            const [owed] = await obj.duePending(Date.now(), 10)
+            expect(owed).toMatchObject({ did, quiet: true })
+            await settleOwed(obj)
+            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect((await obj.recordsOf(did)).filter((r) => r.collection === PROFILE)).toEqual([])
+        })
+        expect(pushed).toEqual([])
+        expect(await rows(stub, "SELECT did FROM window_members")).toEqual([])
+    })
 
     it("a declaration deletion keeps the profile of a DID still in interest", async () => {
         const did = uniqDid()
