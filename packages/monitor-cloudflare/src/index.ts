@@ -13,8 +13,9 @@
  *
  * **The authoritative fetch is not implemented here.** Subclass to supply
  * it — resolving a DID document and reading that DID's own PDS is a
- * deployment's policy (which resolver, which timeouts, whether to verify
- * the CAR proof), not a storage adapter's:
+ * deployment's policy (which resolver, which timeouts), not a storage
+ * adapter's. It must return the `#atproto` key of the document it resolved
+ * through: a fetch with `signingKey: null` verifies nothing and stores nothing.
  *
  *     export class MyMonitor extends MonitorIngest {
  *         protected async fetchRecord(did: string) { … }

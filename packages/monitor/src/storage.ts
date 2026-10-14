@@ -44,9 +44,10 @@ export interface SnapshotEntry {
     /** The PDS this was fetched from. */
     source: string
     /**
-     * The atproto repo signing key resolved at fetch time, `null` if the
-     * DID document carried none. Provenance, not a check this monitor
-     * performed — see `compareObservations`.
+     * The atproto repo signing key resolved at fetch time; equals
+     * `verifiedWith` on an entry written at ingest, and is `null` only for
+     * one stored before ingest verified whose document carried none. See
+     * `compareObservations`.
      */
     signingKey: string | null
     /**
@@ -196,7 +197,8 @@ export interface MonitorIndex {
     /**
      * An attempt that did not confirm anything. Moves the DID to the back of
      * the refresh queue, and out of it until the next interval, so a source
-     * that keeps failing is retried once per interval rather than every pass.
+     * that keeps failing, or a record that will not verify, is retried once per
+     * interval rather than every pass.
      */
     markAttempted(did: string, attemptedAtMs: number): Promise<void>
 

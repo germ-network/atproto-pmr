@@ -455,9 +455,10 @@ never more than the ten-minute coverage lag plus that delay.
 
 A DID confirmed permanently deleted owes no re-fetch and no key update, but its
 stored document still follows the stream, because a relay would otherwise trust
-a superseded key for the rest of the 24 hours. A record a verification hook
-rejects leaves its DID unwatched, so the document its fetch stored is withdrawn
-at once (published as absent) rather than left to age.
+a superseded key for the rest of the 24 hours. A fetch that leaves its DID
+unwatched (a DID never held whose record came back verified absent, or one
+confirmed permanently deleted) has the document that fetch stored withdrawn at once (published as
+absent) rather than left to age; a DID that is still held or owed keeps it.
 
 **Cost.** Per alarm, at most 64 `doc:` writes and one `plc:coverage` write.
 Per day, per watched DID: about two `doc:` writes plus one for each change to
@@ -484,20 +485,43 @@ keeping that document as the DID's
 [stored document](#the-stored-did-document), at no extra subrequest) and
 compares it with the `rev` it holds:
 
-- **Unchanged** — the snapshot is confirmed current as of now.
+- **Unchanged** — the snapshot is confirmed current as of now, unless nothing
+  was ever verified for the declaration (a snapshot stored before ingest
+  verified) or it verified under a key other than the one the document now
+  carries. Those take the fetch below even at an unchanged head; a re-verify at
+  an unchanged `rev`, record CID and key is stored quietly, so an upgrade does not
+  put every legacy DID in the digest window.
 - **Advanced, declaration record unchanged** — a repo `rev` moves on any
-  commit, so this is the common case. Unless the monitor runs a verification
-  hook (then every moved head takes the ordinary path), it stores the new CAR
-  and `rev` quietly: no digest-window entry and no own-DID push, because nothing
-  a client holds became stale. It compares record CIDs to decide this and
-  still does not verify signatures.
+  commit, so this is the common case. The monitor verifies the fetched CAR
+  (see below), then stores the new CAR and signed `rev` quietly: no
+  digest-window entry and no own-DID push, because nothing a client holds
+  became stale. It compares record CIDs to decide this.
 - **Advanced, declaration record changed** (or the DID document re-keyed) —
   the ordinary path: stored, entered in the digest window, pushed.
 - **Regressed** — raised as a regression (once per interval), nothing stored.
 - **Gone at the source** (a repo-level terminal answer, or a signed view
   holding no record) — the deletion path.
-- **Unreachable** — left due and retried behind the others; never recorded
-  as confirmed.
+- **Unreachable** — never recorded as confirmed; retried once per refresh
+  interval.
+- **Unverifiable** — the fetched CAR does not verify under the key of the
+  document fetched with it. The held snapshot is kept and not re-confirmed, and
+  the DID is retried once per refresh interval, so a head still signed by an
+  old key costs two document resolutions, one head read and one record fetch an
+  hour at the default interval.
+
+**Verification at ingest.** Every fetched CAR is checked against the
+`#atproto` key of the DID document fetched with it (commit signature, block
+hashes and the path through the tree) before anything is stored or disposed
+of. A result is *verified* (stored with its signed `rev`, CID and the key it
+verified under), *verified absent* (a signed view holding no record: the
+reversible deletion path, subject to the regression check) or *unverifiable*
+(kept entry, not stored). A fetch that carried no key is unverifiable. A
+malformed CAR is unverifiable, not a transient failure. A DID never held that
+comes back unverifiable stays owed for one interval rather than being dropped,
+and, on the event-driven fetch (not the refresh pass), an unverifiable result
+under a key that differs from the one the held snapshot verified under pushes a
+change once per newly seen key, so the device learns of the rotation and
+verifies for itself.
 
 A confirmation is recorded as a separate `chk:<did>` entry carrying the `rev`
 it confirmed and the time; it is honoured only when that `rev` equals the
@@ -513,7 +537,9 @@ at 1,754 DIDs and grows linearly with the population; it reaches the relay's
 PDS directly for the lapsed ones. Each refreshed DID costs
 two subrequests for the head `rev` (DID document, then commit) plus its KV
 reads and writes, and a DID whose head advanced costs several more (a record
-fetch, and a second one if the change takes the ordinary path). The batch
+fetch, and a second one if the change takes the ordinary path; so does a DID
+with no verified record indexed or a changed key, which on the first cycle
+after an upgrade is every held DID). The batch
 must therefore also fit the platform's per-invocation subrequest limit: even
 an all-confirmed batch of 64 exceeds the free plan's limit of 50, where the
 batch should be lowered.
@@ -526,10 +552,10 @@ for the DID **as CAR**, with the `rev`, `observedAt`, `source`, and
 a monitor is as untrusted as any relay
 ([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)).
 
-`source` (the PDS the record was fetched from) and `signingKey` (the
-atproto verification method the DID document carried at fetch time, absent
-if the document carried none) are **provenance, not a check this monitor
-performed** — a monitor is a pass-through (Q-PMR-24) and does not verify.
+`source` (the PDS the record was fetched from) is provenance, and `signingKey`
+is the key the CAR verified under at ingest (absent only for a snapshot stored
+before ingest verified). A monitor's check does not replace the client's: a
+client still verifies what it is served (Q-PMR-24).
 They are what makes the comparison below meaningful: a monitor's own
 fetch already discards nothing here, so a client comparing two monitors'
 records can tell a legitimate key rotation apart from a stale or dishonest

@@ -43,17 +43,6 @@ export interface FetchHeadRevOptions {
 }
 
 /**
- * **CAR, not JSON**: the monitor's fetch is handed onward — to devices and
- * to a relay admitting a sender's pair put — and handing a record onward is
- * exactly what discards provenance, so the bytes must carry their own proof.
- *
- * The monitor stores and serves what it fetched, and the consumer verifies
- * it against the DID document, which keeps a monitor light enough that
- * several parties can run one. The one thing it reads from the CAR is the
- * declaration record's CID, to tell a real change from an unrelated commit
- * (`refresh.ts`); it never checks a signature.
- */
-/**
  * `com.atproto.sync.getRecord`'s own lexicon-declared error set — the
  * XRPC `error` field values that mean this DID's declaration is
  * confirmed unobtainable, not merely unreachable this attempt. Notably
@@ -129,6 +118,15 @@ export async function fetchHeadRev(
     return { rev, signingKey }
 }
 
+/**
+ * **CAR, not JSON**: the monitor's fetch is handed onward — to devices and
+ * to a relay admitting a sender's pair put — and handing a record onward is
+ * exactly what discards provenance, so the bytes must carry their own proof.
+ *
+ * Returns the CAR and the key of the document it was resolved through; ingest
+ * verifies the one against the other (`ingest.ts`) before anything is
+ * stored, and the consumer verifies again for itself.
+ */
 export async function fetchRecordCar(
     did: string,
     options: FetchRecordOptions

@@ -102,9 +102,11 @@ export interface CarRecord {
 /**
  * The record at `<collection>/<rkey>` and its CID, from the CAR's own
  * commit, WITHOUT checking the commit signature: for change detection by a
- * party that already trusts where the bytes came from (the monitor), never
- * for admission. Block CIDs and the MST path are still checked. `null` when
- * the commit's tree holds no record at that path.
+ * party that already trusts where the bytes came from, never for admission.
+ * The monitor verifies at ingest with `verifyRecordProofOutcome` and uses this
+ * only to compare record CIDs of CARs it has already verified or holds. Block CIDs and the MST
+ * path are still checked. `null` when the commit's tree holds no record at
+ * that path.
  */
 export function readRecordFromCar(
     car: Uint8Array,

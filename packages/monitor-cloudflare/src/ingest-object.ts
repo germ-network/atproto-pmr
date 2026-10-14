@@ -125,9 +125,8 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  *
  * Subclass to supply the authoritative fetch, which is deliberately not
  * implemented here: resolving a DID document and reading from that DID's
- * own PDS is a policy decision (which resolver, which timeouts, whether to
- * verify the CAR proof) that belongs to a deployment, not to a storage
- * adapter.
+ * own PDS is a policy decision (which resolver, which timeouts) that belongs
+ * to a deployment, not to a storage adapter; verifying what it returns is not.
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>

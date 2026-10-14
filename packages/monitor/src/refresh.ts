@@ -1,11 +1,12 @@
 /**
  * The periodic re-check that keeps every held snapshot within the staleness
- * the relay tolerates: confirm each DID's head rev at its source, re-fetch on a move,
+ * the relay tolerates: confirm each DID's head rev at its source, re-fetch and
+ * verify on a move (or when nothing verified is indexed, or the key changed),
  * and record when the snapshot was last confirmed current.
  *
- * A repo rev moves on any commit, so a move whose declaration record CID is
- * unchanged is stored quietly — no digest-window entry, no `onChange`.
- * Only a changed record CID takes the full `settle` path.
+ * A repo rev moves on any commit, so a move whose declaration record CID and
+ * key are unchanged is stored quietly — no digest-window entry, no
+ * `onChange`. Only a changed record CID or key takes the full `settle` path.
  */
 import { RecordNotFoundError, readRecordFromCar } from "@germ-network/atproto-pmr-core"
 import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
@@ -82,14 +83,15 @@ export interface RefreshResult {
  * recently checked first, at most `limit` of them.
  *
  * Anything that is not a confirmation, a quiet advance or a terminal answer
- * leaves the DID due (queued behind the rest), so a source that is down is
- * retried rather than recorded as fresh. A regression is raised once per
+ * is marked attempted and not confirmed, so a source that is down, or a
+ * record that does not verify, is retried once per interval rather than
+ * recorded as fresh. A regression is raised once per
  * `staleAfterMs` until the source's head moves forward again: the snapshot
  * is not re-confirmed (`chk:` is untouched, so it ages out at the relay),
  * but the alarm is not repeated every pass.
  *
- * A moved head is compared by record CID only to decide whether the move
- * matters; the monitor still never verifies signatures here.
+ * A fetched CAR is verified before anything is stored; its record CID then
+ * decides whether a move matters.
  */
 export async function refreshDue(
     deps: RefreshDeps,
