@@ -1,8 +1,8 @@
 ---
-"@germ-network/atproto-pmr-core": minor
-"@germ-network/atproto-pmr-cloudflare": minor
-"@germ-network/atproto-pmr-monitor": minor
-"@germ-network/atproto-pmr-monitor-cloudflare": minor
+"@germ-network/atproto-pmr-core": patch
+"@germ-network/atproto-pmr-cloudflare": patch
+"@germ-network/atproto-pmr-monitor": patch
+"@germ-network/atproto-pmr-monitor-cloudflare": patch
 ---
 
 The relay pins the sender's declaration CID, and verifies it from the monitor instead of the sender's PDS.
