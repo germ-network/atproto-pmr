@@ -236,9 +236,105 @@ describe("fetchHeadRev", () => {
 })
 
 describe("the DID document a fetch resolved through", () => {
-    it.todo("fetchRecordCar returns the directory's document, stamped with the time before the directory request")
-    it.todo("fetchRecordCar resolves the PDS from that same document, one directory request")
-    it.todo("fetchHeadRev hands its document to onDidDocument before reading the head")
-    it.todo("fetchHeadRev without onDidDocument behaves as before")
-    it.todo("a failing onDidDocument does not fail fetchHeadRev")
+    /** A clock the directory's answer advances, so a stamp taken after the request is distinguishable. */
+    function clockedFixture() {
+        const clock = { now: 1_000 }
+        const f = fixture()
+        const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            if (String(input).startsWith("https://plc.directory/")) clock.now += 500
+            return f.impl(input, init)
+        }) as typeof fetch
+        return { clock, impl, seen: f.seen }
+    }
+    const directoryRequests = (seen: string[]) =>
+        seen.filter((u) => u.startsWith("https://plc.directory/"))
+
+    it("fetchRecordCar returns the directory's document, stamped with the time before the directory request", async () => {
+        const f = clockedFixture()
+        const got = await fetchRecordCar(DID, {
+            collection: COLLECTION,
+            fetchImpl: f.impl,
+            nowMs: () => f.clock.now,
+        })
+        expect(got.didDocument?.fetchedAtMs).toBe(1_000)
+        expect(got.didDocument?.document).toMatchObject({
+            id: DID,
+            service: [{ id: "#atproto_pds", serviceEndpoint: PDS }],
+        })
+    })
+
+    it("fetchRecordCar resolves the PDS from that same document, one directory request", async () => {
+        const f = fixture()
+        const got = await fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
+        expect(directoryRequests(f.seen)).toHaveLength(1)
+        expect(got.source).toBe(PDS)
+        expect(got.signingKey).toBe(SIGNING_KEY)
+        expect(got.didDocument?.document.id).toBe(DID)
+    })
+
+    it("fetchHeadRev hands its document to onDidDocument before reading the head", async () => {
+        const f = clockedFixture()
+        const events: string[] = []
+        const handed: unknown[] = []
+        const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            if (String(input).includes("sync.getLatestCommit")) events.push("head")
+            return f.impl(input, init)
+        }) as typeof fetch
+        await fetchHeadRev(DID, {
+            fetchImpl: impl,
+            nowMs: () => f.clock.now,
+            onDidDocument: async (fetched) => {
+                events.push("document")
+                handed.push(fetched)
+            },
+        })
+        expect(events).toEqual(["document", "head"])
+        expect(handed).toHaveLength(1)
+        expect(handed[0]).toMatchObject({ fetchedAtMs: 1_000, document: { id: DID } })
+        expect(directoryRequests(f.seen)).toHaveLength(1)
+    })
+
+    it("fetchHeadRev waits for onDidDocument to finish before reading the head", async () => {
+        const f = fixture()
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => (release = resolve))
+        const done = fetchHeadRev(DID, {
+            fetchImpl: f.impl,
+            onDidDocument: () => gate,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        expect(f.seen.some((u) => u.includes("sync.getLatestCommit"))).toBe(false)
+        release()
+        await done
+        expect(f.seen.some((u) => u.includes("sync.getLatestCommit"))).toBe(true)
+    })
+
+    it("fetchHeadRev hands over the document even when it names no PDS", async () => {
+        const f = fixture({}, { service: [] })
+        const handed: unknown[] = []
+        await expect(
+            fetchHeadRev(DID, {
+                fetchImpl: f.impl,
+                onDidDocument: async (fetched) => void handed.push(fetched),
+            })
+        ).rejects.toThrow(/no #atproto_pds service/)
+        expect(handed).toHaveLength(1)
+    })
+
+    it("fetchHeadRev without onDidDocument behaves as before", async () => {
+        const f = fixture()
+        expect(await fetchHeadRev(DID, { fetchImpl: f.impl })).toBe("3mszqbq6s3y2k")
+        expect(directoryRequests(f.seen)).toHaveLength(1)
+    })
+
+    it("a failing onDidDocument does not fail fetchHeadRev", async () => {
+        const f = fixture()
+        const rev = await fetchHeadRev(DID, {
+            fetchImpl: f.impl,
+            onDidDocument: async () => {
+                throw new Error("store down")
+            },
+        })
+        expect(rev).toBe("3mszqbq6s3y2k")
+    })
 })
