@@ -22,8 +22,16 @@ import {
     type PlcCursorIndex,
     type RefreshIndex,
 } from "@germ-network/atproto-pmr-monitor"
-import { STORED_DID_DOCUMENT_MAX_AGE_MS, type DidDocument } from "@germ-network/atproto-pmr-core"
-import { canonicalDidDocumentJson, kvDidDocumentWriter } from "./did-document-store"
+import {
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    type DidDocument,
+    type PlcCoverage,
+} from "@germ-network/atproto-pmr-core"
+import {
+    canonicalDidDocumentJson,
+    kvDidDocumentWriter,
+    PLC_COVERAGE_KEY,
+} from "./did-document-store"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
@@ -108,6 +116,10 @@ export class MonitorIngest
     private plcHighCreatedAtMs: number | null = null
     private plcContinuousSinceMs: number | null = null
     private plcPersistedAtMs = 0
+    /** Whether the stored cursor row carries the current run's start. */
+    private plcRunPersisted = false
+    /** What `plc:coverage` last claimed in this run. */
+    private plcCoveredThroughMs: number | null = null
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -337,8 +349,17 @@ export class MonitorIngest
      * persisted, so KV never claims a run an eviction could lose.
      */
     async publishPlcCoverage(coveredThroughMs: number | null): Promise<void> {
-        void coveredThroughMs
-        throw new Error("not implemented")
+        const url = this.env.PLC_EXPORT_STREAM_URL
+        if (url === undefined || url === "") return
+        if (!this.plcRunPersisted || this.plcContinuousSinceMs === null) return
+        if (coveredThroughMs !== null) this.plcCoveredThroughMs = coveredThroughMs
+        if (this.plcCoveredThroughMs === null) return
+        const coverage: PlcCoverage = {
+            url,
+            continuousSinceMs: this.plcContinuousSinceMs,
+            coveredThroughMs: this.plcCoveredThroughMs,
+        }
+        await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
     }
 
     // ---- PLC export cursor ------------------------------------------------
@@ -393,6 +414,39 @@ export class MonitorIngest
             })
         )
         this.plcPersistedAtMs = Date.now()
+        this.plcRunPersisted = this.plcContinuousSinceMs !== null
+    }
+
+    /**
+     * Pick the stored run back up after the object was evicted: when the
+     * stored cursor is for `url`, the high-water seq and the run's start are
+     * restored (so the run is not restarted by the next frame) and its seq is
+     * returned. Null when nothing is stored for `url`, or what is stored is
+     * for another stream or unusable; the stored row and any in-memory run
+     * are dropped, and the next frame starts a new run.
+     */
+    async resumePlcCursor(url: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+            .toArray()[0]
+        if (row === undefined) return null
+        const stored = JSON.parse(row.v) as {
+            url?: unknown
+            seq?: unknown
+            continuousSinceMs?: unknown
+        }
+        if (
+            stored.url !== url ||
+            typeof stored.seq !== "number" ||
+            typeof stored.continuousSinceMs !== "number"
+        ) {
+            await this.resetPlcCursor()
+            return null
+        }
+        this.plcHighSeq = stored.seq
+        this.plcContinuousSinceMs = stored.continuousSinceMs
+        this.plcRunPersisted = true
+        return stored.seq
     }
 
     /** The stored seq, or null when none is stored for `url`. */
@@ -415,6 +469,8 @@ export class MonitorIngest
         this.plcHighCreatedAtMs = null
         this.plcContinuousSinceMs = null
         this.plcPersistedAtMs = 0
+        this.plcRunPersisted = false
+        this.plcCoveredThroughMs = null
     }
 
     /**

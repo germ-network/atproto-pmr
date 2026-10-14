@@ -92,6 +92,20 @@ export function kvDidDocumentWriter<TIngest extends MonitorIngest = MonitorInges
 export function kvPlcCoverage<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): () => Promise<PlcCoverage | null> {
-    void env
-    throw new Error("not implemented")
+    return async () => {
+        const text = await env.records.get(PLC_COVERAGE_KEY)
+        if (text === null) return null
+        let value: unknown
+        try {
+            value = JSON.parse(text)
+        } catch {
+            return null
+        }
+        if (typeof value !== "object" || value === null) return null
+        const { url, continuousSinceMs, coveredThroughMs } = value as Record<string, unknown>
+        if (typeof url !== "string") return null
+        if (typeof continuousSinceMs !== "number" || !Number.isFinite(continuousSinceMs)) return null
+        if (typeof coveredThroughMs !== "number" || !Number.isFinite(coveredThroughMs)) return null
+        return { url, continuousSinceMs, coveredThroughMs }
+    }
 }

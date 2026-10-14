@@ -34,7 +34,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
-import { canonicalDidDocumentJson, kvDidDocuments } from "../src/did-document-store"
+import { canonicalDidDocumentJson, kvDidDocuments, kvPlcCoverage } from "../src/did-document-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -1859,13 +1859,170 @@ describe("the PLC export cursor", () => {
 })
 
 describe("PLC stream coverage", () => {
-    it.todo("no coverage is published before a run's cursor row is persisted")
-    it.todo("a drained publish advances coveredThroughMs to the value given, and kvPlcCoverage reads it")
-    it.todo("a null coveredThroughMs re-publishes the previous value")
-    it.todo("a cursor reset starts a new run at the next frame's createdAt")
-    it.todo("a resume from a stored cursor keeps the run's continuousSinceMs")
-    it.todo("a changed PLC_EXPORT_STREAM_URL starts a new run")
-    it.todo("kvPlcCoverage reads a missing or malformed entry as null")
+    const URL_A = "https://plc.example/export/stream"
+    const URL_B = "https://other.example/export/stream"
+    const withUrl = (obj: MonitorIngest, url: string | undefined) => {
+        obj.env = { ...obj.env, PLC_EXPORT_STREAM_URL: url }
+    }
+    const marker = async () => {
+        const text = await testEnv.records.get("plc:coverage")
+        return text === null ? null : (JSON.parse(text) as Record<string, unknown>)
+    }
+    const cursorRow = (stub: DurableObjectStub<MonitorIngest>) =>
+        runInDurableObject(stub, (_obj, state) => {
+            const row = state.storage.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                .toArray()[0]
+            return row === undefined ? null : (JSON.parse(row.v) as Record<string, unknown>)
+        })
+
+    it("no coverage is published before a run's cursor row is persisted", async () => {
+        await testEnv.records.delete("plc:coverage")
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.advancePlcCursor(1, 1_000)
+            withUrl(obj, URL_A)
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toBeNull()
+        await inMonitorObj(stub, async (obj) => {
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 1_000,
+            coveredThroughMs: 1_000,
+        })
+    })
+
+    it("publishes nothing without a stream URL or without any covered time", async () => {
+        await testEnv.records.delete("plc:coverage")
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(null)
+            withUrl(obj, undefined)
+            await obj.publishPlcCoverage(1_000)
+            withUrl(obj, "")
+            await obj.publishPlcCoverage(1_000)
+        })
+        expect(await marker()).toBeNull()
+    })
+
+    it("a drained publish advances coveredThroughMs to the value given, and kvPlcCoverage reads it", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(1_000)
+            await obj.publishPlcCoverage(4_000)
+        })
+        expect(await kvPlcCoverage(testEnv)()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 1_000,
+            coveredThroughMs: 4_000,
+        })
+    })
+
+    it("a null coveredThroughMs re-publishes the previous value", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(3_000)
+            await testEnv.records.delete("plc:coverage")
+            await obj.publishPlcCoverage(null)
+        })
+        expect(await marker()).toMatchObject({ coveredThroughMs: 3_000 })
+    })
+
+    it("a cursor reset starts a new run at the next frame's createdAt", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+            await obj.publishPlcCoverage(2_000)
+            await obj.resetPlcCursor()
+            await testEnv.records.delete("plc:coverage")
+            await obj.publishPlcCoverage(null)
+            expect(await marker()).toBeNull()
+            withUrl(obj, undefined)
+            await obj.advancePlcCursor(2, 5_000)
+            withUrl(obj, URL_A)
+            await obj.publishPlcCoverage(5_000)
+            expect(await marker()).toBeNull()
+            await obj.persistPlcCursor()
+            await obj.publishPlcCoverage(null)
+            expect(await marker()).toBeNull()
+            await obj.publishPlcCoverage(5_000)
+        })
+        expect(await marker()).toEqual({
+            url: URL_A,
+            continuousSinceMs: 5_000,
+            coveredThroughMs: 5_000,
+        })
+    })
+
+    it("a resume from a stored cursor keeps the run's continuousSinceMs", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            expect(await obj.resumePlcCursor(URL_A)).toBe(1)
+            await obj.advancePlcCursor(2, 9_000)
+            await obj.publishPlcCoverage(9_000)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ seq: 2, continuousSinceMs: 1_000 })
+        expect(await marker()).toMatchObject({ continuousSinceMs: 1_000, coveredThroughMs: 9_000 })
+    })
+
+    it("a changed PLC_EXPORT_STREAM_URL starts a new run", async () => {
+        const stub = freshStub()
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_A)
+            await obj.advancePlcCursor(1, 1_000)
+        })
+        await evictDurableObject(stub)
+        await inMonitorObj(stub, async (obj) => {
+            withUrl(obj, URL_B)
+            expect(await obj.resumePlcCursor(URL_B)).toBeNull()
+            expect(await obj.readPlcCursor(URL_A)).toBeNull()
+            await obj.advancePlcCursor(5, 7_000)
+            await obj.publishPlcCoverage(7_000)
+        })
+        expect(await cursorRow(stub)).toMatchObject({ url: URL_B, seq: 5, continuousSinceMs: 7_000 })
+        expect(await marker()).toEqual({
+            url: URL_B,
+            continuousSinceMs: 7_000,
+            coveredThroughMs: 7_000,
+        })
+    })
+
+    it("kvPlcCoverage reads a missing or malformed entry as null", async () => {
+        const read = kvPlcCoverage(testEnv)
+        await testEnv.records.delete("plc:coverage")
+        expect(await read()).toBeNull()
+        const good = { url: URL_A, continuousSinceMs: 1, coveredThroughMs: 2 }
+        for (const bad of [
+            "not json",
+            "[1]",
+            JSON.stringify({ ...good, url: 5 }),
+            JSON.stringify({ ...good, continuousSinceMs: "1" }),
+            JSON.stringify({ ...good, coveredThroughMs: null }),
+            JSON.stringify({ url: URL_A }),
+        ]) {
+            await testEnv.records.put("plc:coverage", bad)
+            expect(await read()).toBeNull()
+        }
+        await testEnv.records.put("plc:coverage", JSON.stringify(good))
+        expect(await read()).toEqual(good)
+    })
 })
 
 describe("PLC export consumer", () => {
