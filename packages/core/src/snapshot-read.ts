@@ -37,6 +37,10 @@ export interface StoredRecordSnapshot extends RecordSnapshot {
      * verdict stale.
      */
     verifiedWith: string | null
+    /** The signed commit's `rev`, as verified at ingest. Null for an entry stored without it. */
+    rev: string | null
+    /** The record's CID (`bafyrei…`), as verified at ingest. Null for an entry stored without it. */
+    cid: string | null
 }
 
 /**

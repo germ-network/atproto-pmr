@@ -3,12 +3,13 @@
  * snapshot, generic over collection and rkey (exercised here on a
  * non-declaration collection), with the 24 h direct CID check.
  */
-import { describe, expect, it, vi } from "vitest"
+import { describe, expect, expectTypeOf, it, vi } from "vitest"
 import { RecordNotFoundError, SIGNING_KEY_TTL_MS } from "../src/atproto-fetch"
 import {
     SNAPSHOT_MAX_AGE_MS,
     snapshotRecordReader,
     type RecordSnapshot,
+    type StoredRecordSnapshot,
 } from "../src/snapshot-read"
 import { buildRepoCar, makeKey, type TestKey } from "./fixtures/repo-car"
 
@@ -216,5 +217,15 @@ describe("snapshotRecordReader", () => {
             await setup({ key: sameKey, freshAtMs: NOW, fetchDirect: direct }).read(DID)
             expect(direct).not.toHaveBeenCalled()
         })
+    })
+})
+
+describe("StoredRecordSnapshot", () => {
+    it("carries rev and cid, nullable for legacy entries", () => {
+        expectTypeOf<StoredRecordSnapshot["rev"]>().toEqualTypeOf<string | null>()
+        expectTypeOf<StoredRecordSnapshot["cid"]>().toEqualTypeOf<string | null>()
+        // @ts-expect-error rev and cid are required, not optional
+        const legacy: StoredRecordSnapshot = { car: new Uint8Array(), freshAtMs: 0, verifiedWith: null }
+        expect(legacy.freshAtMs).toBe(0)
     })
 })

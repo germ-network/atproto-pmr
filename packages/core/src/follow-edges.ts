@@ -1,8 +1,9 @@
 /**
- * The follow-edge index: who follows whom, among the DIDs carrying a Germ
- * declaration. Edges come from `app.bsky.graph.follow` records and are hints,
- * not proof — a device checks one against the follower's signed record
- * (`follower`/`rkey`) before relying on it.
+ * The follow-edge index: who follows whom, for the graphs a monitor serves
+ * (its registered users', or every declaration holder's under `everyone`).
+ * Edges come from `app.bsky.graph.follow` records and are hints, not proof —
+ * a device checks one against the follower's signed record (`follower`/`rkey`)
+ * before relying on it.
  */
 
 /** One `app.bsky.graph.follow` record: `follower` follows `subject`. */
@@ -14,7 +15,7 @@ export interface FollowEdge {
 }
 
 /**
- * The read surface of the index. Every follow of a declaration holder is
+ * The read surface of the index. Every follow of a served graph's owner is
  * stored, so an edge is already in place when its subject gains a
  * declaration; reads return only edges whose other party holds a
  * declaration. That filter is the store's, so no caller can serve an edge
