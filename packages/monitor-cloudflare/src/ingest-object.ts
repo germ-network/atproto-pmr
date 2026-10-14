@@ -22,6 +22,7 @@ import {
     type RefreshIndex,
 } from "@germ-network/atproto-pmr-monitor"
 import type { DidDocument } from "@germ-network/atproto-pmr-core"
+import { canonicalDidDocumentJson } from "./did-document-store"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
@@ -123,6 +124,15 @@ export class MonitorIngest
                     checked_at INTEGER NOT NULL,
                     attempted_at INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS did_documents (
+                    did TEXT PRIMARY KEY,
+                    document TEXT NOT NULL,
+                    as_of INTEGER NOT NULL,
+                    confirmed_at INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    published_version INTEGER,
+                    published_confirmed_at INTEGER
+                );
             `)
         })
     }
@@ -132,7 +142,10 @@ export class MonitorIngest
     /**
      * Ordered by `asOfMs` (see `DidDocumentSink`). A write equal in content
      * (`canonicalDidDocumentJson`) to the stored one only advances its
-     * confirmation time; a different one bumps the row's version. The read,
+     * confirmation time; a different one bumps the row's version, and so
+     * does any write onto a stale-marked or placeholder row (confirmation 0),
+     * because the published entry was removed and must be put again. A
+     * confirmation of 0 therefore means "not trusted". The read,
      * compare and write run with no await between them. SQLite only;
      * `publishDidDocuments` carries it to KV.
      */
@@ -141,10 +154,43 @@ export class MonitorIngest
         document: DidDocument | null,
         asOfMs: number
     ): Promise<void> {
-        void did
-        void document
-        void asOfMs
-        throw new Error("not implemented")
+        const json = canonicalDidDocumentJson(document)
+        const row = this.didDocumentRow(did)
+        if (row === undefined) {
+            this.db.sql.exec(
+                "INSERT INTO did_documents (did, document, as_of, confirmed_at, version) " +
+                    "VALUES (?, ?, ?, ?, 1)",
+                did,
+                json,
+                asOfMs,
+                asOfMs
+            )
+            return
+        }
+        if (asOfMs < row.as_of) return
+        // Content restored after a stale mark is a change to readers: the
+        // published entry was removed, so it must be put again.
+        const changed = json !== row.document || row.confirmed_at === 0
+        this.db.sql.exec(
+            "UPDATE did_documents SET document = ?, as_of = ?, confirmed_at = ?, " +
+                "version = version + ? WHERE did = ?",
+            json,
+            asOfMs,
+            asOfMs,
+            changed ? 1 : 0,
+            did
+        )
+    }
+
+    private didDocumentRow(
+        did: string
+    ): { document: string; as_of: number; confirmed_at: number } | undefined {
+        return this.db.sql
+            .exec<{ document: string; as_of: number; confirmed_at: number }>(
+                "SELECT document, as_of, confirmed_at FROM did_documents WHERE did = ?",
+                did
+            )
+            .toArray()[0]
     }
 
     /**
@@ -156,9 +202,23 @@ export class MonitorIngest
      * cannot land the superseded document as the first row.
      */
     async markDidDocumentStale(did: string, asOfMs: number): Promise<void> {
-        void did
-        void asOfMs
-        throw new Error("not implemented")
+        const row = this.didDocumentRow(did)
+        if (row === undefined) {
+            this.db.sql.exec(
+                "INSERT INTO did_documents (did, document, as_of, confirmed_at, version) " +
+                    "VALUES (?, '', ?, 0, 1)",
+                did,
+                asOfMs
+            )
+            return
+        }
+        if (asOfMs < row.as_of) return
+        this.db.sql.exec(
+            "UPDATE did_documents SET as_of = ?, confirmed_at = 0, version = version + 1 " +
+                "WHERE did = ?",
+            asOfMs,
+            did
+        )
     }
 
     /**

@@ -14,7 +14,11 @@ import {
 } from "cloudflare:test"
 import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { binaryToBase64URL, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import {
+    binaryToBase64URL,
+    RecordNotFoundError,
+    type DidDocument,
+} from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
     mightHaveChanged,
@@ -26,6 +30,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
+import { canonicalDidDocumentJson } from "../src/did-document-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -1135,15 +1140,171 @@ describe("snapshot refresh", () => {
 })
 
 describe("stored DID documents", () => {
-    it.todo("a first recordDidDocument stores the document at its asOf")
-    it.todo("a write older than the stored asOf is dropped")
-    it.todo("a newer write with the same content advances only the confirmation time")
-    it.todo("the directory's document and the render of the same op store as equal content")
-    it.todo("a null document is stored as a tombstone, supersedes an older document, and compares equal to a stored null")
-    it.todo("two writes for one DID started together land in asOf order")
-    it.todo("markDidDocumentStale bumps the version and zeroes the confirmation; a later write restores it")
-    it.todo("markDidDocumentStale older than the stored asOf is dropped")
-    it.todo("markDidDocumentStale with no row inserts an untrusted placeholder that drops an older fetch")
+    interface Row {
+        document: string
+        as_of: number
+        confirmed_at: number
+        version: number
+    }
+    const rowOf = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<Row>(
+                    "SELECT document, as_of, confirmed_at, version FROM did_documents WHERE did = ?",
+                    did
+                )
+                .toArray()[0] ?? null
+        )
+    const record = (
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string,
+        document: DidDocument | null,
+        asOf: number
+    ) => inMonitorObj(stub, (obj) => obj.recordDidDocument(did, document, asOf))
+    const stale = (stub: DurableObjectStub<MonitorIngest>, did: string, asOf: number) =>
+        inMonitorObj(stub, (obj) => obj.markDidDocumentStale(did, asOf))
+
+    const docA = (did: string): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: "https://a.example" }],
+    })
+    const docB = (did: string): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: "https://b.example" }],
+    })
+
+    it("a first recordDidDocument stores the document at its asOf", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8first"
+        await record(stub, did, docA(did), 1_000)
+        expect(await rowOf(stub, did)).toEqual({
+            document: canonicalDidDocumentJson(docA(did)),
+            as_of: 1_000,
+            confirmed_at: 1_000,
+            version: 1,
+        })
+    })
+
+    it("a write older than the stored asOf is dropped", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8older"
+        await record(stub, did, docB(did), 2_000)
+        await record(stub, did, docA(did), 1_999)
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            as_of: 2_000,
+            version: 1,
+        })
+    })
+
+    it("a newer write with the same content advances only the confirmation time", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8same"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, docA(did), 5_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 5_000, confirmed_at: 5_000, version: 1 })
+        await record(stub, did, docB(did), 6_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 6_000, version: 2 })
+    })
+
+    it("the directory's document and the render of the same op store as equal content", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8order"
+        const fetched = {
+            "@context": ["a", "b"],
+            id: did,
+            service: [{ type: "P", id: "#atproto_pds", serviceEndpoint: "https://a.example" }],
+        }
+        const rendered = {
+            service: [{ id: "#atproto_pds", serviceEndpoint: "https://a.example", type: "P" }],
+            id: did,
+            "@context": ["a", "b"],
+        }
+        await record(stub, did, fetched as DidDocument, 1_000)
+        await record(stub, did, rendered as DidDocument, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ version: 1, confirmed_at: 2_000 })
+    })
+
+    it("a null document is stored as a tombstone, supersedes an older document, and compares equal to a stored null", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8null"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, null, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null", version: 2 })
+        await record(stub, did, null, 3_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null", version: 2, confirmed_at: 3_000 })
+        await record(stub, did, docA(did), 1_500)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "null" })
+    })
+
+    it("two writes for one DID started together land in asOf order", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8race"
+        await Promise.all([
+            record(stub, did, docB(did), 2_000),
+            record(stub, did, docA(did), 1_000),
+        ])
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            as_of: 2_000,
+        })
+    })
+
+    it("a write or stale mark at the stored asOf lands", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8tie"
+        await record(stub, did, docA(did), 1_000)
+        await record(stub, did, docB(did), 1_000)
+        expect(await rowOf(stub, did)).toMatchObject({
+            document: canonicalDidDocumentJson(docB(did)),
+            version: 2,
+        })
+        await stale(stub, did, 1_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 0, version: 3 })
+    })
+
+    it("markDidDocumentStale bumps the version and zeroes the confirmation; a later write restores it", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8stale"
+        await record(stub, did, docA(did), 1_000)
+        await stale(stub, did, 2_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 2_000, confirmed_at: 0, version: 2 })
+        await record(stub, did, docA(did), 3_000)
+        expect(await rowOf(stub, did)).toMatchObject({ as_of: 3_000, confirmed_at: 3_000, version: 3 })
+    })
+
+    it("markDidDocumentStale older than the stored asOf is dropped", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8staleold"
+        await record(stub, did, docA(did), 5_000)
+        await stale(stub, did, 4_999)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 5_000, version: 1 })
+    })
+
+    it("markDidDocumentStale with no row inserts an untrusted placeholder that drops an older fetch", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s8placeholder"
+        await stale(stub, did, 5_000)
+        expect(await rowOf(stub, did)).toEqual({
+            document: "",
+            as_of: 5_000,
+            confirmed_at: 0,
+            version: 1,
+        })
+        await record(stub, did, docA(did), 4_000)
+        expect(await rowOf(stub, did)).toMatchObject({ document: "", confirmed_at: 0 })
+        await record(stub, did, docA(did), 6_000)
+        expect(await rowOf(stub, did)).toMatchObject({ confirmed_at: 6_000, version: 2 })
+    })
+
+    it("canonicalDidDocumentJson sorts keys recursively, keeps array order, and writes null as \"null\"", () => {
+        expect(canonicalDidDocumentJson(null)).toBe("null")
+        expect(
+            canonicalDidDocumentJson({ b: [{ z: 1, a: 2 }, 3], a: { y: "x", c: null } } as unknown as DidDocument)
+        ).toBe('{"a":{"c":null,"y":"x"},"b":[{"a":2,"z":1},3]}')
+        expect(canonicalDidDocumentJson({ a: undefined, b: 1 } as unknown as DidDocument)).toBe('{"b":1}')
+        expect(canonicalDidDocumentJson([undefined] as unknown as DidDocument)).toBe("[null]")
+    })
 })
 
 describe("publishing stored DID documents", () => {

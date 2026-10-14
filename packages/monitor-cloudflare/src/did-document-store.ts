@@ -29,8 +29,17 @@ export const PLC_COVERAGE_KEY = "plc:coverage"
  * same state compare equal however their keys were ordered.
  */
 export function canonicalDidDocumentJson(document: DidDocument | null): string {
-    void document
-    throw new Error("not implemented")
+    return JSON.stringify(sortKeys(document))
+}
+
+function sortKeys(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(sortKeys)
+    if (typeof value !== "object" || value === null) return value
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+            .map(([key, v]) => [key, sortKeys(v)])
+    )
 }
 
 /**
