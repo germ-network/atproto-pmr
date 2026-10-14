@@ -20,10 +20,10 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     records: KVNamespace
 
     /**
-     * **A singleton.** One socket, one cursor, one `rev` index for the
-     * whole coverage. Address it by a fixed name, never per user: the
-     * consumer is network-wide where a relay's objects are per
-     * registration.
+     * **A singleton.** One Jetstream socket and cursor (plus the optional
+     * PLC export socket and cursor), one `rev` index for the whole
+     * coverage. Address it by a fixed name, never per user: the consumer is
+     * network-wide where a relay's objects are per registration.
      */
     ingest: DurableObjectNamespace<TIngest>
 
@@ -37,6 +37,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * view of the network.
      */
     JETSTREAM_URL: string
+
+    /**
+     * The PLC directory's export stream (`…/export/stream`), consumed to
+     * keep the relay's cached did:plc signing keys (`sk:` in `records`)
+     * current. Unset, the consumer does not run and cached keys follow
+     * their TTL alone.
+     */
+    PLC_EXPORT_STREAM_URL?: string
 
     /**
      * Watchdog interval, milliseconds. An outbound socket does not

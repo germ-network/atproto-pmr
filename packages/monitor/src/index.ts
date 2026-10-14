@@ -14,6 +14,10 @@
  * several independent parties can run one, the property the redundancy
  * model depends on.
  *
+ * It can also keep a relay's cached did:plc signing keys current from the
+ * PLC directory's export stream (`decodePlcExportFrame`, `intakePlcEvent`,
+ * `drainKeyUpdates`; `spec/key-transparency.md`, "The signing-key cache").
+ *
  * The specification is in `spec/key-transparency.md`. Where this code and
  * the specification disagree, the specification is right and this is a bug.
  */
@@ -36,12 +40,15 @@ export {
     type Cursor,
     type DigestMarker,
     type IntakeOutcome,
+    type KeyUpdateIndex,
     type MonitorIndex,
+    type OwedKeyUpdate,
     type Observation,
     type ObservationComparison,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
+    type SigningKeyCacheWriter,
     type SnapshotStore,
 } from "./storage"
 
@@ -96,6 +103,19 @@ export {
     type IntakeDecision,
     type SettleOutcome,
 } from "./ingest"
+
+// Signing-key cache invalidation from the PLC export stream.
+export {
+    decodePlcExportFrame,
+    drainKeyUpdates,
+    intakePlcEvent,
+    plcCursorAfterClose,
+    type DrainKeyUpdatesDeps,
+    type PlcCursorAction,
+    type PlcExportEvent,
+    type PlcIntakeDecision,
+    type SigningKeyUpdate,
+} from "./plc-export"
 
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"

@@ -121,7 +121,15 @@ path through the commit's tree — and, on an ordinary put, contacts only the mo
 store and the sender's DID directory (the PLC directory, or the `did:web`
 host), with the signing key cached for ten minutes (a DID-document re-key is not
 seen before then, nor for up to six hours if the directory is unreachable,
-when a stale key is used rather than refusing everyone). It does not take the
+when a stale key is used rather than refusing everyone). Where the monitor
+consumes the PLC directory's export stream, a `did:plc` re-key reaches that
+cache when the operation is sequenced, so the ten minutes bound only a
+lagging or gapped stream; the KV propagation delay (about a minute) and the
+stale-if-error window add to either bound. A `did:web` entry follows its TTL,
+shortened by the monitor's identity-event hint. One race remains: a fetch that
+read the old document just before an operation landed can be written after the
+stream's update and keep the old key for up to one TTL. See
+[`key-transparency.md` §The signing-key cache](key-transparency.md#the-signing-key-cache). It does not take the
 declaration from the sender's PDS on a put, for two reasons: an inline fetch
 tells the sender's PDS when the sender sends, and a read from the party
 whose claim is being checked is not independent of it. The cost is

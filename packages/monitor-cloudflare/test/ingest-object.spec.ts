@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { binaryToBase64URL, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
+    intake,
     mightHaveChanged,
     sealDueWindows,
     settleDue,
@@ -26,6 +27,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
+import { kvSigningKeyCache } from "../src/signing-key-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -1131,5 +1133,283 @@ describe("snapshot refresh", () => {
         expect(await read("did:plc:deleted-rec")).toBeNull()
         await store.putRecord("did:plc:deleted-rec", entry("3m1", 2_000))
         expect((await read("did:plc:deleted-rec"))!.freshAtMs).toBe(2_000)
+    })
+})
+
+describe("PLC export consumer", () => {
+    const PLC_URL = "https://plc.invalid/export/stream"
+    const COLLECTION = testEnv.MONITOR_COLLECTION
+    const put = (key: string, asOfMs = 1_000) => ({ kind: "put" as const, key, asOfMs })
+    const del = { kind: "delete" as const }
+
+    /** Run one alarm with every outbound fetch answered by `answer`; resolves the URLs asked for. */
+    async function alarmWithFetch(
+        stub: DurableObjectStub<MonitorIngest>,
+        answer: (url: string) => Promise<Response> = () =>
+            Promise.resolve(new Response(null, { status: 200 }))
+    ): Promise<string[]> {
+        const urls: string[] = []
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        )
+        const original = globalThis.fetch
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            const url = typeof input === "string" ? input : input.toString()
+            urls.push(url)
+            return answer(url)
+        }) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // The stubbed network fails every other stage of the tick.
+        } finally {
+            globalThis.fetch = original
+        }
+        return urls
+    }
+
+    /** `env` is shared across objects in this isolate: put it back. */
+    async function withPlcUrl<R>(
+        obj: MonitorIngest,
+        value: string | undefined,
+        fn: () => Promise<R> | R
+    ): Promise<R> {
+        const before = obj.env.PLC_EXPORT_STREAM_URL
+        obj.env.PLC_EXPORT_STREAM_URL = value
+        try {
+            return await fn()
+        } finally {
+            obj.env.PLC_EXPORT_STREAM_URL = before
+        }
+    }
+
+    const storedCursor = (stub: DurableObjectStub<MonitorIngest>) =>
+        runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            void obj
+            const row = state.storage.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'plc_cursor'")
+                .toArray()[0]
+            return row === undefined ? null : (JSON.parse(row.v) as { url: string; seq: number })
+        })
+
+    it("KeyUpdateIndex: plc cursor advances with oweKeyUpdate and survives a separate entry", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.oweKeyUpdate("did:plc:a", put("zK"), 42)
+        )
+        await evictDurableObject(stub)
+        const cursor = await runInDurableObject(stub, (obj: MonitorIngest) => obj.readPlcCursor())
+        expect(cursor).toBe(42)
+    })
+
+    it("KeyUpdateIndex: a cursor stored for a different PLC_EXPORT_STREAM_URL reads as null", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.oweKeyUpdate("did:plc:a", put("zK"), 42)
+        )
+        await evictDurableObject(stub)
+        const cursor = await runInDurableObject(stub, (obj: MonitorIngest) =>
+            withPlcUrl(obj, "https://other.invalid/export/stream", () => obj.readPlcCursor())
+        )
+        expect(cursor).toBeNull()
+    })
+
+    it("KeyUpdateIndex: advancePlcCursor(10), oweKeyUpdate(…, 11), alarm → stored cursor 11 (one high-water seq)", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.advancePlcCursor(10)
+            await obj.oweKeyUpdate("did:plc:a", put("zK"), 11)
+        })
+        await alarmWithFetch(stub)
+        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 11 })
+
+        // A lazily flushed advance must not drag a newer stored seq back.
+        const other = freshStub()
+        await runInDurableObject(other, async (obj: MonitorIngest) => {
+            await obj.oweKeyUpdate("did:plc:a", put("zK"), 11)
+            await obj.advancePlcCursor(10)
+        })
+        await alarmWithFetch(other)
+        expect(await storedCursor(other)).toEqual({ url: PLC_URL, seq: 11 })
+    })
+
+    it("KeyUpdateIndex: an advance inside the persist interval is flushed by the alarm", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.advancePlcCursor(10)
+            await obj.advancePlcCursor(20)
+        })
+        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 10 })
+        await alarmWithFetch(stub)
+        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 20 })
+    })
+
+    it("KeyUpdateIndex: an advance below the stored cursor on a cold object does not lower it", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.oweKeyUpdate("did:plc:a", put("zK"), 50)
+        )
+        await evictDurableObject(stub)
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.advancePlcCursor(40))
+        await alarmWithFetch(stub)
+        expect(await storedCursor(stub)).toEqual({ url: PLC_URL, seq: 50 })
+    })
+
+    it("KeyUpdateIndex: resetPlcCursor then alarm → cursor stays null", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.advancePlcCursor(10)
+            await obj.resetPlcCursor()
+        })
+        await alarmWithFetch(stub)
+        expect(await storedCursor(stub)).toBeNull()
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.readPlcCursor())).toBeNull()
+    })
+
+    it("KeyUpdateIndex: isWatched covers revs and pending, excludes permanently deleted", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete("did:plc:inrevs", "3m1", 1)
+            await obj.owe("did:plc:inpending", "3m1")
+            await obj.complete("did:plc:gone", "3m1", 1)
+            await obj.completeDeletion("did:plc:gone", 2, true)
+            await obj.complete("did:plc:soft", "3m1", 1)
+            await obj.completeDeletion("did:plc:soft", 2, false)
+            return {
+                inrevs: await obj.isWatched("did:plc:inrevs"),
+                inpending: await obj.isWatched("did:plc:inpending"),
+                gone: await obj.isWatched("did:plc:gone"),
+                soft: await obj.isWatched("did:plc:soft"),
+                never: await obj.isWatched("did:plc:never"),
+            }
+        })
+        expect(result).toEqual({ inrevs: true, inpending: true, gone: false, soft: true, never: false })
+    })
+
+    it("KeyUpdateIndex: oweKeyUpdate replaces and bumps version; clearKeyUpdate with a stale version is a no-op", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.oweKeyUpdate("did:plc:a", put("zOld"))
+            const [first] = await obj.dueKeyUpdates(10)
+            await obj.oweKeyUpdate("did:plc:a", del)
+            await obj.clearKeyUpdate("did:plc:a", first!.version)
+            const stillOwed = await obj.dueKeyUpdates(10)
+            await obj.clearKeyUpdate("did:plc:a", stillOwed[0]!.version)
+            return { first, stillOwed, after: await obj.dueKeyUpdates(10) }
+        })
+        expect(result.first).toEqual({ did: "did:plc:a", update: put("zOld"), version: 1 })
+        expect(result.stillOwed).toEqual([{ did: "did:plc:a", update: del, version: 2 }])
+        expect(result.after).toEqual([])
+    })
+
+    it("KeyUpdateIndex: a null key and a limit round-trip", async () => {
+        const stub = freshStub()
+        const owed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.oweKeyUpdate("did:plc:a", { kind: "put", key: null, asOfMs: 5 })
+            await obj.oweKeyUpdate("did:plc:b", del)
+            return obj.dueKeyUpdates(1)
+        })
+        expect(owed).toEqual([
+            { did: "did:plc:a", update: { kind: "put", key: null, asOfMs: 5 }, version: 1 },
+        ])
+    })
+
+    it("alarm connects to PLC_EXPORT_STREAM_URL with cursor=<plc cursor>, or none at the tip", async () => {
+        const tip = await alarmWithFetch(freshStub())
+        const tipUrl = tip.find((u) => u.startsWith(PLC_URL))
+        expect(tipUrl).toBeDefined()
+        expect(new URL(tipUrl!).searchParams.has("cursor")).toBe(false)
+
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.oweKeyUpdate("did:plc:a", put("zK"), 77)
+        )
+        await evictDurableObject(stub)
+        const resumed = (await alarmWithFetch(stub)).find((u) => u.startsWith(PLC_URL))
+        expect(new URL(resumed!).searchParams.get("cursor")).toBe("77")
+    })
+
+    it("alarm makes no PLC connect when PLC_EXPORT_STREAM_URL is unset", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            obj.env.PLC_EXPORT_STREAM_URL = undefined
+        })
+        let urls: string[]
+        try {
+            urls = await alarmWithFetch(stub)
+        } finally {
+            await runInDurableObject(stub, (obj: MonitorIngest) => {
+                obj.env.PLC_EXPORT_STREAM_URL = PLC_URL
+            })
+        }
+        expect(urls.some((u) => u.includes("plc.invalid"))).toBe(false)
+        expect(urls.some((u) => u.includes("jetstream"))).toBe(true)
+    })
+
+    it("a failed PLC connect does not stop the rest of the alarm", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.oweKeyUpdate("did:plc:failconnect", put("zAfter"))
+        )
+        const urls = await alarmWithFetch(stub, (url) =>
+            url.startsWith(PLC_URL)
+                ? Promise.reject(new Error("plc down"))
+                : Promise.resolve(new Response(null, { status: 200 }))
+        )
+        expect(urls.some((u) => u.startsWith(PLC_URL))).toBe(true)
+        expect(urls.some((u) => u.includes("relay.invalid"))).toBe(true)
+        expect(await kvSigningKeyCache(testEnv).get("did:plc:failconnect")).toMatchObject({
+            key: "zAfter",
+        })
+    })
+
+    it("alarm drains owed key updates into sk:", async () => {
+        const stub = freshStub()
+        const cache = kvSigningKeyCache(testEnv)
+        await cache.put("did:plc:drain-del", { key: "zStale", fetchedAtMs: 1 })
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.oweKeyUpdate("did:plc:drain-put", put("zNew", 1_000))
+            await obj.oweKeyUpdate("did:plc:drain-del", del)
+        })
+        await alarmWithFetch(stub)
+        expect(await cache.get("did:plc:drain-put")).toEqual({ key: "zNew", fetchedAtMs: 1_000 })
+        expect(await cache.get("did:plc:drain-del")).toBeNull()
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.dueKeyUpdates(10))).toEqual([])
+    })
+
+    describe("the identity hint through deps()", () => {
+        const identity = (did: string) => ({
+            kind: "identity" as const,
+            did,
+            seq: 1,
+            timeMs: null,
+        })
+        const hint = (stub: DurableObjectStub<MonitorIngest>, did: string, consumerUnset: boolean) =>
+            runInDurableObject(stub, (obj: MonitorIngest) =>
+                withPlcUrl(obj, consumerUnset ? undefined : PLC_URL, async () => {
+                    await obj.complete(did, "3m1", 1)
+                    const deps = (obj as unknown as { deps(): IngestDeps }).deps()
+                    const decision = await intake(deps, { collection: COLLECTION }, identity(did), "c")
+                    return { decision, owed: (await obj.dueKeyUpdates(10)).map((o) => o.did) }
+                })
+            )
+
+        it("identity event via deps(): a watched did:web owes a key delete; a watched did:plc owes none while the consumer is configured", async () => {
+            expect(await hint(freshStub(), "did:web:example.com", false)).toEqual({
+                decision: "reverify",
+                owed: ["did:web:example.com"],
+            })
+            expect(await hint(freshStub(), "did:plc:watched", false)).toEqual({
+                decision: "reverify",
+                owed: [],
+            })
+        })
+
+        it("identity event via deps() with the consumer unset: a watched did:plc owes a key delete", async () => {
+            expect(await hint(freshStub(), "did:plc:watched", true)).toEqual({
+                decision: "reverify",
+                owed: ["did:plc:watched"],
+            })
+        })
     })
 })
