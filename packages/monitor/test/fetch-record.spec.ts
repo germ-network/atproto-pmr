@@ -234,3 +234,11 @@ describe("fetchHeadRev", () => {
         expect(err).not.toBeInstanceOf(RecordNotFoundError)
     })
 })
+
+describe("the DID document a fetch resolved through", () => {
+    it.todo("fetchRecordCar returns the directory's document, stamped with the time before the directory request")
+    it.todo("fetchRecordCar resolves the PDS from that same document, one directory request")
+    it.todo("fetchHeadRev hands its document to onDidDocument before reading the head")
+    it.todo("fetchHeadRev without onDidDocument behaves as before")
+    it.todo("a failing onDidDocument does not fail fetchHeadRev")
+})

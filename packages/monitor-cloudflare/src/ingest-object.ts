@@ -12,13 +12,16 @@ import {
     windowOf,
     type BackfillProgress,
     type Cursor,
+    type DidDocumentSink,
     type FetchedRecord,
     type IngestDeps,
     type IntakeOutcome,
     type MonitorIndex,
     type PendingFetch,
+    type PlcCursorIndex,
     type RefreshIndex,
 } from "@germ-network/atproto-pmr-monitor"
+import type { DidDocument } from "@germ-network/atproto-pmr-core"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
@@ -81,7 +84,7 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
-    implements MonitorIndex, RefreshIndex
+    implements MonitorIndex, RefreshIndex, DidDocumentSink, PlcCursorIndex
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -122,6 +125,119 @@ export class MonitorIngest
                 );
             `)
         })
+    }
+
+    // ---- Stored DID documents ---------------------------------------------
+
+    /**
+     * Ordered by `asOfMs` (see `DidDocumentSink`). A write equal in content
+     * (`canonicalDidDocumentJson`) to the stored one only advances its
+     * confirmation time; a different one bumps the row's version. The read,
+     * compare and write run with no await between them. SQLite only;
+     * `publishDidDocuments` carries it to KV.
+     */
+    async recordDidDocument(
+        did: string,
+        document: DidDocument | null,
+        asOfMs: number
+    ): Promise<void> {
+        void did
+        void document
+        void asOfMs
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Ordered like `recordDidDocument`. Bumps the version and zeroes the
+     * confirmation, so the next publish removes `doc:<did>` and every reader
+     * falls back to the directory; a later write restores it. With no row
+     * yet, inserts an untrusted placeholder (document `""`, distinct from
+     * `"null"` = gone) at `asOfMs`, so a fetch that started before the change
+     * cannot land the superseded document as the first row.
+     */
+    async markDidDocumentStale(did: string, asOfMs: number): Promise<void> {
+        void did
+        void asOfMs
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Publish up to `limit` stored documents to KV, content changes first. A
+     * trusted document is put as a `CachedDidDocument`; a tombstone, a stale
+     * mark or a placeholder removes `doc:<did>` instead, so readers ask the
+     * directory. Rows selected:
+     * any whose version differs from the published one; then any confirmed
+     * at least half of `STORED_DID_DOCUMENT_MAX_AGE_MS` after what KV holds
+     * (so an unchanged document costs at most two KV writes a day); then any
+     * whose KV confirmation predates the stream's current unbroken run while
+     * its stored one does not. Marks published the version and confirmation
+     * it put, not whatever the row holds by then. A KV failure leaves the row
+     * for the next call. Resolves `{published, remaining, coveredThroughMs}`:
+     * `remaining` counts content changes (staleness included) unpublished
+     * after the last put; `coveredThroughMs` is the high-water `createdAt`
+     * taken before any row was selected, or null when the pass is not drained
+     * or no run has begun — so a change that lands mid-pass is never counted
+     * as covered.
+     */
+    async publishDidDocuments(
+        limit: number
+    ): Promise<{ published: number; remaining: number; coveredThroughMs: number | null }> {
+        void limit
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Publish `plc:coverage`, advancing `coveredThroughMs` to the given value
+     * (from a drained `publishDidDocuments`) or re-publishing the previous
+     * one when null. Called only after the cursor row holding the run's
+     * `continuousSinceMs` is persisted; a no-op until a run has been
+     * persisted, so KV never claims a run an eviction could lose.
+     */
+    async publishPlcCoverage(coveredThroughMs: number | null): Promise<void> {
+        void coveredThroughMs
+        throw new Error("not implemented")
+    }
+
+    // ---- PLC export cursor ------------------------------------------------
+
+    async isWatched(did: string): Promise<boolean> {
+        void did
+        throw new Error("not implemented")
+    }
+
+    /**
+     * In memory; persisted at most every 5 s (checked on the next frame, not
+     * by a timer) and on every alarm. Losing the unpersisted tail only replays.
+     */
+    async advancePlcCursor(seq: number, createdAtMs: number): Promise<void> {
+        void seq
+        void createdAtMs
+        throw new Error("not implemented")
+    }
+
+    /** The stored seq, or null when none is stored for `url`. */
+    async readPlcCursor(url: string): Promise<number | null> {
+        void url
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Clears the stored row and the in-memory high-water seq together, and
+     * ends the unbroken run: the next frame's `createdAt` starts a new one.
+     */
+    async resetPlcCursor(): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    /**
+     * The second outbound socket, to `PLC_EXPORT_STREAM_URL`, resuming after
+     * the stored seq, or from the tip (starting a new unbroken run) when there
+     * is none for this URL. Same bounded upgrade as `connect`. Frames are
+     * handled strictly in order on one promise chain. A no-op when the
+     * variable is unset or the socket is open.
+     */
+    async connectPlc(): Promise<void> {
+        throw new Error("not implemented")
     }
 
     // ---- MonitorIndex -----------------------------------------------------

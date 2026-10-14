@@ -34,12 +34,15 @@ export {
     compareRev,
     type BackfillProgress,
     type Cursor,
+    FETCH_AS_OF_SKEW_MS,
+    type DidDocumentSink,
     type DigestMarker,
     type IntakeOutcome,
     type MonitorIndex,
     type Observation,
     type ObservationComparison,
     type PendingFetch,
+    type PlcCursorIndex,
     type RevComparison,
     type SnapshotEntry,
     type SnapshotStore,
@@ -83,13 +86,19 @@ export {
 } from "./notify"
 
 // The authoritative read.
-export { fetchRecordCar, fetchHeadRev, type FetchRecordOptions } from "./fetch-record"
+export {
+    fetchRecordCar,
+    fetchHeadRev,
+    type FetchHeadRevOptions,
+    type FetchRecordOptions,
+} from "./fetch-record"
 
 // Ingest orchestration.
 export {
     intake,
     settle,
     settleDue,
+    type FetchedDidDocument,
     type FetchedRecord,
     type IngestConfig,
     type IngestDeps,
@@ -109,3 +118,15 @@ export {
     type RefreshResult,
     type SnapshotCheck,
 } from "./refresh"
+
+// The PLC directory's export stream: keeps stored did:plc documents current.
+export {
+    decodePlcExportFrame,
+    intakePlcEvent,
+    plcCursorAfterClose,
+    type PlcCursorAction,
+    type PlcDocumentChange,
+    type PlcExportEvent,
+    type PlcIntakeDecision,
+    type PlcIntakeDeps,
+} from "./plc-export"

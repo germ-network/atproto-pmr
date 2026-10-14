@@ -301,3 +301,7 @@ describe("refreshDue", () => {
         expect(h.dueCalls[0]!.limit).toBe(2)
     })
 })
+
+describe("refresh keeps the stored DID document", () => {
+    it.todo("a quiet advance records the fetched record's document")
+})

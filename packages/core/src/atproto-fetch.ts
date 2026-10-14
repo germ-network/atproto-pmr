@@ -476,7 +476,11 @@ export interface PDSResolution {
  */
 const PLC_TOMBSTONE_MESSAGE_PREFIX = "DID not available: "
 
-async function fetchDidDocument(
+/**
+ * The DID's document from its directory (plc.directory, or the did:web host),
+ * checked to claim `did`. A did:plc tombstone raises `RecordNotFoundError`.
+ */
+export async function fetchDidDocument(
     did: string,
     fetchImpl: typeof fetch
 ): Promise<Record<string, unknown>> {
@@ -528,6 +532,16 @@ export async function resolvePDSEndpoint(
         endpoint: service,
         signingKey: extractSigningKey(doc),
     }
+}
+
+/**
+ * `resolvePDSEndpoint`'s answer from a document already in hand, so a caller
+ * that keeps the document does not fetch it twice. Throws when the document
+ * has no `#atproto_pds` service.
+ */
+export function pdsResolutionFromDocument(doc: Record<string, unknown>): PDSResolution {
+    void doc
+    throw new Error("not implemented")
 }
 
 /**
@@ -688,7 +702,7 @@ function extractPDSService(doc: Record<string, unknown>): string | null {
  * exists to make — a monitor still serves what it read, and an atproto
  * client is what fails a record against no key, not this resolver.
  */
-function extractSigningKey(doc: Record<string, unknown>): string | null {
+export function extractSigningKey(doc: Record<string, unknown>): string | null {
     const methods = doc.verificationMethod
     if (!Array.isArray(methods)) return null
 

@@ -17,7 +17,7 @@ import {
     guardedFetchBytes,
     resolvePDSEndpoint,
 } from "@germ-network/atproto-pmr-core"
-import type { FetchedRecord } from "./ingest"
+import type { FetchedDidDocument, FetchedRecord } from "./ingest"
 
 export interface FetchRecordOptions {
     /** The collection carrying the published key. */
@@ -25,6 +25,19 @@ export interface FetchRecordOptions {
     /** Records that carry one key per repo sit at `self`. */
     rkey?: string
     fetchImpl?: typeof fetch
+    /** Stamps the returned `didDocument`. Defaults to `Date.now`. */
+    nowMs?: () => number
+}
+
+export interface FetchHeadRevOptions {
+    fetchImpl?: typeof fetch
+    /**
+     * Handed the DID document the head was resolved through, so the refresh
+     * pass keeps the stored copy current at no extra subrequest.
+     */
+    onDidDocument?: (fetched: FetchedDidDocument) => Promise<void>
+    /** Stamps `onDidDocument`'s argument. Defaults to `Date.now`. */
+    nowMs?: () => number
 }
 
 /**
@@ -83,7 +96,7 @@ const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
  */
 export async function fetchHeadRev(
     did: string,
-    options: { fetchImpl?: typeof fetch } = {}
+    options: FetchHeadRevOptions = {}
 ): Promise<string> {
     const fetchImpl = options.fetchImpl ?? fetch
     const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)

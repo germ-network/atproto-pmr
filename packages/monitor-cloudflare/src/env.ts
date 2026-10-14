@@ -115,6 +115,17 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     REFRESH_STALE_AFTER_MS: string
 
     /**
+     * The PLC directory's export stream (`wss://plc.directory/export/stream`,
+     * written as https). Optional: unset, no second socket is opened and
+     * stored did:plc documents follow only the refresh pass and are trusted
+     * only for the direct-fetch TTL. Must be the same directory the monitor's
+     * fetches and the relay's fallback read (plc.directory): a mirror's
+     * coverage says nothing about what they see. The cursor is stored per
+     * URL, because `seq` is per directory host.
+     */
+    PLC_EXPORT_STREAM_URL?: string
+
+    /**
      * The registration surface: own-DID push. Optional — a deployment that
      * does not bind this serves the monitor with no registration/push
      * capability at all (`onChange` no-ops), matching `webPushSender`'s

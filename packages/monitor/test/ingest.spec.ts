@@ -639,3 +639,12 @@ describe("compareObservations", () => {
         ).toBe("skew")
     })
 })
+
+describe("settle keeps the stored DID document", () => {
+    it.todo("records the fetched document as of its fetch time less FETCH_AS_OF_SKEW_MS on a stored outcome")
+    it.todo("records the fetched document even when verification rejects the record")
+    it.todo("records the fetched document even when the rev regressed")
+    it.todo("records nothing when the fetch carried no document")
+    it.todo("records nothing when didDocuments is not wired")
+    it.todo("a failing document write does not fail the settle")
+})

@@ -14,11 +14,12 @@
  * of work the store has *lost* — it can only run ahead of work still owed.
  */
 
-import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { RecordNotFoundError, type DidDocument } from "@germ-network/atproto-pmr-core"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
     type Cursor,
+    type DidDocumentSink,
     type MonitorIndex,
     type SnapshotStore,
 } from "./storage"
@@ -32,6 +33,19 @@ export interface FetchedRecord {
     /** The atproto signing key resolved at fetch time; `null` if the DID
      * document carried none. See `resolvePDSEndpoint` in core. */
     signingKey: string | null
+    /**
+     * The DID document the PDS was resolved from, when the fetch kept it.
+     * Absent from a deployment fetch that does not; then nothing is stored.
+     */
+    didDocument?: FetchedDidDocument
+}
+
+/** A DID document as fetched from its directory. */
+export interface FetchedDidDocument {
+    document: DidDocument
+    /** Taken before the directory request, so a write ordered by it can never
+     * claim to be newer than what the directory had when asked. */
+    fetchedAtMs: number
 }
 
 export interface IngestDeps {
@@ -64,6 +78,12 @@ export interface IngestDeps {
      * re-checking a reversible one rather than treating it as settled.
      */
     onDelete?(did: string): Promise<void>
+    /**
+     * Where a DID document fetched alongside a record is kept. Recorded on
+     * every successful fetch, whatever the record's own outcome: the
+     * document came from the directory, not from the PDS being judged.
+     */
+    didDocuments?: DidDocumentSink
     nowMs(): number
 }
 

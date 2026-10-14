@@ -1133,3 +1133,62 @@ describe("snapshot refresh", () => {
         expect((await read("did:plc:deleted-rec"))!.freshAtMs).toBe(2_000)
     })
 })
+
+describe("stored DID documents", () => {
+    it.todo("a first recordDidDocument stores the document at its asOf")
+    it.todo("a write older than the stored asOf is dropped")
+    it.todo("a newer write with the same content advances only the confirmation time")
+    it.todo("the directory's document and the render of the same op store as equal content")
+    it.todo("a null document is stored as a tombstone, supersedes an older document, and compares equal to a stored null")
+    it.todo("two writes for one DID started together land in asOf order")
+    it.todo("markDidDocumentStale bumps the version and zeroes the confirmation; a later write restores it")
+    it.todo("markDidDocumentStale older than the stored asOf is dropped")
+    it.todo("markDidDocumentStale with no row inserts an untrusted placeholder that drops an older fetch")
+})
+
+describe("publishing stored DID documents", () => {
+    it.todo("publishDidDocuments writes a changed document to KV and kvDidDocuments reads it back")
+    it.todo("skips an unchanged document confirmed under half the max age after what KV holds")
+    it.todo("re-publishes an unchanged document confirmed half the max age after what KV holds")
+    it.todo("re-publishes a document whose KV confirmation predates the current unbroken run")
+    it.todo("publishes content changes before re-confirmations")
+    it.todo("stops at limit, leaves the rest for the next call, and reports remaining content changes")
+    it.todo("a document recorded while its publish is in flight is published on the next call")
+    it.todo("a KV failure leaves the document unpublished")
+    it.todo("a stale-marked document, a tombstone or a placeholder removes the KV entry")
+    it.todo("a published document carries source plc or web by DID method")
+    it.todo("coveredThroughMs is the high-water taken before selection; a render injected through a KV put is not counted covered")
+    it.todo("kvDidDocuments reads a missing or malformed entry as null")
+})
+
+describe("wiring stored DID documents into the monitor", () => {
+    it.todo("settle through the real deps records the fetched record's DID document")
+    it.todo("the default fetchHeadRev records the document it resolved through")
+    it.todo("the alarm publishes documents after the refresh pass, and a publish failure does not skip sealing")
+})
+
+describe("the PLC export cursor", () => {
+    it.todo("isWatched: a DID in revs (deleted included), or only pending, is watched; an unknown DID is not")
+    it.todo("advancePlcCursor never lowers the high-water seq or createdAt")
+    it.todo("the cursor is persisted on alarm and read back for the same URL")
+    it.todo("readPlcCursor answers null when the stored cursor was for another URL")
+    it.todo("resetPlcCursor clears the stored row and the in-memory seq, so a later flush cannot restore it")
+    it.todo("intakePlcEvent through the real object stores a watched DID's render and ignores an unwatched DID")
+})
+
+describe("PLC stream coverage", () => {
+    it.todo("no coverage is published before a run's cursor row is persisted")
+    it.todo("a drained publish advances coveredThroughMs to the value given, and kvPlcCoverage reads it")
+    it.todo("a null coveredThroughMs re-publishes the previous value")
+    it.todo("a cursor reset starts a new run at the next frame's createdAt")
+    it.todo("a resume from a stored cursor keeps the run's continuousSinceMs")
+    it.todo("a changed PLC_EXPORT_STREAM_URL starts a new run")
+    it.todo("kvPlcCoverage reads a missing or malformed entry as null")
+})
+
+describe("PLC export consumer", () => {
+    it.todo("connectPlc is a no-op when PLC_EXPORT_STREAM_URL is unset")
+    it.todo("connectPlc sends the stored seq as the cursor parameter, and none when there is no cursor for this URL")
+    it.todo("a failed PLC connect does not skip the rest of the alarm")
+    it.todo("the alarm persists the PLC cursor before publishing coverage and before sealing")
+})

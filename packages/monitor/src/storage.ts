@@ -25,6 +25,8 @@
  * is a serving copy, not a truth.
  */
 
+import type { DidDocument } from "@germ-network/atproto-pmr-core"
+
 /**
  * A position in the upstream stream, in whatever units the stream uses
  * (Jetstream: microseconds). Opaque: a monitor stores and replays it, and
@@ -380,4 +382,50 @@ export function compareObservations(
         return "equivocation"
     }
     return a.source === b.source ? "agree" : "different-source"
+}
+
+/**
+ * Subtracted from a fetch's start time to give its `asOfMs`, so clock skew
+ * between the directory (whose `createdAt` orders stream writes) and this
+ * monitor cannot let a fetch that read a pre-operation document outrank the
+ * operation. Losing a tie costs one confirmation, nothing more.
+ */
+export const FETCH_AS_OF_SKEW_MS = 5_000
+
+/**
+ * The monitor's stored DID documents. Writes are ordered by `asOfMs`, not by
+ * arrival: a write whose `asOfMs` is older than the stored one is dropped.
+ * A stream operation's `asOfMs` is its directory `createdAt`; a fetch's is
+ * its start time less {@link FETCH_AS_OF_SKEW_MS}. So a fetch that read the
+ * directory before an operation was accepted never overwrites it, and a
+ * replayed old operation never overwrites a later fetch. (That a fetch
+ * started after acceptance sees the operation is an inference about the
+ * directory, not spec text.)
+ *
+ * Index I/O only — safe on the socket read loop. Publishing to where
+ * readers look is the implementation's own, separate step.
+ */
+export interface DidDocumentSink {
+    /** `document` null: the directory says the identity is gone. */
+    recordDidDocument(did: string, document: DidDocument | null, asOfMs: number): Promise<void>
+    /**
+     * The directory accepted a change at `asOfMs` that could not be rendered:
+     * whatever is stored no longer describes the DID, so it must stop being
+     * trusted until a later write (a re-fetch) lands. Ordered like a write.
+     */
+    markDidDocumentStale(did: string, asOfMs: number): Promise<void>
+}
+
+/** The export stream's position, and the watched set it filters against. */
+export interface PlcCursorIndex {
+    /**
+     * In the rev index (confirmed-deleted DIDs included, so a recovery
+     * operation is still seen) or owed a fetch.
+     */
+    isWatched(did: string): Promise<boolean>
+    /**
+     * Raise the high-water `seq`, and the `createdAt` it carries; never lowers
+     * either. Persistence may be deferred.
+     */
+    advancePlcCursor(seq: number, createdAtMs: number): Promise<void>
 }
