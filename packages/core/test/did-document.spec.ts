@@ -4,8 +4,15 @@
  * is fresh.
  */
 import { describe, expect, it } from "vitest"
-import { pdsResolutionFromDocument, resolvePDSEndpoint } from "../src/atproto-fetch"
-import { renderPlcDocument } from "../src/did-document"
+import { pdsResolutionFromDocument, resolvePDSEndpoint, SIGNING_KEY_TTL_MS } from "../src/atproto-fetch"
+import {
+    PLC_COVERAGE_MAX_LAG_MS,
+    renderPlcDocument,
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    storedSigningKeyResolver,
+    type CachedDidDocument,
+    type PlcCoverage,
+} from "../src/did-document"
 
 /**
  * Operations are the current heads of live did:plc identities and the
@@ -223,14 +230,164 @@ describe("pdsResolutionFromDocument", () => {
 })
 
 describe("storedSigningKeyResolver", () => {
-    it.todo("covered plc: uses a document fetched within the max age, without calling fallback")
-    it.todo("covered plc: a document fetched before continuousSinceMs is trusted only for the TTL")
-    it.todo("coverage lagging more than PLC_COVERAGE_MAX_LAG_MS: a plc document is trusted only for the TTL")
-    it.todo("no coverage, or reading it throws: a plc document is trusted only for the TTL")
-    it.todo("web: a cached document is trusted only for the TTL, whatever the coverage")
-    it.todo("a cached document's source, not the DID string, decides plc vs web trust")
-    it.todo("calls fallback when the stored document is past its trust window")
-    it.todo("calls fallback when there is no stored document")
-    it.todo("calls fallback when reading the stored document throws")
-    it.todo("trust windows are inclusive at their bound and stale one ms past it")
+    const NOW = 1_700_000_000_000
+    const KEY = "zQ3shdrX5UZHPdAPDCvCCxGn8mktUByzn2ZrzA24tddqWpQmt"
+    const FALLBACK_KEY = "zQ3sFallback"
+    const MINUTE = 60_000
+    const HOUR = 60 * MINUTE
+
+    const coverage = (over: Partial<PlcCoverage> = {}): PlcCoverage => ({
+        url: "https://plc.example/export/stream",
+        continuousSinceMs: NOW - 48 * HOUR,
+        coveredThroughMs: NOW - MINUTE,
+        ...over,
+    })
+
+    function setup(opts: {
+        cached?: CachedDidDocument | null | "throws"
+        coverage?: PlcCoverage | null | "throws"
+    }) {
+        const calls = { documents: 0, coverage: 0, fallback: 0 }
+        const resolve = storedSigningKeyResolver({
+            documents: {
+                get: async () => {
+                    calls.documents++
+                    if (opts.cached === "throws") throw new Error("kv down")
+                    return opts.cached ?? null
+                },
+            },
+            getPlcCoverage: async () => {
+                calls.coverage++
+                if (opts.coverage === "throws") throw new Error("kv down")
+                return opts.coverage ?? null
+            },
+            fallback: async () => {
+                calls.fallback++
+                return FALLBACK_KEY
+            },
+            nowMs: () => NOW,
+        })
+        return { resolve, calls }
+    }
+
+    const cachedAt = (
+        fetchedAtMs: number,
+        source: "plc" | "web" = "plc"
+    ): CachedDidDocument => ({
+        doc: K256_DOC as unknown as CachedDidDocument["doc"],
+        fetchedAtMs,
+        source,
+    })
+
+    it("covered plc: uses a document fetched within the max age, without calling fallback", async () => {
+        const { resolve, calls } = setup({
+            cached: cachedAt(NOW - 20 * HOUR),
+            coverage: coverage(),
+        })
+        expect(await resolve(K256_DID)).toBe(KEY)
+        expect(calls.fallback).toBe(0)
+    })
+
+    it("covered plc: a document fetched before continuousSinceMs is trusted only for the TTL", async () => {
+        const cov = coverage({ continuousSinceMs: NOW - 2 * HOUR })
+        const old = setup({ cached: cachedAt(NOW - 3 * HOUR), coverage: cov })
+        expect(await old.resolve(K256_DID)).toBe(FALLBACK_KEY)
+        const recent = setup({ cached: cachedAt(NOW - 5 * MINUTE), coverage: cov })
+        expect(await recent.resolve(K256_DID)).toBe(KEY)
+        expect(recent.calls.fallback).toBe(0)
+    })
+
+    it("coverage lagging more than PLC_COVERAGE_MAX_LAG_MS: a plc document is trusted only for the TTL", async () => {
+        const cov = coverage({ coveredThroughMs: NOW - PLC_COVERAGE_MAX_LAG_MS - 1 })
+        const old = setup({ cached: cachedAt(NOW - HOUR), coverage: cov })
+        expect(await old.resolve(K256_DID)).toBe(FALLBACK_KEY)
+        const recent = setup({ cached: cachedAt(NOW - 5 * MINUTE), coverage: cov })
+        expect(await recent.resolve(K256_DID)).toBe(KEY)
+    })
+
+    it("no coverage, or reading it throws: a plc document is trusted only for the TTL", async () => {
+        for (const cov of [null, "throws"] as const) {
+            const old = setup({ cached: cachedAt(NOW - HOUR), coverage: cov })
+            expect(await old.resolve(K256_DID)).toBe(FALLBACK_KEY)
+            const recent = setup({ cached: cachedAt(NOW - 5 * MINUTE), coverage: cov })
+            expect(await recent.resolve(K256_DID)).toBe(KEY)
+            expect(recent.calls.fallback).toBe(0)
+        }
+    })
+
+    it("web: a cached document is trusted only for the TTL, whatever the coverage", async () => {
+        const old = setup({ cached: cachedAt(NOW - HOUR, "web"), coverage: coverage() })
+        expect(await old.resolve(K256_DID)).toBe(FALLBACK_KEY)
+        expect(old.calls.coverage).toBe(0)
+        const recent = setup({ cached: cachedAt(NOW - 5 * MINUTE, "web"), coverage: null })
+        expect(await recent.resolve(K256_DID)).toBe(KEY)
+    })
+
+    it("a cached document's source, not the DID string, decides plc vs web trust", async () => {
+        const webLooking = setup({
+            cached: cachedAt(NOW - HOUR, "plc"),
+            coverage: coverage(),
+        })
+        expect(await webLooking.resolve("did:web:example.com")).toBe(KEY)
+        const plcLooking = setup({
+            cached: cachedAt(NOW - HOUR, "web"),
+            coverage: coverage(),
+        })
+        expect(await plcLooking.resolve(K256_DID)).toBe(FALLBACK_KEY)
+    })
+
+    it("coverage lag is ten minutes", async () => {
+        const behind = (ms: number) =>
+            setup({
+                cached: cachedAt(NOW - HOUR),
+                coverage: coverage({ coveredThroughMs: NOW - ms }),
+            }).resolve(K256_DID)
+        expect(await behind(9 * MINUTE)).toBe(KEY)
+        expect(await behind(11 * MINUTE)).toBe(FALLBACK_KEY)
+    })
+
+    it("a cached entry with no usable fetchedAtMs is not trusted", async () => {
+        for (const bad of [Number.NaN, undefined as unknown as number]) {
+            const { resolve } = setup({ cached: cachedAt(bad), coverage: coverage() })
+            expect(await resolve(K256_DID)).toBe(FALLBACK_KEY)
+        }
+    })
+
+    it("calls fallback when the stored document is past its trust window", async () => {
+        const { resolve, calls } = setup({
+            cached: cachedAt(NOW - 25 * HOUR),
+            coverage: coverage(),
+        })
+        expect(await resolve(K256_DID)).toBe(FALLBACK_KEY)
+        expect(calls.fallback).toBe(1)
+    })
+
+    it("calls fallback when there is no stored document", async () => {
+        const { resolve, calls } = setup({ cached: null, coverage: coverage() })
+        expect(await resolve(K256_DID)).toBe(FALLBACK_KEY)
+        expect(calls.fallback).toBe(1)
+        expect(calls.coverage).toBe(0)
+    })
+
+    it("calls fallback when reading the stored document throws", async () => {
+        const { resolve, calls } = setup({ cached: "throws", coverage: coverage() })
+        expect(await resolve(K256_DID)).toBe(FALLBACK_KEY)
+        expect(calls.fallback).toBe(1)
+    })
+
+    it("trust windows are inclusive at their bound and stale one ms past it", async () => {
+        const at = (age: number, source: "plc" | "web", cov: PlcCoverage | null) =>
+            setup({ cached: cachedAt(NOW - age, source), coverage: cov }).resolve(K256_DID)
+        expect(await at(STORED_DID_DOCUMENT_MAX_AGE_MS, "plc", coverage())).toBe(KEY)
+        expect(await at(STORED_DID_DOCUMENT_MAX_AGE_MS + 1, "plc", coverage())).toBe(FALLBACK_KEY)
+        expect(await at(SIGNING_KEY_TTL_MS, "web", null)).toBe(KEY)
+        expect(await at(SIGNING_KEY_TTL_MS + 1, "web", null)).toBe(FALLBACK_KEY)
+
+        const edge = (over: Partial<PlcCoverage>) =>
+            at(HOUR, "plc", coverage(over))
+        expect(await edge({ coveredThroughMs: NOW - PLC_COVERAGE_MAX_LAG_MS })).toBe(KEY)
+        expect(await edge({ coveredThroughMs: NOW - PLC_COVERAGE_MAX_LAG_MS - 1 })).toBe(FALLBACK_KEY)
+        expect(await edge({ continuousSinceMs: NOW - HOUR })).toBe(KEY)
+        expect(await edge({ continuousSinceMs: NOW - HOUR + 1 })).toBe(FALLBACK_KEY)
+    })
 })

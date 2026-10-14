@@ -186,12 +186,46 @@ export interface StoredSigningKeyResolverDeps {
  * Trusted for {@link STORED_DID_DOCUMENT_MAX_AGE_MS} when `source` is `plc`,
  * `fetchedAtMs >= continuousSinceMs`, and the coverage is within
  * {@link PLC_COVERAGE_MAX_LAG_MS} of now; otherwise for `SIGNING_KEY_TTL_MS`.
+ * A cached entry whose age is not a number is not trusted. Timestamps come
+ * from the monitor's clock and are compared with the relay's, so the windows
+ * assume the two clocks differ by far less than the ten-minute lag bound.
  */
 export function storedSigningKeyResolver(
     deps: StoredSigningKeyResolverDeps
 ): (did: string) => Promise<string | null> {
-    void deps
-    void extractSigningKey
-    void SIGNING_KEY_TTL_MS
-    throw new Error("not implemented")
+    return async (did) => {
+        let cached: CachedDidDocument | null = null
+        try {
+            cached = await deps.documents.get(did)
+        } catch {
+            return deps.fallback(did)
+        }
+        if (!cached) return deps.fallback(did)
+
+        const now = deps.nowMs()
+        let window = SIGNING_KEY_TTL_MS
+        if (cached.source === "plc" && (await streamCovers(deps, cached.fetchedAtMs, now))) {
+            window = STORED_DID_DOCUMENT_MAX_AGE_MS
+        }
+        if (!(now - cached.fetchedAtMs <= window)) return deps.fallback(did)
+        return extractSigningKey({ ...cached.doc })
+    }
+}
+
+async function streamCovers(
+    deps: StoredSigningKeyResolverDeps,
+    fetchedAtMs: number,
+    now: number
+): Promise<boolean> {
+    let coverage: PlcCoverage | null = null
+    try {
+        coverage = await deps.getPlcCoverage()
+    } catch {
+        return false
+    }
+    return (
+        coverage !== null &&
+        fetchedAtMs >= coverage.continuousSinceMs &&
+        now - coverage.coveredThroughMs <= PLC_COVERAGE_MAX_LAG_MS
+    )
 }
