@@ -51,19 +51,41 @@ function sortKeys(value: unknown): unknown {
 export function kvDidDocuments<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): DidDocumentCache {
-    void env
-    throw new Error("not implemented")
+    return {
+        async get(did) {
+            const text = await env.records.get(DID_DOCUMENT_PREFIX + did)
+            return text === null ? null : parseCached(text)
+        },
+    }
 }
 
-/** No expirationTtl: the reader enforces age from `confirmedAtMs`. */
+function parseCached(text: string): CachedDidDocument | null {
+    let value: unknown
+    try {
+        value = JSON.parse(text)
+    } catch {
+        return null
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null
+    const { doc, fetchedAtMs, source } = value as Record<string, unknown>
+    if (typeof doc !== "object" || doc === null || Array.isArray(doc)) return null
+    if (typeof (doc as { id?: unknown }).id !== "string") return null
+    if (typeof fetchedAtMs !== "number" || !Number.isFinite(fetchedAtMs)) return null
+    if (source !== "plc" && source !== "web") return null
+    return value as CachedDidDocument
+}
+
+/** No expirationTtl: the reader enforces age from `fetchedAtMs`. */
 export function kvDidDocumentWriter<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): {
     put(did: string, cached: CachedDidDocument): Promise<void>
     delete(did: string): Promise<void>
 } {
-    void env
-    throw new Error("not implemented")
+    return {
+        put: (did, cached) => env.records.put(DID_DOCUMENT_PREFIX + did, JSON.stringify(cached)),
+        delete: (did) => env.records.delete(DID_DOCUMENT_PREFIX + did),
+    }
 }
 
 /** The relay's read: `storedSigningKeyResolver`'s `getPlcCoverage`. A malformed entry reads as none. */

@@ -21,8 +21,8 @@ import {
     type PlcCursorIndex,
     type RefreshIndex,
 } from "@germ-network/atproto-pmr-monitor"
-import type { DidDocument } from "@germ-network/atproto-pmr-core"
-import { canonicalDidDocumentJson } from "./did-document-store"
+import { STORED_DID_DOCUMENT_MAX_AGE_MS, type DidDocument } from "@germ-network/atproto-pmr-core"
+import { canonicalDidDocumentJson, kvDidDocumentWriter } from "./did-document-store"
 import type { MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
@@ -62,6 +62,13 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
     return existingAlarmAt === null || existingAlarmAt <= nowMs
 }
 
+type PublishRow = {
+    did: string
+    document: string
+    confirmed_at: number
+    version: number
+}
+
 /**
  * The monitor's single writer: it holds the stream, and it is the only
  * thing that advances the cursor or the `rev` index.
@@ -89,6 +96,10 @@ export class MonitorIngest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
+    /** The export stream's high-water mark and the start of its current unbroken run. */
+    private plcHighSeq: number | null = null
+    private plcHighCreatedAtMs: number | null = null
+    private plcContinuousSinceMs: number | null = null
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -242,8 +253,72 @@ export class MonitorIngest
     async publishDidDocuments(
         limit: number
     ): Promise<{ published: number; remaining: number; coveredThroughMs: number | null }> {
-        void limit
-        throw new Error("not implemented")
+        const highWater = this.plcHighCreatedAtMs
+        const runStart = this.plcContinuousSinceMs
+        const writer = kvDidDocumentWriter(this.env)
+
+        const changed = this.db.sql
+            .exec<PublishRow>(
+                "SELECT did, document, confirmed_at, version FROM did_documents " +
+                    "WHERE published_version IS NULL OR published_version != version " +
+                    "ORDER BY as_of LIMIT ?",
+                limit
+            )
+            .toArray()
+        const reconfirm =
+            changed.length >= limit
+                ? []
+                : this.db.sql
+                      .exec<PublishRow>(
+                          "SELECT did, document, confirmed_at, version FROM did_documents " +
+                              "WHERE published_version = version AND document NOT IN ('null', '') AND (" +
+                              "confirmed_at - published_confirmed_at >= ? " +
+                              "OR (? IS NOT NULL AND published_confirmed_at < ? AND ? <= confirmed_at)) " +
+                              "ORDER BY confirmed_at - published_confirmed_at DESC LIMIT ?",
+                          STORED_DID_DOCUMENT_MAX_AGE_MS / 2,
+                          runStart,
+                          runStart,
+                          runStart,
+                          limit - changed.length
+                      )
+                      .toArray()
+
+        let published = 0
+        for (const row of [...changed, ...reconfirm]) {
+            try {
+                if (row.confirmed_at > 0 && row.document !== "null" && row.document !== "") {
+                    await writer.put(row.did, {
+                        doc: JSON.parse(row.document) as DidDocument,
+                        fetchedAtMs: row.confirmed_at,
+                        source: row.did.startsWith("did:plc:") ? "plc" : "web",
+                    })
+                } else {
+                    await writer.delete(row.did)
+                }
+            } catch {
+                continue
+            }
+            this.db.sql.exec(
+                "UPDATE did_documents SET published_version = ?, published_confirmed_at = ? " +
+                    "WHERE did = ?",
+                row.version,
+                row.confirmed_at,
+                row.did
+            )
+            published += 1
+        }
+
+        const remaining = this.db.sql
+            .exec<{ n: number }>(
+                "SELECT COUNT(*) AS n FROM did_documents " +
+                    "WHERE published_version IS NULL OR published_version != version"
+            )
+            .one().n
+        return {
+            published,
+            remaining,
+            coveredThroughMs: remaining === 0 ? highWater : null,
+        }
     }
 
     /**
@@ -270,9 +345,11 @@ export class MonitorIngest
      * by a timer) and on every alarm. Losing the unpersisted tail only replays.
      */
     async advancePlcCursor(seq: number, createdAtMs: number): Promise<void> {
-        void seq
-        void createdAtMs
-        throw new Error("not implemented")
+        this.plcContinuousSinceMs ??= createdAtMs
+        if (this.plcHighSeq === null || seq > this.plcHighSeq) this.plcHighSeq = seq
+        if (this.plcHighCreatedAtMs === null || createdAtMs > this.plcHighCreatedAtMs) {
+            this.plcHighCreatedAtMs = createdAtMs
+        }
     }
 
     /** The stored seq, or null when none is stored for `url`. */

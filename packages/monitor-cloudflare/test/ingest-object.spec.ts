@@ -17,6 +17,8 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
     binaryToBase64URL,
     RecordNotFoundError,
+    STORED_DID_DOCUMENT_MAX_AGE_MS,
+    type CachedDidDocument,
     type DidDocument,
 } from "@germ-network/atproto-pmr-core"
 import {
@@ -30,7 +32,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
-import { canonicalDidDocumentJson } from "../src/did-document-store"
+import { canonicalDidDocumentJson, kvDidDocuments } from "../src/did-document-store"
 import { needsRearm } from "../src/ingest-object"
 import type { MonitorIngest } from "../src/ingest-object"
 import type { MonitorEnv } from "../src/env"
@@ -1308,18 +1310,223 @@ describe("stored DID documents", () => {
 })
 
 describe("publishing stored DID documents", () => {
-    it.todo("publishDidDocuments writes a changed document to KV and kvDidDocuments reads it back")
-    it.todo("skips an unchanged document confirmed under half the max age after what KV holds")
-    it.todo("re-publishes an unchanged document confirmed half the max age after what KV holds")
-    it.todo("re-publishes a document whose KV confirmation predates the current unbroken run")
-    it.todo("publishes content changes before re-confirmations")
-    it.todo("stops at limit, leaves the rest for the next call, and reports remaining content changes")
-    it.todo("a document recorded while its publish is in flight is published on the next call")
-    it.todo("a KV failure leaves the document unpublished")
-    it.todo("a stale-marked document, a tombstone or a placeholder removes the KV entry")
-    it.todo("a published document carries source plc or web by DID method")
-    it.todo("coveredThroughMs is the high-water taken before selection; a render injected through a KV put is not counted covered")
-    it.todo("kvDidDocuments reads a missing or malformed entry as null")
+    const HALF = STORED_DID_DOCUMENT_MAX_AGE_MS / 2
+    const doc = (did: string, endpoint = "https://a.example"): DidDocument => ({
+        id: did,
+        service: [{ id: "#atproto_pds", type: "P", serviceEndpoint: endpoint }],
+    })
+    const record = (
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string,
+        document: DidDocument | null,
+        asOf: number
+    ) => inMonitorObj(stub, (obj) => obj.recordDidDocument(did, document, asOf))
+    const publish = (stub: DurableObjectStub<MonitorIngest>, limit = 64) =>
+        inMonitorObj(stub, (obj) => obj.publishDidDocuments(limit))
+    const kvEntry = async (did: string) =>
+        (await kvDidDocuments(testEnv).get(did)) as CachedDidDocument | null
+
+    /** Run `fn` with `records.put` wrapped; the wrapper runs before the real put. */
+    function withPut<R>(
+        stub: DurableObjectStub<MonitorIngest>,
+        before: (obj: MonitorIngest, key: string) => Promise<void>,
+        fn: (obj: MonitorIngest) => Promise<R>
+    ): Promise<R> {
+        return inMonitorObj(stub, async (obj) => {
+            const real = obj.env
+            const records = Object.create(real.records) as KVNamespace
+            records.put = (async (key: string, value: string, opts?: KVNamespacePutOptions) => {
+                await before(obj, key)
+                return real.records.put(key, value, opts)
+            }) as typeof records.put
+            obj.env = { ...real, records }
+            try {
+                return await fn(obj)
+            } finally {
+                obj.env = real
+            }
+        })
+    }
+
+    it("publishDidDocuments writes a changed document to KV and kvDidDocuments reads it back", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9basic"
+        await record(stub, did, doc(did), 1_000)
+        expect(await publish(stub)).toMatchObject({ published: 1, remaining: 0 })
+        expect(await kvEntry(did)).toEqual({ doc: doc(did), fetchedAtMs: 1_000, source: "plc" })
+        expect(await publish(stub)).toMatchObject({ published: 0, remaining: 0 })
+    })
+
+    it("skips an unchanged document confirmed under half the max age after what KV holds", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9skip"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await record(stub, did, doc(did), 1_000 + HALF - 1)
+        expect((await publish(stub)).published).toBe(0)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(1_000)
+    })
+
+    it("re-publishes an unchanged document confirmed half the max age after what KV holds", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9half"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await record(stub, did, doc(did), 1_000 + HALF)
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(1_000 + HALF)
+    })
+
+    it("re-publishes a document whose KV confirmation predates the current unbroken run", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9run"
+        await record(stub, did, doc(did), 1_000)
+        await publish(stub)
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 5_000))
+        expect((await publish(stub)).published).toBe(0)
+        await record(stub, did, doc(did), 6_000)
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.fetchedAtMs).toBe(6_000)
+    })
+
+    it("publishes content changes before re-confirmations", async () => {
+        const stub = freshStub()
+        const aging = "did:plc:s9aging"
+        const changed = "did:plc:s9changed"
+        await record(stub, aging, doc(aging), 1_000)
+        await publish(stub)
+        await record(stub, aging, doc(aging), 1_000 + HALF)
+        await record(stub, changed, doc(changed), 2_000)
+        expect((await publish(stub, 1)).published).toBe(1)
+        expect(await kvEntry(changed)).not.toBeNull()
+        expect((await kvEntry(aging))?.fetchedAtMs).toBe(1_000)
+    })
+
+    it("stops at limit, leaves the rest for the next call, and reports remaining content changes", async () => {
+        const stub = freshStub()
+        const dids = ["did:plc:s9lim1", "did:plc:s9lim2", "did:plc:s9lim3"]
+        for (const did of dids) await record(stub, did, doc(did), 1_000)
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 9_000))
+        expect(await publish(stub, 2)).toEqual({ published: 2, remaining: 1, coveredThroughMs: null })
+        expect(await publish(stub, 2)).toEqual({ published: 1, remaining: 0, coveredThroughMs: 9_000 })
+    })
+
+    it("a document recorded while its publish is in flight is published on the next call", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9flight"
+        await record(stub, did, doc(did, "https://a.example"), 1_000)
+        await withPut(
+            stub,
+            (obj) => obj.recordDidDocument(did, doc(did, "https://b.example"), 2_000),
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect((await kvEntry(did))?.doc).toEqual(doc(did, "https://a.example"))
+        expect((await publish(stub)).published).toBe(1)
+        expect((await kvEntry(did))?.doc).toEqual(doc(did, "https://b.example"))
+    })
+
+    it("a KV failure leaves the document unpublished", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9fail"
+        await record(stub, did, doc(did), 1_000)
+        const failed = await withPut(
+            stub,
+            async () => {
+                throw new Error("kv down")
+            },
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(failed).toMatchObject({ published: 0, remaining: 1, coveredThroughMs: null })
+        expect(await kvEntry(did)).toBeNull()
+        expect((await publish(stub)).published).toBe(1)
+        expect(await kvEntry(did)).not.toBeNull()
+    })
+
+    it("a stale-marked document, a tombstone or a placeholder removes the KV entry", async () => {
+        const stub = freshStub()
+        const staled = "did:plc:s9stale"
+        const gone = "did:plc:s9gone"
+        const fresh = "did:plc:s9placeholder"
+        await record(stub, staled, doc(staled), 1_000)
+        await record(stub, gone, doc(gone), 1_000)
+        await publish(stub)
+        expect(await kvEntry(staled)).not.toBeNull()
+        expect(await kvEntry(gone)).not.toBeNull()
+
+        await inMonitorObj(stub, (obj) => obj.markDidDocumentStale(staled, 2_000))
+        await record(stub, gone, null, 2_000)
+        await inMonitorObj(stub, (obj) => obj.markDidDocumentStale(fresh, 2_000))
+        expect((await publish(stub)).published).toBe(3)
+        expect(await kvEntry(staled)).toBeNull()
+        expect(await kvEntry(gone)).toBeNull()
+        expect(await kvEntry(fresh)).toBeNull()
+
+        await record(stub, staled, doc(staled), 3_000)
+        expect((await publish(stub)).published).toBe(1)
+        expect(await kvEntry(staled)).toMatchObject({ fetchedAtMs: 3_000 })
+    })
+
+    it("a published document carries source plc or web by DID method", async () => {
+        const stub = freshStub()
+        const web = "did:web:s9.example.com"
+        const plc = "did:plc:s9source"
+        await record(stub, web, doc(web), 1_000)
+        await record(stub, plc, doc(plc), 1_000)
+        await publish(stub)
+        expect((await kvEntry(web))?.source).toBe("web")
+        expect((await kvEntry(plc))?.source).toBe("plc")
+    })
+
+    it("coveredThroughMs is the high-water taken before selection; a render injected through a KV put is not counted covered", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9covered"
+        expect((await publish(stub)).coveredThroughMs).toBeNull()
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 7_000))
+        await record(stub, did, doc(did, "https://a.example"), 1_000)
+        const first = await withPut(
+            stub,
+            async (obj) => {
+                await obj.advancePlcCursor(2, 8_000)
+                await obj.recordDidDocument(did, doc(did, "https://b.example"), 8_000)
+            },
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(first).toMatchObject({ remaining: 1, coveredThroughMs: null })
+        expect((await publish(stub)).coveredThroughMs).toBe(8_000)
+    })
+
+    it("a cursor that advances during a pass is not counted covered by it", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s9snapshot"
+        await inMonitorObj(stub, (obj) => obj.advancePlcCursor(1, 7_000))
+        await record(stub, did, doc(did), 1_000)
+        const pass = await withPut(
+            stub,
+            (obj) => obj.advancePlcCursor(2, 8_000),
+            (obj) => obj.publishDidDocuments(64)
+        )
+        expect(pass).toMatchObject({ remaining: 0, coveredThroughMs: 7_000 })
+    })
+
+    it("kvDidDocuments reads a missing or malformed entry as null", async () => {
+        const read = (did: string) => kvDidDocuments(testEnv).get(did)
+        expect(await read("did:plc:s9missing")).toBeNull()
+        const good = { doc: { id: "did:plc:s9bad" }, fetchedAtMs: 5, source: "plc" }
+        const bad: Record<string, string> = {
+            "did:plc:s9bad1": "not json",
+            "did:plc:s9bad2": JSON.stringify({ ...good, doc: null }),
+            "did:plc:s9bad3": JSON.stringify({ ...good, doc: { id: 7 } }),
+            "did:plc:s9bad4": JSON.stringify({ ...good, fetchedAtMs: "5" }),
+            "did:plc:s9bad5": JSON.stringify({ ...good, source: "other" }),
+            "did:plc:s9bad6": JSON.stringify([good]),
+        }
+        for (const [did, value] of Object.entries(bad)) {
+            await testEnv.records.put(`doc:${did}`, value)
+            expect(await read(did)).toBeNull()
+        }
+        await testEnv.records.put("doc:did:plc:s9ok", JSON.stringify(good))
+        expect(await read("did:plc:s9ok")).toEqual(good)
+    })
 })
 
 describe("wiring stored DID documents into the monitor", () => {
