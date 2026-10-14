@@ -27,6 +27,7 @@ const COLLECTION = "com.germnetwork.declaration"
 const DID = "did:plc:alice"
 const PDS = "https://pds.example"
 const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
+const CID = "bafyreiexamplecid"
 
 function commit(rev: string, collection = COLLECTION): CommitEvent {
     const e = decodeEvent(
@@ -46,7 +47,10 @@ function commit(rev: string, collection = COLLECTION): CommitEvent {
 }
 
 /** In-memory stand-ins; the real ones are one DO and one KV namespace. */
-function harness(overrides: Partial<IngestDeps> = {}) {
+function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
+    const { rev: fetchedRev = "3m2", ...depOverrides } = overrides
+    const attempted = new Map<string, number>()
+    const completed: Array<{ cid: string; verifiedWith: string }> = []
     const revs = new Map<string, string>()
     const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
     const records = new Map<string, SnapshotEntry>()
@@ -70,7 +74,8 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
             return { outcome: "accepted" }
         },
-        complete: async (did, rev, observedAtMs) => {
+        complete: async (did, rev, observedAtMs, verified) => {
+            completed.push(verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
@@ -91,8 +96,13 @@ function harness(overrides: Partial<IngestDeps> = {}) {
             if (p !== undefined) pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
         },
         revOf: async (did) => revs.get(did) ?? null,
+        recordsOf: async () => [],
+        holderStateOf: async () => null,
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
         clearPending: async (did) => void pending.delete(did),
+        markAttempted: async (did, at) => void attempted.set(did, at),
+        isWatched: async (did) =>
+            (revs.has(did) || pending.has(did)) && !deleted.has(did),
         windowMembers: async (w) => [...(members.get(w) ?? [])].sort(),
         dropWindow: async (w) => void members.delete(w),
         readBackfillProgress: async () => backfillProgress,
@@ -113,15 +123,18 @@ function harness(overrides: Partial<IngestDeps> = {}) {
         index,
         snapshot,
         fetchRecord: async () => ({
-            rev: "3m2",
             car: new Uint8Array([1, 2, 3]),
             source: PDS,
             signingKey: SIGNING_KEY,
         }),
+        verify: async (_did, record) =>
+            record.signingKey === null
+                ? { kind: "unverifiable" }
+                : { kind: "verified", key: record.signingKey, rev: fetchedRev, cid: CID },
         nowMs: () => 1_000_000,
-        ...overrides,
+        ...depOverrides,
     }
-    return { deps, revs, pending, records, members, deleted, windows, marker: () => marker }
+    return { deps, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake", () => {
@@ -206,9 +219,9 @@ describe("settle", () => {
             },
             index: {
                 ...h.deps.index,
-                complete: async (did, rev, at) => {
+                complete: async (did, rev, at, verified) => {
                     order.push("index")
-                    await h.deps.index.complete(did, rev, at)
+                    await h.deps.index.complete(did, rev, at, verified)
                 },
             },
         }
@@ -234,7 +247,6 @@ describe("settle", () => {
         const h = harness({
             onChange,
             fetchRecord: async () => ({
-                rev: "3m2",
                 car: new Uint8Array([1, 2, 3]),
                 source: PDS,
                 signingKey: ROTATED_KEY,
@@ -247,6 +259,8 @@ describe("settle", () => {
             observedAtMs: 500_000,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: CID,
         })
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(onChange).toHaveBeenCalledWith(DID, "3m2")
@@ -262,12 +276,14 @@ describe("settle", () => {
             observedAtMs: 500_000,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: CID,
         })
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(onChange).not.toHaveBeenCalled()
     })
 
-    it("does not treat an unresolved signing key on either side as a rotation", async () => {
+    it("does not treat an unresolved signing key as a rotation", async () => {
         // Mirrors `compareObservations`' own documented blind spot: a
         // `null` key on either side means rotation cannot be asserted, not
         // that one is ruled out.
@@ -275,7 +291,6 @@ describe("settle", () => {
         const h = harness({
             onChange,
             fetchRecord: async () => ({
-                rev: "3m2",
                 car: new Uint8Array([1, 2, 3]),
                 source: PDS,
                 signingKey: null,
@@ -288,8 +303,10 @@ describe("settle", () => {
             observedAtMs: 500_000,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: CID,
         })
-        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(onChange).not.toHaveBeenCalled()
     })
 
@@ -308,8 +325,8 @@ describe("settle", () => {
         const onRegression = vi.fn(async () => {})
         const h = harness({
             onRegression,
+            rev: "3m1",
             fetchRecord: async () => ({
-                rev: "3m1",
                 car: new Uint8Array([9]),
                 source: PDS,
                 signingKey: SIGNING_KEY,
@@ -328,12 +345,11 @@ describe("settle", () => {
     })
 
     it("stores nothing when verification fails", async () => {
-        const h = harness({ verify: async () => false })
+        const h = harness({ verify: async () => ({ kind: "unverifiable" as const }) })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
-        expect(await settle(h.deps, DID)).toBe("rejected")
+        expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(h.records.size).toBe(0)
         expect(h.revs.size).toBe(0)
-        expect(h.pending.has(DID)).toBe(false)
     })
 
     it("a confirmed deletion disposes of the stored record and clears the obligation", async () => {
@@ -352,6 +368,8 @@ describe("settle", () => {
             observedAtMs: 500_000,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: CID,
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
 
@@ -429,8 +447,8 @@ describe("settle", () => {
 
     it("a resurrection (a later successful settle) clears the isDeleted mark", async () => {
         const h = harness({
+            rev: "3m9",
             fetchRecord: async () => ({
-                rev: "3m9",
                 car: new Uint8Array([9]),
                 source: PDS,
                 signingKey: SIGNING_KEY,
@@ -459,6 +477,8 @@ describe("settle", () => {
             observedAtMs: 100,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: CID,
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m2"), "c1")
 
@@ -513,9 +533,8 @@ describe("settleDue", () => {
         // A rejection is not a failure, but it is not progress either;
         // reporting it as settled hid a permanent retry loop.
         const h = harness({
-            verify: async () => false,
+            verify: async () => ({ kind: "unverifiable" as const }),
             fetchRecord: async () => ({
-                rev: "3m1",
                 car: new Uint8Array([1]),
                 source: PDS,
                 signingKey: SIGNING_KEY,
@@ -523,7 +542,7 @@ describe("settleDue", () => {
         })
         await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
         expect(await settleDue(h.deps)).toBe(0)
-        expect(h.pending.size).toBe(0)
+        expect(h.pending.get(DID)?.notBeforeMs).toBeGreaterThan(h.deps.nowMs())
     })
 
     it("clears the obligation once the fetch succeeds", async () => {
@@ -645,7 +664,6 @@ describe("settle keeps the stored DID document", () => {
     const FETCHED_AT = 777_000
     const DOCUMENT = { id: DID, alsoKnownAs: ["at://alice.example"] }
     const withDocument = () => ({
-        rev: "3m2",
         car: new Uint8Array([1, 2, 3]),
         source: PDS,
         signingKey: SIGNING_KEY,
@@ -674,14 +692,14 @@ describe("settle keeps the stored DID document", () => {
         ])
     })
 
-    it("records the fetched document when verification rejects the record, then withdraws trust in it", async () => {
+    it("records the fetched document when the record is unverifiable, then withdraws trust in it", async () => {
         const s = sink()
         const h = harness({
             fetchRecord: async () => withDocument(),
-            verify: async () => false,
+            verify: async () => ({ kind: "unverifiable" as const }),
             didDocuments: s.didDocuments,
         })
-        expect(await settle(h.deps, DID)).toBe("rejected")
+        expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(s.writes).toHaveLength(1)
         expect(s.didDocuments.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
             DID,
@@ -693,7 +711,7 @@ describe("settle keeps the stored DID document", () => {
         const s = sink()
         const stored = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
         await settle(stored.deps, DID)
-        const bare = harness({ verify: async () => false, didDocuments: s.didDocuments })
+        const bare = harness({ verify: async () => ({ kind: "unverifiable" as const }), didDocuments: s.didDocuments })
         await settle(bare.deps, DID)
         expect(s.didDocuments.markDidDocumentStale).not.toHaveBeenCalled()
     })
@@ -769,5 +787,203 @@ describe("identity events and the signing-key cache", () => {
         h.deleted.add(DID)
         expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("ignored")
         expect(owed).toEqual([])
+    })
+})
+
+describe("settle verifies at ingest", () => {
+    const FETCHED_AT = 777_000
+    const DOCUMENT = { id: DID }
+    const ROTATED_KEY = "zQ3shRotatedKeyNotARealMultikey00000000000"
+    const withDocument = (signingKey: string | null = SIGNING_KEY) => ({
+        car: new Uint8Array([1, 2, 3]),
+        source: PDS,
+        signingKey,
+        didDocument: { document: DOCUMENT, fetchedAtMs: FETCHED_AT },
+    })
+    const unverifiable = async () => ({ kind: "unverifiable" as const })
+    const stale = () => vi.fn(async () => {})
+    const sink = () => ({ recordDidDocument: vi.fn(async () => {}), markDidDocumentStale: stale() })
+    const storedEntry = (overrides: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
+        rev: "3m1",
+        car: new Uint8Array([1]),
+        observedAtMs: 500_000,
+        source: PDS,
+        signingKey: SIGNING_KEY,
+        verifiedWith: SIGNING_KEY,
+        cid: CID,
+        ...overrides,
+    })
+
+    it("verified CAR is stored with the signed commit rev, key and cid", async () => {
+        const h = harness({
+            rev: "3m5",
+            verify: async () => ({ kind: "verified", key: SIGNING_KEY, rev: "3m5", cid: "bafyreisigned" }),
+        })
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(h.records.get(DID)).toMatchObject({
+            rev: "3m5",
+            verifiedWith: SIGNING_KEY,
+            cid: "bafyreisigned",
+        })
+        expect(h.revs.get(DID)).toBe("3m5")
+        expect(h.completed).toEqual([{ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }])
+    })
+
+    it("verified exclusion proof at a current rev disposes the snapshot reversibly", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onDelete,
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m2" }),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.records.has(DID)).toBe(false)
+        expect(h.deleted.has(DID)).toBe(false)
+        expect(onDelete).toHaveBeenCalledWith(DID)
+    })
+
+    it("older exclusion proof does not delete a newer record", async () => {
+        const onRegression = vi.fn(async () => {})
+        const h = harness({
+            onRegression,
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m1" }),
+        })
+        h.revs.set(DID, "3m9")
+        h.records.set(DID, storedEntry({ rev: "3m9" }))
+        expect(await settle(h.deps, DID)).toBe("rejected")
+        expect(h.records.has(DID)).toBe(true)
+        expect(onRegression).toHaveBeenCalledWith(DID, "3m9", "3m1")
+    })
+
+    it("unverifiable CAR keeps the entry, clears pending and marks attempted", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({ verify: unverifiable, onChange })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        expect(await settle(h.deps, DID)).toBe("unverifiable")
+        expect(h.records.get(DID)?.rev).toBe("3m1")
+        expect(h.revs.get(DID)).toBe("3m1")
+        expect(h.pending.has(DID)).toBe(false)
+        expect(h.attempted.get(DID)).toBe(h.deps.nowMs())
+        expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it("unverifiable CAR for a still-watched DID keeps its stored document", async () => {
+        const s = sink()
+        const h = harness({
+            verify: unverifiable,
+            fetchRecord: async () => withDocument(),
+            didDocuments: s,
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        await settle(h.deps, DID)
+        expect(s.markDidDocumentStale).not.toHaveBeenCalled()
+    })
+
+    it("unverifiable CAR for a DID never held withdraws its stored document", async () => {
+        const s = sink()
+        const h = harness({
+            verify: unverifiable,
+            fetchRecord: async () => withDocument(),
+            didDocuments: s,
+        })
+        await settle(h.deps, DID)
+        expect(s.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
+            DID,
+            FETCHED_AT - FETCH_AS_OF_SKEW_MS
+        )
+    })
+
+    it("verified absence leaving the DID unwatched withdraws its stored document", async () => {
+        const s = sink()
+        const h = harness({
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m2" }),
+            fetchRecord: async () => withDocument(),
+            didDocuments: s,
+        })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(s.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
+            DID,
+            FETCHED_AT - FETCH_AS_OF_SKEW_MS
+        )
+    })
+
+    it("a malformed CAR is unverifiable, not a transient failure", async () => {
+        const h = harness({ verify: unverifiable })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        expect(await settleDue(h.deps)).toBe(0)
+        // Deferred by the retry interval, not by transient-failure backoff.
+        const owed = h.pending.get(DID)
+        expect(owed?.notBeforeMs).toBe(h.deps.nowMs() + 3_600_000)
+    })
+
+    it("an unverifiable result under a rotated key pushes onChange once", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            verify: unverifiable,
+            fetchRecord: async () => withDocument(ROTATED_KEY),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        await settle(h.deps, DID)
+        await settle(h.deps, DID)
+        expect(onChange).toHaveBeenCalledTimes(1)
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.records.get(DID)?.seenKey).toBe(ROTATED_KEY)
+        expect(h.records.get(DID)?.rev).toBe("3m1")
+    })
+
+    it("a never-held DID that comes back unverifiable stays owed and is retried after the interval", async () => {
+        let now = 1_000_000
+        const sinkStub = sink()
+        const fetchRecord = vi.fn(async () => withDocument())
+        const h = harness({
+            verify: unverifiable,
+            fetchRecord,
+            nowMs: () => now,
+            unverifiableRetryMs: 600_000,
+            didDocuments: sinkStub,
+        })
+        await intake(h.deps, { collection: COLLECTION }, commit("3m1"), "c1")
+        expect(await settleDue(h.deps)).toBe(0)
+        expect(h.pending.has(DID)).toBe(true)
+        expect(await h.deps.index.isWatched(DID)).toBe(true)
+        expect(fetchRecord).toHaveBeenCalledTimes(1)
+        expect(sinkStub.markDidDocumentStale).not.toHaveBeenCalled()
+
+        await settleDue(h.deps)
+        expect(fetchRecord).toHaveBeenCalledTimes(1)
+
+        now += 600_000
+        await settleDue(h.deps)
+        expect(fetchRecord).toHaveBeenCalledTimes(2)
+    })
+
+    it("reverify after an identity event verifies under the newly fetched key", async () => {
+        const verify = vi.fn(async (_did: string, record: { signingKey: string | null }) => ({
+            kind: "verified" as const,
+            key: record.signingKey!,
+            rev: "3m1",
+            cid: CID,
+        }))
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            verify,
+            onChange,
+            fetchRecord: async () => withDocument(ROTATED_KEY),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+        expect(await intake(h.deps, { collection: COLLECTION }, id, "c1")).toBe("reverify")
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(verify.mock.calls[0]![1].signingKey).toBe(ROTATED_KEY)
+        expect(h.records.get(DID)).toMatchObject({ verifiedWith: ROTATED_KEY })
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
     })
 })

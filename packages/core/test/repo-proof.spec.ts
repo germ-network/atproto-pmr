@@ -3,7 +3,12 @@
  * CID) only under the DID document's signing key, whatever host served it.
  */
 import { describe, expect, it } from "vitest"
-import { RepoProofError, readRecordFromCar, verifyRecordProof } from "../src/repo-proof"
+import {
+    RepoProofError,
+    readRecordFromCar,
+    verifyRecordProof,
+    verifyRecordProofOutcome,
+} from "../src/repo-proof"
 import {
     REAL_DID,
     REAL_RECORD_CID,
@@ -278,5 +283,40 @@ describe("readRecordFromCar", () => {
     it("returns null when the commit's tree holds no record at the path", () => {
         const repo = buildRepoCar({ did: DID, records: SIBLINGS })
         expect(readRecordFromCar(repo.car, "com.germnetwork.declaration", "self")).toBeNull()
+    })
+})
+
+describe("verifyRecordProofOutcome", () => {
+    const expectation = (signingKey: string) => ({
+        did: DID,
+        signingKey,
+        collection: "com.germnetwork.declaration",
+        rkey: "self",
+    })
+
+    it("a valid absence proof returns its signed rev", () => {
+        const repo = buildRepoCar({ did: DID, records: SIBLINGS })
+        expect(verifyRecordProofOutcome(repo.car, expectation(repo.key.multikey))).toEqual({
+            kind: "absent",
+            rev: "3kaaaaaaaaaaa",
+        })
+    })
+
+    it("a present record returns the verified record", () => {
+        const repo = buildRepoCar({ did: DID, records: { [PATH]: RECORD, ...SIBLINGS } })
+        const out = verifyRecordProofOutcome(repo.car, expectation(repo.key.multikey))
+        expect(out).toMatchObject({
+            kind: "present",
+            cid: repo.recordCids[PATH],
+            rev: "3kaaaaaaaaaaa",
+        })
+    })
+
+    it("a bad signature on an absence proof still throws", () => {
+        const repo = buildRepoCar({ did: DID, signWith: makeKey(), records: SIBLINGS })
+        expectCode(
+            () => verifyRecordProofOutcome(repo.car, expectation(repo.key.multikey)),
+            "signature-invalid"
+        )
     })
 })

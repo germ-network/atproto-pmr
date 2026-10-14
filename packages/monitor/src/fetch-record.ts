@@ -43,17 +43,6 @@ export interface FetchHeadRevOptions {
 }
 
 /**
- * **CAR, not JSON**: the monitor's fetch is handed onward — to devices and
- * to a relay admitting a sender's pair put — and handing a record onward is
- * exactly what discards provenance, so the bytes must carry their own proof.
- *
- * The monitor stores and serves what it fetched, and the consumer verifies
- * it against the DID document, which keeps a monitor light enough that
- * several parties can run one. The one thing it reads from the CAR is the
- * declaration record's CID, to tell a real change from an unrelated commit
- * (`refresh.ts`); it never checks a signature.
- */
-/**
  * `com.atproto.sync.getRecord`'s own lexicon-declared error set — the
  * XRPC `error` field values that mean this DID's declaration is
  * confirmed unobtainable, not merely unreachable this attempt. Notably
@@ -90,8 +79,16 @@ const TERMINAL_XRPC_ERRORS = [
  */
 const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
 
+/** The repo's head and the `#atproto` key of the document it was resolved through. */
+export interface HeadRev {
+    rev: string
+    /** `null` when the document carries no `#atproto` key. */
+    signingKey: string | null
+}
+
 /**
- * The repo's current head `rev` from the DID's own PDS, for the periodic
+ * The repo's current head `rev` from the DID's own PDS, and the signing key
+ * of the document it was resolved through, for the periodic
  * refresh. Re-resolves the DID document each time, so a PDS migration shows
  * up here; a repo-level terminal answer raises `RecordNotFoundError` exactly
  * as `fetchRecordCar` does.
@@ -99,7 +96,7 @@ const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
 export async function fetchHeadRev(
     did: string,
     options: FetchHeadRevOptions = {}
-): Promise<string> {
+): Promise<HeadRev> {
     const fetchImpl = options.fetchImpl ?? fetch
     const fetchedAtMs = (options.nowMs ?? Date.now)()
     const document = await fetchDidDocument(did, fetchImpl)
@@ -113,13 +110,23 @@ export async function fetchHeadRev(
     } catch {
         // Keeping the stored copy current must not cost the refresh its head.
     }
-    const { endpoint } = pdsResolutionFromDocument(document)
-    return fetchLatestRev(endpoint, did, fetchImpl, {
+    const { endpoint, signingKey } = pdsResolutionFromDocument(document)
+    const rev = await fetchLatestRev(endpoint, did, fetchImpl, {
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
+    return { rev, signingKey }
 }
 
+/**
+ * **CAR, not JSON**: the monitor's fetch is handed onward — to devices and
+ * to a relay admitting a sender's pair put — and handing a record onward is
+ * exactly what discards provenance, so the bytes must carry their own proof.
+ *
+ * Returns the CAR and the key of the document it was resolved through; ingest
+ * verifies the one against the other (`ingest.ts`) before anything is
+ * stored, and the consumer verifies again for itself.
+ */
 export async function fetchRecordCar(
     did: string,
     options: FetchRecordOptions
@@ -138,13 +145,7 @@ export async function fetchRecordCar(
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
-    // `rev` read authoritatively from the PDS, never taken from the wake
-    // signal (a hostile feed could otherwise fake or mask a rollback). Shared
-    // with the relay's watch via core — see `fetchLatestRev`. One extra round
-    // trip per *changed* record is nothing at a single collection's change rate.
-    const rev = await fetchLatestRev(pds, did, fetchImpl)
     return {
-        rev,
         car,
         source: pds,
         signingKey,

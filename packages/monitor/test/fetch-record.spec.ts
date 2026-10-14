@@ -67,13 +67,12 @@ function fixture(
 }
 
 describe("fetchRecordCar", () => {
-    it("reads the record as CAR, and the rev from the PDS", async () => {
+    it("reads the record as CAR", async () => {
         const f = fixture()
         const got = await fetchRecordCar(DID, {
             collection: COLLECTION,
             fetchImpl: f.impl,
         })
-        expect(got.rev).toBe("3mszqbq6s3y2k")
         expect([...got.car]).toEqual([...CAR])
     })
 
@@ -159,14 +158,6 @@ describe("fetchRecordCar", () => {
         expect(f.seen.some((u) => u.includes("com.atproto.repo.getRecord"))).toBe(false)
     })
 
-    it("asks the PDS for the rev rather than accepting one from elsewhere", async () => {
-        // Taking the stream's rev would let a hostile feed fake a
-        // regression alarm, or mask a real one.
-        const f = fixture()
-        await fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
-        expect(f.seen.some((u) => u.includes("sync.getLatestCommit"))).toBe(true)
-    })
-
     it("addresses the record it was asked for", async () => {
         const f = fixture()
         await fetchRecordCar(DID, {
@@ -178,15 +169,6 @@ describe("fetchRecordCar", () => {
         expect(url).toContain(`did=${encodeURIComponent(DID)}`)
         expect(url).toContain(`collection=${encodeURIComponent(COLLECTION)}`)
         expect(url).toContain("rkey=custom")
-    })
-
-    it("refuses a rev the PDS did not supply", async () => {
-        const f = fixture({
-            "sync.getLatestCommit": () => Response.json({ cid: "bafy..." }),
-        })
-        await expect(
-            fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
-        ).rejects.toThrow(/no rev/)
     })
 
     it("refuses a DID document that claims a different DID", async () => {
@@ -323,18 +305,29 @@ describe("the DID document a fetch resolved through", () => {
 
     it("fetchHeadRev without onDidDocument behaves as before", async () => {
         const f = fixture()
-        expect(await fetchHeadRev(DID, { fetchImpl: f.impl })).toBe("3mszqbq6s3y2k")
+        expect(await fetchHeadRev(DID, { fetchImpl: f.impl })).toEqual({
+            rev: "3mszqbq6s3y2k",
+            signingKey: SIGNING_KEY,
+        })
         expect(directoryRequests(f.seen)).toHaveLength(1)
     })
 
     it("a failing onDidDocument does not fail fetchHeadRev", async () => {
         const f = fixture()
-        const rev = await fetchHeadRev(DID, {
+        const head = await fetchHeadRev(DID, {
             fetchImpl: f.impl,
             onDidDocument: async () => {
                 throw new Error("store down")
             },
         })
-        expect(rev).toBe("3mszqbq6s3y2k")
+        expect(head.rev).toBe("3mszqbq6s3y2k")
+    })
+})
+
+describe("fetchRecordCar without a rev read", () => {
+    it("fetchRecordCar makes no getLatestCommit call", async () => {
+        const f = fixture()
+        await fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
+        expect(f.seen.some((u) => u.includes("sync.getLatestCommit"))).toBe(false)
     })
 })

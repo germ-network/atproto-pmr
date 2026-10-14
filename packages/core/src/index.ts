@@ -280,11 +280,13 @@ export {
 // Single-record repo proofs (CAR + commit signature + MST path).
 export {
     verifyRecordProof,
+    verifyRecordProofOutcome,
     readRecordFromCar,
     RepoProofError,
     type CarRecord,
     type RepoProofErrorCode,
     type RecordProofExpectation,
+    type RecordProofOutcome,
     type VerifiedRecord,
 } from "./repo-proof"
 

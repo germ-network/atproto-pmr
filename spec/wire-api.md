@@ -1095,14 +1095,14 @@ an attacker can mint a well-formed declaration binding their own key to a
 victim's DID.
 
 A key monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface))
-is a CAR pass-through: it fetches the record, stores the bytes and the
-`rev`, and forwards them, needing no CAR parser and no MST walk. Verifying
-what it forwards is defense in depth against a lying PDS, not a prerequisite.
-It compares record CIDs to tell a real declaration change from an unrelated
-commit, without verifying signatures.
+fetches the record, verifies the CAR against the signing key of the DID
+document fetched with it, and stores and forwards the bytes with the signed
+`rev`; a CAR that does not verify is not stored. It compares record CIDs to
+tell a real declaration change from an unrelated commit. A client still
+verifies what it is served.
 
 A relay resolving a counterpart declaration to check a pair-put signature is
-the opposite case: it parses and verifies the CAR it takes from the monitor
+likewise: it parses and verifies the CAR it takes from the monitor, rather than relying on the monitor's check
 (commit signature under the DID document's signing key, and the record's
 path through the commit's tree), and does not take the declaration from the
 sender's PDS.

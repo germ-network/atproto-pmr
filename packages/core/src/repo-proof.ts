@@ -53,6 +53,30 @@ export interface VerifiedRecord {
 }
 
 /**
+ * What a single-record proof shows under the signing key: the record, or that
+ * the signed repo holds no record at that path, as of the signed rev.
+ */
+export type RecordProofOutcome =
+    | ({ kind: "present" } & VerifiedRecord)
+    | { kind: "absent"; rev: string }
+
+/**
+ * Like `verifyRecordProof`, but a valid absence is a result carrying the
+ * signed rev rather than an error. Throws `RepoProofError` for anything that
+ * does not verify.
+ */
+export function verifyRecordProofOutcome(
+    car: Uint8Array,
+    expected: RecordProofExpectation
+): RecordProofOutcome {
+    const parsed = parseProof(car, expected.did)
+    verifyCommitSignature(parsed.commit, expected.signingKey)
+    const found = findRecord(parsed, expected.collection, expected.rkey)
+    if (!found) return { kind: "absent", rev: parsed.commit.rev }
+    return { kind: "present", cid: found.cid, record: found.record, rev: parsed.commit.rev }
+}
+
+/**
  * Throws `RepoProofError`. `record-absent` means the proof is otherwise valid
  * and its signed view holds no record at that path.
  */
@@ -78,9 +102,11 @@ export interface CarRecord {
 /**
  * The record at `<collection>/<rkey>` and its CID, from the CAR's own
  * commit, WITHOUT checking the commit signature: for change detection by a
- * party that already trusts where the bytes came from (the monitor), never
- * for admission. Block CIDs and the MST path are still checked. `null` when
- * the commit's tree holds no record at that path.
+ * party that already trusts where the bytes came from, never for admission.
+ * The monitor verifies at ingest with `verifyRecordProofOutcome` and uses this
+ * only to compare record CIDs of CARs it has already verified or holds. Block CIDs and the MST
+ * path are still checked. `null` when the commit's tree holds no record at
+ * that path.
  */
 export function readRecordFromCar(
     car: Uint8Array,

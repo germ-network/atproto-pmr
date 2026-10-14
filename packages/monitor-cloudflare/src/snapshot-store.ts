@@ -65,6 +65,9 @@ interface StoredMeta {
     observedAtMs: number
     source: string
     signingKey: string | null
+    verifiedWith: string | null
+    cid: string | null
+    seenKey: string | null
 }
 
 /**
@@ -90,6 +93,9 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                 observedAtMs: metadata.observedAtMs,
                 source: metadata.source,
                 signingKey: metadata.signingKey,
+                verifiedWith: metadata.verifiedWith ?? null,
+                cid: metadata.cid ?? null,
+                seenKey: metadata.seenKey ?? null,
             }
         },
 
@@ -102,6 +108,9 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
                     observedAtMs: entry.observedAtMs,
                     source: entry.source,
                     signingKey: entry.signingKey,
+                    verifiedWith: entry.verifiedWith,
+                    cid: entry.cid,
+                    seenKey: entry.seenKey ?? null,
                 } satisfies StoredMeta,
             })
         },

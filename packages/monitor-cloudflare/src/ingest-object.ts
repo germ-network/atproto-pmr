@@ -19,6 +19,9 @@ import {
     type DidDocumentSink,
     type Cursor,
     type FetchedRecord,
+    type HeadRev,
+    type HolderState,
+    type IndexedRecord,
     type IngestDeps,
     type IntakeOutcome,
     type KeyUpdateIndex,
@@ -27,9 +30,13 @@ import {
     type PendingFetch,
     type RefreshIndex,
     type SigningKeyUpdate,
+    type VerifiedWrite,
+    type VerifyOutcome,
 } from "@germ-network/atproto-pmr-monitor"
 import {
+    RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
+    verifyRecordProofOutcome,
     type DidDocument,
     type PlcCoverage,
 } from "@germ-network/atproto-pmr-core"
@@ -118,9 +125,8 @@ export function needsRearm(existingAlarmAt: number | null, nowMs: number): boole
  *
  * Subclass to supply the authoritative fetch, which is deliberately not
  * implemented here: resolving a DID document and reading from that DID's
- * own PDS is a policy decision (which resolver, which timeouts, whether to
- * verify the CAR proof) that belongs to a deployment, not to a storage
- * adapter.
+ * own PDS is a policy decision (which resolver, which timeouts) that belongs
+ * to a deployment, not to a storage adapter; verifying what it returns is not.
  */
 export class MonitorIngest
     extends DurableObject<MonitorEnv>
@@ -193,12 +199,27 @@ export class MonitorIngest
                     as_of INTEGER,
                     version INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS records (
+                    did TEXT NOT NULL,
+                    collection TEXT NOT NULL,
+                    rkey TEXT NOT NULL,
+                    rev TEXT NOT NULL,
+                    cid TEXT NOT NULL,
+                    verified_with TEXT NOT NULL,
+                    PRIMARY KEY (did, collection, rkey)
+                );
+                CREATE TABLE IF NOT EXISTS holder_state (
+                    did TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK (state IN ('held', 'gone-reversible', 'gone-permanent')),
+                    held_at INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
                     checked_at INTEGER NOT NULL,
                     attempted_at INTEGER NOT NULL DEFAULT 0
                 );
             `)
+            this.seedHolderState()
         })
     }
 
@@ -611,9 +632,119 @@ export class MonitorIngest
     }
 
     /**
+     * Gives every DID already in `revs` or `deleted` a holder state, once:
+     * held, or gone-permanent where a `deleted` row says so. A reversibly-gone
+     * DID has a `revs` row and neither of those marks, so it is seeded held;
+     * the refresh that finds it gone re-asserts gone-reversible.
+     */
+    private seedHolderState(): void {
+        const seeded = this.db.sql
+            .exec("SELECT 1 FROM meta WHERE k = 'holder_seeded'")
+            .toArray()
+        if (seeded.length > 0) return
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO holder_state (did, state, held_at) " +
+                    "SELECT r.did, CASE WHEN d.did IS NULL THEN 'held' ELSE 'gone-permanent' END, " +
+                    "r.observed_at FROM revs r LEFT JOIN deleted d ON d.did = r.did"
+            )
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO holder_state (did, state) " +
+                    "SELECT did, 'gone-permanent' FROM deleted"
+            )
+            this.db.sql.exec("INSERT INTO meta (k, v) VALUES ('holder_seeded', '1')")
+        })
+    }
+
+    async recordsOf(did: string): Promise<IndexedRecord[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>("SELECT did, collection, rkey, rev, cid, verified_with FROM records WHERE did = ?", did)
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async holderStateOf(did: string): Promise<HolderState | null> {
+        const row = this.db.sql
+            .exec<{ state: HolderState }>("SELECT state FROM holder_state WHERE did = ?", did)
+            .toArray()[0]
+        return row?.state ?? null
+    }
+
+    /** The rev, the verified declaration row and the held mark, in one step. */
+    private writeVerified(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): void {
+        this.db.sql.exec(
+            "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, observed_at = excluded.observed_at",
+            did,
+            rev,
+            observedAtMs
+        )
+        this.db.sql.exec(
+            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
+                "VALUES (?, ?, 'self', ?, ?, ?) " +
+                "ON CONFLICT(did, collection, rkey) DO UPDATE SET rev = excluded.rev, " +
+                "cid = excluded.cid, verified_with = excluded.verified_with",
+            did,
+            this.env.MONITOR_COLLECTION,
+            rev,
+            verified.cid,
+            verified.verifiedWith
+        )
+        // Only a transition into held restarts `held_at`. A permanently deleted
+        // DID is not re-marked here: refresh never visits one.
+        this.db.sql.exec(
+            "INSERT INTO holder_state (did, state, held_at) VALUES (?1, 'held', ?2) " +
+                "ON CONFLICT(did) DO UPDATE SET state = 'held', " +
+                "held_at = CASE WHEN state = 'held' THEN held_at ELSE ?2 END",
+            did,
+            observedAtMs
+        )
+    }
+
+    /**
+     * A refresh found `did` reversibly gone with nothing left to dispose of:
+     * re-assert the state with no digest entry and no push. Stays
+     * gone-permanent for a DID with a `deleted` row.
+     */
+    async markGoneReversible(did: string): Promise<void> {
+        this.setGoneState(did, false)
+    }
+
+    private setGoneState(did: string, permanent: boolean): void {
+        // A DID already permanently gone stays so under a reversible answer.
+        this.db.sql.exec(
+            "INSERT INTO holder_state (did, state) VALUES (?1, ?2) " +
+                "ON CONFLICT(did) DO UPDATE SET state = CASE " +
+                "WHEN EXISTS (SELECT 1 FROM deleted WHERE did = ?1) THEN 'gone-permanent' " +
+                "ELSE excluded.state END",
+            did,
+            permanent ? "gone-permanent" : "gone-reversible"
+        )
+    }
+
+    /**
      * Index the rev, add the DID to the open digest window, and clear the
-     * obligation — after the bytes are durable, and in one batch so the
-     * object's serialized execution makes it atomic.
+     * obligation — after the bytes are durable, and in one transaction with the
+     * declaration's `records` row and held mark.
      *
      * The window is chosen by **observation time**, `observedAtMs`, not by
      * when the change happened: a sealed filter cannot be amended, and the
@@ -623,29 +754,31 @@ export class MonitorIngest
      * the ordinary commit path just fetched and stored a live record for
      * it, so a prior deletion no longer holds.
      */
-    async complete(did: string, rev: string, observedAtMs: number): Promise<void> {
-        this.db.sql.exec(
-            "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, observed_at = excluded.observed_at",
-            did,
-            rev,
-            observedAtMs
-        )
-        this.db.sql.exec(
-            "INSERT INTO window_members (window, did) VALUES (?, ?) " +
-                "ON CONFLICT(window, did) DO NOTHING",
-            windowOf(observedAtMs, this.digestWidthMs()),
-            did
-        )
-        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
-        this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+    async complete(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.writeVerified(did, rev, observedAtMs, verified)
+            this.db.sql.exec(
+                "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                    "ON CONFLICT(window, did) DO NOTHING",
+                windowOf(observedAtMs, this.digestWidthMs()),
+                did
+            )
+            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+        })
     }
 
     /**
      * Deletion's counterpart to `complete`: add `did` to the open digest
      * window the same way a stored change would, and discharge the
-     * pending row — one batch, same atomicity argument. Deliberately
-     * leaves `revs` untouched; see `MonitorIndex.completeDeletion`.
+     * pending row, drop the declaration's `records` row and set the holder
+     * state — one transaction. Deliberately leaves `revs` untouched; see
+     * `MonitorIndex.completeDeletion`.
      *
      * `permanent` gates only the `deleted` row — see that method's own
      * doc for why a reversible state must NOT mark `did` `isDeleted`.
@@ -655,21 +788,30 @@ export class MonitorIngest
         observedAtMs: number,
         permanent: boolean
     ): Promise<void> {
-        if (permanent) {
+        this.ctx.storage.transactionSync(() => {
+            if (permanent) {
+                this.db.sql.exec(
+                    "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
+                        "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
+                    did,
+                    observedAtMs
+                )
+            }
+            this.setGoneState(did, permanent)
+            // Only the declaration goes: other collections' snapshots outlive it.
             this.db.sql.exec(
-                "INSERT INTO deleted (did, deleted_at) VALUES (?, ?) " +
-                    "ON CONFLICT(did) DO UPDATE SET deleted_at = excluded.deleted_at",
+                "DELETE FROM records WHERE did = ? AND collection = ?",
                 did,
-                observedAtMs
+                this.env.MONITOR_COLLECTION
             )
-        }
-        this.db.sql.exec(
-            "INSERT INTO window_members (window, did) VALUES (?, ?) " +
-                "ON CONFLICT(window, did) DO NOTHING",
-            windowOf(observedAtMs, this.digestWidthMs()),
-            did
-        )
-        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.db.sql.exec(
+                "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                    "ON CONFLICT(window, did) DO NOTHING",
+                windowOf(observedAtMs, this.digestWidthMs()),
+                did
+            )
+            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+        })
     }
 
     async isDeleted(did: string): Promise<boolean> {
@@ -757,9 +899,11 @@ export class MonitorIngest
     /**
      * Held DIDs not confirmed since `checkedBeforeMs`. A DID counts as
      * confirmed at its last check or, if never checked, when it was last
-     * stored. Ordered by the later of that and its last failed attempt, so a
-     * DID whose source keeps failing queues behind the healthy ones instead
-     * of occupying the head of every batch. A separate table from `revs` so
+     * stored. A DID attempted since `checkedBeforeMs` is not due, so one whose
+     * source keeps failing, or whose record will not verify, is retried once
+     * per interval rather than on every alarm. Ordered by the later of the
+     * confirmation and the last attempt, so such a DID queues behind the
+     * healthy ones. A separate table from `revs` so
      * recording a check needs no schema change there.
      */
     async dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]> {
@@ -771,8 +915,9 @@ export class MonitorIngest
                     "FROM revs r LEFT JOIN checks c ON c.did = r.did " +
                     "WHERE r.did NOT IN (SELECT did FROM deleted) " +
                     "AND r.did NOT IN (SELECT did FROM pending) " +
-                    "AND confirmed < ? " +
-                    "ORDER BY last ASC LIMIT ?",
+                    "AND confirmed < ?1 " +
+                    "AND COALESCE(c.attempted_at, 0) < ?1 " +
+                    "ORDER BY last ASC LIMIT ?2",
                 checkedBeforeMs,
                 limit
             )
@@ -801,16 +946,15 @@ export class MonitorIngest
     /**
      * Advance the rev for a snapshot whose declaration record did not
      * change: no digest-window entry, because nothing a client holds became
-     * stale.
+     * stale. Writes the verified `records` row and asserts held.
      */
-    async completeQuietly(did: string, rev: string, observedAtMs: number): Promise<void> {
-        this.db.sql.exec(
-            "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, observed_at = excluded.observed_at",
-            did,
-            rev,
-            observedAtMs
-        )
+    async completeQuietly(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.writeVerified(did, rev, observedAtMs, verified))
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -826,13 +970,41 @@ export class MonitorIngest
     }
 
     /**
-     * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
-     * to a real read that also keeps the DID document it resolved through; a
-     * subclass overrides it alongside `fetchRecord` when the deployment
-     * resolves DIDs differently, and must hand its own document to
-     * `recordDidDocument` to keep that.
+     * Checks a fetched CAR against the signing key of the document fetched
+     * with it. A fetch that carried no key verifies nothing, so a deployment
+     * `fetchRecord` returning `signingKey: null` stores nothing. Protected so
+     * a test can stand in for placeholder CARs.
      */
-    protected fetchHeadRev(did: string): Promise<string> {
+    protected verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome> {
+        if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
+        try {
+            const outcome = verifyRecordProofOutcome(record.car, {
+                did,
+                signingKey: record.signingKey,
+                collection: this.env.MONITOR_COLLECTION,
+                rkey: "self",
+            })
+            return Promise.resolve(
+                outcome.kind === "present"
+                    ? { kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid }
+                    : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
+            )
+        } catch (err) {
+            if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
+            throw err
+        }
+    }
+
+    /**
+     * The head `rev` of the DID's repo at its PDS, with the signing key of
+     * the document it was resolved through, for the refresh. Defaults to a
+     * real read that also keeps that document; a subclass overrides it
+     * alongside `fetchRecord` when the deployment resolves DIDs differently,
+     * and must hand its own document to `recordDidDocument` to keep that.
+     * The key must be in the form `fetchRecord` returns, since refresh
+     * compares the two as strings; a `null` key counts as a mismatch.
+     */
+    protected fetchHeadRev(did: string): Promise<HeadRev> {
         return fetchHeadRev(did, {
             onDidDocument: ({ document, fetchedAtMs }) =>
                 this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
@@ -936,6 +1108,8 @@ export class MonitorIngest
             index: this,
             snapshot: kvSnapshotStore(this.env),
             fetchRecord: (did) => this.fetchRecord(did),
+            verify: (did, record) => this.verifyRecord(did, record),
+            unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),

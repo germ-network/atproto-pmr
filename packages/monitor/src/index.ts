@@ -53,6 +53,9 @@ export {
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
+    type HolderState,
+    type IndexedRecord,
+    type VerifiedWrite,
     type SigningKeyCacheWriter,
     type SnapshotStore,
 } from "./storage"
@@ -99,6 +102,7 @@ export {
     fetchRecordCar,
     fetchHeadRev,
     type FetchHeadRevOptions,
+    type HeadRev,
     type FetchRecordOptions,
 } from "./fetch-record"
 
@@ -113,6 +117,7 @@ export {
     type IngestDeps,
     type IntakeDecision,
     type SettleOutcome,
+    type VerifyOutcome,
 } from "./ingest"
 
 // The PLC directory's export stream: keeps the relay's signing-key cache and
