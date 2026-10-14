@@ -16,7 +16,7 @@ import {
     type RecordReadResponse,
 } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
-import type { RecordSnapshotStore } from "./snapshot-read.js"
+import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { toResponseBody } from "./util.js"
 import type { WatchedRecord } from "./watched.js"
 
@@ -45,15 +45,32 @@ export interface RecordReadDeps {
  * Wraps `requestRecheck` with a per-isolate memo, so a burst of reads of one
  * lapsed declaration becomes one request to the monitor within `windowMs`,
  * and one log line: a lapse means the monitor is over 24 h behind, an
- * operational alarm. Bounded; the oldest entry goes first.
+ * operational alarm. Bounded; the oldest entry goes first. A request that
+ * fails is not retried within the window. Build it once per isolate: a memo
+ * built per request dedupes nothing.
  */
 export function dedupedRecheck(
     requestRecheck: (did: string) => Promise<void>,
     nowMs: () => number,
-    windowMs: number
+    windowMs: number,
+    maxEntries = RECHECK_MEMO_MAX
 ): (did: string) => Promise<void> {
-    throw new Error("not implemented")
+    const requestedAt = new Map<string, number>()
+    return async (did) => {
+        const now = nowMs()
+        const last = requestedAt.get(did)
+        if (last !== undefined && now - last < windowMs) return
+        requestedAt.delete(did)
+        if (requestedAt.size >= maxEntries) {
+            requestedAt.delete(requestedAt.keys().next().value!)
+        }
+        requestedAt.set(did, now)
+        console.warn(`declaration snapshot past ${SNAPSHOT_MAX_AGE_MS} ms; requesting re-check`, did)
+        await requestRecheck(did)
+    }
 }
+
+const RECHECK_MEMO_MAX = 1024
 
 /**
  * `GET /pmr/v1/records/{did}/{collection}/{rkey}` — the held snapshot's CAR,
@@ -108,6 +125,16 @@ export async function handleRecordRead(
             code: "not-held",
             reason: "the held snapshot proves the record absent",
         })
+    }
+    if (
+        isDeclaration(collection, rkey) &&
+        !(deps.nowMs() - snapshot.freshAtMs <= SNAPSHOT_MAX_AGE_MS)
+    ) {
+        deps.waitUntil(
+            Promise.resolve()
+                .then(() => deps.requestRecheck(did))
+                .catch((error) => console.warn("re-check request failed", did, error))
+        )
     }
     return recordResponse({
         found: true,

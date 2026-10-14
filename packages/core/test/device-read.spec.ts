@@ -3,17 +3,18 @@
  * cache could reveal, never reach a PDS on the response path, and serve held
  * bytes unchanged.
  */
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { encodeCose, type CoseValue } from "../src/cose/cbor"
 import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
 import {
     decodeRecordReadResponse,
+    dedupedRecheck,
     encodeRecordReadResponse,
     handleRecordRead,
     type RecordReadDeps,
 } from "../src/device-read"
 import { RECORD_READ_KEYS, type RecordReadResponse } from "../src/read-api"
-import type { StoredRecordSnapshot } from "../src/snapshot-read"
+import { SNAPSHOT_MAX_AGE_MS, type StoredRecordSnapshot } from "../src/snapshot-read"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
 
 const DID = "did:plc:alice1234567890123456789012"
@@ -23,6 +24,8 @@ const PATH = `${COLLECTION}/${RKEY}`
 const PATH_OK = `/pmr/v1/records/${DID}/${COLLECTION}/${RKEY}`
 const NOW = 10_000_000_000
 const record = (n: number) => ({ $type: COLLECTION, n })
+
+afterEach(() => vi.restoreAllMocks())
 
 const get = (path: string, headers: Record<string, string> = {}) =>
     new Request(`https://pmr.example${path}`, { headers })
@@ -234,18 +237,162 @@ describe("record read", () => {
 })
 
 describe("record read past the 24-hour rule", () => {
-    it.todo("a lapsed declaration resolves its response even when requestRecheck never settles, and the recheck goes to waitUntil")
-    it.todo("the lapsed response is byte-identical to the response for the same snapshot when fresh")
-    it.todo("a fresh declaration requests no recheck")
-    it.todo("a lapsed non-declaration record requests no recheck")
-    it.todo("a rejected recheck does not fail or change the read")
+    const DECL_PATH = `/pmr/v1/records/${DID}/${DECLARATION_COLLECTION_NSID}/self`
+    const lapsed = NOW - SNAPSHOT_MAX_AGE_MS - 1
+
+    function withRecheck(options: Parameters<typeof setup>[0]) {
+        const s = setup(options)
+        const requested: string[] = []
+        const waited: Promise<unknown>[] = []
+        s.deps.requestRecheck = async (did) => {
+            requested.push(did)
+        }
+        s.deps.waitUntil = (p) => {
+            waited.push(p)
+        }
+        return { ...s, requested, waited }
+    }
+
+    it("a lapsed declaration resolves its response even when requestRecheck never settles, and the recheck goes to waitUntil", async () => {
+        const { deps, waited, requested } = withRecheck({ declaration: true, freshAtMs: lapsed })
+        deps.requestRecheck = (did) => {
+            requested.push(did)
+            return new Promise<void>(() => {})
+        }
+        const res = await handleRecordRead(get(DECL_PATH), deps)
+        expect(decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer())).found).toBe(true)
+        expect(requested).toEqual([DID])
+        expect(waited).toHaveLength(1)
+    })
+
+    it("the lapsed response is byte-identical to the response for the same snapshot when fresh", async () => {
+        const { deps, requested } = withRecheck({ declaration: true, freshAtMs: NOW - 1 })
+        const fresh = await handleRecordRead(get(DECL_PATH), deps)
+        expect(requested).toEqual([])
+        deps.nowMs = () => NOW + SNAPSHOT_MAX_AGE_MS
+        const late = await handleRecordRead(get(DECL_PATH), deps)
+        expect(requested).toEqual([DID])
+        expect([...late.headers]).toEqual([...fresh.headers])
+        expect(new Uint8Array(await late.arrayBuffer())).toEqual(
+            new Uint8Array(await fresh.arrayBuffer())
+        )
+    })
+
+    it("a fresh declaration requests no recheck", async () => {
+        const { deps, requested, waited } = withRecheck({
+            declaration: true,
+            freshAtMs: NOW - SNAPSHOT_MAX_AGE_MS,
+        })
+        await handleRecordRead(get(DECL_PATH), deps)
+        expect(requested).toEqual([])
+        expect(waited).toEqual([])
+    })
+
+    it("a lapsed non-declaration record requests no recheck", async () => {
+        const { deps, requested, waited } = withRecheck({ freshAtMs: lapsed })
+        const res = await handleRecordRead(get(PATH_OK), deps)
+        expect(decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer())).found).toBe(true)
+        expect(requested).toEqual([])
+        expect(waited).toEqual([])
+    })
+
+    it("a rejected recheck does not fail or change the read", async () => {
+        const { deps, waited } = withRecheck({ declaration: true, freshAtMs: lapsed })
+        deps.requestRecheck = async () => {
+            throw new Error("monitor down")
+        }
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const res = await handleRecordRead(get(DECL_PATH), deps)
+        await Promise.all(waited)
+        warn.mockRestore()
+        expect(res.status).toBe(200)
+        expect(decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer())).found).toBe(true)
+    })
+
+    it("a throwing requestRecheck does not fail the read either", async () => {
+        const { deps, waited } = withRecheck({ declaration: true, freshAtMs: lapsed })
+        deps.requestRecheck = () => {
+            throw new Error("sync failure")
+        }
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const res = await handleRecordRead(get(DECL_PATH), deps)
+        await Promise.all(waited)
+        warn.mockRestore()
+        expect(res.status).toBe(200)
+    })
 })
 
 describe("dedupedRecheck", () => {
-    it.todo("N requests for one DID within the window call requestRecheck once")
-    it.todo("a request after the window calls requestRecheck again")
-    it.todo("the memo is bounded and drops its oldest entry first")
-    it.todo("a lapse is logged once per DID per window, not per read")
+    const WINDOW = 10_000
+    function make(maxEntries?: number, settle = true) {
+        let now = 1_000
+        const calls: string[] = []
+        const fn = dedupedRecheck(
+            (did) => {
+                calls.push(did)
+                return settle ? Promise.resolve() : new Promise<void>(() => {})
+            },
+            () => now,
+            WINDOW,
+            maxEntries
+        )
+        return { fn, calls, advance: (ms: number) => (now += ms) }
+    }
+
+    it("a burst of concurrent requests for one DID calls requestRecheck once", async () => {
+        const { fn, calls } = make(undefined, false)
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (let i = 0; i < 5; i++) void fn("did:plc:a")
+        await Promise.resolve()
+        expect(calls).toEqual(["did:plc:a"])
+        expect(warn).toHaveBeenCalledTimes(1)
+    })
+
+    it("N requests for one DID within the window call requestRecheck once", async () => {
+        const { fn, calls, advance } = make()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (let i = 0; i < 5; i++) {
+            await fn("did:plc:a")
+            advance(WINDOW / 10)
+        }
+        warn.mockRestore()
+        expect(calls).toEqual(["did:plc:a"])
+    })
+
+    it("a request after the window calls requestRecheck again", async () => {
+        const { fn, calls, advance } = make()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        await fn("did:plc:a")
+        advance(WINDOW)
+        await fn("did:plc:a")
+        warn.mockRestore()
+        expect(calls).toEqual(["did:plc:a", "did:plc:a"])
+    })
+
+    it("the memo is bounded and drops its oldest entry first", async () => {
+        const { fn, calls } = make(3)
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (let i = 0; i <= 3; i++) await fn(`did:plc:${i}`)
+        calls.length = 0
+        await fn("did:plc:3")
+        expect(calls).toEqual([])
+        await fn("did:plc:0")
+        warn.mockRestore()
+        expect(calls).toEqual(["did:plc:0"])
+    })
+
+    it("a lapse is logged once per DID per window, not per read", async () => {
+        const { fn, advance } = make()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        await fn("did:plc:a")
+        await fn("did:plc:a")
+        await fn("did:plc:a")
+        expect(warn).toHaveBeenCalledTimes(1)
+        advance(WINDOW)
+        await fn("did:plc:a")
+        expect(warn).toHaveBeenCalledTimes(2)
+        warn.mockRestore()
+    })
 })
 
 describe("record read codec", () => {
