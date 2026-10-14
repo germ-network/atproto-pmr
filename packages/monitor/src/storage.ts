@@ -641,6 +641,27 @@ export interface PendingRecordFetch extends OwedRecord {
 /** Why a secondary index write was refused: a newer rev is indexed, or the DID left interest. */
 export type SecondaryWriteAnswer = "older" | "left"
 
+export type SecondaryIntakeOutcome =
+    | IntakeOutcome
+    /** The DID is not in interest; nothing was owed. */
+    | { outcome: "ignored" }
+
+/**
+ * The live half of the secondary index: what the follow/profile stream owes.
+ * Apart from `SecondaryIndex` so a settle never needs it.
+ */
+export interface SecondaryIntakeIndex {
+    /**
+     * Owe a fetch of one secondary and advance the follow stream's cursor,
+     * atomically. The `rec_pending` upsert sets both `rev` and `epoch`, the
+     * epoch read in the same step as membership, so a row left from an
+     * earlier epoch is settled at the current one.
+     * `duplicate` without owing when `rev` is the indexed one; `ignored` for
+     * a DID not in interest.
+     */
+    oweSecondary(owed: OwedRecord, cursor: Cursor): Promise<SecondaryIntakeOutcome>
+}
+
 /**
  * The single writer's index of secondary records (`MONITOR_COLLECTIONS`).
  * Secondaries never touch `revs`, the digest window or the holder state:
@@ -649,26 +670,34 @@ export type SecondaryWriteAnswer = "older" | "left"
 export interface SecondaryIndex {
     dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
     deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void>
-    clearSecondary(ref: RecordRef): Promise<void>
+    /**
+     * Drop the pending row, only while it still owes `owedRev`: a newer
+     * commit owed by the live stream during the settle survives.
+     */
+    clearSecondary(ref: RecordRef, owedRev: string): Promise<void>
     /**
      * Index a verified secondary at its signed `rev` and clear its pending
      * row, after its bytes are in the store. Writes nothing and answers
      * `older` when the indexed rev is newer, or `left` when `did` has left
      * the interest `epoch` it was owed under. The caller checks both before
      * its KV put, so only `left` can follow a put, and only `left` deletes
-     * what the put wrote.
+     * what the put wrote. The pending row is cleared only while its rev is
+     * still `owedRev`, the one this settle was owed at, so a commit owed by
+     * the live stream during the fetch survives the completion.
      */
     completeSecondary(
         ref: RecordRef,
         rev: string,
         verified: VerifiedWrite,
-        epoch: number
+        epoch: number,
+        owedRev: string
     ): Promise<SecondaryWriteAnswer | "stored">
     /** Drop a secondary verified absent at `rev`, under the same rules. */
     disposeSecondary(
         ref: RecordRef,
         rev: string,
-        epoch: number
+        epoch: number,
+        owedRev: string
     ): Promise<SecondaryWriteAnswer | "disposed">
     /** The indexed rev of one secondary, for the check before a KV put. */
     secondaryRevOf(ref: RecordRef): Promise<string | null>

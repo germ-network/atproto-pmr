@@ -117,4 +117,44 @@ describe("decodeEvent", () => {
         )
         expect(e).toMatchObject({ kind: "commit", operation: "update" })
     })
+
+    it("reads a follow record's subject, and null when the record has none", () => {
+        const commit = (record?: unknown, operation = "create") =>
+            decodeEvent(
+                JSON.stringify({
+                    payload: {
+                        $type: "…#commit",
+                        did: "did:plc:x",
+                        collection: "app.bsky.graph.follow",
+                        rev: "3m",
+                        rkey: "r1",
+                        operation,
+                        ...(record === undefined ? {} : { record }),
+                    },
+                })
+            )
+        expect(commit({ subject: "did:plc:y" })).toMatchObject({ subject: "did:plc:y" })
+        expect(commit(undefined, "delete")).toMatchObject({ subject: null })
+        expect(commit({ subject: 5 })).toMatchObject({ subject: null })
+        expect(commit({})).toMatchObject({ subject: null })
+    })
+
+    it("reads an account event's active and status", () => {
+        const account = (fields: Record<string, unknown>) =>
+            decodeEvent(JSON.stringify({ payload: { $type: "…#account", did: "did:plc:x", ...fields } }))
+        expect(account({ active: true })).toMatchObject({ kind: "account", active: true, status: null })
+        expect(account({ active: false, status: "takendown" })).toMatchObject({
+            active: false,
+            status: "takendown",
+        })
+        expect(account({ active: "yes" })).toMatchObject({ active: null })
+        expect(
+            decodeEvent(JSON.stringify({ kind: "account", did: "did:plc:x", account: { active: true } }))
+        ).toMatchObject({ active: true })
+        expect(decodeEvent(JSON.stringify({ payload: { $type: "…#sync", did: "did:plc:x" } }))).toMatchObject({
+            kind: "sync",
+            active: null,
+            status: null,
+        })
+    })
 })

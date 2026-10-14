@@ -34,6 +34,11 @@ export interface CommitEvent {
     cid: string | null
     seq: number | null
     timeMs: number | null
+    /**
+     * A follow record's `subject` DID, from the commit's record body. Null
+     * when the record carries none (a delete, or a malformed record).
+     */
+    subject: string | null
 }
 
 /**
@@ -48,6 +53,10 @@ export interface IdentityEvent {
     did: string
     seq: number | null
     timeMs: number | null
+    /** An account event's `active`; null when absent or not a boolean. */
+    active: boolean | null
+    /** An account event's `status` (e.g. `takendown`); null when absent. */
+    status: string | null
 }
 
 export type MonitorEvent = CommitEvent | IdentityEvent
@@ -111,7 +120,22 @@ export function decodeEvent(raw: string): MonitorEvent | null {
     const seq = num(payload.seq)
     const at = timeMs(payload)
 
-    if (kind !== "commit") return { kind, did, seq, timeMs: at }
+    if (kind !== "commit") {
+        // v1 nests an account's fields; v2 flattens them onto the payload.
+        const a = (
+            typeof payload.account === "object" && payload.account !== null
+                ? payload.account
+                : payload
+        ) as Record<string, unknown>
+        return {
+            kind,
+            did,
+            seq,
+            timeMs: at,
+            active: typeof a.active === "boolean" ? a.active : null,
+            status: str(a.status),
+        }
+    }
 
     // v1 nests commit fields; v2 flattens them onto the payload.
     const c = (
@@ -126,6 +150,7 @@ export function decodeEvent(raw: string): MonitorEvent | null {
     if (collection === null || rev === null || rkey === null) return null
 
     const op = str(c.operation)
+    const record = typeof c.record === "object" && c.record !== null ? c.record : null
     return {
         kind: "commit",
         did,
@@ -137,5 +162,6 @@ export function decodeEvent(raw: string): MonitorEvent | null {
         cid: str(c.cid),
         seq,
         timeMs: at,
+        subject: record === null ? null : str((record as Record<string, unknown>).subject),
     }
 }

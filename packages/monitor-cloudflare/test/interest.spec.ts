@@ -8,12 +8,14 @@ import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
+    intakeSecondary,
     intakePlcEvent,
     refreshDue,
     settle,
     settleDeletion,
     settleDue,
     settleSecondaryDue,
+    type CommitEvent,
     type FetchedRecord,
     type IngestDeps,
     type PlcExportEvent,
@@ -752,13 +754,13 @@ describe("joining and leaving interest", () => {
         const ref = { did, collection: PROFILE, rkey: "self" }
         await inObj(registeredStub(), async (obj) => {
             await obj.setRegistered(did, true, 1)
-            expect(await obj.completeSecondary(ref, "3m5", { cid: "c", verifiedWith: KEY }, 1)).toBe("stored")
-            expect(await obj.completeSecondary(ref, "3m4", { cid: "c", verifiedWith: KEY }, 1)).toBe("older")
-            expect(await obj.disposeSecondary(ref, "3m4", 1)).toBe("older")
-            expect(await obj.completeSecondary(ref, "3m6", { cid: "c", verifiedWith: KEY }, 7)).toBe("left")
+            expect(await obj.completeSecondary(ref, "3m5", { cid: "c", verifiedWith: KEY }, 1, "3m5")).toBe("stored")
+            expect(await obj.completeSecondary(ref, "3m4", { cid: "c", verifiedWith: KEY }, 1, "3m4")).toBe("older")
+            expect(await obj.disposeSecondary(ref, "3m4", 1, "3m4")).toBe("older")
+            expect(await obj.completeSecondary(ref, "3m6", { cid: "c", verifiedWith: KEY }, 7, "3m6")).toBe("left")
             expect(await obj.secondaryRevOf(ref)).toBe("3m5")
             await obj.setRegistered(did, false, 2)
-            expect(await obj.disposeSecondary(ref, "3m9", 1)).toBe("left")
+            expect(await obj.disposeSecondary(ref, "3m9", 1, "3m9")).toBe("left")
             expect(await obj.secondaryRevOf(ref)).toBe("3m5")
         })
     })
@@ -1140,6 +1142,174 @@ describe("joining and leaving interest", () => {
 
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
+
+describe("owed secondary fetch", () => {
+    const profileCommit = (did: string, rev: string, rkey = "self", collection = PROFILE): CommitEvent => ({
+        kind: "commit",
+        did,
+        collection,
+        rkey,
+        operation: "update",
+        rev,
+        cid: null,
+        seq: null,
+        timeMs: null,
+        subject: null,
+    })
+    const live = (obj: MonitorIngest, event: CommitEvent, cursor = "9000") =>
+        intakeSecondary({ index: obj }, { records: monitorCollections(obj.env) }, event, cursor)
+    const pendingOf = (obj: MonitorIngest, did: string) =>
+        obj.ctx.storage.sql
+            .exec<{ rev: string; epoch: number }>("SELECT rev, epoch FROM rec_pending WHERE did = ?", did)
+            .toArray()
+    const ref = (did: string) => ({ did, collection: PROFILE, rkey: "self" })
+
+    type SecondaryInternals = {
+        secondaryDeps(): SecondaryDeps
+        fetchRecordAt: (ref: RecordRef) => Promise<FetchedRecord>
+        verifyRecordAt: (ref: RecordRef, record: FetchedRecord) => Promise<VerifyOutcome>
+    }
+    /** A settle whose fetch runs `during` first, so a live commit can land mid-flight. */
+    const settleWith = (
+        obj: MonitorIngest,
+        fetched: { rev: string } | Error,
+        during: () => Promise<void>,
+        verify: "verified" | "unverifiable" = "verified"
+    ) => {
+        const o = obj as unknown as SecondaryInternals
+        o.fetchRecordAt = async () => {
+            await during()
+            if (fetched instanceof Error) throw fetched
+            return { car: new Uint8Array([5]), source: "https://pds", signingKey: KEY, rev: fetched.rev } as FetchedRecord
+        }
+        o.verifyRecordAt = async (_ref, record) =>
+            verify === "unverifiable"
+                ? { kind: "unverifiable" }
+                : { kind: "verified", key: KEY, rev: (record as FetchedRecord & { rev: string }).rev, cid: "bafyreiprofile" }
+        return settleSecondaryDue(o.secondaryDeps(), 32)
+    }
+
+    it("profile commit for a DID in interest owes a fetch with the cursor", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            expect(await live(obj, profileCommit(did, "3m7"), "9000")).toBe("accepted")
+            expect(pendingOf(obj, did)).toEqual([{ rev: "3m7", epoch: await obj.interestEpoch(did) }])
+        })
+        expect(await rows(stub, "SELECT v FROM meta WHERE k = 'follow_cursor'")).toEqual([{ v: "9000" }])
+    })
+
+    it("profile commit at the indexed rev is a duplicate", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await obj.completeSecondary(ref(did), "3m5", VERIFIED, 1, "3m5")
+            expect(await live(obj, profileCommit(did, "3m5"))).toBe("duplicate")
+            expect(pendingOf(obj, did)).toEqual([])
+            expect(await live(obj, profileCommit(did, "3m6"))).toBe("accepted")
+        })
+    })
+
+    it("profile commit outside interest is ignored", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            expect(await live(obj, profileCommit(did, "3m7"))).toBe("ignored")
+            await obj.setRegistered(did, true, 1)
+            await obj.setRegistered(did, false, 2)
+            expect(await live(obj, profileCommit(did, "3m8"))).toBe("ignored")
+            expect(pendingOf(obj, did)).toEqual([])
+        })
+        expect(await rows(stub, "SELECT v FROM meta WHERE k = 'follow_cursor'")).toEqual([])
+    })
+
+    it("a commit on an unwatched rkey is ignored", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            expect(await live(obj, profileCommit(did, "3m7", "other"))).toBe("ignored")
+            expect(await live(obj, profileCommit(did, "3m7", "self", "app.bsky.feed.post"))).toBe("ignored")
+            expect(pendingOf(obj, did)).toEqual([])
+        })
+    })
+
+    it("a live owe over a row from an earlier epoch settles at the current epoch", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj) // the join owes the row at epoch 1
+            await obj.setRegistered(did, false, 2)
+            await obj.setRegistered(did, true, 3) // netted: no transition applied
+            expect(pendingOf(obj, did)).toEqual([{ rev: "", epoch: 1 }])
+            expect(await live(obj, profileCommit(did, "3m7"))).toBe("accepted")
+            expect(pendingOf(obj, did)).toEqual([{ rev: "3m7", epoch: 3 }])
+            expect(await settleWith(obj, { rev: "3m7" }, async () => {})).toBe(1)
+            expect(await obj.secondaryRevOf(ref(did))).toBe("3m7")
+            expect(pendingOf(obj, did)).toEqual([])
+        })
+    })
+
+    it("a live owe during an in-flight settle survives", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            const settled = await settleWith(obj, { rev: "3m4" }, async () => {
+                expect(await live(obj, profileCommit(did, "3m9"))).toBe("accepted")
+            })
+            expect(settled).toBe(1)
+            expect(await obj.secondaryRevOf(ref(did))).toBe("3m4")
+            expect(pendingOf(obj, did)).toMatchObject([{ rev: "3m9" }])
+            // The surviving owe is then settled on its own.
+            expect(await settleWith(obj, { rev: "3m9" }, async () => {})).toBe(1)
+            expect(pendingOf(obj, did)).toEqual([])
+        })
+    })
+
+    it("a live owe during a settle that ends not-found survives", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await settleWith(obj, new RecordNotFoundError("gone", false, "RecordNotFound"), async () => {
+                await live(obj, profileCommit(did, "3m9"))
+            })
+            expect(pendingOf(obj, did)).toMatchObject([{ rev: "3m9" }])
+        })
+    })
+
+    it("a live owe during a settle that ends unverifiable survives", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await settleWith(obj, { rev: "3m4" }, async () => {
+                await live(obj, profileCommit(did, "3m9"))
+            }, "unverifiable")
+            expect(pendingOf(obj, did)).toMatchObject([{ rev: "3m9" }])
+        })
+    })
+
+    it("a live owe during a settle that ends older survives", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await obj.completeSecondary(ref(did), "3m8", VERIFIED, 1, "")
+            await live(obj, profileCommit(did, "3m2"))
+            await settleWith(obj, { rev: "3m4" }, async () => {
+                await live(obj, profileCommit(did, "3m9"))
+            })
+            expect(await obj.secondaryRevOf(ref(did))).toBe("3m8")
+            expect(pendingOf(obj, did)).toMatchObject([{ rev: "3m9" }])
+        })
+    })
+})
 
 describe("head checks follow interest", () => {
     const due = (obj: MonitorIngest, now = Date.now()) =>

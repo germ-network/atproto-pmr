@@ -33,6 +33,11 @@ MONITOR_COLLECTIONS = "app.bsky.actor.profile/self"
 REFRESH_NONHOLDER_STALE_AFTER_MS = "86400000"
 # How long an unregister waits for a re-register before it applies.
 UNREGISTER_GRACE_MS = "600000"
+# The monitor also holds a second Jetstream socket for follows and the
+# MONITOR_COLLECTIONS records, with its own cursor. While it only drops events,
+# that cursor (and last_connected_at) is persisted at most this often; a kept
+# event persists it at once.
+FOLLOW_CURSOR_PERSIST_MS = "5000"
 
 # A monitor is not bound to any one provider. Point this at a self-hosted
 # instance to take a third party out of the noticing path; the trust model

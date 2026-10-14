@@ -59,6 +59,12 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      */
     UNREGISTER_GRACE_MS?: string
 
+    /**
+     * Longest (ms) the follow/profile stream's cursor goes unpersisted while
+     * it only drops events, default 5 s. An event kept persists it at once.
+     */
+    FOLLOW_CURSOR_PERSIST_MS?: string
+
     /** Interest transitions applied per alarm, default 64. */
     INTEREST_BATCH?: string
 

@@ -47,19 +47,25 @@ function harness(
     let indexedRev = opts.indexedRev ?? null
     let epoch = opts.epoch ?? 1
     const calls: string[] = []
+    const owedRevs: string[] = []
     const deps: SecondaryDeps = {
         index: {
             dueSecondaries: async () => [OWED],
             deferSecondary: async () => void calls.push("defer"),
-            clearSecondary: async () => void calls.push("clear"),
-            completeSecondary: async (_ref, rev) => {
+            clearSecondary: async (_ref, owedRev) => {
+                calls.push("clear")
+                owedRevs.push(owedRev)
+            },
+            completeSecondary: async (_ref, rev, _verified, _epoch, owedRev) => {
                 calls.push("complete")
+                owedRevs.push(owedRev)
                 const answer = opts.complete ?? "stored"
                 if (answer === "stored") indexedRev = rev
                 return answer
             },
-            disposeSecondary: async () => {
+            disposeSecondary: async (_ref, _rev, _epoch, owedRev) => {
                 calls.push("dispose")
+                owedRevs.push(owedRev)
                 indexedRev = null
                 return "disposed"
             },
@@ -89,7 +95,7 @@ function harness(
         deferToDeclaration: async () => void calls.push("defer-declaration"),
         nowMs: () => 1_000,
     }
-    return { deps, calls, stored: () => stored, indexedRev: () => indexedRev, setEpoch: (n: number) => (epoch = n) }
+    return { deps, calls, owedRevs, stored: () => stored, indexedRev: () => indexedRev, setEpoch: (n: number) => (epoch = n) }
 }
 
 describe("settleSecondary", () => {
@@ -196,6 +202,27 @@ describe("settleSecondary", () => {
         }
         expect(await settleSecondary(h.deps, OWED)).toBe("left")
         expect(h.calls).not.toContain("put")
+    })
+
+    it("every exit settles only the rev it was owed, never the verified one", async () => {
+        const owed = { ...OWED, rev: "3m2" }
+        const notFound = (reason: string) => async () => {
+            throw new RecordNotFoundError("gone", true, reason)
+        }
+        const exits = [
+            harness(), // stored
+            harness({ complete: "left" }),
+            harness({ inInterest: false }), // left before the fetch
+            harness({ indexedRev: "3m9" }), // older
+            harness({ verify: { kind: "unverifiable" } }),
+            harness({ fetch: notFound("RecordNotFound") }),
+            harness({ fetch: notFound("RepoNotFound") }), // deferred
+            harness({ stored: entry("3m3"), indexedRev: "3m3", verify: { kind: "verified-absent", key: KEY, rev: "3m5" } }), // deleted
+        ]
+        for (const h of exits) {
+            await settleSecondary(h.deps, owed)
+            expect(h.owedRevs).toEqual(["3m2"])
+        }
     })
 
     it("a transient failure is deferred with backoff, not dropped", async () => {

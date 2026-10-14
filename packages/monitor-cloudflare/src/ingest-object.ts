@@ -8,9 +8,11 @@ import {
     drainKeyUpdates,
     intake,
     intakePlcEvent,
+    routeFollowEvent,
     listReposByCollection,
     plcCursorAfterClose,
     FETCH_AS_OF_SKEW_MS,
+    FOLLOW_COLLECTION_NSID,
     fetchHeadRev,
     pushDeclarationChange,
     refreshDue,
@@ -30,10 +32,15 @@ import {
     type IntakeOutcome,
     type InterestIndex,
     type InterestTransition,
+    type FollowStreamIndex,
+    type NewEdgeOp,
+    type OwedRecord,
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryDeps,
     type SecondaryIndex,
+    type SecondaryIntakeIndex,
+    type SecondaryIntakeOutcome,
     type SecondaryWriteAnswer,
     type KeyUpdateIndex,
     type MonitorIndex,
@@ -159,11 +166,16 @@ export class MonitorIngest
         DidDocumentSink,
         InterestIndex,
         SecondaryIndex,
+        SecondaryIntakeIndex,
+        FollowStreamIndex,
         MonitorRegistrationNotify
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
     private plcSocket: WebSocket | null = null
+    private followSocket: WebSocket | null = null
+    private followCursorPersistedAt = 0
+    private followConnectedAt = 0
     /**
      * The highest export `seq` seen, shared by every path that advances the
      * PLC cursor so a lazy flush can never write an older value over a
@@ -271,6 +283,19 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     change TEXT NOT NULL CHECK (change IN ('join', 'leave')),
                     epoch INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS edge_ops (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK (kind IN ('create', 'delete')),
+                    follower TEXT NOT NULL,
+                    rkey TEXT NOT NULL,
+                    subject TEXT,
+                    rev TEXT NOT NULL,
+                    cursor TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS listing_requeue (
+                    did TEXT PRIMARY KEY,
+                    queued_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
@@ -1494,20 +1519,16 @@ export class MonitorIngest
         )
     }
 
-    async clearSecondary(ref: RecordRef): Promise<void> {
-        this.db.sql.exec(
-            "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
-            ref.did,
-            ref.collection,
-            ref.rkey
-        )
+    async clearSecondary(ref: RecordRef, owedRev: string): Promise<void> {
+        this.clearSecondarySync(ref, owedRev)
     }
 
     async completeSecondary(
         ref: RecordRef,
         rev: string,
         verified: VerifiedWrite,
-        epoch: number
+        epoch: number,
+        owedRev: string
     ): Promise<SecondaryWriteAnswer | "stored"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
@@ -1524,7 +1545,7 @@ export class MonitorIngest
                 verified.cid,
                 verified.verifiedWith
             )
-            this.clearSecondarySync(ref)
+            this.clearSecondarySync(ref, owedRev)
             return "stored" as const
         })
     }
@@ -1532,7 +1553,8 @@ export class MonitorIngest
     async disposeSecondary(
         ref: RecordRef,
         rev: string,
-        epoch: number
+        epoch: number,
+        owedRev: string
     ): Promise<SecondaryWriteAnswer | "disposed"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
@@ -1543,7 +1565,7 @@ export class MonitorIngest
                 ref.collection,
                 ref.rkey
             )
-            this.clearSecondarySync(ref)
+            this.clearSecondarySync(ref, owedRev)
             return "disposed" as const
         })
     }
@@ -1575,12 +1597,14 @@ export class MonitorIngest
         )
     }
 
-    private clearSecondarySync(ref: RecordRef): void {
+    /** Only while the row still owes the rev this settle read: a newer live commit survives. */
+    private clearSecondarySync(ref: RecordRef, owedRev: string): void {
         this.db.sql.exec(
-            "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
+            "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ? AND rev = ?",
             ref.did,
             ref.collection,
-            ref.rkey
+            ref.rkey,
+            owedRev
         )
     }
 
@@ -1597,6 +1621,114 @@ export class MonitorIngest
             )
             this.db.sql.exec("DELETE FROM rec_pending WHERE did = ?", did)
         })
+    }
+
+    // ---- SecondaryIntakeIndex ---------------------------------------------
+
+    async oweSecondary(owed: OwedRecord, cursor: Cursor): Promise<SecondaryIntakeOutcome> {
+        return this.ctx.storage.transactionSync(() => {
+            const interest = this.db.sql
+                .exec<{ member: number; epoch: number }>(
+                    "SELECT member, epoch FROM interest WHERE did = ?",
+                    owed.did
+                )
+                .toArray()[0]
+            if (interest === undefined || interest.member !== 1) {
+                return { outcome: "ignored" as const }
+            }
+            if (this.secondaryRevSync(owed) === owed.rev) {
+                return { outcome: "duplicate" as const }
+            }
+            this.db.sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) VALUES (?, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
+                    "rev = excluded.rev, epoch = excluded.epoch",
+                owed.did,
+                owed.collection,
+                owed.rkey,
+                owed.rev,
+                interest.epoch
+            )
+            this.raiseFollowCursor(cursor)
+            return { outcome: "accepted" as const }
+        })
+    }
+
+    // ---- FollowStreamIndex ------------------------------------------------
+
+    async readFollowCursor(): Promise<Cursor | null> {
+        return (
+            this.db.sql
+                .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'follow_cursor'")
+                .toArray()[0]?.v ?? null
+        )
+    }
+
+    async skipFollowEvent(cursor: Cursor): Promise<void> {
+        const nowMs = Date.now()
+        if (nowMs - this.followCursorPersistedAt < this.followPersistMs()) return
+        this.raiseFollowCursor(cursor)
+        this.followCursorPersistedAt = nowMs
+    }
+
+    /** Logged only: nothing reads `edge_ops` until the edge index exists. */
+    async logEdgeOp(op: NewEdgeOp, cursor: Cursor): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor) " +
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                op.kind,
+                op.follower,
+                op.rkey,
+                op.kind === "create" ? op.subject : null,
+                op.rev,
+                op.cursor
+            )
+            this.raiseFollowCursor(cursor)
+        })
+    }
+
+    async requeueListing(did: string, cursor: Cursor): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO listing_requeue (did, queued_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET queued_at = excluded.queued_at",
+                did,
+                Date.now()
+            )
+            this.raiseFollowCursor(cursor)
+        })
+    }
+
+    private followPersistMs(): number {
+        return this.envInt(this.env.FOLLOW_CURSOR_PERSIST_MS, 5_000)
+    }
+
+    /**
+     * Persist the follow stream's cursor, only ever raising it: a kept event
+     * carrying a lower cursor than one already stored leaves it alone.
+     */
+    private raiseFollowCursor(cursor: Cursor): void {
+        if (!/^\d+$/.test(cursor)) return
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('follow_cursor', ?1) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v " +
+                "WHERE CAST(excluded.v AS INTEGER) > CAST(meta.v AS INTEGER)",
+            cursor
+        )
+        this.followCursorPersistedAt = Date.now()
+    }
+
+    /** Stamp `last_connected_at`, at most once per cursor-persist interval. */
+    private markFollowOpen(force = false): void {
+        const nowMs = Date.now()
+        if (!force && nowMs - this.followConnectedAt < this.followPersistMs()) return
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('last_connected_at', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            String(nowMs)
+        )
+        this.followConnectedAt = nowMs
     }
 
     // ---- ingest -----------------------------------------------------------
@@ -1844,6 +1976,11 @@ export class MonitorIngest
         await this.armWatchdog()
         if (this.socket === null) await this.connect()
         try {
+            await this.connectFollow()
+        } catch (err) {
+            console.error("monitor: follow connect failed", err)
+        }
+        try {
             await this.connectPlc()
         } catch (err) {
             console.error("monitor: plc connect failed", err)
@@ -1885,6 +2022,42 @@ export class MonitorIngest
         ws.addEventListener("close", drop)
         ws.addEventListener("error", drop)
         await this.armWatchdog()
+    }
+
+    /**
+     * Open the follow/profile stream: a second Jetstream socket on
+     * `collections` = the follow collection plus the secondaries'
+     * collections, with no `dids`, from `meta.follow_cursor` (µs), or the tip
+     * on first run. `meta.last_connected_at` is the last time the socket was
+     * known open: written when it opens and refreshed while it stays open, at
+     * the cursor-persist interval, so a long-open socket evicted later does
+     * not read as an outage. Bounded like `connect`, reconnected only from the
+     * alarm, and independent of the declaration socket: neither one's close
+     * touches the other.
+     */
+    async connectFollow(): Promise<void> {
+        if (this.followSocket !== null) return
+        const cursor = await this.readFollowCursor()
+        const url = new URL(this.env.JETSTREAM_URL)
+        const collections = [
+            FOLLOW_COLLECTION_NSID,
+            ...new Set(monitorCollections(this.env).map((r) => r.collection)),
+        ]
+        url.searchParams.set("collections", collections.join(","))
+        if (cursor !== null) url.searchParams.set("cursor", cursor)
+
+        const ws = await this.upgrade(url, "jetstream follow stream")
+        this.followSocket = ws
+        this.markFollowOpen(true)
+
+        ws.addEventListener("message", (event) => {
+            void this.onFollowFrame(String(event.data))
+        })
+        const drop = () => {
+            if (this.followSocket === ws) this.followSocket = null
+        }
+        ws.addEventListener("close", drop)
+        ws.addEventListener("error", drop)
     }
 
     /**
@@ -2041,6 +2214,29 @@ export class MonitorIngest
         if (decision === "ignored" && cursor !== null && cursor !== "") this.advanceIgnoredCursor(cursor)
     }
 
+    /**
+     * The follow stream's read loop. Every route is index lookups and one
+     * synchronous write with the cursor; nothing is awaited on the network.
+     */
+    private async onFollowFrame(raw: string): Promise<void> {
+        try {
+            this.markFollowOpen()
+            const event = decodeEvent(raw)
+            if (event === null) return
+            const cursor =
+                event.timeMs === null
+                    ? await this.readFollowCursor()
+                    : String(Math.round(event.timeMs * 1000))
+            await routeFollowEvent(
+                { index: this, secondaries: monitorCollections(this.env) },
+                event,
+                cursor ?? ""
+            )
+        } catch (err) {
+            console.error("monitor: follow frame failed", err)
+        }
+    }
+
     private cursorAdvancedAt = 0
 
     /**
@@ -2092,6 +2288,11 @@ export class MonitorIngest
                 await this.connectPlc()
             } catch (err) {
                 console.error("monitor: plc connect failed", err)
+            }
+            try {
+                await this.connectFollow()
+            } catch (err) {
+                console.error("monitor: follow connect failed", err)
             }
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
