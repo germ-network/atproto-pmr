@@ -27,9 +27,12 @@ import {
     type PendingFetch,
     type RefreshIndex,
     type SigningKeyUpdate,
+    type VerifyOutcome,
 } from "@germ-network/atproto-pmr-monitor"
 import {
+    RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
+    verifyRecordProofOutcome,
     type DidDocument,
     type PlcCoverage,
 } from "@germ-network/atproto-pmr-core"
@@ -826,6 +829,32 @@ export class MonitorIngest
     }
 
     /**
+     * Checks a fetched CAR against the signing key of the document fetched
+     * with it. A fetch that carried no key verifies nothing, so a deployment
+     * `fetchRecord` returning `signingKey: null` stores nothing. Protected so
+     * a test can stand in for placeholder CARs.
+     */
+    protected verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome> {
+        if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
+        try {
+            const outcome = verifyRecordProofOutcome(record.car, {
+                did,
+                signingKey: record.signingKey,
+                collection: this.env.MONITOR_COLLECTION,
+                rkey: "self",
+            })
+            return Promise.resolve(
+                outcome.kind === "present"
+                    ? { kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid }
+                    : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
+            )
+        } catch (err) {
+            if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
+            throw err
+        }
+    }
+
+    /**
      * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
      * to a real read that also keeps the DID document it resolved through; a
      * subclass overrides it alongside `fetchRecord` when the deployment
@@ -936,6 +965,8 @@ export class MonitorIngest
             index: this,
             snapshot: kvSnapshotStore(this.env),
             fetchRecord: (did) => this.fetchRecord(did),
+            verify: (did, record) => this.verifyRecord(did, record),
+            unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),

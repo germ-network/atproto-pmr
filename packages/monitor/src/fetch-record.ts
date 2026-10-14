@@ -138,13 +138,7 @@ export async function fetchRecordCar(
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
-    // `rev` read authoritatively from the PDS, never taken from the wake
-    // signal (a hostile feed could otherwise fake or mask a rollback). Shared
-    // with the relay's watch via core — see `fetchLatestRev`. One extra round
-    // trip per *changed* record is nothing at a single collection's change rate.
-    const rev = await fetchLatestRev(pds, did, fetchImpl)
     return {
-        rev,
         car,
         source: pds,
         signingKey,

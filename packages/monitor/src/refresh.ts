@@ -138,29 +138,33 @@ async function refreshOne(
         return disposeGone(deps, did, err.permanent, nowMs)
     }
     await recordFetchedDocument(ingest, did, fetched.didDocument)
-    const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
-    if (incoming === null) {
+    const verified = await ingest.verify(did, fetched)
+    if (verified.kind === "unverifiable") {
+        // Not evidence of anything: leave the snapshot as it is and retry
+        // next interval.
+        await deps.refreshIndex.markAttempted(did, nowMs)
+        return "failed"
+    }
+    if (verified.kind === "verified-absent") {
         // A 200 with an exclusion proof: the repo is alive and the record is
         // gone. Reversible, because the account may publish it again.
         return disposeGone(deps, did, false, nowMs)
     }
+    const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 
     const previous = await ingest.snapshot.getRecord(did)
     const previousRecord =
         previous === null
             ? null
             : readRecordFromCar(previous.car, deps.collection, deps.rkey)
-    const rekeyed =
-        previous !== null &&
-        previous.signingKey !== null &&
-        fetched.signingKey !== null &&
-        previous.signingKey !== fetched.signingKey
+    const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
+    const rekeyed = previousKey !== null && previousKey !== verified.key
     const quiet =
-        ingest.verify === undefined &&
         previousRecord !== null &&
+        incoming !== null &&
         previousRecord.cid === incoming.cid &&
         !rekeyed &&
-        compareRev(indexed, fetched.rev) === "advanced"
+        compareRev(indexed, verified.rev) === "advanced"
     if (!quiet) {
         // `settle` re-fetches; the extra read is the price of one code path
         // for everything that is a real change.
@@ -169,14 +173,16 @@ async function refreshOne(
     }
 
     await ingest.snapshot.putRecord(did, {
-        rev: fetched.rev,
+        rev: verified.rev,
         car: fetched.car,
         observedAtMs: nowMs,
         source: fetched.source,
-        signingKey: fetched.signingKey,
+        signingKey: verified.key,
+        verifiedWith: verified.key,
+        cid: verified.cid,
     })
-    await deps.refreshIndex.completeQuietly(did, fetched.rev, nowMs)
-    await confirm(deps, did, fetched.rev, nowMs)
+    await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs)
+    await confirm(deps, did, verified.rev, nowMs)
     return "advanced-quiet"
 }
 

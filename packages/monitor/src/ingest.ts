@@ -28,7 +28,6 @@ import {
 
 /** The authoritative record, as fetched from the DID's own PDS. */
 export interface FetchedRecord {
-    rev: string
     car: Uint8Array
     /** The PDS this was fetched from. */
     source: string
@@ -59,13 +58,17 @@ export interface IngestDeps {
      */
     fetchRecord(did: string): Promise<FetchedRecord>
     /**
-     * Optional defense in depth. A monitor that forwards what it fetched
-     * needs no signature check — the consumer verifies against the DID
-     * document — so verification is a seam rather than a dependency. When
-     * set, the periodic refresh sends every moved head through `settle`
-     * (and so through this hook) instead of storing it quietly.
+     * Checks the fetched CAR against the signing key of the DID document
+     * fetched with it. Nothing is stored or disposed of without it: the
+     * monitor stores nothing fetched, and disposes of nothing on an exclusion
+     * proof, without it.
      */
-    verify?(did: string, record: FetchedRecord): Promise<boolean>
+    verify(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+    /**
+     * How long a DID that has never been held and came back unverifiable
+     * stays owed before it is fetched again. Defaults to an hour.
+     */
+    unverifiableRetryMs?: number
     /** Own-DID push, where a registration holds this DID. */
     onChange?(did: string, rev: string): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
@@ -94,6 +97,8 @@ export interface IngestDeps {
     keyUpdates?: Pick<KeyUpdateIndex, "oweKeyUpdate">
     nowMs(): number
 }
+
+const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
 
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
@@ -158,7 +163,17 @@ export async function intake(
  * a failed verification, there is no record left to have an opinion
  * about — the source confirmed it is gone.
  */
-export type SettleOutcome = "stored" | "rejected" | "deleted"
+export type SettleOutcome = "stored" | "rejected" | "deleted" | "unverifiable"
+
+/**
+ * What checking a fetched CAR against the signing key of the DID document
+ * fetched with it established. `verified-absent` is a valid proof that the
+ * record does not exist at `rev`, not a failure to verify.
+ */
+export type VerifyOutcome =
+    | { kind: "verified"; key: string; rev: string; cid: string }
+    | { kind: "verified-absent"; key: string; rev: string }
+    | { kind: "unverifiable" }
 
 /**
  * The source confirmed this DID's declaration is gone. Nothing is left to
@@ -205,22 +220,39 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    if (deps.verify !== undefined && !(await deps.verify(did, record))) {
-        // Not evidence of anything the monitor may serve. Terminal, not
-        // transient: the same bytes will fail again next time. The DID is
-        // left unwatched, so nothing will keep its document current: stop
-        // vouching for it.
+    const outcome = await settleFetched(deps, did, record)
+    // A DID left unwatched has nothing keeping its document current: stop
+    // vouching for the one this fetch stored.
+    if (!(await deps.index.isWatched(did))) {
         await withdrawFetchedDocument(deps, did, record.didDocument)
+    }
+    return outcome
+}
+
+async function settleFetched(
+    deps: IngestDeps,
+    did: string,
+    record: FetchedRecord
+): Promise<SettleOutcome> {
+    const verified = await deps.verify(did, record)
+    if (verified.kind === "unverifiable") {
+        await settleUnverifiable(deps, did, record)
+        return "unverifiable"
+    }
+
+    const indexed = await deps.index.revOf(did)
+    const movement = compareRev(indexed, verified.rev)
+    if (movement === "regressed" && indexed !== null) {
+        await deps.onRegression?.(did, indexed, verified.rev)
         await deps.index.clearPending(did)
         return "rejected"
     }
 
-    const indexed = await deps.index.revOf(did)
-    const movement = compareRev(indexed, record.rev)
-    if (movement === "regressed" && indexed !== null) {
-        await deps.onRegression?.(did, indexed, record.rev)
-        await deps.index.clearPending(did)
-        return "rejected"
+    if (verified.kind === "verified-absent") {
+        // The repo is alive and signed to hold no such record. Reversible,
+        // because the account may publish it again.
+        await settleDeletion(deps, did, false)
+        return "deleted"
     }
 
     // A DID-document rotation lands here even when `rev` is unchanged —
@@ -237,25 +269,70 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
     let keyRotated = false
     if (movement === "unchanged") {
         const previous = await deps.snapshot.getRecord(did)
-        keyRotated =
-            previous !== null &&
-            previous.signingKey !== null &&
-            record.signingKey !== null &&
-            previous.signingKey !== record.signingKey
+        const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
+        keyRotated = previousKey !== null && previousKey !== verified.key
     }
 
     const observedAtMs = deps.nowMs()
     await deps.snapshot.putRecord(did, {
-        rev: record.rev,
+        rev: verified.rev,
         car: record.car,
         observedAtMs,
         source: record.source,
-        signingKey: record.signingKey,
+        signingKey: verified.key,
+        verifiedWith: verified.key,
+        cid: verified.cid,
     })
-    await deps.index.complete(did, record.rev, observedAtMs)
+    await deps.index.complete(did, verified.rev, observedAtMs)
 
-    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, record.rev)
+    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"
+}
+
+/**
+ * Bytes that do not verify are not evidence of anything the monitor may
+ * serve, and the same bytes will fail again, so this is terminal rather
+ * than transient. A held DID keeps its entry and is retried by the next
+ * refresh interval; a DID never held stays owed (so it stays watched) but
+ * waits out that interval.
+ */
+async function settleUnverifiable(
+    deps: IngestDeps,
+    did: string,
+    record: FetchedRecord
+): Promise<void> {
+    const held = (await deps.index.revOf(did)) !== null
+    if (held) {
+        await deps.index.clearPending(did)
+        await deps.index.markAttempted(did, deps.nowMs())
+    } else {
+        await deps.index.deferPending(
+            did,
+            deps.nowMs() + (deps.unverifiableRetryMs ?? DEFAULT_UNVERIFIABLE_RETRY_MS)
+        )
+    }
+    await pushNewlySeenKey(deps, did, record.signingKey)
+}
+
+/**
+ * A fetched key that differs from the one the stored entry verified under
+ * means a rotation the monitor cannot itself vouch for; the device can
+ * verify for itself, so it is told once per newly seen key.
+ */
+async function pushNewlySeenKey(
+    deps: IngestDeps,
+    did: string,
+    fetchedKey: string | null
+): Promise<void> {
+    if (fetchedKey === null) return
+    const previous = await deps.snapshot.getRecord(did)
+    if (previous === null) return
+    const previousKey = previous.verifiedWith ?? previous.signingKey
+    if (previousKey === null || fetchedKey === previousKey) return
+    if (fetchedKey === previous.seenKey) return
+    // KV cannot update metadata alone, so recording the key rewrites the entry.
+    await deps.snapshot.putRecord(did, { ...previous, seenKey: fetchedKey })
+    await deps.onChange?.(did, previous.rev)
 }
 
 /**

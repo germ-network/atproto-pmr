@@ -3,7 +3,7 @@
  * treating unrelated repo commits as declaration changes.
  */
 import { describe, expect, it, vi } from "vitest"
-import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { RecordNotFoundError, verifyRecordProofOutcome } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/repo-car"
 import type { IngestDeps, FetchedRecord } from "../src/ingest"
 import { refreshDue, type RefreshDeps, type SnapshotCheck } from "../src/refresh"
@@ -14,29 +14,38 @@ const RKEY = "self"
 const PATH = `${COLLECTION}/${RKEY}`
 const DID = "did:plc:alice"
 const PDS = "https://pds.example"
-const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 const NOW = 10_000_000
 const STALE = 3_600_000
 
 const key: TestKey = makeKey()
 
-function car(rev: string, record: unknown, extra: Record<string, unknown> = {}) {
+function car(rev: string, record: unknown, extra: Record<string, unknown> = {}, signWith = key) {
     return buildRepoCar({
         did: DID,
-        key,
+        key: signWith,
         rev,
         records: { ...(record === null ? {} : { [PATH]: record }), ...extra },
     })
 }
 const decl = (n: number) => ({ $type: COLLECTION, version: "1.1.0", n })
 
-function fetched(rev: string, record: unknown, signingKey = SIGNING_KEY, extra = {}): FetchedRecord {
-    return { rev, car: car(rev, record, extra).car, source: PDS, signingKey }
+function fetched(
+    rev: string,
+    record: unknown,
+    signWith: TestKey = key,
+    extra = {}
+): FetchedRecord & { rev: string } {
+    return {
+        rev,
+        car: car(rev, record, extra, signWith).car,
+        source: PDS,
+        signingKey: signWith.multikey,
+    }
 }
 
 function harness(opts: {
     indexed?: Record<string, string>
-    stored?: Record<string, FetchedRecord>
+    stored?: Record<string, FetchedRecord & { rev: string }>
     head?: (did: string) => Promise<string>
     fetchRecord?: (did: string) => Promise<FetchedRecord>
     due?: string[]
@@ -45,7 +54,12 @@ function harness(opts: {
     const records = new Map<string, SnapshotEntry>(
         Object.entries(opts.stored ?? {}).map(([did, r]) => [
             did,
-            { ...r, observedAtMs: 1 },
+            {
+                ...r,
+                observedAtMs: 1,
+                verifiedWith: r.signingKey,
+                cid: "bafyreistored",
+            },
         ])
     )
     const checks = new Map<string, SnapshotCheck>()
@@ -71,6 +85,8 @@ function harness(opts: {
             revs.delete(did)
         },
         clearPending: async () => {},
+        markAttempted: async (did: string, at: number) => void attempted.set(did, at),
+        isWatched: async (did: string) => revs.has(did) && !deleted.has(did),
         isDeleted: async (did: string) => deleted.has(did),
     } as unknown as MonitorIndex
     const snapshot = {
@@ -85,6 +101,22 @@ function harness(opts: {
         index,
         snapshot,
         fetchRecord: opts.fetchRecord ?? (async () => fetched("3m2", decl(1))),
+        verify: async (did, record) => {
+            if (record.signingKey === null) return { kind: "unverifiable" }
+            try {
+                const out = verifyRecordProofOutcome(record.car, {
+                    did,
+                    signingKey: record.signingKey,
+                    collection: COLLECTION,
+                    rkey: RKEY,
+                })
+                return out.kind === "present"
+                    ? { kind: "verified", key: record.signingKey, rev: out.rev, cid: out.cid }
+                    : { kind: "verified-absent", key: record.signingKey, rev: out.rev }
+            } catch {
+                return { kind: "unverifiable" }
+            }
+        },
         onChange,
         onRegression,
         onDelete,
@@ -130,7 +162,7 @@ describe("refreshDue", () => {
 
     it("an advanced rev with the same declaration record CID stores the new CAR quietly: no window entry, no onChange", async () => {
         const stored = fetched("3m1", decl(1))
-        const next = fetched("3m2", decl(1), SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
+        const next = fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
         const h = harness({
             indexed: { [DID]: "3m1" },
             stored: { [DID]: stored },
@@ -201,7 +233,7 @@ describe("refreshDue", () => {
             indexed: { [DID]: "3m1" },
             stored: { [DID]: fetched("3m1", decl(1)) },
             head: async () => "3m2",
-            fetchRecord: async () => fetched("3m2", null, SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            fetchRecord: async () => fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
         })
         const result = await run(h)
         expect(result.outcomes.deleted).toBe(1)
@@ -237,25 +269,12 @@ describe("refreshDue", () => {
         expect(h.onDelete).toHaveBeenCalledTimes(1)
     })
 
-    it("with a verify hook configured, an unchanged record still goes through settle", async () => {
-        const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => "3m2",
-            fetchRecord: async () => fetched("3m2", decl(1)),
-        })
-        h.deps.ingest.verify = async () => true
-        const result = await run(h)
-        expect(result.outcomes.changed).toBe(1)
-        expect(h.quiet).toEqual([])
-    })
-
     it("a re-keyed DID document with the same record CID goes through settle so a registered device is told", async () => {
         const h = harness({
             indexed: { [DID]: "3m1" },
             stored: { [DID]: fetched("3m1", decl(1)) },
             head: async () => "3m2",
-            fetchRecord: async () => fetched("3m2", decl(1), "zQ3shOTHERkeyOTHERkeyOTHERkeyOTHERkeyOTHERkey1234"),
+            fetchRecord: async () => fetched("3m2", decl(1), makeKey()),
         })
         const result = await run(h)
         expect(result.outcomes.changed).toBe(1)
@@ -307,7 +326,7 @@ describe("refresh keeps the stored DID document", () => {
         const document = { id: DID }
         const recordDidDocument = vi.fn(async () => {})
         const next = {
-            ...fetched("3m2", decl(1), SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            ...fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
             didDocument: { document, fetchedAtMs: 123_456 },
         }
         const h = harness({
@@ -360,7 +379,7 @@ describe("refresh keeps the stored DID document", () => {
 
     it("a failing document write does not fail the quiet advance", async () => {
         const next = {
-            ...fetched("3m2", decl(1), SIGNING_KEY, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            ...fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
             didDocument: { document: { id: DID }, fetchedAtMs: 1 },
         }
         const h = harness({
@@ -377,4 +396,13 @@ describe("refresh keeps the stored DID document", () => {
         }
         expect((await run(h)).outcomes["advanced-quiet"]).toBe(1)
     })
+})
+
+describe("refresh re-verifies", () => {
+    it.todo("unchanged head with no records row re-fetches and verifies quietly")
+    it.todo("unchanged head with an entry verified under a rotated key re-fetches")
+    it.todo("an exclusion proof that does not verify does not dispose the snapshot")
+    it.todo("quiet advance verifies and stays quiet")
+    it.todo("a DID attempted this interval is not retried until the next")
+    it.todo("the first pass after upgrade puts no legacy DID in the digest window")
 })

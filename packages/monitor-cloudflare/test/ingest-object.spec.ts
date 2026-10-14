@@ -34,6 +34,7 @@ import {
     type IngestDeps,
     type PlcExportEvent,
 } from "@germ-network/atproto-pmr-monitor"
+import { buildRepoCar, makeKey } from "../../core/test/fixtures/repo-car"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
 import { canonicalDidDocumentJson, kvDidDocuments, kvPlcCoverage } from "../src/did-document-store"
@@ -71,9 +72,22 @@ function inMonitorObj<R>(
  * `withFetchThroughRealOnChange` (in the "own-DID push" describe block)
  * for those instead, which routes through the object's real `deps()`.
  */
+/** A fetch stub's CAR is a placeholder, so its signed rev rides along for `stubVerify`. */
+type StubFetched = FetchedRecord & { rev: string }
+
+const stubVerify: IngestDeps["verify"] = async (_did, record) =>
+    record.signingKey === null
+        ? { kind: "unverifiable" }
+        : {
+              kind: "verified",
+              key: record.signingKey,
+              rev: (record as StubFetched).rev,
+              cid: "bafyreistub",
+          }
+
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
-    fetchRecord: (did: string) => Promise<FetchedRecord>
+    fetchRecord: (did: string) => Promise<StubFetched>
 ) {
     return runInDurableObject(stub, async (obj: MonitorIngest) => {
         ;(obj as unknown as { fetchRecord: typeof fetchRecord }).fetchRecord = fetchRecord
@@ -81,6 +95,7 @@ function withFetch(
             index: obj,
             snapshot: kvSnapshotStore(testEnv),
             fetchRecord,
+            verify: stubVerify,
             nowMs: () => Date.now(),
         })
     })
@@ -568,6 +583,8 @@ describe("the snapshot store", () => {
             observedAtMs: 1,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: "bafyreistub",
         })
         const back = await store.getRecord("did:plc:ttl")
         expect(back).toMatchObject({
@@ -590,6 +607,8 @@ describe("the snapshot store", () => {
             observedAtMs: 1,
             source: PDS,
             signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: "bafyreistub",
         })
         await store.deleteRecord("did:plc:gone")
         expect(await store.getRecord("did:plc:gone")).toBeNull()
@@ -902,11 +921,11 @@ describe("own-DID push", () => {
          */
         function withFetchThroughRealOnChange(
             stub: DurableObjectStub<MonitorIngest>,
-            fetchRecord: (did: string) => Promise<FetchedRecord>
+            fetchRecord: (did: string) => Promise<StubFetched>
         ) {
             return runInDurableObject(stub, async (obj: MonitorIngest) => {
                 const realDeps = (obj as unknown as { deps(): IngestDeps }).deps()
-                return settleDue({ ...realDeps, fetchRecord })
+                return settleDue({ ...realDeps, fetchRecord, verify: stubVerify })
             })
         }
 
@@ -1024,7 +1043,8 @@ describe("snapshot refresh", () => {
         const old = Date.now() - 3 * HOUR
         await inMonitorObj(stub, async (obj) => {
             const o = obj as unknown as {
-                fetchRecord: (did: string) => Promise<FetchedRecord>
+                fetchRecord: (did: string) => Promise<StubFetched>
+                verifyRecord: IngestDeps["verify"]
                 fetchHeadRev: (did: string) => Promise<string>
                 windowMembers: (w: number) => Promise<string[]>
             }
@@ -1032,6 +1052,7 @@ describe("snapshot refresh", () => {
                 log.push(`fetchRecord ${did}`)
                 return { rev: "3m2", car: new Uint8Array([1]), source: PDS, signingKey: SIGNING_KEY }
             }
+            o.verifyRecord = stubVerify
             o.fetchHeadRev = async (did) => {
                 log.push(`fetchHeadRev ${did}`)
                 return "3m1"
@@ -1642,6 +1663,8 @@ describe("wiring stored DID documents into the monitor", () => {
                 observedAtMs: Date.now() - 3 * 3_600_000,
                 source: PDS,
                 signingKey: SIGNING_KEY,
+                verifiedWith: SIGNING_KEY,
+                cid: "bafyreistub",
             })
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
@@ -2786,4 +2809,84 @@ describe("PLC export consumer", () => {
             })
         })
     })
+})
+
+describe("verifying a fetched record", () => {
+    const COLLECTION = testEnv.MONITOR_COLLECTION
+    const key = makeKey()
+    const verifyRecord = (record: FetchedRecord, did = DID) =>
+        runInDurableObject(freshStub(), (obj: MonitorIngest) =>
+            (
+                obj as unknown as {
+                    verifyRecord(did: string, record: FetchedRecord): Promise<unknown>
+                }
+            ).verifyRecord(did, record)
+        )
+    const fetched = (car: Uint8Array, signingKey: string | null = key.multikey): FetchedRecord => ({
+        car,
+        source: PDS,
+        signingKey,
+    })
+
+    it("a CAR signed by the fetched key verifies with its signed rev and cid", async () => {
+        const repo = buildRepoCar({
+            did: DID,
+            key,
+            records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+        })
+        expect(await verifyRecord(fetched(repo.car))).toEqual({
+            kind: "verified",
+            key: key.multikey,
+            rev: "3kaaaaaaaaaaa",
+            cid: repo.recordCids[`${COLLECTION}/self`],
+        })
+    })
+
+    it("a signed exclusion proof is verified-absent", async () => {
+        const repo = buildRepoCar({ did: DID, key, records: { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } } })
+        expect(await verifyRecord(fetched(repo.car))).toEqual({
+            kind: "verified-absent",
+            key: key.multikey,
+            rev: "3kaaaaaaaaaaa",
+        })
+    })
+
+    it("a CAR signed by another key, a malformed CAR, or a fetch with no key is unverifiable", async () => {
+        const repo = buildRepoCar({
+            did: DID,
+            key,
+            records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+        })
+        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toEqual({ kind: "unverifiable" })
+        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toEqual({ kind: "unverifiable" })
+        expect(await verifyRecord(fetched(repo.car, null))).toEqual({ kind: "unverifiable" })
+    })
+
+    it("the snapshot store round-trips verifiedWith, cid and seenKey", async () => {
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord("did:plc:meta", {
+            rev: "3m1",
+            car: new Uint8Array([9]),
+            observedAtMs: 1,
+            source: PDS,
+            signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: "bafyreimeta",
+            seenKey: "zQ3shSeen",
+        })
+        expect(await store.getRecord("did:plc:meta")).toMatchObject({
+            verifiedWith: SIGNING_KEY,
+            cid: "bafyreimeta",
+            seenKey: "zQ3shSeen",
+        })
+    })
+})
+
+describe("record index and holder state", () => {
+    it.todo("declaration rev in revs and records agree after settle, quiet advance and deletion")
+    it.todo("existing revs rows are held after upgrade; deleted rows are gone-permanent")
+    it.todo("a second constructor run does not change holder state")
+    it.todo("completeQuietly asserts held")
+    it.todo("a reversible already-gone answer re-asserts gone-reversible")
+    it.todo("a permanent answer for a deleted DID stays gone-permanent")
 })

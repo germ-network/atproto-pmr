@@ -53,6 +53,30 @@ export interface VerifiedRecord {
 }
 
 /**
+ * What a single-record proof shows under the signing key: the record, or that
+ * the signed repo holds no record at that path, as of the signed rev.
+ */
+export type RecordProofOutcome =
+    | ({ kind: "present" } & VerifiedRecord)
+    | { kind: "absent"; rev: string }
+
+/**
+ * Like `verifyRecordProof`, but a valid absence is a result carrying the
+ * signed rev rather than an error. Throws `RepoProofError` for anything that
+ * does not verify.
+ */
+export function verifyRecordProofOutcome(
+    car: Uint8Array,
+    expected: RecordProofExpectation
+): RecordProofOutcome {
+    const parsed = parseProof(car, expected.did)
+    verifyCommitSignature(parsed.commit, expected.signingKey)
+    const found = findRecord(parsed, expected.collection, expected.rkey)
+    if (!found) return { kind: "absent", rev: parsed.commit.rev }
+    return { kind: "present", cid: found.cid, record: found.record, rev: parsed.commit.rev }
+}
+
+/**
  * Throws `RepoProofError`. `record-absent` means the proof is otherwise valid
  * and its signed view holds no record at that path.
  */

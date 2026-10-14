@@ -49,6 +49,40 @@ export interface SnapshotEntry {
      * performed — see `compareObservations`.
      */
     signingKey: string | null
+    /**
+     * The `#atproto` key the commit signature verified against at ingest;
+     * null for an entry stored before ingest verified.
+     */
+    verifiedWith: string | null
+    /** The record's CID (`bafyrei…`) as verified at ingest. */
+    cid: string | null
+    /** The newest signing key a rotation push has been sent for. */
+    seenKey?: string | null
+}
+
+/** Whether a DID's declaration is held, and if not, whether that can reverse. */
+export type HolderState = "held" | "gone-reversible" | "gone-permanent"
+
+/** One stored snapshot as the index knows it; the rev authority for that record. */
+export interface IndexedRecord {
+    did: string
+    collection: string
+    rkey: string
+    /** The signed commit's rev the stored CAR was verified at. */
+    rev: string
+    cid: string
+    /** Only verified records are indexed. */
+    verifiedWith: string
+}
+
+/**
+ * The single writer's index of every stored snapshot and of each DID's
+ * declaration state. A completion writes its record row and holder state in
+ * the same step as the declaration's `revs`/`deleted` rows, at the same rev.
+ */
+export interface RecordIndex {
+    recordsOf(did: string): Promise<IndexedRecord[]>
+    holderStateOf(did: string): Promise<HolderState | null>
 }
 
 /**
@@ -160,6 +194,19 @@ export interface MonitorIndex {
      * loop against the very DID under attack.
      */
     clearPending(did: string): Promise<void>
+
+    /**
+     * An attempt that did not confirm anything. Moves the DID to the back of
+     * the refresh queue, and out of it until the next interval, so a source
+     * that keeps failing is retried once per interval rather than every pass.
+     */
+    markAttempted(did: string, attemptedAtMs: number): Promise<void>
+
+    /**
+     * Whether this monitor keeps `did` current: held or owed, and not
+     * permanently deleted. Mirrors `KeyUpdateIndex.isWatched`.
+     */
+    isWatched(did: string): Promise<boolean>
 
     /**
      * Apply a completed fetch: index the rev, add the DID to the open
