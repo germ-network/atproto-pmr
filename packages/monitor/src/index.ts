@@ -102,6 +102,7 @@ export {
     fetchRecordCar,
     fetchHeadRev,
     type FetchHeadRevOptions,
+    type HeadRev,
     type FetchRecordOptions,
 } from "./fetch-record"
 

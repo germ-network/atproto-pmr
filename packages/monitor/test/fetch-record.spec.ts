@@ -305,19 +305,22 @@ describe("the DID document a fetch resolved through", () => {
 
     it("fetchHeadRev without onDidDocument behaves as before", async () => {
         const f = fixture()
-        expect(await fetchHeadRev(DID, { fetchImpl: f.impl })).toBe("3mszqbq6s3y2k")
+        expect(await fetchHeadRev(DID, { fetchImpl: f.impl })).toEqual({
+            rev: "3mszqbq6s3y2k",
+            signingKey: SIGNING_KEY,
+        })
         expect(directoryRequests(f.seen)).toHaveLength(1)
     })
 
     it("a failing onDidDocument does not fail fetchHeadRev", async () => {
         const f = fixture()
-        const rev = await fetchHeadRev(DID, {
+        const head = await fetchHeadRev(DID, {
             fetchImpl: f.impl,
             onDidDocument: async () => {
                 throw new Error("store down")
             },
         })
-        expect(rev).toBe("3mszqbq6s3y2k")
+        expect(head.rev).toBe("3mszqbq6s3y2k")
     })
 })
 

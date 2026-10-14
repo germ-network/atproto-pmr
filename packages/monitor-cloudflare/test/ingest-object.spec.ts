@@ -1047,7 +1047,7 @@ describe("snapshot refresh", () => {
             const o = obj as unknown as {
                 fetchRecord: (did: string) => Promise<StubFetched>
                 verifyRecord: IngestDeps["verify"]
-                fetchHeadRev: (did: string) => Promise<string>
+                fetchHeadRev: (did: string) => Promise<{ rev: string; signingKey: string | null }>
                 windowMembers: (w: number) => Promise<string[]>
             }
             o.fetchRecord = async (did) => {
@@ -1057,7 +1057,7 @@ describe("snapshot refresh", () => {
             o.verifyRecord = stubVerify
             o.fetchHeadRev = async (did) => {
                 log.push(`fetchHeadRev ${did}`)
-                return "3m1"
+                return { rev: "3m1", signingKey: SIGNING_KEY }
             }
             const windowMembers = obj.windowMembers.bind(obj)
             o.windowMembers = async (w) => {
@@ -1122,7 +1122,11 @@ describe("snapshot refresh", () => {
             // A stale check never makes a recently stored DID due.
             await obj.markChecked("did:plc:r-fresh", 10)
             expect(await obj.dueRefresh(50_000, 10)).not.toContain("did:plc:r-fresh")
-            // A failed attempt keeps the DID due but queues it behind the rest.
+            // An attempt within the interval takes the DID out until the next one.
+            await obj.markAttempted("did:plc:r3", 55_000)
+            expect(await obj.dueRefresh(50_000, 10)).toEqual(["did:plc:r2"])
+            await obj.markAttempted("did:plc:r3", 10)
+            // An attempt from an earlier interval keeps it due, queued behind the rest.
             await obj.markAttempted("did:plc:r2", 40_000)
             expect(await obj.dueRefresh(50_000, 1)).toEqual(["did:plc:r3"])
             expect(await obj.dueRefresh(50_000, 10)).toEqual(["did:plc:r3", "did:plc:r2"])
@@ -1621,9 +1625,13 @@ describe("wiring stored DID documents into the monitor", () => {
         }) as typeof fetch
         try {
             const rev = await inMonitorObj(stub, (obj) =>
-                (obj as unknown as { fetchHeadRev(did: string): Promise<string> }).fetchHeadRev(did)
+                (
+                    obj as unknown as {
+                        fetchHeadRev(did: string): Promise<{ rev: string; signingKey: string | null }>
+                    }
+                ).fetchHeadRev(did)
             )
-            expect(rev).toBe("3m5")
+            expect(rev).toEqual({ rev: "3m5", signingKey: null })
         } finally {
             globalThis.fetch = original
         }
@@ -1641,11 +1649,11 @@ describe("wiring stored DID documents into the monitor", () => {
             const o = obj as unknown as {
                 publishDidDocuments: (limit: number) => Promise<unknown>
                 windowMembers: (w: number) => Promise<string[]>
-                fetchHeadRev: (did: string) => Promise<string>
+                fetchHeadRev: (did: string) => Promise<{ rev: string; signingKey: string | null }>
             }
             o.fetchHeadRev = async (did) => {
                 log.push(`refresh ${did}`)
-                return "3m1"
+                return { rev: "3m1", signingKey: SIGNING_KEY }
             }
             o.publishDidDocuments = async (limit) => {
                 log.push(`publish ${limit}`)

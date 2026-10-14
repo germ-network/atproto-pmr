@@ -9,6 +9,7 @@
  */
 import { RecordNotFoundError, readRecordFromCar } from "@germ-network/atproto-pmr-core"
 import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
+import type { HeadRev } from "./fetch-record"
 import { compareRev, type VerifiedWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
@@ -18,13 +19,17 @@ export interface SnapshotCheck {
 }
 
 export interface RefreshIndex {
-    /** Held, not deleted, not pending; least recently checked first. */
+    /**
+     * Held, not deleted, not pending, not confirmed or attempted since
+     * `checkedBeforeMs`; least recently checked first.
+     */
     dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]>
     markChecked(did: string, checkedAtMs: number): Promise<void>
     /**
-     * An attempt that did not confirm anything. Moves the DID to the back of
-     * the queue so a persistently failing source cannot starve the rest; it
-     * stays due, because it does not count as a confirmation.
+     * An attempt that did not confirm anything. The DID is not due again
+     * until the next interval, so a source that keeps failing, or a record
+     * that will not verify, is retried once per interval and cannot starve
+     * the rest.
      */
     markAttempted(did: string, attemptedAtMs: number): Promise<void>
     /**
@@ -50,8 +55,11 @@ export interface RefreshDeps {
     ingest: IngestDeps
     refreshIndex: RefreshIndex
     refreshSnapshots: RefreshSnapshots
-    /** `com.atproto.sync.getLatestCommit` rev, re-resolving the DID document each time. */
-    fetchHeadRev(did: string): Promise<string>
+    /**
+     * `com.atproto.sync.getLatestCommit` rev, re-resolving the DID document
+     * each time, with that document's signing key.
+     */
+    fetchHeadRev(did: string): Promise<HeadRev>
     collection: string
     rkey: string
 }
@@ -118,7 +126,7 @@ async function refreshOne(
     nowMs: number
 ): Promise<RefreshOutcome> {
     const { ingest } = deps
-    let head: string
+    let head: HeadRev
     try {
         head = await deps.fetchHeadRev(did)
     } catch (err) {
@@ -127,15 +135,17 @@ async function refreshOne(
     }
 
     const indexed = await ingest.index.revOf(did)
-    const movement = compareRev(indexed, head)
+    const movement = compareRev(indexed, head.rev)
     if (movement === "regressed" && indexed !== null) {
-        await ingest.onRegression?.(did, indexed, head)
+        await ingest.onRegression?.(did, indexed, head.rev)
         await deps.refreshIndex.markChecked(did, nowMs)
         return "regressed"
     }
     if (movement === "unchanged" && indexed !== null) {
-        await confirm(deps, did, indexed, nowMs)
-        return "confirmed"
+        if (!(await needsReverify(deps, did, head))) {
+            await confirm(deps, did, indexed, nowMs)
+            return "confirmed"
+        }
     }
 
     // The head moved, but a repo rev moves on any commit. Only a different
@@ -175,7 +185,7 @@ async function refreshOne(
         incoming !== null &&
         previousRecord.cid === incoming.cid &&
         !rekeyed &&
-        compareRev(indexed, verified.rev) === "advanced"
+        compareRev(indexed, verified.rev) !== "regressed"
     if (!quiet) {
         // `settle` re-fetches; the extra read is the price of one code path
         // for everything that is a real change.
@@ -198,6 +208,20 @@ async function refreshOne(
     })
     await confirm(deps, did, verified.rev, nowMs)
     return "advanced-quiet"
+}
+
+/**
+ * An unchanged head still needs a fetch when nothing was ever verified for
+ * the declaration (a snapshot stored before ingest verified), or it verified
+ * under a key other than the one the document now carries, including no key.
+ * A declaration already known reversibly gone has no row by design and is
+ * left to the next event or head move.
+ */
+async function needsReverify(deps: RefreshDeps, did: string, head: HeadRev): Promise<boolean> {
+    const rows = await deps.ingest.index.recordsOf(did)
+    const held = rows.find((r) => r.collection === deps.collection && r.rkey === deps.rkey)
+    if (held !== undefined) return held.verifiedWith !== head.signingKey
+    return (await deps.ingest.index.holderStateOf(did)) !== "gone-reversible"
 }
 
 /**

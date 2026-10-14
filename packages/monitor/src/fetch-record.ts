@@ -90,8 +90,16 @@ const TERMINAL_XRPC_ERRORS = [
  */
 const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
 
+/** The repo's head and the `#atproto` key of the document it was resolved through. */
+export interface HeadRev {
+    rev: string
+    /** `null` when the document carries no `#atproto` key. */
+    signingKey: string | null
+}
+
 /**
- * The repo's current head `rev` from the DID's own PDS, for the periodic
+ * The repo's current head `rev` from the DID's own PDS, and the signing key
+ * of the document it was resolved through, for the periodic
  * refresh. Re-resolves the DID document each time, so a PDS migration shows
  * up here; a repo-level terminal answer raises `RecordNotFoundError` exactly
  * as `fetchRecordCar` does.
@@ -99,7 +107,7 @@ const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
 export async function fetchHeadRev(
     did: string,
     options: FetchHeadRevOptions = {}
-): Promise<string> {
+): Promise<HeadRev> {
     const fetchImpl = options.fetchImpl ?? fetch
     const fetchedAtMs = (options.nowMs ?? Date.now)()
     const document = await fetchDidDocument(did, fetchImpl)
@@ -113,11 +121,12 @@ export async function fetchHeadRev(
     } catch {
         // Keeping the stored copy current must not cost the refresh its head.
     }
-    const { endpoint } = pdsResolutionFromDocument(document)
-    return fetchLatestRev(endpoint, did, fetchImpl, {
+    const { endpoint, signingKey } = pdsResolutionFromDocument(document)
+    const rev = await fetchLatestRev(endpoint, did, fetchImpl, {
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })
+    return { rev, signingKey }
 }
 
 export async function fetchRecordCar(

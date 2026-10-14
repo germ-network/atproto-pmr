@@ -19,6 +19,7 @@ import {
     type DidDocumentSink,
     type Cursor,
     type FetchedRecord,
+    type HeadRev,
     type HolderState,
     type IndexedRecord,
     type IngestDeps,
@@ -899,9 +900,11 @@ export class MonitorIngest
     /**
      * Held DIDs not confirmed since `checkedBeforeMs`. A DID counts as
      * confirmed at its last check or, if never checked, when it was last
-     * stored. Ordered by the later of that and its last failed attempt, so a
-     * DID whose source keeps failing queues behind the healthy ones instead
-     * of occupying the head of every batch. A separate table from `revs` so
+     * stored. A DID attempted since `checkedBeforeMs` is not due, so one whose
+     * source keeps failing, or whose record will not verify, is retried once
+     * per interval rather than on every alarm. Ordered by the later of the
+     * confirmation and the last attempt, so such a DID queues behind the
+     * healthy ones. A separate table from `revs` so
      * recording a check needs no schema change there.
      */
     async dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]> {
@@ -913,8 +916,9 @@ export class MonitorIngest
                     "FROM revs r LEFT JOIN checks c ON c.did = r.did " +
                     "WHERE r.did NOT IN (SELECT did FROM deleted) " +
                     "AND r.did NOT IN (SELECT did FROM pending) " +
-                    "AND confirmed < ? " +
-                    "ORDER BY last ASC LIMIT ?",
+                    "AND confirmed < ?1 " +
+                    "AND COALESCE(c.attempted_at, 0) < ?1 " +
+                    "ORDER BY last ASC LIMIT ?2",
                 checkedBeforeMs,
                 limit
             )
@@ -993,13 +997,15 @@ export class MonitorIngest
     }
 
     /**
-     * The head `rev` of the DID's repo at its PDS, for the refresh. Defaults
-     * to a real read that also keeps the DID document it resolved through; a
-     * subclass overrides it alongside `fetchRecord` when the deployment
-     * resolves DIDs differently, and must hand its own document to
-     * `recordDidDocument` to keep that.
+     * The head `rev` of the DID's repo at its PDS, with the signing key of
+     * the document it was resolved through, for the refresh. Defaults to a
+     * real read that also keeps that document; a subclass overrides it
+     * alongside `fetchRecord` when the deployment resolves DIDs differently,
+     * and must hand its own document to `recordDidDocument` to keep that.
+     * The key must be in the form `fetchRecord` returns, since refresh
+     * compares the two as strings; a `null` key counts as a mismatch.
      */
-    protected fetchHeadRev(did: string): Promise<string> {
+    protected fetchHeadRev(did: string): Promise<HeadRev> {
         return fetchHeadRev(did, {
             onDidDocument: ({ document, fetchedAtMs }) =>
                 this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
