@@ -210,27 +210,37 @@ describe("settleSecondary", () => {
 })
 
 describe("a repo-level answer on the declaration path", () => {
-    function declarationDeps(error: RecordNotFoundError) {
+    function declarationDeps(
+        error: RecordNotFoundError | "absent",
+        held = true
+    ) {
         const dispose = vi.fn(async () => {})
         const onDelete = vi.fn(async () => {})
         const completeDeletion = vi.fn(async () => {})
+        const clearPending = vi.fn(async () => {})
         const deps = {
             index: {
-                revOf: async () => "3m1",
+                revOf: async () => (held ? "3m1" : null),
+                holderStateOf: async () => (held ? "held" : null),
                 completeDeletion,
+                clearPending,
                 isWatched: async () => true,
             } as unknown as MonitorIndex,
             snapshot: { deleteRecord: async () => {} } as unknown as SnapshotStore,
             fetchRecord: async () => {
-                throw error
+                if (error !== "absent") throw error
+                return { car: new Uint8Array([1]), source: "s", signingKey: KEY }
             },
-            verify: async () => ({ kind: "unverifiable" as const }),
+            verify: async () =>
+                error === "absent"
+                    ? ({ kind: "verified-absent" as const, key: KEY, rev: "3m1" })
+                    : ({ kind: "unverifiable" as const }),
             interest: { inInterest: async () => true, interestEpoch: async () => 1 },
             secondaries: { dispose },
             onDelete,
             nowMs: () => 1,
         } satisfies IngestDeps
-        return { deps, dispose, onDelete, completeDeletion }
+        return { deps, dispose, onDelete, completeDeletion, clearPending }
     }
 
     it("a repo-level deletion disposes the profile", async () => {
@@ -249,5 +259,23 @@ describe("a repo-level answer on the declaration path", () => {
         const h = declarationDeps(new RecordNotFoundError("tombstoned", true))
         await settle(h.deps, DID)
         expect(h.dispose).toHaveBeenCalledWith(DID)
+    })
+
+    it("a quiet settle for a DID that never held a declaration records nothing", async () => {
+        const absent = declarationDeps("absent", false)
+        expect(await settle(absent.deps, DID, { quiet: true })).toBe("deleted")
+        expect(absent.completeDeletion).not.toHaveBeenCalled()
+        expect(absent.clearPending).toHaveBeenCalledWith(DID)
+        expect(absent.dispose).not.toHaveBeenCalled()
+
+        const repo = declarationDeps(new RecordNotFoundError("gone", true, "RepoNotFound"), false)
+        expect(await settle(repo.deps, DID, { quiet: true })).toBe("deleted")
+        expect(repo.completeDeletion).not.toHaveBeenCalled()
+        expect(repo.dispose).toHaveBeenCalledWith(DID)
+
+        // Quiet is what makes it so: a real obligation is still recorded.
+        const loud = declarationDeps("absent", false)
+        await settle(loud.deps, DID)
+        expect(loud.completeDeletion).toHaveBeenCalled()
     })
 })

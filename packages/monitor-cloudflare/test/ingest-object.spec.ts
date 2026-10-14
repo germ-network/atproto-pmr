@@ -87,6 +87,24 @@ const stubVerify: IngestDeps["verify"] = async (_did, record) =>
               cid: "bafyreistub",
           }
 
+/** Answer secondary fetches with a profile at `rev`, signed under `SIGNING_KEY`. */
+function stubSecondaryFetch(obj: MonitorIngest, log: string[] = [], rev = "3m1") {
+    const o = obj as unknown as {
+        fetchRecordAt: (ref: { did: string }) => Promise<StubFetched>
+        verifyRecordAt: (ref: unknown, record: StubFetched) => ReturnType<IngestDeps["verify"]>
+    }
+    o.fetchRecordAt = async (ref) => {
+        log.push(`fetchRecordAt ${ref.did}`)
+        return { rev, car: new Uint8Array([2]), source: PDS, signingKey: SIGNING_KEY }
+    }
+    o.verifyRecordAt = async (_ref, record) => ({
+        kind: "verified",
+        key: SIGNING_KEY,
+        rev: record.rev,
+        cid: "bafyreiprofile",
+    })
+}
+
 function withFetch(
     stub: DurableObjectStub<MonitorIngest>,
     fetchRecord: (did: string) => Promise<StubFetched>
@@ -1056,6 +1074,7 @@ describe("snapshot refresh", () => {
                 return { rev: "3m2", car: new Uint8Array([1]), source: PDS, signingKey: SIGNING_KEY }
             }
             o.verifyRecord = stubVerify
+            stubSecondaryFetch(obj, log)
             o.fetchHeadRev = async (did) => {
                 log.push(`fetchHeadRev ${did}`)
                 return { rev: "3m1", signingKey: SIGNING_KEY }
@@ -1088,6 +1107,8 @@ describe("snapshot refresh", () => {
 
         expect(log.filter((l) => !l.startsWith("seal"))).toEqual([
             "fetchRecord did:plc:refresh-a",
+            // refresh-b joined interest at the start of this tick: its profile is owed.
+            "fetchRecordAt did:plc:refresh-b",
             "fetchHeadRev did:plc:refresh-b",
         ])
         expect(log.indexOf("seal")).toBeGreaterThan(log.indexOf("fetchHeadRev did:plc:refresh-b"))
@@ -1652,6 +1673,7 @@ describe("wiring stored DID documents into the monitor", () => {
                 windowMembers: (w: number) => Promise<string[]>
                 fetchHeadRev: (did: string) => Promise<{ rev: string; signingKey: string | null }>
             }
+            stubSecondaryFetch(obj)
             o.fetchHeadRev = async (did) => {
                 log.push(`refresh ${did}`)
                 return { rev: "3m1", signingKey: SIGNING_KEY }

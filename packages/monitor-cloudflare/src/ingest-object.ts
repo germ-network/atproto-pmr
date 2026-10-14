@@ -787,7 +787,8 @@ export class MonitorIngest
         const epoch = (row?.epoch ?? 0) + 1
         this.db.sql.exec(
             "INSERT INTO interest (did, member, epoch, since) VALUES (?1, ?2, ?3, ?4) " +
-                "ON CONFLICT(did) DO UPDATE SET member = ?2, epoch = ?3, since = ?4",
+                "ON CONFLICT(did) DO UPDATE SET member = ?2, epoch = ?3, " +
+                "since = CASE WHEN ?2 = 1 THEN ?4 ELSE since END",
             did,
             want ? 1 : 0,
             epoch,
@@ -1058,29 +1059,46 @@ export class MonitorIngest
     // ---- RefreshIndex -----------------------------------------------------
 
     /**
-     * Held DIDs not confirmed since `checkedBeforeMs`. A DID counts as
-     * confirmed at its last check or, if never checked, when it was last
-     * stored. A DID attempted since `checkedBeforeMs` is not due, so one whose
-     * source keeps failing, or whose record will not verify, is retried once
-     * per interval rather than on every alarm. Ordered by the later of the
+     * The interest set (plus, under `everyone`, reversibly gone holders, so a
+     * reversal is still found by polling) not confirmed or attempted since
+     * its bound: `checkedBeforeMs` for a DID with a holder state,
+     * `nonHolderCheckedBeforeMs` for one without. A DID counts as confirmed
+     * at its last check, its last store or its join, whichever is latest, and
+     * a DID attempted since its bound is not due, so one whose source keeps
+     * failing, or whose record will not verify, is retried once per its own
+     * interval rather than on every alarm. Ordered by the later of the
      * confirmation and the last attempt, so such a DID queues behind the
-     * healthy ones. A separate table from `revs` so
-     * recording a check needs no schema change there.
+     * healthy ones. A DID owed a fetch (a declaration, or a secondary) is left
+     * to that settle.
      */
-    async dueRefresh(checkedBeforeMs: number, limit: number): Promise<string[]> {
+    async dueRefresh(
+        checkedBeforeMs: number,
+        limit: number,
+        nonHolderCheckedBeforeMs: number
+    ): Promise<string[]> {
         return this.db.sql
             .exec<{ did: string }>(
-                "SELECT r.did AS did, " +
-                    "MAX(r.observed_at, COALESCE(c.checked_at, 0)) AS confirmed, " +
-                    "MAX(r.observed_at, COALESCE(c.checked_at, 0), COALESCE(c.attempted_at, 0)) AS last " +
-                    "FROM revs r LEFT JOIN checks c ON c.did = r.did " +
-                    "WHERE r.did NOT IN (SELECT did FROM deleted) " +
-                    "AND r.did NOT IN (SELECT did FROM pending) " +
-                    "AND confirmed < ?1 " +
-                    "AND COALESCE(c.attempted_at, 0) < ?1 " +
-                    "ORDER BY last ASC LIMIT ?2",
+                "SELECT d.did AS did, " +
+                    "CASE WHEN h.did IS NOT NULL THEN ?1 ELSE ?2 END AS bound, " +
+                    "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0)) AS confirmed, " +
+                    "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0), " +
+                    "COALESCE(c.attempted_at, 0)) AS last " +
+                    "FROM (SELECT did FROM interest WHERE member = 1 " +
+                    "UNION SELECT did FROM holder_state WHERE state = 'gone-reversible' AND ?4 = 'everyone') d " +
+                    "LEFT JOIN revs r ON r.did = d.did " +
+                    "LEFT JOIN checks c ON c.did = d.did " +
+                    "LEFT JOIN interest i ON i.did = d.did " +
+                    "LEFT JOIN holder_state h ON h.did = d.did " +
+                    "WHERE d.did NOT IN (SELECT did FROM deleted) " +
+                    "AND d.did NOT IN (SELECT did FROM pending) " +
+                    "AND d.did NOT IN (SELECT did FROM rec_pending) " +
+                    "AND confirmed < bound " +
+                    "AND COALESCE(c.attempted_at, 0) < bound " +
+                    "ORDER BY last ASC LIMIT ?3",
                 checkedBeforeMs,
-                limit
+                nonHolderCheckedBeforeMs,
+                limit,
+                this.interestPolicy()
             )
             .toArray()
             .map((r) => r.did)
@@ -2138,10 +2156,18 @@ export class MonitorIngest
                         fetchHeadRev: (did) => this.fetchHeadRev(did),
                         collection: this.env.MONITOR_COLLECTION,
                         rkey: "self",
+                        secondary: {
+                            deps: this.secondaryDeps(),
+                            records: monitorCollections(this.env),
+                        },
                     },
                     {
                         nowMs: Date.now(),
                         staleAfterMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
+                        nonHolderStaleAfterMs: this.envInt(
+                            this.env.REFRESH_NONHOLDER_STALE_AFTER_MS,
+                            86_400_000
+                        ),
                         limit: this.envInt(this.env.REFRESH_BATCH, 64),
                     }
                 )

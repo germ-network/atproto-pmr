@@ -21,7 +21,7 @@ import {
     type IngestDeps,
 } from "./ingest"
 import type { HeadRev } from "./fetch-record"
-import type { SecondaryDeps } from "./secondary"
+import { settleSecondary, type SecondaryDeps } from "./secondary"
 import { compareRev, type VerifiedWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
@@ -32,16 +32,16 @@ export interface SnapshotCheck {
 
 export interface RefreshIndex {
     /**
-     * Held, not deleted, not pending, not confirmed or attempted since
-     * `checkedBeforeMs`; least recently checked first. With
-     * `nonHolderCheckedBeforeMs`, the queue is the interest set: a DID that
-     * has never held a declaration is due against that older bound instead,
-     * and a reversibly gone holder stays due under `everyone`.
+     * The interest set, not deleted and not owed a fetch, not confirmed or
+     * attempted since its bound; least recently checked first. A DID with a
+     * holder state is due against `checkedBeforeMs`, any other against
+     * `nonHolderCheckedBeforeMs`. A reversibly gone holder stays due under
+     * `everyone`, so a reversal is found by polling.
      */
     dueRefresh(
         checkedBeforeMs: number,
         limit: number,
-        nonHolderCheckedBeforeMs?: number
+        nonHolderCheckedBeforeMs: number
     ): Promise<string[]>
     markChecked(did: string, checkedAtMs: number): Promise<void>
     /**
@@ -85,8 +85,9 @@ export interface RefreshDeps {
      * The secondaries the same head check covers. One indexed at the head's
      * rev under the current key is confirmed; one behind, missing,
      * unverified or under another key is fetched and settled quietly.
+     * `records` is empty where none is kept.
      */
-    secondary?: { deps: SecondaryDeps; records: readonly WatchedRecord[] }
+    secondary: { deps: SecondaryDeps; records: readonly WatchedRecord[] }
 }
 
 export type RefreshOutcome =
@@ -103,8 +104,10 @@ export interface RefreshResult {
 }
 
 /**
- * One pass over the DIDs not confirmed since `nowMs - staleAfterMs`, least
- * recently checked first, at most `limit` of them.
+ * One pass over the DIDs due for a head check, least recently checked
+ * first, at most `limit` of them: holders when not confirmed since
+ * `nowMs - staleAfterMs`, other DIDs in interest since
+ * `nowMs - nonHolderStaleAfterMs`.
  *
  * Anything that is not a confirmation, a quiet advance or a terminal answer
  * is marked attempted and not confirmed, so a source that is down, or a
@@ -123,13 +126,14 @@ export async function refreshDue(
         nowMs: number
         staleAfterMs: number
         limit: number
-        /** How stale a never-held DID's snapshots may get; default one day. */
-        nonHolderStaleAfterMs?: number
+        /** How stale a never-held DID's snapshots may get. */
+        nonHolderStaleAfterMs: number
     }
 ): Promise<RefreshResult> {
     const dids = await deps.refreshIndex.dueRefresh(
         opts.nowMs - opts.staleAfterMs,
-        opts.limit
+        opts.limit,
+        opts.nowMs - opts.nonHolderStaleAfterMs
     )
     const outcomes: Record<RefreshOutcome, number> = {
         confirmed: 0,
@@ -152,6 +156,9 @@ export async function refreshDue(
     return { checked: dids.length, outcomes }
 }
 
+/** A terminal answer that is about the repo or the DID, not about one record. */
+const repoLevel = (err: RecordNotFoundError) => err.reason !== "RecordNotFound"
+
 async function refreshOne(
     deps: RefreshDeps,
     did: string,
@@ -163,20 +170,48 @@ async function refreshOne(
         head = await deps.fetchHeadRev(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        return disposeGone(deps, did, err.permanent, nowMs)
+        // A repo that does not answer a head read is gone, whatever the name.
+        return disposeGone(deps, did, err.permanent, true, nowMs)
     }
 
+    // A DID that never held a declaration has none to fetch: the declaration
+    // socket catches a later publish.
+    const held = (await ingest.index.revOf(did)) !== null
+    const checked = held ? await refreshDeclaration(deps, did, head, nowMs) : null
+    const declaration = checked?.outcome ?? null
+    if (declaration === "deleted" || declaration === "regressed") return declaration
+    // The repo is gone: its secondaries went with it, and fetching them again
+    // would only be handed the same answer.
+    if (checked !== null && checked.repoGone) return checked.outcome
+
+    const secondaries = await refreshSecondaries(deps, did, head, nowMs)
+    if (secondaries === "failed") {
+        await deps.refreshIndex.markAttempted(did, nowMs)
+        return "failed"
+    }
+    if (declaration !== null && declaration !== "confirmed") return declaration
+    if (declaration === null) await deps.refreshIndex.markChecked(did, nowMs)
+    return secondaries
+}
+
+async function refreshDeclaration(
+    deps: RefreshDeps,
+    did: string,
+    head: HeadRev,
+    nowMs: number
+): Promise<{ outcome: RefreshOutcome; repoGone: boolean }> {
+    const { ingest } = deps
     const indexed = await ingest.index.revOf(did)
     const movement = compareRev(indexed, head.rev)
     if (movement === "regressed" && indexed !== null) {
         await ingest.onRegression?.(did, indexed, head.rev)
         await deps.refreshIndex.markChecked(did, nowMs)
-        return "regressed"
+        return { outcome: "regressed", repoGone: false }
     }
     if (movement === "unchanged" && indexed !== null) {
         if (!(await needsReverify(deps, did, head))) {
             await confirm(deps, did, indexed, nowMs)
-            return "confirmed"
+            return { outcome: "confirmed", repoGone: false }
         }
     }
 
@@ -188,7 +223,10 @@ async function refreshOne(
         fetched = await ingest.fetchRecord(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        return disposeGone(deps, did, err.permanent, nowMs)
+        return {
+            outcome: await disposeGone(deps, did, err.permanent, repoLevel(err), nowMs),
+            repoGone: repoLevel(err),
+        }
     }
     await recordFetchedDocument(ingest, did, fetched.didDocument)
     const verified = await ingest.verify(did, fetched)
@@ -197,12 +235,12 @@ async function refreshOne(
         // retried next interval. Only a newly seen key is recorded and pushed.
         await deps.refreshIndex.markAttempted(did, nowMs)
         await pushNewlySeenKey(ingest, did, fetched.signingKey)
-        return "failed"
+        return { outcome: "failed", repoGone: false }
     }
     if (verified.kind === "verified-absent") {
         // A 200 with an exclusion proof: the repo is alive and the record is
         // gone. Reversible, because the account may publish it again.
-        return disposeGone(deps, did, false, nowMs)
+        return { outcome: await disposeGone(deps, did, false, false, nowMs), repoGone: false }
     }
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 
@@ -223,7 +261,7 @@ async function refreshOne(
         // `settle` re-fetches; the extra read is the price of one code path
         // for everything that is a real change.
         await settle(ingest, did)
-        return "changed"
+        return { outcome: "changed", repoGone: false }
     }
 
     await ingest.snapshot.putRecord(did, {
@@ -240,7 +278,49 @@ async function refreshOne(
         verifiedWith: verified.key,
     })
     await confirm(deps, did, verified.rev, nowMs)
-    return "advanced-quiet"
+    return { outcome: "advanced-quiet", repoGone: false }
+}
+
+/**
+ * The same head read covers each secondary. One indexed at the head's rev
+ * under the head's key is confirmed; one behind, missing, unverified or under
+ * another key is fetched and settled, which stores it at its signed rev
+ * without a window entry or a push. Any that did not end up current (an
+ * unverifiable answer, a repo-level one handed to the declaration) makes the
+ * pass `failed`, so it is retried next interval.
+ */
+async function refreshSecondaries(
+    deps: RefreshDeps,
+    did: string,
+    head: HeadRev,
+    nowMs: number
+): Promise<"confirmed" | "advanced-quiet" | "failed"> {
+    const { deps: secondary, records } = deps.secondary
+    if (records.length === 0 || !(await deps.ingest.interest.inInterest(did))) return "confirmed"
+    const rows = await deps.ingest.index.recordsOf(did)
+    let outcome: "confirmed" | "advanced-quiet" | "failed" = "confirmed"
+    for (const r of records) {
+        const ref = { did, collection: r.collection, rkey: r.rkey }
+        const row = rows.find((x) => x.collection === r.collection && x.rkey === r.rkey)
+        if (row !== undefined && row.rev === head.rev && row.verifiedWith === head.signingKey) {
+            await secondary.snapshot.putSecondaryCheck(ref, { rev: row.rev, checkedAtMs: nowMs })
+            continue
+        }
+        const epoch = await deps.ingest.interest.interestEpoch(did)
+        const settled = await settleSecondary(secondary, {
+            ...ref,
+            rev: head.rev,
+            attempts: 0,
+            notBeforeMs: 0,
+            epoch,
+        })
+        if (settled === "stored" || settled === "deleted") {
+            if (outcome === "confirmed") outcome = "advanced-quiet"
+        } else if (settled !== "older") {
+            outcome = "failed"
+        }
+    }
+    return outcome
 }
 
 /**
@@ -258,28 +338,47 @@ async function needsReverify(deps: RefreshDeps, did: string, head: HeadRev): Pro
 }
 
 /**
- * A reversible deletion leaves the DID indexed, so it comes due again every
- * pass. Only the first sighting is a change worth a window entry and a push;
- * after that the snapshot is already gone and the answer is merely re-confirmed.
+ * The declaration, or the whole repo, is gone.
+ *
+ * A DID never held has nothing to tell anyone and nothing indexed to mark: a
+ * repo-level answer disposes its secondaries and leaves it on its own
+ * cadence; no `deleted` row, window entry, push or holder state is written.
+ *
+ * A held DID's reversible deletion leaves it indexed, so it comes due again
+ * every pass. Only the first sighting is a change worth a window entry and a
+ * push; after that the snapshot is already gone and the answer is merely
+ * re-confirmed. A repo-level answer takes the secondaries with it.
  */
 async function disposeGone(
     deps: RefreshDeps,
     did: string,
     permanent: boolean,
+    repoWide: boolean,
     nowMs: number
 ): Promise<RefreshOutcome> {
-    if ((await deps.ingest.snapshot.getRecord(did)) === null) {
-        // An earlier reversible answer can harden into a permanent one.
-        if (permanent && !(await deps.ingest.index.isDeleted(did))) {
-            await settleDeletion(deps.ingest, did, true)
-            return "deleted"
-        }
-        if (!permanent) await deps.refreshIndex.markGoneReversible(did)
+    const { ingest } = deps
+    if ((await ingest.index.revOf(did)) === null) {
+        if (repoWide) await ingest.secondaries?.dispose(did)
         await deps.refreshIndex.markChecked(did, nowMs)
-        return "confirmed"
+        return "deleted"
     }
-    await settleDeletion(deps.ingest, did, permanent)
-    return "deleted"
+    let outcome: RefreshOutcome
+    if ((await ingest.snapshot.getRecord(did)) === null) {
+        // An earlier reversible answer can harden into a permanent one.
+        if (permanent && !(await ingest.index.isDeleted(did))) {
+            await settleDeletion(ingest, did, true)
+            outcome = "deleted"
+        } else {
+            if (!permanent) await deps.refreshIndex.markGoneReversible(did)
+            await deps.refreshIndex.markChecked(did, nowMs)
+            outcome = "confirmed"
+        }
+    } else {
+        await settleDeletion(ingest, did, permanent)
+        outcome = "deleted"
+    }
+    if (repoWide) await ingest.secondaries?.dispose(did)
+    return outcome
 }
 
 async function confirm(

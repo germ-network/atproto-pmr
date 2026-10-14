@@ -239,8 +239,10 @@ export async function settleDeletion(
 export interface SettleOptions {
     /**
      * Owed by a join, not a change: an advance is stored through
-     * `completeQuietly` with no `onChange`, and a not-found re-asserts
-     * gone-reversible with no window entry and no `onDelete`.
+     * `completeQuietly` with no `onChange`. A not-found for a DID that held a
+     * declaration is recorded (gone-reversible, or `deleted` if permanent)
+     * with no window entry and no `onDelete`; for a DID that never held one
+     * nothing is recorded.
      */
     quiet?: boolean
 }
@@ -259,8 +261,16 @@ export async function settle(
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
         if (await moved()) return "left"
+        const repoLevel = err.reason !== "RecordNotFound"
+        if (quiet && (await neverHeld(deps, did))) {
+            // A followee with no declaration is the ordinary case: nothing is
+            // recorded for it, so it stays on the non-holder cadence.
+            await deps.index.clearPending(did)
+            if (repoLevel) await deps.secondaries?.dispose(did)
+            return "deleted"
+        }
         await settleDeletion(deps, did, err.permanent, quiet)
-        if (err.reason !== "RecordNotFound") await deps.secondaries?.dispose(did)
+        if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)
@@ -272,6 +282,11 @@ export async function settle(
         await withdrawFetchedDocument(deps, did, record.didDocument)
     }
     return outcome
+}
+
+/** No declaration was ever indexed for `did`, held or gone. */
+async function neverHeld(deps: IngestDeps, did: string): Promise<boolean> {
+    return (await deps.index.revOf(did)) === null && (await deps.index.holderStateOf(did)) === null
 }
 
 async function settleFetched(
@@ -299,6 +314,10 @@ async function settleFetched(
     if (verified.kind === "verified-absent") {
         // The repo is alive and signed to hold no such record. Reversible,
         // because the account may publish it again.
+        if (quiet && (await neverHeld(deps, did))) {
+            await deps.index.clearPending(did)
+            return "deleted"
+        }
         await settleDeletion(deps, did, false, quiet)
         return "deleted"
     }

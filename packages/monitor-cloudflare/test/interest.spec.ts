@@ -9,6 +9,7 @@ import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
     intakePlcEvent,
+    refreshDue,
     settle,
     settleDeletion,
     settleDue,
@@ -1050,6 +1051,15 @@ describe("joining and leaving interest", () => {
         })
     })
 
+    /** A holder that joins interest with a quiet declaration obligation still owed. */
+    async function quietOwedHolder(obj: MonitorIngest, did: string) {
+        await obj.complete(did, "3m1", 1_000, VERIFIED)
+        ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec(
+            "DELETE FROM window_members; INSERT INTO pending (did, rev, quiet) VALUES (?, '3m1', 1)",
+            did
+        )
+    }
+
     it("a join settle that finds the declaration gone records gone-reversible without a window entry or onDelete", async () => {
         const stub = registeredStub()
         const did = uniqDid()
@@ -1059,7 +1069,7 @@ describe("joining and leaving interest", () => {
                 throw new RecordNotFoundError("no record", false)
             }).pushed
             await obj.setRegistered(did, true, 1)
-            await applyTransitions(obj)
+            await quietOwedHolder(obj, did)
             await settleOwed(obj)
             expect(await obj.holderStateOf(did)).toBe("gone-reversible")
             expect(await obj.isDeleted(did)).toBe(false)
@@ -1067,6 +1077,31 @@ describe("joining and leaving interest", () => {
         expect(pushed).toEqual([])
         expect(await windowCount(stub)).toBe(0)
         expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+    })
+
+    it("a join settle for a DID that never held a declaration records nothing", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            for (const permanent of [false, true]) {
+                drive(obj, async () => {
+                    throw new RecordNotFoundError("no record", permanent, "RecordNotFound")
+                })
+                await obj.setRegistered(did, true, 1)
+                await applyTransitions(obj)
+                await settleOwed(obj)
+                expect(await obj.holderStateOf(did)).toBeNull()
+                expect(await obj.isDeleted(did)).toBe(false)
+                await obj.owe(did, "x") // a real obligation would be settled loudly
+                ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec(
+                    "UPDATE pending SET quiet = 1"
+                )
+                await settleOwed(obj)
+                expect(await obj.holderStateOf(did)).toBeNull()
+            }
+        })
+        expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+        expect(await windowCount(stub)).toBe(0)
     })
 
     it("a leave then a join before the alarm disposes nothing", async () => {
@@ -1094,7 +1129,7 @@ describe("joining and leaving interest", () => {
                 throw new RecordNotFoundError("repo gone", true)
             }).pushed
             await obj.setRegistered(did, true, 1)
-            await applyTransitions(obj)
+            await quietOwedHolder(obj, did)
             await settleOwed(obj)
             expect(await obj.isDeleted(did)).toBe(true)
         })
@@ -1103,12 +1138,125 @@ describe("joining and leaving interest", () => {
     })
 })
 
+const HOUR = 3_600_000
+const DAY = 24 * HOUR
+
 describe("head checks follow interest", () => {
-    it.todo("a non-holder followee's profile is head-checked")
-    it.todo("a non-holder is due once per REFRESH_NONHOLDER_STALE_AFTER_MS, a holder once per REFRESH_STALE_AFTER_MS")
-    it.todo("a reversibly gone holder stays due for refresh under everyone")
-    it.todo("a failing non-holder is retried once per its own daily bound")
-    it.todo("a reversibly gone non-holder keeps the daily cadence")
+    const due = (obj: MonitorIngest, now = Date.now()) =>
+        obj.dueRefresh(now - HOUR, 50, now - DAY)
+
+    it("a non-holder followee's profile is head-checked", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            const now = Date.now()
+            await obj.setOwnerFollowers(did, 1, now - 2 * DAY)
+            expect(await due(obj, now)).toEqual([did])
+            // Owed a fetch, it is left to that settle.
+            await applyTransitions(obj)
+            expect(await due(obj, now)).toEqual([])
+        })
+    })
+
+    it("a non-holder is due once per REFRESH_NONHOLDER_STALE_AFTER_MS, a holder once per REFRESH_STALE_AFTER_MS", async () => {
+        await inObj(everyoneStub(), async (obj) => {
+            const now = Date.now()
+            const holderOld = uniqDid()
+            const holderFresh = uniqDid()
+            const nonHolderOld = uniqDid()
+            const nonHolderFresh = uniqDid()
+            await obj.complete(holderOld, "3m1", now - 2 * HOUR, VERIFIED)
+            await obj.complete(holderFresh, "3m1", now - HOUR / 2, VERIFIED)
+            await obj.setRegistered(nonHolderOld, true, now - 25 * HOUR)
+            await obj.setRegistered(nonHolderFresh, true, now - 2 * HOUR)
+            expect((await due(obj, now)).sort()).toEqual([holderOld, nonHolderOld].sort())
+        })
+    })
+
+    it("a reversibly gone holder stays due for refresh under everyone", async () => {
+        const did = uniqDid()
+        await inObj(everyoneStub(), async (obj) => {
+            const now = Date.now()
+            await obj.complete(did, "3m1", now - 3 * HOUR, VERIFIED)
+            await obj.completeDeletion(did, now - 2 * HOUR, false)
+            expect(await obj.inInterest(did)).toBe(false)
+            expect(await due(obj, now)).toEqual([did])
+            await obj.completeDeletion(did, now - HOUR, true)
+            expect(await due(obj, now)).toEqual([])
+        })
+    })
+
+    it("a reversibly gone holder is not polled under registered", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            const now = Date.now()
+            await obj.complete(did, "3m1", now - 3 * HOUR, VERIFIED)
+            await obj.completeDeletion(did, now - 2 * HOUR, false)
+            expect(await obj.holderStateOf(did)).toBe("gone-reversible")
+            expect(await due(obj, now)).toEqual([])
+        })
+    })
+
+    it("a DID owed a declaration or a secondary is left to that settle, not head-checked", async () => {
+        const stub = registeredStub()
+        await inObj(stub, async (obj) => {
+            const now = Date.now()
+            const sql = (obj as unknown as { db: DurableObjectStorage }).db.sql
+            const [a, b, c] = [uniqDid(), uniqDid(), uniqDid()]
+            for (const did of [a, b, c]) await obj.setOwnerFollowers(did, 1, now - 3 * DAY)
+            expect((await due(obj, now)).sort()).toEqual([a, b, c].sort())
+            sql.exec("INSERT INTO pending (did, rev) VALUES (?, '')", a)
+            expect((await due(obj, now)).sort()).toEqual([b, c].sort())
+            sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev) VALUES (?, ?, 'self', '')",
+                b,
+                PROFILE
+            )
+            expect(await due(obj, now)).toEqual([c])
+        })
+    })
+
+    it("a failing non-holder is retried once per its own daily bound", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            const now = Date.now()
+            await obj.setOwnerFollowers(did, 1, now - 3 * DAY)
+            await obj.markAttempted(did, now - 2 * HOUR)
+            expect(await due(obj, now)).toEqual([])
+            await obj.markAttempted(did, now - 25 * HOUR)
+            expect(await due(obj, now)).toEqual([did])
+        })
+    })
+
+    it("a reversibly gone non-holder keeps the daily cadence", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setOwnerFollowers(did, 1, Date.now() - 3 * DAY)
+            await applyTransitions(obj)
+            await (obj as unknown as { db: DurableObjectStorage }).db.sql.exec("DELETE FROM pending; DELETE FROM rec_pending")
+            const o = obj as unknown as Internals
+            const result = await refreshDue(
+                {
+                    ingest: o.deps(),
+                    refreshIndex: obj,
+                    refreshSnapshots: kvSnapshotStore(testEnv),
+                    fetchHeadRev: async () => {
+                        throw new RecordNotFoundError("suspended", false, "RepoSuspended")
+                    },
+                    collection: testEnv.MONITOR_COLLECTION,
+                    rkey: "self",
+                    secondary: { deps: (obj as unknown as SecondaryInternals).secondaryDeps(), records: [] },
+                },
+                { nowMs: Date.now(), staleAfterMs: HOUR, nonHolderStaleAfterMs: DAY, limit: 10 }
+            )
+            expect(result.outcomes.deleted).toBe(1)
+            expect(await obj.holderStateOf(did)).toBeNull()
+            expect(await obj.isDeleted(did)).toBe(false)
+            expect(await due(obj)).toEqual([])
+            // Due again a day later, on the daily bound, not the hourly one.
+            expect(await due(obj, Date.now() + 2 * HOUR)).toEqual([])
+            expect(await due(obj, Date.now() + 25 * HOUR)).toEqual([did])
+        })
+    })
 })
 
 describe("declaration intake by policy", () => {
