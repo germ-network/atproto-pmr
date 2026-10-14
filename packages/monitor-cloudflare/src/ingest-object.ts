@@ -59,6 +59,7 @@ import {
     pruneGraphChanges,
     reconcileGraphMirror,
 } from "@germ-network/atproto-pmr-monitor"
+import type { StatementBudget } from "@germ-network/atproto-pmr-monitor"
 import { d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
 import {
     RepoProofError,
@@ -116,6 +117,8 @@ const IGNORED_CURSOR_PERSIST_MS = 5_000
 const RECONCILE_INTERVAL_MS = 86_400_000
 /** How often the D1 graph mirror is checked against the single writer's state, both ways. */
 const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
+/** D1 statements the writer spends per mirrored DID. */
+const MIRROR_STATEMENTS_PER_DID = 10
 
 interface MirrorSqlRow extends Record<string, SqlStorageValue> {
     did: string
@@ -337,7 +340,8 @@ export class MonitorIngest
                     owner INTEGER NOT NULL,
                     holder INTEGER NOT NULL,
                     member INTEGER NOT NULL,
-                    registered INTEGER NOT NULL
+                    registered INTEGER NOT NULL,
+                    inflight INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
@@ -1792,6 +1796,10 @@ export class MonitorIngest
         "LEFT JOIN holder_state h ON h.did = c.did " +
         "LEFT JOIN interest i ON i.did = c.did "
 
+    /**
+     * Scans every DID in `interest`, `holder_state` and `graph_mirrored` on
+     * each call: the same order of rows as the refresh scan, once per alarm.
+     */
     async dueMirror(limit: number): Promise<GraphMirrorTransition[]> {
         const rows = this.db.sql
             .exec<MirrorSqlRow & PriorSqlRow>(
@@ -1799,12 +1807,25 @@ export class MonitorIngest
                     "m.member AS m_member, m.registered AS m_registered FROM (" +
                     MonitorIngest.STANDING +
                     ") s LEFT JOIN graph_mirrored m ON m.did = s.did " +
-                    "WHERE s.owner <> COALESCE(m.owner, 0) OR s.holder <> COALESCE(m.holder, 0) " +
+                    "WHERE COALESCE(m.inflight, 0) = 1 OR s.owner <> COALESCE(m.owner, 0) " +
+                    "OR s.holder <> COALESCE(m.holder, 0) " +
                     "OR s.member <> COALESCE(m.member, 0) OR s.registered <> COALESCE(m.registered, 0) " +
                     "ORDER BY s.did LIMIT ?",
                 limit
             )
             .toArray()
+        // Sent rows stay due until `markMirrored` records them, so a batch that
+        // commits in D1 but is never recorded is re-sent even if the standing
+        // flips back to what was last recorded.
+        this.ctx.storage.transactionSync(() => {
+            for (const r of rows) {
+                this.db.sql.exec(
+                    "INSERT INTO graph_mirrored (did, owner, holder, member, registered, inflight) " +
+                        "VALUES (?, 0, 0, 0, 0, 1) ON CONFLICT (did) DO UPDATE SET inflight = 1",
+                    r.did
+                )
+            }
+        })
         return rows.map((r) => ({
             now: mirrorRow(r),
             mirrored:
@@ -1828,9 +1849,9 @@ export class MonitorIngest
                     continue
                 }
                 this.db.sql.exec(
-                    "INSERT INTO graph_mirrored (did, owner, holder, member, registered) " +
-                        "VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (did) DO UPDATE SET " +
-                        "owner = ?2, holder = ?3, member = ?4, registered = ?5",
+                    "INSERT INTO graph_mirrored (did, owner, holder, member, registered, inflight) " +
+                        "VALUES (?1, ?2, ?3, ?4, ?5, 0) ON CONFLICT (did) DO UPDATE SET " +
+                        "owner = ?2, holder = ?3, member = ?4, registered = ?5, inflight = 0",
                     r.did,
                     r.owner ? 1 : 0,
                     r.holder ? 1 : 0,
@@ -1878,13 +1899,24 @@ export class MonitorIngest
      */
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
-        const deps: GraphMirrorDeps = {
+        const deps = {
             index: this,
             edges: d1FollowEdgeWriter(this.env.graph!, budget),
             nowMs: () => Date.now(),
+            budget,
         }
         for (const [name, step] of [
-            ["graph mirror", () => mirrorGraph(deps, this.envInt(this.env.GRAPH_MIRROR_BATCH, 50))],
+            [
+                "graph mirror",
+                () =>
+                    mirrorGraph(
+                        deps,
+                        Math.min(
+                            this.envInt(this.env.GRAPH_MIRROR_BATCH, 50),
+                            Math.floor(budget.remaining / MIRROR_STATEMENTS_PER_DID)
+                        )
+                    ),
+            ],
             [
                 "graph change prune",
                 () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
@@ -1900,7 +1932,7 @@ export class MonitorIngest
     }
 
     /** One page of the daily two-way reconcile; the cursor persists until a pass completes. */
-    private async reconcileGraph(deps: GraphMirrorDeps): Promise<void> {
+    private async reconcileGraph(deps: GraphMirrorDeps & { budget: StatementBudget }): Promise<void> {
         const metaOf = (k: string) =>
             this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
         const setMeta = (k: string, v: string | null) =>
@@ -1914,11 +1946,21 @@ export class MonitorIngest
         const stored = metaOf("graph_reconcile_cursor")
         const lastDone = Number(metaOf("graph_reconcile_done") ?? 0)
         if (stored === undefined && deps.nowMs() - lastDone < GRAPH_RECONCILE_INTERVAL_MS) return
-        const cursor = stored === undefined ? null : (JSON.parse(stored) as MirrorReconcileCursor)
+        let cursor: MirrorReconcileCursor | null = null
+        if (stored !== undefined) {
+            try {
+                cursor = JSON.parse(stored) as MirrorReconcileCursor
+            } catch {
+                // A corrupt cursor restarts the pass rather than wedging it.
+            }
+        }
         const next = await reconcileGraphMirror(
             deps,
             cursor,
-            this.envInt(this.env.GRAPH_RECONCILE_BATCH, 25)
+            Math.min(
+                this.envInt(this.env.GRAPH_RECONCILE_BATCH, 25),
+                Math.floor(deps.budget.remaining / (MIRROR_STATEMENTS_PER_DID + 2))
+            )
         )
         if (next === null) {
             setMeta("graph_reconcile_cursor", null)

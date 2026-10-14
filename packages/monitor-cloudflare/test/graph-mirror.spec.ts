@@ -292,7 +292,11 @@ describe("graph mirror", () => {
         })
         await alarm(s)
         await runInDurableObject(s, async (_obj, state) => {
-            expect(await state.storage.getAlarm()).not.toBeNull()
+            const at = await state.storage.getAlarm()
+            // The watchdog interval, not a retry the runtime scheduled itself.
+            const interval = Number(testEnv.WATCHDOG_INTERVAL_MS)
+            expect(at).not.toBeNull()
+            expect(at! - Date.now()).toBeGreaterThan(interval - 30_000)
         })
         // Nothing was mirrored, so it is still due.
         await inObj(s, async (obj) => {
@@ -328,6 +332,100 @@ describe("graph mirror", () => {
         expect(await dids("interest")).toEqual([])
     })
 
+    it("a flag that flips back after an unrecorded commit is mirrored on the next pass", async () => {
+        const s = stub()
+        await inObj(s, async (obj) => {
+            await obj.setRegistered("did:plc:a", true, 1)
+            await mirrorGraph(deps(obj), 10)
+            await obj.setRegistered("did:plc:a", false, 2)
+            // The removal commits in D1, but the object never records it.
+            await deps(obj).edges.mirror(await obj.dueMirror(10))
+            expect(await dids("interest")).toEqual([])
+            await obj.setRegistered("did:plc:a", true, 3)
+            await mirrorGraph(deps(obj), 10)
+        })
+        expect(await dids("interest")).toEqual(["did:plc:a"])
+    })
+
+    it("a change in the registered flag alone is mirrored", async () => {
+        const s = stub()
+        await inObj(s, async (obj) => {
+            await obj.setOwnerFollowers("did:plc:f", 1, 1)
+            await mirrorGraph(deps(obj), 10)
+            expect(await all("SELECT registered FROM interest")).toEqual([{ registered: 0 }])
+            await obj.setRegistered("did:plc:f", true, 2)
+            await mirrorGraph(deps(obj), 10)
+        })
+        expect(await all("SELECT registered FROM interest")).toEqual([{ registered: 1 }])
+    })
+
+    it("reconcile pages the single writer's rows past the first page", async () => {
+        const s = stub()
+        await inObj(s, async (obj) => {
+            for (const d of ["did:a", "did:b"]) {
+                await obj.setRegistered(d, true, 1)
+                await obj.markMirrored([
+                    { did: d, owner: false, holder: false, member: true, registered: true },
+                ])
+            }
+            let cursor: MirrorReconcileCursor | null = null
+            do cursor = await reconcileGraphMirror(deps(obj), cursor, 1)
+            while (cursor !== null)
+        })
+        expect(await dids("interest")).toEqual(["did:a", "did:b"])
+    })
+
+    it("the daily reconcile runs once a day and clears its cursor when a pass completes", async () => {
+        const s = stub()
+        await inObj(s, async (obj) => {
+            const step = (nowMs: number) =>
+                (
+                    obj as unknown as {
+                        reconcileGraph(d: GraphMirrorDeps & { budget: unknown }): Promise<void>
+                    }
+                ).reconcileGraph({ ...deps(obj), nowMs: () => nowMs, budget: statementBudget(1000) })
+            const meta = (k: string) =>
+                sql(obj, "SELECT v FROM meta WHERE k = ?", k).toArray()
+            const t = Date.now()
+            await db.prepare("INSERT INTO interest (did, registered) VALUES ('did:o1', 0)").run()
+            await step(t)
+            expect(meta("graph_reconcile_cursor")).toHaveLength(1)
+            await step(t)
+            expect(meta("graph_reconcile_cursor")).toHaveLength(0)
+            expect(meta("graph_reconcile_done")).toHaveLength(1)
+            expect(await dids("interest")).toEqual([])
+            // Done today: a new orphan waits for tomorrow's pass.
+            await db.prepare("INSERT INTO interest (did, registered) VALUES ('did:o2', 0)").run()
+            await step(t + 3_600_000)
+            await step(t + 3_600_000)
+            expect(await dids("interest")).toEqual(["did:o2"])
+            await step(t + 86_400_000 + 1)
+            await step(t + 86_400_000 + 1)
+            expect(await dids("interest")).toEqual([])
+        })
+    })
+
+    it("each graph step fails alone", async () => {
+        const s = stub()
+        const old = Date.now() - 8 * 86_400_000
+        await db.batch([
+            db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:old', 'following', ?)").bind(old),
+            db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:new', 'following', ?)").bind(Date.now()),
+        ])
+        await listed("did:plc:a")
+        await inObj(s, async (obj) => {
+            await obj.setRegistered("did:plc:a", true, 1)
+            const writesFail = {
+                prepare: (q: string) => db.prepare(q),
+                batch: () => Promise.reject(new Error("batch down")),
+            }
+            obj.env = { ...obj.env, graph: writesFail as unknown as D1Database }
+        })
+        await alarm(s)
+        // The mirror's batch failed; the prune still ran.
+        expect(await all<{ did: string }>("SELECT did FROM graph_changes")).toEqual([{ did: "did:new" }])
+    })
+
     it("the alarm mirrors, prunes and reconciles", async () => {
         const s = stub()
         await listed("did:plc:a")
@@ -335,7 +433,8 @@ describe("graph mirror", () => {
         await db.prepare("INSERT INTO interest (did, registered) VALUES ('did:orphan', 0)").run()
         await alarm(s)
         expect(await dids("interest")).toEqual(["did:orphan", "did:plc:a"])
-        // The first alarm's reconcile found the orphan D1 holds and the DO does not.
+        // The first alarm paged the single writer's side; the second found the
+        // orphan D1 holds and the DO does not.
         await alarm(s)
         await inObj(s, async (obj) => {
             const cursor = (obj as unknown as { db: DurableObjectStorage }).db.sql
