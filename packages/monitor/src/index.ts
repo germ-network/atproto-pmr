@@ -64,6 +64,8 @@ export {
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryIndex,
+    type SecondaryIntakeIndex,
+    type SecondaryIntakeOutcome,
     type SecondarySnapshotStore,
     type SecondaryWriteAnswer,
 } from "./storage"
@@ -71,11 +73,26 @@ export {
 // The allow list and the secondary records it keeps.
 export { applyInterestTransitions, type InterestDeps } from "./interest"
 export {
+    intakeSecondary,
     settleSecondary,
     settleSecondaryDue,
+    type SecondaryConfig,
     type SecondaryDeps,
+    type SecondaryIntakeDecision,
     type SecondarySettleOutcome,
 } from "./secondary"
+
+// The follow/profile stream.
+export {
+    EDGE_OPS_TABLE,
+    FOLLOW_COLLECTION_NSID,
+    routeFollowEvent,
+    type EdgeOp,
+    type FollowRoute,
+    type FollowRouteDeps,
+    type FollowStreamIndex,
+    type NewEdgeOp,
+} from "./follow-stream"
 
 // The change digest.
 export {

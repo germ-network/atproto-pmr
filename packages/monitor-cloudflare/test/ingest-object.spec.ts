@@ -2782,6 +2782,8 @@ describe("PLC export consumer", () => {
             did,
             seq: 1,
             timeMs: null,
+            active: null,
+            status: null,
         })
         const hint = (stub: DurableObjectStub<MonitorIngest>, did: string, consumerUnset: boolean) =>
             runInDurableObject(stub, (obj: MonitorIngest) =>

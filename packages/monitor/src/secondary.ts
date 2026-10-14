@@ -5,15 +5,18 @@
  * never moves `revs`; its rev authority is its own `records` row, and a write
  * never replaces a newer one.
  */
-import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { RecordNotFoundError, type WatchedRecord } from "@germ-network/atproto-pmr-core"
+import type { CommitEvent } from "./jetstream"
 import { recordFetchedDocument, type FetchedRecord, type VerifyOutcome } from "./ingest"
 import {
     compareRev,
+    type Cursor,
     type DidDocumentSink,
     type InterestIndex,
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryIndex,
+    type SecondaryIntakeIndex,
     type SecondarySnapshotStore,
 } from "./storage"
 
@@ -34,6 +37,13 @@ export interface SecondaryDeps {
     nowMs(): number
 }
 
+/** Which secondaries a monitor keeps. Commits on any other record are ignored. */
+export interface SecondaryConfig {
+    records: readonly WatchedRecord[]
+}
+
+export type SecondaryIntakeDecision = "ignored" | "duplicate" | "accepted"
+
 export type SecondarySettleOutcome =
     | "stored"
     /** A newer rev is indexed: nothing was written. */
@@ -44,6 +54,33 @@ export type SecondarySettleOutcome =
     | "unverifiable"
     /** Handed to the declaration path on a repo-level terminal answer. */
     | "deferred"
+
+/**
+ * In the follow stream's read loop: owe a fetch for a commit on a watched
+ * secondary of a DID in interest, together with the cursor. No I/O beyond
+ * the index.
+ */
+export async function intakeSecondary(
+    deps: { index: SecondaryIntakeIndex },
+    config: SecondaryConfig,
+    event: CommitEvent,
+    cursor: Cursor
+): Promise<SecondaryIntakeDecision> {
+    const watched = config.records.some(
+        (r) => r.collection === event.collection && r.rkey === event.rkey
+    )
+    if (!watched) return "ignored"
+    const result = await deps.index.oweSecondary(
+        {
+            did: event.did,
+            collection: event.collection,
+            rkey: event.rkey,
+            rev: event.rev,
+        },
+        cursor
+    )
+    return result.outcome
+}
 
 /**
  * Fetch, verify and store one owed secondary, off the read loop. Throws only
@@ -63,7 +100,7 @@ export async function settleSecondary(
 ): Promise<SecondarySettleOutcome> {
     const ref: RecordRef = { did: owed.did, collection: owed.collection, rkey: owed.rkey }
     const left = async (): Promise<SecondarySettleOutcome> => {
-        await deps.index.clearSecondary(ref)
+        await deps.index.clearSecondary(ref, owed.rev)
         return "left"
     }
     if (!(await stillOwedUnder(deps, ref.did, owed.epoch))) return left()
@@ -73,7 +110,7 @@ export async function settleSecondary(
         record = await deps.fetchRecord(ref)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        await deps.index.clearSecondary(ref)
+        await deps.index.clearSecondary(ref, owed.rev)
         // Without a proof of absence nothing here may be disposed. A gone
         // repo is the declaration's to judge, which also disposes this.
         if (err.reason === "RecordNotFound") return "unverifiable"
@@ -84,19 +121,19 @@ export async function settleSecondary(
 
     const verified = await deps.verify(ref, record)
     if (verified.kind === "unverifiable") {
-        await deps.index.clearSecondary(ref)
+        await deps.index.clearSecondary(ref, owed.rev)
         return "unverifiable"
     }
     if (!(await stillOwedUnder(deps, ref.did, owed.epoch))) return left()
     const indexed = await deps.index.secondaryRevOf(ref)
     if (indexed !== null && compareRev(indexed, verified.rev) === "regressed") {
-        await deps.index.clearSecondary(ref)
+        await deps.index.clearSecondary(ref, owed.rev)
         return "older"
     }
 
     if (verified.kind === "verified-absent") {
         await deps.snapshot.deleteSecondary(ref)
-        const answer = await deps.index.disposeSecondary(ref, verified.rev, owed.epoch)
+        const answer = await deps.index.disposeSecondary(ref, verified.rev, owed.epoch, owed.rev)
         return answer === "disposed" ? "deleted" : answer
     }
 
@@ -113,7 +150,8 @@ export async function settleSecondary(
         ref,
         verified.rev,
         { cid: verified.cid, verifiedWith: verified.key },
-        owed.epoch
+        owed.epoch,
+        owed.rev
     )
     if (answer === "left") await deps.snapshot.deleteSecondary(ref)
     return answer

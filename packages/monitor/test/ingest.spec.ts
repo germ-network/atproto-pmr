@@ -214,7 +214,7 @@ describe("intake", () => {
         // whole network, so the snapshot is the filter. For a DID we hold,
         // a re-key changes what its record verifies against.
         const h = harness()
-        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
         expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(h.pending.size).toBe(0)
 
@@ -237,7 +237,7 @@ describe("intake", () => {
         const h = harness()
         h.revs.set(DID, "3m1")
         h.deleted.add(DID)
-        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
 
         expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(h.pending.size).toBe(0)
@@ -549,7 +549,7 @@ describe("settle", () => {
         await settle(h.deps, DID)
         expect(h.pending.has(DID)).toBe(false)
 
-        const id = { kind: "account" as const, did: DID, seq: 2, timeMs: null }
+        const id = { kind: "account" as const, did: DID, seq: 2, timeMs: null, active: null, status: null }
         expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c2")).toBe("reverify")
         expect(h.pending.has(DID)).toBe(true)
     })
@@ -795,7 +795,7 @@ describe("settle keeps the stored DID document", () => {
 })
 
 describe("identity events and the signing-key cache", () => {
-    const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+    const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
 
     function withKeyUpdates() {
         const owed: Array<{ did: string; update: unknown; plcSeq?: number }> = []
@@ -1022,7 +1022,7 @@ describe("settle verifies at ingest", () => {
         })
         h.revs.set(DID, "3m1")
         h.records.set(DID, storedEntry())
-        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null }
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
         expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(verify.mock.calls[0]![1].signingKey).toBe(ROTATED_KEY)
