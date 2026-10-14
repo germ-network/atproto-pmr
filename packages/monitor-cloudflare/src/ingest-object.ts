@@ -89,6 +89,9 @@ const KEY_DRAIN_BATCH = 64
  */
 const PLC_CURSOR_PERSIST_MS = 5_000
 
+/** How often the registered set is re-listed from the directory. */
+const RECONCILE_INTERVAL_MS = 86_400_000
+
 /**
  * Whether `armWatchdog` should replace the stored alarm: absent, OR
  * already due. The second case is not hypothetical — observed in
@@ -237,6 +240,13 @@ export class MonitorIngest
                     member INTEGER NOT NULL DEFAULT 0,
                     epoch INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS reg_state (
+                    did TEXT PRIMARY KEY,
+                    registered_at INTEGER NOT NULL DEFAULT 0,
+                    unregistered_at INTEGER NOT NULL DEFAULT 0,
+                    unregister_due INTEGER,
+                    mark INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS interest_transitions (
                     did TEXT PRIMARY KEY,
                     change TEXT NOT NULL CHECK (change IN ('join', 'leave')),
@@ -248,6 +258,7 @@ export class MonitorIngest
                     attempted_at INTEGER NOT NULL DEFAULT 0
                 );
             `)
+            this.assertConfig()
             this.seedHolderState()
             this.seedInterest()
         })
@@ -1081,11 +1092,30 @@ export class MonitorIngest
     // ---- Registration (RPC from the relay's directory) ---------------------
 
     /**
+     * Startup check: an unknown `INTEREST_POLICY` throws, and so does
+     * `registered` without the `pmrDirectory` it reconciles against.
+     */
+    assertConfig(): void {
+        if (this.interestPolicy() === "registered" && this.env.pmrDirectory === undefined) {
+            throw new Error("INTEREST_POLICY=registered requires a pmrDirectory binding")
+        }
+    }
+
+    /**
      * The relay registered `did`: it joins interest, and any unregister
      * still waiting out `UNREGISTER_GRACE_MS` is cancelled.
      */
-    async register(_did: string): Promise<void> {
-        throw new Error("not implemented")
+    async register(did: string): Promise<void> {
+        const nowMs = Date.now()
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO reg_state (did, registered_at) VALUES (?1, ?2) " +
+                    "ON CONFLICT(did) DO UPDATE SET registered_at = ?2, unregister_due = NULL",
+                did,
+                nowMs
+            )
+            this.setRegisteredSync(did, true, nowMs)
+        })
     }
 
     /**
@@ -1093,8 +1123,43 @@ export class MonitorIngest
      * `UNREGISTER_GRACE_MS` has passed with no `register` in between, so a
      * replace (unregister then register) disposes of nothing.
      */
-    async unregister(_did: string): Promise<void> {
-        throw new Error("not implemented")
+    async unregister(did: string): Promise<void> {
+        const nowMs = Date.now()
+        this.db.sql.exec(
+            "INSERT INTO reg_state (did, unregistered_at, unregister_due) VALUES (?1, ?2, ?3) " +
+                "ON CONFLICT(did) DO UPDATE SET unregistered_at = ?2, unregister_due = ?3",
+            did,
+            nowMs,
+            nowMs + this.registrationGraceMs()
+        )
+    }
+
+    private registrationGraceMs(): number {
+        return this.envInt(this.env.UNREGISTER_GRACE_MS, 600_000)
+    }
+
+    /**
+     * How far a directory listing may disagree with the registrations the RPC
+     * recorded: KV `list` is eventually consistent in both directions.
+     */
+    private reconcileMarginMs(): number {
+        return Math.max(60_000, this.registrationGraceMs())
+    }
+
+    /** Apply every unregister whose grace has passed. */
+    protected async applyExpiredUnregisters(nowMs: number): Promise<void> {
+        const due = this.db.sql
+            .exec<{ did: string }>(
+                "SELECT did FROM reg_state WHERE unregister_due IS NOT NULL AND unregister_due <= ?",
+                nowMs
+            )
+            .toArray()
+        for (const { did } of due) {
+            this.ctx.storage.transactionSync(() => {
+                this.db.sql.exec("UPDATE reg_state SET unregister_due = NULL WHERE did = ?", did)
+                this.setRegisteredSync(did, false, nowMs)
+            })
+        }
     }
 
     /**
@@ -1103,10 +1168,114 @@ export class MonitorIngest
      * pass's generation, then unmarks registrations older than the pass. A DID
      * registered after the pass began is never removed by it. One that has
      * never run is due at once. A no-op without the binding, which only
-     * `everyone` allows.
+     * `everyone` allows. A listing that fails part-way removes nothing and is
+     * retried by the next alarm. A registration whose unregister is waiting
+     * out its grace is left to that grace.
      */
-    protected async reconcileRegistrations(_nowMs: number): Promise<void> {
-        throw new Error("not implemented")
+    protected async reconcileRegistrations(nowMs: number): Promise<void> {
+        const directory = this.env.pmrDirectory
+        if (directory === undefined) return
+        const last = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'registrations_reconciled_at'")
+            .toArray()[0]
+        if (last !== undefined && nowMs - Number(last.v) < RECONCILE_INTERVAL_MS) return
+
+        const margin = this.reconcileMarginMs()
+        const cutoff = nowMs - margin
+        let cursor: string | undefined
+        for (;;) {
+            const page = await directory.list({ prefix: "did:", cursor })
+            for (const { name } of page.keys) {
+                this.ctx.storage.transactionSync(() => this.markListed(name, nowMs, cutoff))
+            }
+            if (page.list_complete) break
+            cursor = page.cursor
+        }
+        const stale = this.db.sql
+            .exec<{ did: string }>(
+                "SELECT i.did AS did FROM interest i LEFT JOIN reg_state r ON r.did = i.did " +
+                    "WHERE i.registered = 1 AND COALESCE(r.mark, 0) != ?1 " +
+                    "AND COALESCE(r.registered_at, 0) < ?2 AND r.unregister_due IS NULL",
+                nowMs,
+                cutoff
+            )
+            .toArray()
+        this.ctx.storage.transactionSync(() => {
+            for (const { did } of stale) this.setRegisteredSync(did, false, nowMs)
+            this.db.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('registrations_reconciled_at', ?1) " +
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                String(nowMs)
+            )
+        })
+    }
+
+    /**
+     * A listed DID is marked, and registered unless its unregister is
+     * pending or newer than the margin, which the listing may not yet show.
+     */
+    private markListed(did: string, generation: number, cutoff: number): void {
+        const row = this.db.sql
+            .exec<{ unregistered_at: number; unregister_due: number | null }>(
+                "SELECT unregistered_at, unregister_due FROM reg_state WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        const unregisterRecent =
+            row !== undefined && (row.unregister_due !== null || row.unregistered_at > cutoff)
+        this.db.sql.exec(
+            "INSERT INTO reg_state (did, mark) VALUES (?1, ?2) " +
+                "ON CONFLICT(did) DO UPDATE SET mark = ?2",
+            did,
+            generation
+        )
+        if (unregisterRecent) return
+        const registered = this.db.sql
+            .exec("SELECT 1 FROM interest WHERE did = ? AND registered = 1", did)
+            .toArray()
+        if (registered.length > 0) return
+        this.db.sql.exec("UPDATE reg_state SET registered_at = ?2 WHERE did = ?1", did, generation)
+        this.setRegisteredSync(did, true, generation)
+    }
+
+    /**
+     * Once, after the first complete reconcile under `registered` (so the
+     * registered set is no longer empty by omission): queue a leave for every
+     * DID with a `revs` or `records` row that is outside interest. Until a
+     * leave applies, such a DID stays watched.
+     */
+    protected queueRegisteredLeaves(): void {
+        if (this.interestPolicy() !== "registered") return
+        const flag = (k: string) =>
+            this.db.sql.exec("SELECT 1 FROM meta WHERE k = ?", k).toArray().length > 0
+        if (!flag("registrations_reconciled_at") || flag("registered_leaves_queued")) return
+        this.ctx.storage.transactionSync(() => {
+            const outside = this.db.sql
+                .exec<{ did: string }>(
+                    "SELECT did FROM (SELECT did FROM revs UNION SELECT did FROM records) " +
+                        "WHERE did NOT IN (SELECT did FROM interest WHERE member = 1)"
+                )
+                .toArray()
+            for (const { did } of outside) {
+                this.db.sql.exec(
+                    "INSERT INTO interest (did, member, epoch) VALUES (?1, 0, 1) " +
+                        "ON CONFLICT(did) DO UPDATE SET epoch = epoch + 1",
+                    did
+                )
+                const { epoch } = this.db.sql
+                    .exec<{ epoch: number }>("SELECT epoch FROM interest WHERE did = ?", did)
+                    .one()
+                this.db.sql.exec(
+                    "INSERT INTO interest_transitions (did, change, epoch) VALUES (?, 'leave', ?) " +
+                        "ON CONFLICT(did) DO UPDATE SET change = 'leave', epoch = excluded.epoch",
+                    did,
+                    epoch
+                )
+            }
+            this.db.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('registered_leaves_queued', '1')"
+            )
+        })
     }
 
     // ---- InterestIndex ----------------------------------------------------
@@ -1145,15 +1314,17 @@ export class MonitorIngest
     }
 
     async setRegistered(did: string, registered: boolean, atMs: number): Promise<void> {
-        this.ctx.storage.transactionSync(() => {
-            this.db.sql.exec(
-                "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
-                    "ON CONFLICT(did) DO UPDATE SET registered = ?2",
-                did,
-                registered ? 1 : 0
-            )
-            this.reevaluateInterest(did, atMs)
-        })
+        this.ctx.storage.transactionSync(() => this.setRegisteredSync(did, registered, atMs))
+    }
+
+    private setRegisteredSync(did: string, registered: boolean, atMs: number): void {
+        this.db.sql.exec(
+            "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
+                "ON CONFLICT(did) DO UPDATE SET registered = ?2",
+            did,
+            registered ? 1 : 0
+        )
+        this.reevaluateInterest(did, atMs)
     }
 
     async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
@@ -1667,21 +1838,40 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: plc coverage publish failed", err)
             }
+            // Joins and leaves are applied ahead of the settles; each step
+            // fails alone so a directory outage cannot strand them.
+            for (const [name, step] of [
+                ["unregisters", () => this.applyExpiredUnregisters(Date.now())],
+                ["registration reconcile", () => this.reconcileRegistrations(Date.now())],
+                ["registered leaves", () => this.queueRegisteredLeaves()],
+            ] as const) {
+                try {
+                    await step()
+                } catch (err) {
+                    console.error(`monitor: ${name} failed`, err)
+                }
+            }
             // Before settling, so a DID this sweep just discovered is
             // eligible for the same tick's settle pass rather than
             // waiting a full watchdog interval — `SETTLE_BATCH` still
             // caps how much of it actually gets fetched this tick either
             // way, so a large page cannot turn into an unbounded fetch
             // burst.
-            await sweepBackfill({
-                index: this,
-                listRepos: (cursor) =>
-                    listReposByCollection(cursor, {
-                        relayUrl: this.env.BACKFILL_RELAY_URL,
-                        collection: this.env.MONITOR_COLLECTION,
-                        limit: this.envInt(this.env.BACKFILL_BATCH, 100),
-                    }),
-            })
+            if (this.interestPolicy() === "everyone") {
+                try {
+                    await sweepBackfill({
+                        index: this,
+                        listRepos: (cursor) =>
+                            listReposByCollection(cursor, {
+                                relayUrl: this.env.BACKFILL_RELAY_URL,
+                                collection: this.env.MONITOR_COLLECTION,
+                                limit: this.envInt(this.env.BACKFILL_BATCH, 100),
+                            }),
+                    })
+                } catch (err) {
+                    console.error("monitor: backfill sweep failed", err)
+                }
+            }
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
             // After settling (a just-stored snapshot is not yet due) and

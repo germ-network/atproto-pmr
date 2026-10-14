@@ -3,8 +3,9 @@
  * policy, how registrations reach it, and what joining and leaving do to
  * everything kept for a DID.
  */
-import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
+import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { intakePlcEvent, settle, type PlcExportEvent } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "../src/env"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -20,6 +21,19 @@ const stubOf = (ns: DurableObjectNamespace<MonitorIngest>) => {
     n += 1
     return ns.get(ns.idFromName(`interest-${n}`))
 }
+/** One alarm with the network stubbed out; the connect stages fail, the rest runs. */
+async function alarm(stub: DurableObjectStub<MonitorIngest>) {
+    const original = globalThis.fetch
+    globalThis.fetch = (() => Promise.resolve(new Response(null, { status: 200 }))) as typeof fetch
+    try {
+        await runDurableObjectAlarm(stub)
+    } catch {
+        // connect() has no real socket to open here.
+    } finally {
+        globalThis.fetch = original
+    }
+}
+
 const everyoneStub = () => stubOf(testEnv.ingest)
 const registeredStub = () => stubOf(testEnv.ingestRegistered)
 const inObj = <R>(stub: DurableObjectStub<MonitorIngest>, fn: (obj: MonitorIngest) => Promise<R>) =>
@@ -195,8 +209,6 @@ describe("interest set and policy", () => {
         expect(after!.version).toBe(before!.version + 1)
     })
 
-    it.todo("upgrade under registered leaves DIDs outside interest only after the first complete reconcile")
-
     it("after upgrade under everyone, a PLC rotation for a held DID before the first alarm is followed", async () => {
         const stub = everyoneStub()
         await inObj(stub, (obj) => obj.complete("did:plc:held", "3m1", 1_000, VERIFIED))
@@ -261,17 +273,244 @@ describe("interest set and policy", () => {
     })
 })
 
+/** The directory KV's `list`, paged two at a time, with a hook per page. */
+function directory(names: string[], onPage: (page: number) => Promise<void> = async () => {}) {
+    let page = 0
+    return {
+        list: async ({ prefix, cursor }: { prefix?: string; cursor?: string }) => {
+            const all = names.filter((k) => k.startsWith(prefix ?? ""))
+            const from = cursor === undefined ? 0 : Number(cursor)
+            await onPage(page++)
+            const keys = all.slice(from, from + 2).map((name) => ({ name }))
+            const done = from + 2 >= all.length
+            return { keys, list_complete: done, cursor: done ? undefined : String(from + 2) }
+        },
+    } as unknown as KVNamespace
+}
+
+type Reg = {
+    applyExpiredUnregisters(nowMs: number): Promise<void>
+    reconcileRegistrations(nowMs: number): Promise<void>
+    queueRegisteredLeaves(): void
+}
+const reg = (obj: MonitorIngest) => obj as unknown as Reg
+const withDirectory = (obj: MonitorIngest, dir: KVNamespace | undefined) => {
+    obj.env = { ...obj.env, pmrDirectory: dir }
+}
+const FAR = () => Date.now() + 3_600_000
+
 describe("registration RPC and reconcile", () => {
-    it.todo("register marks the DID registered and in interest")
-    it.todo("unregister clears registered; the DID leaves interest unless still followed by an owner")
-    it.todo("reconcile adds a registration the RPC missed and removes a stale one")
-    it.todo("unregister followed by register within the grace disposes nothing")
-    it.todo("reconcile does not remove a DID registered after the listing began")
-    it.todo("reconcile does not remove a DID registered just before the listing")
-    it.todo("reconcile does not re-add a just-unregistered DID")
-    it.todo("registered policy without pmrDirectory fails at startup")
-    it.todo("a reconcile that has never run runs on the first alarm")
-    it.todo("a failing reconcile does not stop the settles behind it")
+    it("register marks the DID registered and in interest", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:a")
+            expect(await obj.isRegistered("did:plc:a")).toBe(true)
+            expect(await obj.inInterest("did:plc:a")).toBe(true)
+            expect(await obj.dueTransitions(10)).toEqual([{ did: "did:plc:a", change: "join", epoch: 1 }])
+        })
+    })
+
+    it("unregister clears registered; the DID leaves interest unless still followed by an owner", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:a")
+            await obj.register("did:plc:b")
+            await obj.setOwnerFollowers("did:plc:b", 1, 1)
+            await obj.unregister("did:plc:a")
+            await obj.unregister("did:plc:b")
+            // Nothing happens until the grace has passed.
+            await reg(obj).applyExpiredUnregisters(Date.now())
+            expect(await obj.isRegistered("did:plc:a")).toBe(true)
+            await reg(obj).applyExpiredUnregisters(FAR())
+            expect(await obj.isRegistered("did:plc:a")).toBe(false)
+            expect(await obj.inInterest("did:plc:a")).toBe(false)
+            expect(await obj.isRegistered("did:plc:b")).toBe(false)
+            expect(await obj.inInterest("did:plc:b")).toBe(true)
+        })
+    })
+
+    it("reconcile adds a registration the RPC missed and removes a stale one", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:stale")
+            await obj.register("did:plc:kept")
+            withDirectory(obj, directory(["did:plc:missed", "did:plc:kept", "did:plc:other", "other:key"]))
+            await reg(obj).reconcileRegistrations(FAR())
+            expect(await obj.isRegistered("did:plc:missed")).toBe(true)
+            expect(await obj.isRegistered("did:plc:other")).toBe(true)
+            expect(await obj.isRegistered("did:plc:kept")).toBe(true)
+            expect(await obj.isRegistered("did:plc:stale")).toBe(false)
+            expect(await obj.isRegistered("other:key")).toBe(false)
+        })
+    })
+
+    it("unregister followed by register within the grace disposes nothing", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:a")
+            await obj.clearTransition("did:plc:a", 1)
+            await obj.unregister("did:plc:a")
+            await obj.register("did:plc:a")
+            await reg(obj).applyExpiredUnregisters(FAR())
+            expect(await obj.isRegistered("did:plc:a")).toBe(true)
+            expect(await obj.dueTransitions(10)).toEqual([])
+            expect(await obj.interestEpoch("did:plc:a")).toBe(1)
+        })
+    })
+
+    it("reconcile does not remove a DID registered after the listing began", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            withDirectory(
+                obj,
+                directory(["did:plc:x", "did:plc:y", "did:plc:z"], async (page) => {
+                    if (page === 1) await obj.register("did:plc:late")
+                })
+            )
+            await reg(obj).reconcileRegistrations(Date.now())
+            expect(await obj.isRegistered("did:plc:late")).toBe(true)
+            expect(await obj.isRegistered("did:plc:z")).toBe(true)
+        })
+    })
+
+    it("reconcile does not remove a DID registered just before the listing", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:recent")
+            withDirectory(obj, directory([]))
+            await reg(obj).reconcileRegistrations(Date.now() + 1_000)
+            expect(await obj.isRegistered("did:plc:recent")).toBe(true)
+        })
+    })
+
+    it("reconcile does not re-add a just-unregistered DID", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:gone")
+            await obj.unregister("did:plc:gone")
+            await reg(obj).applyExpiredUnregisters(FAR())
+            await obj.register("did:plc:pending")
+            await obj.unregister("did:plc:pending")
+            withDirectory(obj, directory(["did:plc:gone", "did:plc:pending"]))
+            await reg(obj).reconcileRegistrations(Date.now() + 1_000)
+            expect(await obj.isRegistered("did:plc:gone")).toBe(false)
+            // A pending unregister is neither cancelled nor pre-empted.
+            expect(await obj.isRegistered("did:plc:pending")).toBe(true)
+            await reg(obj).applyExpiredUnregisters(FAR())
+            expect(await obj.isRegistered("did:plc:pending")).toBe(false)
+        })
+    })
+
+    it("a failing listing removes nothing and is retried", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:a")
+            withDirectory(
+                obj,
+                directory(["did:plc:x", "did:plc:y", "did:plc:z"], async (page) => {
+                    if (page === 1) throw new Error("kv down")
+                })
+            )
+            await expect(reg(obj).reconcileRegistrations(FAR())).rejects.toThrow("kv down")
+            expect(await obj.isRegistered("did:plc:a")).toBe(true)
+            // Not recorded as done, so the next alarm tries again.
+            withDirectory(obj, directory([]))
+            await reg(obj).reconcileRegistrations(FAR())
+            expect(await obj.isRegistered("did:plc:a")).toBe(false)
+        })
+    })
+
+    it("registered policy without pmrDirectory fails at startup", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            withDirectory(obj, undefined)
+            expect(() => obj.assertConfig()).toThrow(/pmrDirectory/)
+        })
+        await inObj(everyoneStub(), async (obj) => {
+            withDirectory(obj, undefined)
+            expect(() => obj.assertConfig()).not.toThrow()
+            await expect(reg(obj).reconcileRegistrations(Date.now())).resolves.toBeUndefined()
+        })
+    })
+
+    it("reconcile leaves a registration whose unregister is in its grace", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.register("did:plc:replacing")
+            await obj.unregister("did:plc:replacing")
+            withDirectory(obj, directory([]))
+            await reg(obj).reconcileRegistrations(FAR())
+            expect(await obj.isRegistered("did:plc:replacing")).toBe(true)
+            expect(await obj.dueTransitions(10)).toEqual([
+                { did: "did:plc:replacing", change: "join", epoch: 1 },
+            ])
+        })
+    })
+
+    it("an object configured for registered without pmrDirectory refuses to start", async () => {
+        const ns = (env as unknown as { ingestUnbound: DurableObjectNamespace<MonitorIngest> }).ingestUnbound
+        await expect(
+            ns.get(ns.idFromName("unbound")).isRegistered("did:plc:a")
+        ).rejects.toThrow(/pmrDirectory/)
+    })
+
+    it("a reconcile that has never run runs on the first alarm", async () => {
+        const stub = registeredStub()
+        await inObj(stub, async (obj) => {
+            withDirectory(obj, directory(["did:plc:listed"]))
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await alarm(stub)
+        await inObj(stub, async (obj) => {
+            expect(await obj.isRegistered("did:plc:listed")).toBe(true)
+            // Done, so the next call inside the day lists nothing.
+            withDirectory(obj, directory([]))
+            await reg(obj).reconcileRegistrations(Date.now() + 1_000)
+            expect(await obj.isRegistered("did:plc:listed")).toBe(true)
+            await reg(obj).reconcileRegistrations(FAR() + 86_400_000)
+            expect(await obj.isRegistered("did:plc:listed")).toBe(false)
+        })
+    })
+
+    it("a failing reconcile does not stop the settles behind it", async () => {
+        const stub = registeredStub()
+        const fetched: string[] = []
+        await inObj(stub, async (obj) => {
+            withDirectory(obj, {
+                list: async () => {
+                    throw new Error("kv list down")
+                },
+            } as unknown as KVNamespace)
+            ;(obj as unknown as { fetchRecord: (did: string) => Promise<never> }).fetchRecord = async (did) => {
+                fetched.push(did)
+                throw new RecordNotFoundError("gone", true)
+            }
+            await obj.owe("did:plc:owed", "3m1")
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        await alarm(stub)
+        expect(fetched).toEqual(["did:plc:owed"])
+    })
+
+    it("upgrade under registered leaves DIDs outside interest only after the first complete reconcile", async () => {
+        await inObj(registeredStub(), async (obj) => {
+            await obj.complete("did:plc:old", "3m1", 1_000, VERIFIED)
+            await obj.complete("did:plc:kept", "3m1", 1_000, VERIFIED)
+            await obj.register("did:plc:kept")
+            await obj.clearTransition("did:plc:kept", 1)
+            reg(obj).queueRegisteredLeaves()
+            expect(await obj.dueTransitions(10)).toEqual([])
+
+            withDirectory(obj, {
+                list: async () => {
+                    throw new Error("down")
+                },
+            } as unknown as KVNamespace)
+            await expect(reg(obj).reconcileRegistrations(FAR())).rejects.toThrow()
+            reg(obj).queueRegisteredLeaves()
+            expect(await obj.dueTransitions(10)).toEqual([])
+
+            withDirectory(obj, directory(["did:plc:kept"]))
+            await reg(obj).reconcileRegistrations(FAR())
+            reg(obj).queueRegisteredLeaves()
+            expect(await obj.dueTransitions(10)).toEqual([{ did: "did:plc:old", change: "leave", epoch: 1 }])
+            // Once only.
+            await obj.clearTransition("did:plc:old", 1)
+            reg(obj).queueRegisteredLeaves()
+            expect(await obj.dueTransitions(10)).toEqual([])
+            expect(await obj.isWatched("did:plc:old")).toBe(true)
+        })
+    })
 })
 
 describe("joining and leaving interest", () => {

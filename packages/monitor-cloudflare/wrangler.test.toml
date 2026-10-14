@@ -11,6 +11,7 @@ compatibility_date = "2026-07-01"
 bindings = [
 	{ name = "ingest", class_name = "MonitorIngest" },
 	{ name = "ingestRegistered", class_name = "RegisteredMonitorIngest" },
+	{ name = "ingestUnbound", class_name = "UnboundMonitorIngest" },
 ]
 
 [[migrations]]
@@ -20,6 +21,10 @@ new_sqlite_classes = ["MonitorIngest"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RegisteredMonitorIngest"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["UnboundMonitorIngest"]
 
 # Illustrative values, matching wrangler.example.toml. All are
 # implementation-defined; tests read them from env rather than hardcoding.
