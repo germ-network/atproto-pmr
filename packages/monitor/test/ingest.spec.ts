@@ -50,6 +50,7 @@ function commit(rev: string, collection = COLLECTION): CommitEvent {
 function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const { rev: fetchedRev = "3m2", ...depOverrides } = overrides
     const attempted = new Map<string, number>()
+    const completed: Array<{ cid: string; verifiedWith: string }> = []
     const revs = new Map<string, string>()
     const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
     const records = new Map<string, SnapshotEntry>()
@@ -73,7 +74,8 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
             return { outcome: "accepted" }
         },
-        complete: async (did, rev, observedAtMs) => {
+        complete: async (did, rev, observedAtMs, verified) => {
+            completed.push(verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
@@ -94,6 +96,8 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             if (p !== undefined) pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
         },
         revOf: async (did) => revs.get(did) ?? null,
+        recordsOf: async () => [],
+        holderStateOf: async () => null,
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
         clearPending: async (did) => void pending.delete(did),
         markAttempted: async (did, at) => void attempted.set(did, at),
@@ -130,7 +134,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         nowMs: () => 1_000_000,
         ...depOverrides,
     }
-    return { deps, revs, pending, attempted, records, members, deleted, windows, marker: () => marker }
+    return { deps, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake", () => {
@@ -215,9 +219,9 @@ describe("settle", () => {
             },
             index: {
                 ...h.deps.index,
-                complete: async (did, rev, at) => {
+                complete: async (did, rev, at, verified) => {
                     order.push("index")
-                    await h.deps.index.complete(did, rev, at)
+                    await h.deps.index.complete(did, rev, at, verified)
                 },
             },
         }
@@ -822,6 +826,7 @@ describe("settle verifies at ingest", () => {
             cid: "bafyreisigned",
         })
         expect(h.revs.get(DID)).toBe("3m5")
+        expect(h.completed).toEqual([{ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }])
     })
 
     it("verified exclusion proof at a current rev disposes the snapshot reversibly", async () => {

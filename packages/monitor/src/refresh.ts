@@ -9,7 +9,7 @@
  */
 import { RecordNotFoundError, readRecordFromCar } from "@germ-network/atproto-pmr-core"
 import { recordFetchedDocument, settle, settleDeletion, type IngestDeps } from "./ingest"
-import { compareRev } from "./storage"
+import { compareRev, type VerifiedWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
 export interface SnapshotCheck {
@@ -27,8 +27,19 @@ export interface RefreshIndex {
      * stays due, because it does not count as a confirmation.
      */
     markAttempted(did: string, attemptedAtMs: number): Promise<void>
+    /**
+     * The declaration is reversibly gone and already disposed of: re-assert
+     * that state, with no digest-window entry and no push.
+     */
+    markGoneReversible(did: string): Promise<void>
+
     /** Advance the rev index without a digest-window entry. */
-    completeQuietly(did: string, rev: string, observedAtMs: number): Promise<void>
+    completeQuietly(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void>
 }
 
 export interface RefreshSnapshots {
@@ -181,7 +192,10 @@ async function refreshOne(
         verifiedWith: verified.key,
         cid: verified.cid,
     })
-    await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs)
+    await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
+        cid: verified.cid,
+        verifiedWith: verified.key,
+    })
     await confirm(deps, did, verified.rev, nowMs)
     return "advanced-quiet"
 }
@@ -203,6 +217,7 @@ async function disposeGone(
             await settleDeletion(deps.ingest, did, true)
             return "deleted"
         }
+        if (!permanent) await deps.refreshIndex.markGoneReversible(did)
         await deps.refreshIndex.markChecked(did, nowMs)
         return "confirmed"
     }

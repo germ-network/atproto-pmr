@@ -48,6 +48,8 @@ const DID = "did:plc:alice"
 const PDS = "https://pds.example"
 const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 
+const STUB_VERIFIED = { cid: "bafyreistub", verifiedWith: SIGNING_KEY }
+
 let n = 0
 function freshStub(): DurableObjectStub<MonitorIngest> {
     n += 1
@@ -185,7 +187,7 @@ describe("the index", () => {
         // not a PDS round trip — while still accounting for the event.
         const stub = freshStub()
         const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete(DID, "3m1", Date.now())
+            await obj.complete(DID, "3m1", Date.now(), STUB_VERIFIED)
             const outcome = await obj.intake({ did: DID, rev: "3m1" }, "200")
             return {
                 outcome: outcome.outcome,
@@ -200,7 +202,7 @@ describe("the index", () => {
         const stub = freshStub()
         const owed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.intake({ did: DID, rev: "3m1" }, "100")
-            await obj.complete(DID, "3m1", Date.now())
+            await obj.complete(DID, "3m1", Date.now(), STUB_VERIFIED)
             return obj.duePending(Date.now(), 10)
         })
         expect(owed).toEqual([])
@@ -228,7 +230,7 @@ describe("the index", () => {
     it("completeDeletion leaves the rev index untouched -- the regression floor survives", async () => {
         const stub = freshStub()
         const untouched = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete(DID, "3m1", Date.now())
+            await obj.complete(DID, "3m1", Date.now(), STUB_VERIFIED)
             await obj.completeDeletion(DID, Date.now(), true)
             return obj.revOf(DID)
         })
@@ -239,7 +241,7 @@ describe("the index", () => {
         const stub = freshStub()
         const isDeleted = await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.completeDeletion(DID, Date.now(), true)
-            await obj.complete(DID, "3m9", Date.now())
+            await obj.complete(DID, "3m9", Date.now(), STUB_VERIFIED)
             return obj.isDeleted(DID)
         })
         expect(isDeleted).toBe(false)
@@ -403,7 +405,7 @@ describe("the way in", () => {
     it("owes a re-read on demand, past the dedupe check", async () => {
         const stub = freshStub()
         const owed = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete(DID, "3m1", Date.now())
+            await obj.complete(DID, "3m1", Date.now(), STUB_VERIFIED)
             // intake would call this a duplicate; a rotation still needs it.
             await obj.owe(DID, "3m1")
             return obj.duePending(Date.now(), 10)
@@ -430,7 +432,7 @@ describe("digest windows", () => {
         const stub = freshStub()
         const observedAtMs = 12 * 600_000 + 5_000
         const members = await inMonitorObj(stub, async (obj) => {
-            await obj.complete(DID, "3m1", observedAtMs)
+            await obj.complete(DID, "3m1", observedAtMs, STUB_VERIFIED)
             // Identified by START INSTANT, so the width can be retuned
             // without old and new windows colliding on one key.
             return obj.windowMembers(12 * 600_000)
@@ -443,8 +445,8 @@ describe("digest windows", () => {
         const now = Date.now()
         const currentWindow = Math.floor(now / 600_000) * 600_000
         const sealed = await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:old", "3m1", currentWindow - 2 * 600_000)
-            await obj.complete("did:plc:now", "3m2", now)
+            await obj.complete("did:plc:old", "3m1", currentWindow - 2 * 600_000, STUB_VERIFIED)
+            await obj.complete("did:plc:now", "3m2", now, STUB_VERIFIED)
             // As if sealing had already progressed to just before the old
             // window on a prior tick — a fresh install starts coverage
             // "now", not retroactively, so this test needs a marker to
@@ -490,7 +492,7 @@ describe("digest windows", () => {
         const stub = freshStub()
         const t = 12 * 600_000 + 5_000
         const members = await inMonitorObj(stub, async (obj) => {
-            await obj.complete(DID, "3m1", t)
+            await obj.complete(DID, "3m1", t, STUB_VERIFIED)
             return obj.windowMembers(12 * 600_000)
         })
         expect(members).toEqual([DID])
@@ -558,7 +560,7 @@ describe("backfill", () => {
     it("does not re-discover a DID the live tail already indexed", async () => {
         const stub = freshStub()
         await runInDurableObject(stub, (obj: MonitorIngest) =>
-            obj.complete(DID, "3m1", Date.now())
+            obj.complete(DID, "3m1", Date.now(), STUB_VERIFIED)
         )
         const swept = await inMonitorObj(stub, (obj) =>
             sweepBackfill({
@@ -965,7 +967,7 @@ describe("own-DID push", () => {
             const stub = freshStub()
             const spy = await spyOnDeliver(stub)
             await runInDurableObject(stub, (obj: MonitorIngest) =>
-                obj.complete(did, "3m9", Date.now())
+                obj.complete(did, "3m9", Date.now(), STUB_VERIFIED)
             )
             await runInDurableObject(stub, (obj: MonitorIngest) =>
                 obj.intake({ did, rev: "3m1" }, "c1")
@@ -986,7 +988,7 @@ describe("own-DID push", () => {
             const stub = freshStub()
             const spy = await spyOnDeliver(stub)
             await runInDurableObject(stub, (obj: MonitorIngest) =>
-                obj.complete(did, "3m1", Date.now())
+                obj.complete(did, "3m1", Date.now(), STUB_VERIFIED)
             )
             // Intake a DIFFERENT claimed rev than what's already indexed,
             // so this genuinely owes a fetch rather than deduping to
@@ -1062,7 +1064,7 @@ describe("snapshot refresh", () => {
                 log.push("seal")
                 return windowMembers(w)
             }
-            await obj.complete("did:plc:refresh-b", "3m1", old)
+            await obj.complete("did:plc:refresh-b", "3m1", old, STUB_VERIFIED)
             await kvSnapshotStore(testEnv).putRecord("did:plc:refresh-b", entry("3m1", old))
             await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, "1")
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
@@ -1098,14 +1100,14 @@ describe("snapshot refresh", () => {
     it("dueRefresh skips deleted and pending DIDs and orders by last check", async () => {
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:r1", "3m1", 1_000)
-            await obj.complete("did:plc:r2", "3m1", 2_000)
-            await obj.complete("did:plc:r3", "3m1", 3_000)
-            await obj.complete("did:plc:r-deleted", "3m1", 100)
+            await obj.complete("did:plc:r1", "3m1", 1_000, STUB_VERIFIED)
+            await obj.complete("did:plc:r2", "3m1", 2_000, STUB_VERIFIED)
+            await obj.complete("did:plc:r3", "3m1", 3_000, STUB_VERIFIED)
+            await obj.complete("did:plc:r-deleted", "3m1", 100, STUB_VERIFIED)
             await obj.completeDeletion("did:plc:r-deleted", 200, true)
-            await obj.complete("did:plc:r-pending", "3m1", 100)
+            await obj.complete("did:plc:r-pending", "3m1", 100, STUB_VERIFIED)
             await obj.owe("did:plc:r-pending", "3m2")
-            await obj.complete("did:plc:r-fresh", "3m1", 90_000)
+            await obj.complete("did:plc:r-fresh", "3m1", 90_000, STUB_VERIFIED)
 
             expect(await obj.dueRefresh(50_000, 10)).toEqual([
                 "did:plc:r1",
@@ -1125,7 +1127,7 @@ describe("snapshot refresh", () => {
             expect(await obj.dueRefresh(50_000, 1)).toEqual(["did:plc:r3"])
             expect(await obj.dueRefresh(50_000, 10)).toEqual(["did:plc:r3", "did:plc:r2"])
             // Quiet completion advances the rev without a digest-window entry.
-            await obj.completeQuietly("did:plc:r2", "3m9", 1_300_000)
+            await obj.completeQuietly("did:plc:r2", "3m9", 1_300_000, STUB_VERIFIED)
             expect(await obj.revOf("did:plc:r2")).toBe("3m9")
             expect(await obj.windowMembers(Math.floor(1_300_000 / 600_000))).toEqual([])
         })
@@ -1656,7 +1658,7 @@ describe("wiring stored DID documents into the monitor", () => {
             }
             // A completion three hours back makes a digest window due, which
             // is what makes the alarm seal (and so reach `windowMembers`).
-            await obj.complete("did:plc:s10alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await obj.complete("did:plc:s10alarm", "3m1", Date.now() - 3 * 3_600_000, STUB_VERIFIED)
             await kvSnapshotStore(testEnv).putRecord("did:plc:s10alarm", {
                 rev: "3m1",
                 car: new Uint8Array([7]),
@@ -1719,7 +1721,7 @@ describe("the PLC export cursor", () => {
     it("isWatched: a DID in revs, or only pending, is watched; an unknown DID is not", async () => {
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:s11rev", "3m1", 1_000)
+            await obj.complete("did:plc:s11rev", "3m1", 1_000, STUB_VERIFIED)
             await obj.intake({ did: "did:plc:s11pend", rev: "3m1" }, "1")
             expect(await obj.isWatched("did:plc:s11rev")).toBe(true)
             expect(await obj.isWatched("did:plc:s11pend")).toBe(true)
@@ -1730,7 +1732,7 @@ describe("the PLC export cursor", () => {
     it("a permanently deleted DID is not watched", async () => {
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
-            await obj.complete("did:plc:s11gone", "3m1", 1_000)
+            await obj.complete("did:plc:s11gone", "3m1", 1_000, STUB_VERIFIED)
             await obj.completeDeletion("did:plc:s11gone", 2_000, true)
             expect(await obj.isDeleted("did:plc:s11gone")).toBe(true)
             expect(await obj.isWatched("did:plc:s11gone")).toBe(false)
@@ -1867,7 +1869,7 @@ describe("the PLC export cursor", () => {
         })
         await inMonitorObj(stub, async (obj) => {
             withUrl(obj, URL_A)
-            await obj.complete(watched, "3m1", 1_000)
+            await obj.complete(watched, "3m1", 1_000, STUB_VERIFIED)
             expect(await intakePlcEvent(obj, event(unwatched, 10, 5_000), obj)).toBe("ignored")
             expect(await intakePlcEvent(obj, event(watched, 11, 6_000), obj)).toBe("owed")
             obj.persistPlcCursor()
@@ -2186,7 +2188,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
                 log.push("seal")
                 return windowMembers(w)
             }
-            await obj.complete("did:plc:s13alarm", "3m1", Date.now() - 3 * 3_600_000)
+            await obj.complete("did:plc:s13alarm", "3m1", Date.now() - 3 * 3_600_000, STUB_VERIFIED)
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
         await runAlarm(stub)
@@ -2242,7 +2244,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
                 log.push("seal")
                 return windowMembers(w)
             }
-            await obj.complete("did:plc:s13order", "3m1", Date.now() - 3 * 3_600_000)
+            await obj.complete("did:plc:s13order", "3m1", Date.now() - 3 * 3_600_000, STUB_VERIFIED)
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
         await runAlarm(stub)
@@ -2272,7 +2274,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
                 log.push("seal")
                 return windowMembers(w)
             }
-            await obj.complete("did:plc:s13fail", "3m1", Date.now() - 3 * 3_600_000)
+            await obj.complete("did:plc:s13fail", "3m1", Date.now() - 3 * 3_600_000, STUB_VERIFIED)
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
         await runAlarm(stub)
@@ -2309,7 +2311,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
                 log.push("seal")
                 return windowMembers(w)
             }
-            await obj.complete("did:plc:s13both", "3m1", Date.now() - 3 * 3_600_000)
+            await obj.complete("did:plc:s13both", "3m1", Date.now() - 3 * 3_600_000, STUB_VERIFIED)
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
         await runAlarm(stub)
@@ -2321,7 +2323,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
         const other = "did:plc:s13unwatched"
         await inMonitorObj(stub, async (obj) => {
             withUrl(obj, URL_A)
-            await obj.complete(WATCHED, "3m1", 1_000)
+            await obj.complete(WATCHED, "3m1", 1_000, STUB_VERIFIED)
             const advanced: number[] = []
             const advance = obj.advancePlcCursor.bind(obj)
             obj.advancePlcCursor = async (seq, createdAtMs) => {
@@ -2370,7 +2372,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
         const stub = freshStub()
         await inMonitorObj(stub, async (obj) => {
             withUrl(obj, URL_A)
-            await obj.complete(WATCHED, "3m1", 1_000)
+            await obj.complete(WATCHED, "3m1", 1_000, STUB_VERIFIED)
             const real = obj.recordDidDocument.bind(obj)
             let calls = 0
             obj.recordDidDocument = async (did, doc, asOf) => {
@@ -2428,7 +2430,7 @@ describe("PLC export consumer: frames, sockets and the alarm", () => {
         await inMonitorObj(stub, async (obj) => {
             withUrl(obj, URL_A)
             await obj.recordDidDocument(did, { id: did }, 1_000)
-            await obj.complete(did, "3m1", 1_000)
+            await obj.complete(did, "3m1", 1_000, STUB_VERIFIED)
             await obj.completeDeletion(did, 2_000, true)
             const event: PlcExportEvent = {
                 seq: 5,
@@ -2666,11 +2668,11 @@ describe("PLC export consumer", () => {
     it("KeyUpdateIndex: isWatched covers revs and pending, excludes permanently deleted", async () => {
         const stub = freshStub()
         const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
-            await obj.complete("did:plc:inrevs", "3m1", 1)
+            await obj.complete("did:plc:inrevs", "3m1", 1, STUB_VERIFIED)
             await obj.owe("did:plc:inpending", "3m1")
-            await obj.complete("did:plc:gone", "3m1", 1)
+            await obj.complete("did:plc:gone", "3m1", 1, STUB_VERIFIED)
             await obj.completeDeletion("did:plc:gone", 2, true)
-            await obj.complete("did:plc:soft", "3m1", 1)
+            await obj.complete("did:plc:soft", "3m1", 1, STUB_VERIFIED)
             await obj.completeDeletion("did:plc:soft", 2, false)
             return {
                 inrevs: await obj.isWatched("did:plc:inrevs"),
@@ -2784,7 +2786,7 @@ describe("PLC export consumer", () => {
         const hint = (stub: DurableObjectStub<MonitorIngest>, did: string, consumerUnset: boolean) =>
             runInDurableObject(stub, (obj: MonitorIngest) =>
                 withPlcUrl(obj, consumerUnset ? undefined : PLC_URL, async () => {
-                    await obj.complete(did, "3m1", 1)
+                    await obj.complete(did, "3m1", 1, STUB_VERIFIED)
                     const deps = (obj as unknown as { deps(): IngestDeps }).deps()
                     const decision = await intake(deps, { collection: COLLECTION }, identity(did), "c")
                     return { decision, owed: (await obj.dueKeyUpdates(10)).map((o) => o.did) }
@@ -2883,10 +2885,171 @@ describe("verifying a fetched record", () => {
 })
 
 describe("record index and holder state", () => {
-    it.todo("declaration rev in revs and records agree after settle, quiet advance and deletion")
-    it.todo("existing revs rows are held after upgrade; deleted rows are gone-permanent")
-    it.todo("a second constructor run does not change holder state")
-    it.todo("completeQuietly asserts held")
-    it.todo("a reversible already-gone answer re-asserts gone-reversible")
-    it.todo("a permanent answer for a deleted DID stays gone-permanent")
+    const verified = (cid = "bafyreic1") => ({ cid, verifiedWith: SIGNING_KEY })
+    const rows = <T>(stub: DurableObjectStub<MonitorIngest>, query: string) =>
+        runInDurableObject(stub, (_obj, state) => state.storage.sql.exec(query).toArray() as T[])
+
+    it("declaration rev in revs and records agree after settle, quiet advance and deletion", async () => {
+        const stub = freshStub()
+        const revOfRecords = async () =>
+            (await runInDurableObject(stub, (obj: MonitorIngest) => obj.recordsOf(DID))).map(
+                (r) => r.rev
+            )
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.complete(DID, "3m1", Date.now(), verified())
+        )
+        expect(await revOfRecords()).toEqual(["3m1"])
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.revOf(DID))).toBe("3m1")
+
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.completeQuietly(DID, "3m2", Date.now(), verified())
+        )
+        expect(await revOfRecords()).toEqual(["3m2"])
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.revOf(DID))).toBe("3m2")
+
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.completeDeletion(DID, Date.now(), false)
+        )
+        expect(await revOfRecords()).toEqual([])
+        // The rev floor outlives the record.
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.revOf(DID))).toBe("3m2")
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
+            "gone-reversible"
+        )
+    })
+
+    it("a record row carries the collection, cid and the key it verified under", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.complete(DID, "3m1", Date.now(), verified("bafyreic9"))
+        )
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.recordsOf(DID))).toEqual([
+            {
+                did: DID,
+                collection: testEnv.MONITOR_COLLECTION,
+                rkey: "self",
+                rev: "3m1",
+                cid: "bafyreic9",
+                verifiedWith: SIGNING_KEY,
+            },
+        ])
+    })
+
+    it("existing revs rows are held after upgrade; deleted rows are gone-permanent", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (_obj, state) => {
+            state.storage.sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:a', '3m1', 1), ('did:plc:b', '3m1', 1)")
+            state.storage.sql.exec("INSERT INTO deleted (did, deleted_at) VALUES ('did:plc:b', 1)")
+            state.storage.sql.exec("DELETE FROM holder_state")
+            state.storage.sql.exec("DELETE FROM meta WHERE k = 'holder_seeded'")
+        })
+        await evictDurableObject(stub)
+        const states = await runInDurableObject(stub, async (obj: MonitorIngest) => ({
+            a: await obj.holderStateOf("did:plc:a"),
+            b: await obj.holderStateOf("did:plc:b"),
+            none: await obj.holderStateOf("did:plc:none"),
+        }))
+        expect(states).toEqual({ a: "held", b: "gone-permanent", none: null })
+        expect(await rows(stub, "SELECT did FROM records")).toEqual([])
+    })
+
+    it("a second constructor run does not change holder state", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), verified())
+            await obj.completeDeletion(DID, Date.now(), false)
+        })
+        await evictDurableObject(stub)
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
+            "gone-reversible"
+        )
+    })
+
+    it("completeQuietly asserts held", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), verified())
+            await obj.completeDeletion(DID, Date.now(), false)
+            await obj.completeQuietly(DID, "3m2", Date.now(), verified())
+        })
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe("held")
+    })
+
+    it("a reversible already-gone answer re-asserts gone-reversible", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), verified())
+            await obj.completeDeletion(DID, Date.now(), false)
+            await obj.completeDeletion(DID, Date.now(), false)
+        })
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
+            "gone-reversible"
+        )
+    })
+
+    it("held_at restarts on a transition into held, not on every write while held", async () => {
+        const stub = freshStub()
+        const heldAt = () => rows<{ held_at: number }>(stub, "SELECT held_at FROM holder_state")
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.complete(DID, "3m1", 1_000, verified()))
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.complete(DID, "3m2", 2_000, verified()))
+        expect(await heldAt()).toEqual([{ held_at: 1_000 }])
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.completeDeletion(DID, 3_000, false))
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.completeQuietly(DID, "3m3", 5_000, verified()))
+        expect(await heldAt()).toEqual([{ held_at: 5_000 }])
+    })
+
+    it("a seeded held DID that refresh finds gone becomes gone-reversible, quietly; a deleted one stays permanent", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, (_obj, state) => {
+            state.storage.sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:a', '3m1', 1), ('did:plc:b', '3m1', 1)")
+            state.storage.sql.exec("INSERT INTO deleted (did, deleted_at) VALUES ('did:plc:b', 1)")
+            state.storage.sql.exec("DELETE FROM holder_state")
+            state.storage.sql.exec("DELETE FROM meta WHERE k = 'holder_seeded'")
+        })
+        await evictDurableObject(stub)
+        const out = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.markGoneReversible("did:plc:a")
+            await obj.markGoneReversible("did:plc:b")
+            return {
+                a: await obj.holderStateOf("did:plc:a"),
+                b: await obj.holderStateOf("did:plc:b"),
+                window: await obj.windowMembers(0),
+            }
+        })
+        expect(out).toEqual({ a: "gone-reversible", b: "gone-permanent", window: [] })
+    })
+
+    it("deleting the declaration leaves the DID's other collections' records", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), verified())
+        })
+        await runInDurableObject(stub, (_obj, state) => {
+            state.storage.sql.exec(
+                "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) VALUES (?, 'app.bsky.actor.profile', 'self', '3m1', 'c', 'k')",
+                DID
+            )
+        })
+        await runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.completeDeletion(DID, Date.now(), false)
+        )
+        expect(
+            (await runInDurableObject(stub, (o: MonitorIngest) => o.recordsOf(DID))).map(
+                (r) => r.collection
+            )
+        ).toEqual(["app.bsky.actor.profile"])
+    })
+
+    it("a permanent answer for a deleted DID stays gone-permanent", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), verified())
+            await obj.completeDeletion(DID, Date.now(), true)
+            await obj.completeDeletion(DID, Date.now(), false)
+        })
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
+            "gone-permanent"
+        )
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(true)
+    })
 })

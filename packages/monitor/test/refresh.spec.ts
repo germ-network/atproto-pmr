@@ -67,6 +67,8 @@ function harness(opts: {
     const attempted = new Map<string, number>()
     const windows: string[] = []
     const quiet: string[] = []
+    const quietVerified: Array<{ cid: string; verifiedWith: string }> = []
+    const goneReversible: string[] = []
     const deleted = new Set<string>()
     const onChange = vi.fn(async () => {})
     const onRegression = vi.fn(async () => {})
@@ -131,9 +133,11 @@ function harness(opts: {
             },
             markChecked: async (did, at) => void checkedAt.set(did, at),
             markAttempted: async (did, at) => void attempted.set(did, at),
-            completeQuietly: async (did, rev) => {
+            markGoneReversible: async (did) => void goneReversible.push(did),
+            completeQuietly: async (did, rev, _at, verified) => {
                 revs.set(did, rev)
                 quiet.push(did)
+                quietVerified.push(verified)
             },
         },
         refreshSnapshots: { putCheck: async (did, c) => void checks.set(did, c) },
@@ -141,7 +145,7 @@ function harness(opts: {
         collection: COLLECTION,
         rkey: RKEY,
     }
-    return { deps, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
+    return { deps, quietVerified, goneReversible, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
 }
 
 const run = (h: ReturnType<typeof harness>, limit = 64) =>
@@ -175,6 +179,9 @@ describe("refreshDue", () => {
         expect(h.records.get(DID)!.rev).toBe("3m2")
         expect(h.revs.get(DID)).toBe("3m2")
         expect(h.quiet).toEqual([DID])
+        expect(h.quietVerified).toEqual([
+            { cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey },
+        ])
         expect(h.checks.get(DID)).toEqual({ rev: "3m2", checkedAtMs: NOW })
         expect(h.windows).toEqual([])
         expect(h.onChange).not.toHaveBeenCalled()
@@ -253,6 +260,7 @@ describe("refreshDue", () => {
         expect(result.outcomes.confirmed).toBe(1)
         expect(h.windows).toEqual([])
         expect(h.onDelete).not.toHaveBeenCalled()
+        expect(h.goneReversible).toEqual([DID])
         expect(h.checkedAt.get(DID)).toBe(NOW)
     })
 

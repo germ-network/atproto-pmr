@@ -283,7 +283,10 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
     })
-    await deps.index.complete(did, verified.rev, observedAtMs)
+    await deps.index.complete(did, verified.rev, observedAtMs, {
+        cid: verified.cid,
+        verifiedWith: verified.key,
+    })
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"

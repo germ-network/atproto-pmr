@@ -63,6 +63,14 @@ export interface SnapshotEntry {
 /** Whether a DID's declaration is held, and if not, whether that can reverse. */
 export type HolderState = "held" | "gone-reversible" | "gone-permanent"
 
+/** What a completion records about the bytes it just stored. */
+export interface VerifiedWrite {
+    /** The record's CID, as verified. */
+    cid: string
+    /** The `#atproto` key the commit signature verified against. */
+    verifiedWith: string
+}
+
 /** One stored snapshot as the index knows it; the rev authority for that record. */
 export interface IndexedRecord {
     did: string
@@ -73,16 +81,6 @@ export interface IndexedRecord {
     cid: string
     /** Only verified records are indexed. */
     verifiedWith: string
-}
-
-/**
- * The single writer's index of every stored snapshot and of each DID's
- * declaration state. A completion writes its record row and holder state in
- * the same step as the declaration's `revs`/`deleted` rows, at the same rev.
- */
-export interface RecordIndex {
-    recordsOf(did: string): Promise<IndexedRecord[]>
-    holderStateOf(did: string): Promise<HolderState | null>
 }
 
 /**
@@ -209,9 +207,10 @@ export interface MonitorIndex {
     isWatched(did: string): Promise<boolean>
 
     /**
-     * Apply a completed fetch: index the rev, add the DID to the open
-     * window, clear the pending row — **atomically**, and only after the
-     * bytes are durable in the `SnapshotStore`.
+     * Apply a completed fetch: index the rev and the verified record, mark
+     * the DID held, add it to the open window, clear the pending row —
+     * **atomically**, and only after the bytes are durable in the
+     * `SnapshotStore`.
      *
      * Also clears any prior `completeDeletion` mark for `did`. A DID that
      * reaches here again did so through the ordinary commit path — a real
@@ -219,7 +218,12 @@ export interface MonitorIndex {
      * applies; leaving it set would wrongly suppress reverification of a
      * DID that is live again.
      */
-    complete(did: string, rev: string, observedAtMs: number): Promise<void>
+    complete(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void>
 
     /**
      * Apply a confirmed deletion: add `did` to the open digest window and
@@ -269,6 +273,12 @@ export interface MonitorIndex {
 
     /** The indexed rev, for regression detection and duplicate suppression. */
     revOf(did: string): Promise<string | null>
+
+    /** Every verified snapshot stored for `did`, at the rev it was verified at. */
+    recordsOf(did: string): Promise<IndexedRecord[]>
+
+    /** `null` for a DID with no held or gone history. */
+    holderStateOf(did: string): Promise<HolderState | null>
 
     /**
      * The DIDs recorded in one window — a window is indexed by

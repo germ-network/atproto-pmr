@@ -55,7 +55,7 @@ export {
     type SnapshotEntry,
     type HolderState,
     type IndexedRecord,
-    type RecordIndex,
+    type VerifiedWrite,
     type SigningKeyCacheWriter,
     type SnapshotStore,
 } from "./storage"
