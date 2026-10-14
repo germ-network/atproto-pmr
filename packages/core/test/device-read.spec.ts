@@ -11,8 +11,10 @@ import {
     dedupedRecheck,
     encodeRecordReadResponse,
     handleRecordRead,
+    projectGraph,
     type RecordReadDeps,
 } from "../src/device-read"
+import type { FollowEdge } from "../src/follow-edges"
 import { RECORD_READ_KEYS, type RecordReadResponse } from "../src/read-api"
 import { SNAPSHOT_MAX_AGE_MS, type StoredRecordSnapshot } from "../src/snapshot-read"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
@@ -449,10 +451,64 @@ describe("record read codec", () => {
 })
 
 describe("projectGraph", () => {
-    it.todo("following and followers carry each edge's other party and follow rkey")
-    it.todo("an edge is mutual iff a reverse edge is present")
-    it.todo("two follow records of the same pair are two edges")
-    it.todo("edges are sorted by did then rkey, so equal inputs encode to equal bytes")
+    const ME = "did:plc:me"
+    const A = "did:plc:a"
+    const B = "did:plc:b"
+    const edge = (follower: string, subject: string, rkey: string): FollowEdge => ({
+        follower,
+        subject,
+        rkey,
+    })
+
+    it("following and followers carry each edge's other party and follow rkey", () => {
+        const out = projectGraph(ME, [edge(ME, A, "r1")], [edge(B, ME, "r2")])
+        expect(out).toEqual({
+            did: ME,
+            following: [{ did: A, rkey: "r1", mutual: false }],
+            followers: [{ did: B, rkey: "r2", mutual: false }],
+        })
+    })
+
+    it("an edge is mutual iff a reverse edge is present", () => {
+        const out = projectGraph(
+            ME,
+            [edge(ME, A, "r1"), edge(ME, B, "r2")],
+            [edge(A, ME, "r3")]
+        )
+        expect(out.following).toEqual([
+            { did: A, rkey: "r1", mutual: true },
+            { did: B, rkey: "r2", mutual: false },
+        ])
+        expect(out.followers).toEqual([{ did: A, rkey: "r3", mutual: true }])
+    })
+
+    it("two follow records of the same pair are two edges", () => {
+        const out = projectGraph(ME, [edge(ME, A, "r1"), edge(ME, A, "r2")], [])
+        expect(out.following).toEqual([
+            { did: A, rkey: "r1", mutual: false },
+            { did: A, rkey: "r2", mutual: false },
+        ])
+    })
+
+    it("edges are sorted by did then rkey, so equal inputs encode to equal bytes", () => {
+        const edges = [edge(ME, B, "r2"), edge(ME, A, "r9"), edge(ME, A, "r1"), edge(ME, B, "r1")]
+        const inbound = edges.map((e) => edge(e.subject, ME, e.rkey))
+        const forward = projectGraph(ME, edges, inbound)
+        const reversed = projectGraph(ME, [...edges].reverse(), [...inbound].reverse())
+        expect(forward.followers.map((e) => `${e.did}/${e.rkey}`)).toEqual([
+            `${A}/r1`,
+            `${A}/r9`,
+            `${B}/r1`,
+            `${B}/r2`,
+        ])
+        expect(forward.following.map((e) => `${e.did}/${e.rkey}`)).toEqual([
+            `${A}/r1`,
+            `${A}/r9`,
+            `${B}/r1`,
+            `${B}/r2`,
+        ])
+        expect(reversed).toEqual(forward)
+    })
 })
 
 describe("graph read", () => {

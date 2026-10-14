@@ -11,6 +11,7 @@ import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import type { FollowEdge } from "./follow-edges.js"
 import {
     RECORD_READ_KEYS,
+    type GraphEdge,
     type GraphReadResponse,
     type RecordReadMiss,
     type RecordReadResponse,
@@ -240,7 +241,33 @@ export function projectGraph(
     following: FollowEdge[],
     followers: FollowEdge[]
 ): GraphReadResponse {
-    throw new Error("not implemented")
+    const followingDids = new Set(following.map((e) => e.subject))
+    const followerDids = new Set(followers.map((e) => e.follower))
+    return {
+        did,
+        following: sortEdges(
+            following.map((e) => ({
+                did: e.subject,
+                rkey: e.rkey,
+                mutual: followerDids.has(e.subject),
+            }))
+        ),
+        followers: sortEdges(
+            followers.map((e) => ({
+                did: e.follower,
+                rkey: e.rkey,
+                mutual: followingDids.has(e.follower),
+            }))
+        ),
+    }
+}
+
+function sortEdges(edges: GraphEdge[]): GraphEdge[] {
+    return edges.sort((a, b) => compareStrings(a.did, b.did) || compareStrings(a.rkey, b.rkey))
+}
+
+function compareStrings(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0
 }
 
 export function encodeGraphReadResponse(response: GraphReadResponse): Uint8Array {
