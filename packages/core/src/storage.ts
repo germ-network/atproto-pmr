@@ -341,7 +341,10 @@ export interface PMRStore {
      * another. Private to this registration.
      */
     putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void>
-    /** Null for a token never served here or since dropped. */
+    /**
+     * Null for a token never served here or since dropped. The token is
+     * client-supplied: one that cannot be a key is simply not held.
+     */
     getSummaryIndex(token: string): Promise<SummaryIndex | null>
 
     /**

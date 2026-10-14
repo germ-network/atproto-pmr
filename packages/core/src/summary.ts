@@ -7,7 +7,13 @@
  * state on the owner's registration.
  */
 
-import { encodeGraphReadResponse, type GraphProjectionStore } from "./device-read.js"
+import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
+import {
+    encodeGraphReadResponse,
+    graphFromCose,
+    graphToCose,
+    type GraphProjectionStore,
+} from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import type { RecordSnapshotStore } from "./snapshot-read.js"
@@ -133,7 +139,8 @@ function compareStrings(a: string, b: string): number {
     return a < b ? -1 : a > b ? 1 : 0
 }
 
-const refKey = (r: SummaryRecordRef) => JSON.stringify([r.did, r.collection, r.rkey])
+/** Identifies a record across summaries. */
+export const refKey = (r: SummaryRecordRef) => JSON.stringify([r.did, r.collection, r.rkey])
 
 /**
  * What changed from `base` to `current`. With no `base`, everything changed
@@ -198,10 +205,73 @@ export const SUMMARY_RECORD_KEYS = {
 } as const satisfies WireKeys<SummaryRecord>
 
 export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
-    throw new Error("not implemented")
+    const R = SUMMARY_RECORD_KEYS
+    const ref = (r: SummaryRecordRef): Map<string, CoseValue> =>
+        new Map<string, CoseValue>([
+            [R.did, r.did],
+            [R.collection, r.collection],
+            [R.rkey, r.rkey],
+        ])
+    return encodeCose(
+        new Map<string, CoseValue>([
+            [SUMMARY_DELTA_KEYS.token, delta.token],
+            [SUMMARY_DELTA_KEYS.full, delta.full],
+            [SUMMARY_DELTA_KEYS.graph, delta.graph === null ? null : graphToCose(delta.graph)],
+            [
+                SUMMARY_DELTA_KEYS.records,
+                delta.records.map((r) => {
+                    const m = ref(r)
+                    m.set(R.cid, r.cid)
+                    m.set(R.verifiedWith, r.verifiedWith)
+                    m.set(R.car, r.car)
+                    return m
+                }),
+            ],
+            [SUMMARY_DELTA_KEYS.removed, delta.removed.map(ref)],
+        ])
+    )
 }
 
 /** Ignores keys it does not know; throws on a body missing a required field. */
 export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
-    throw new Error("not implemented")
+    const D = SUMMARY_DELTA_KEYS
+    const R = SUMMARY_RECORD_KEYS
+    const map = decodeCoseMap(bytes)
+    const str = (m: Map<number | string, CoseValue>, key: string): string => {
+        const v = m.get(key)
+        if (typeof v !== "string") throw new Error(`summary: missing or malformed "${key}"`)
+        return v
+    }
+    const items = (key: string): Map<number | string, CoseValue>[] => {
+        const list = map.get(key)
+        if (!Array.isArray(list) || !list.every((i) => i instanceof Map)) {
+            throw new Error(`summary: missing or malformed "${key}"`)
+        }
+        return list as Map<number | string, CoseValue>[]
+    }
+    const refOf = (m: Map<number | string, CoseValue>): SummaryRecordRef => ({
+        did: str(m, R.did),
+        collection: str(m, R.collection),
+        rkey: str(m, R.rkey),
+    })
+    const full = map.get(D.full)
+    if (typeof full !== "boolean") throw new Error("summary: missing or malformed full")
+    const graph = map.get(D.graph)
+    if (graph !== null && !(graph instanceof Map)) throw new Error("summary: malformed graph")
+    return {
+        token: str(map, D.token),
+        full,
+        graph: graph === null ? null : graphFromCose(graph),
+        records: items(D.records).map((m) => {
+            const car = m.get(R.car)
+            if (!(car instanceof Uint8Array)) throw new Error("summary: missing or malformed car")
+            return {
+                ...refOf(m),
+                cid: str(m, R.cid),
+                verifiedWith: str(m, R.verifiedWith),
+                car,
+            }
+        }),
+        removed: items(D.removed).map(refOf),
+    }
 }

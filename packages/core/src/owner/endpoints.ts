@@ -15,7 +15,14 @@ import type {
     RegistrationFields,
 } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
-import type { SummaryDeps } from "../summary.js"
+import {
+    buildSummary,
+    diffSummaryIndex,
+    encodeSummaryDelta,
+    refKey,
+    type SummaryDelta,
+    type SummaryDeps,
+} from "../summary.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
     authenticateOwner,
@@ -807,5 +814,53 @@ export async function handleSummaryRead(
     request: Request,
     deps: OwnerDeps & SummaryDeps & { randomBytes: (n: number) => Uint8Array; nowMs: () => number }
 ): Promise<Response> {
-    throw new Error("not implemented")
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+    const { did, store } = a.auth
+
+    const built = await buildSummary(did, deps)
+    if (!built) {
+        return amortize(
+            new Response(null, {
+                status: 409,
+                headers: {
+                    "Retry-After": String(SUMMARY_RETRY_AFTER_SECONDS),
+                    "cache-control": "no-store",
+                },
+            }),
+            did,
+            deps
+        )
+    }
+
+    const since = new URL(request.url).searchParams.get("since")
+    const base = since === null ? null : await store.getSummaryIndex(since)
+    const diff = diffSummaryIndex(base, built.index)
+    const unchanged =
+        !diff.full && !diff.graphChanged && diff.changed.length === 0 && diff.removed.length === 0
+
+    const token = unchanged ? since! : binaryToBase64URL(deps.randomBytes(SUMMARY_TOKEN_BYTES))
+    await store.putSummaryIndex(token, built.index, deps.nowMs())
+
+    const changedKeys = new Set(diff.changed.map(refKey))
+    const delta: SummaryDelta = {
+        token,
+        full: diff.full,
+        graph: diff.graphChanged ? built.index.graph : null,
+        records: diff.full
+            ? built.records
+            : built.records.filter((r) => changedKeys.has(refKey(r))),
+        removed: diff.removed,
+    }
+    return amortize(
+        new Response(toResponseBody(encodeSummaryDelta(delta)), {
+            status: 200,
+            headers: { "content-type": "application/cbor", "cache-control": "no-store" },
+        }),
+        did,
+        deps
+    )
 }
+
+const SUMMARY_RETRY_AFTER_SECONDS = 60
+const SUMMARY_TOKEN_BYTES = 16

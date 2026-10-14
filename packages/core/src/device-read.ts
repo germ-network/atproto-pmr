@@ -273,6 +273,11 @@ function compareStrings(a: string, b: string): number {
 }
 
 export function encodeGraphReadResponse(response: GraphReadResponse): Uint8Array {
+    return encodeCose(graphToCose(response))
+}
+
+/** The graph as a CBOR map, for embedding in another body. */
+export function graphToCose(response: GraphReadResponse): Map<string, CoseValue> {
     const edges = (list: GraphEdge[]): CoseValue[] =>
         list.map(
             (e) =>
@@ -282,18 +287,19 @@ export function encodeGraphReadResponse(response: GraphReadResponse): Uint8Array
                     [GRAPH_EDGE_KEYS.mutual, e.mutual],
                 ])
         )
-    return encodeCose(
-        new Map<string, CoseValue>([
-            [GRAPH_READ_KEYS.did, response.did],
-            [GRAPH_READ_KEYS.following, edges(response.following)],
-            [GRAPH_READ_KEYS.followers, edges(response.followers)],
-        ])
-    )
+    return new Map<string, CoseValue>([
+        [GRAPH_READ_KEYS.did, response.did],
+        [GRAPH_READ_KEYS.following, edges(response.following)],
+        [GRAPH_READ_KEYS.followers, edges(response.followers)],
+    ])
 }
 
 /** Ignores keys it does not know; throws on a body missing a required field. */
 export function decodeGraphReadResponse(bytes: Uint8Array): GraphReadResponse {
-    const map = decodeCoseMap(bytes)
+    return graphFromCose(decodeCoseMap(bytes))
+}
+
+export function graphFromCose(map: Map<number | string, CoseValue>): GraphReadResponse {
     const did = map.get(GRAPH_READ_KEYS.did)
     if (typeof did !== "string") throw new Error("graph read: missing or malformed did")
     const edges = (key: string): GraphEdge[] => {
