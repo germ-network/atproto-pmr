@@ -154,7 +154,7 @@ export interface PendingFetch {
      * settle adds no digest-window entry and no push. A real intake for the
      * DID clears it, so a commit that coalesces into the row still counts.
      */
-    quiet?: boolean
+    quiet: boolean
 }
 
 export type IntakeOutcome =
@@ -260,7 +260,26 @@ export interface MonitorIndex {
      * way a reversal is ever noticed. `true` marking `isDeleted` is what
      * that suppression is for — see `isDeleted`.
      */
-    completeDeletion(did: string, observedAtMs: number, permanent: boolean): Promise<void>
+    completeDeletion(
+        did: string,
+        observedAtMs: number,
+        permanent: boolean,
+        /** Owed by a join, not a change: no window entry. */
+        quiet?: boolean
+    ): Promise<void>
+
+    /**
+     * `complete` without a digest-window entry: the verified rev and record,
+     * the held mark and the cleared join obligation, for a DID that was owed
+     * because it joined interest, not because anything changed. An obligation
+     * a real commit made stays owed.
+     */
+    completeQuietly(
+        did: string,
+        rev: string,
+        observedAtMs: number,
+        verified: VerifiedWrite
+    ): Promise<void>
 
     /**
      * Whether `did`'s declaration is marked *permanently* confirmed-gone
@@ -599,10 +618,11 @@ export interface InterestIndex {
      * `records`, `rec_pending` and `checks` rows. Under `registered` also its
      * `pending`, `revs`, `holder_state`, `deleted` and `key_updates` rows;
      * under `everyone` those stay, so a reactivation or re-publish owed
-     * after a gone settle is still settled. A no-op once `did`'s epoch has
-     * moved past `epoch`.
+     * after a gone settle is still settled. Applies whatever the epoch: the
+     * bytes are already deleted, and a join that raced in re-owes everything
+     * from the now-empty index.
      */
-    forgetLeft(did: string, epoch: number): Promise<void>
+    forgetLeft(did: string): Promise<void>
 }
 
 /** A secondary record a commit or a join says to fetch again. */

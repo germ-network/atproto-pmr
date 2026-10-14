@@ -143,6 +143,7 @@ function harness(opts: {
         onChange,
         onRegression,
         onDelete,
+        interest: { inInterest: async () => true, interestEpoch: async () => 0 },
         nowMs: () => NOW,
     }
     const deps: RefreshDeps = {

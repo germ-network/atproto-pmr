@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers"
 import {
+    applyInterestTransitions,
     decodeEvent,
     decodePlcExportFrame,
     drainKeyUpdates,
@@ -54,7 +55,7 @@ import {
     kvDidDocumentWriter,
     PLC_COVERAGE_KEY,
 } from "./did-document-store"
-import { interestPolicy as policyFromEnv, type MonitorEnv } from "./env"
+import { interestPolicy as policyFromEnv, monitorCollections, type MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
@@ -240,6 +241,16 @@ export class MonitorIngest
                     member INTEGER NOT NULL DEFAULT 0,
                     epoch INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS rec_pending (
+                    did TEXT NOT NULL,
+                    collection TEXT NOT NULL,
+                    rkey TEXT NOT NULL,
+                    rev TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    not_before INTEGER NOT NULL DEFAULT 0,
+                    epoch INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (did, collection, rkey)
+                );
                 CREATE TABLE IF NOT EXISTS reg_state (
                     did TEXT PRIMARY KEY,
                     registered_at INTEGER NOT NULL DEFAULT 0,
@@ -258,6 +269,13 @@ export class MonitorIngest
                     attempted_at INTEGER NOT NULL DEFAULT 0
                 );
             `)
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'quiet'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
             this.assertConfig()
             this.seedHolderState()
             this.seedInterest()
@@ -652,7 +670,7 @@ export class MonitorIngest
         }
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev",
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
             event.did,
             event.rev
         )
@@ -668,7 +686,7 @@ export class MonitorIngest
     async owe(did: string, rev: string): Promise<void> {
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev",
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
             did,
             rev
         )
@@ -918,7 +936,8 @@ export class MonitorIngest
     async completeDeletion(
         did: string,
         observedAtMs: number,
-        permanent: boolean
+        permanent: boolean,
+        quiet = false
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             if (permanent) {
@@ -936,12 +955,14 @@ export class MonitorIngest
                 did,
                 this.env.MONITOR_COLLECTION
             )
-            this.db.sql.exec(
-                "INSERT INTO window_members (window, did) VALUES (?, ?) " +
-                    "ON CONFLICT(window, did) DO NOTHING",
-                windowOf(observedAtMs, this.digestWidthMs()),
-                did
-            )
+            if (!quiet) {
+                this.db.sql.exec(
+                    "INSERT INTO window_members (window, did) VALUES (?, ?) " +
+                        "ON CONFLICT(window, did) DO NOTHING",
+                    windowOf(observedAtMs, this.digestWidthMs()),
+                    did
+                )
+            }
             this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
         })
     }
@@ -996,8 +1017,8 @@ export class MonitorIngest
 
     async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
         return this.db.sql
-            .exec<{ did: string; rev: string; attempts: number; not_before: number }>(
-                "SELECT did, rev, attempts, not_before FROM pending " +
+            .exec<{ did: string; rev: string; attempts: number; not_before: number; quiet: number }>(
+                "SELECT did, rev, attempts, not_before, quiet FROM pending " +
                     "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
                 nowMs,
                 limit
@@ -1008,6 +1029,7 @@ export class MonitorIngest
                 rev: r.rev,
                 attempts: r.attempts,
                 notBeforeMs: r.not_before,
+                quiet: r.quiet === 1,
             }))
     }
 
@@ -1086,7 +1108,13 @@ export class MonitorIngest
         observedAtMs: number,
         verified: VerifiedWrite
     ): Promise<void> {
-        this.ctx.storage.transactionSync(() => this.writeVerified(did, rev, observedAtMs, verified))
+        this.ctx.storage.transactionSync(() => {
+            this.writeVerified(did, rev, observedAtMs, verified)
+            // A live record again: the join obligation and any deletion mark
+            // are spent, but a commit's obligation is still owed.
+            this.db.sql.exec("DELETE FROM pending WHERE did = ? AND quiet = 1", did)
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+        })
     }
 
     // ---- Registration (RPC from the relay's directory) ---------------------
@@ -1356,12 +1384,46 @@ export class MonitorIngest
         )
     }
 
-    async oweJoin(_did: string, _records: readonly WatchedRecord[], _epoch: number): Promise<void> {
-        throw new Error("not implemented")
+    async oweJoin(did: string, records: readonly WatchedRecord[], epoch: number): Promise<void> {
+        if ((await this.interestEpoch(did)) !== epoch) return
+        this.ctx.storage.transactionSync(() => {
+            const indexed =
+                this.db.sql.exec("SELECT 1 FROM revs WHERE did = ?", did).toArray().length > 0
+            const deleted =
+                this.db.sql.exec("SELECT 1 FROM deleted WHERE did = ?", did).toArray().length > 0
+            if (!indexed && !deleted) {
+                this.db.sql.exec(
+                    "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
+                        "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
+                    did
+                )
+            }
+            for (const r of records) {
+                this.db.sql.exec(
+                    "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) " +
+                        "VALUES (?1, ?2, ?3, COALESCE((SELECT rev FROM records " +
+                        "WHERE did = ?1 AND collection = ?2 AND rkey = ?3), ''), ?4) " +
+                        "ON CONFLICT(did, collection, rkey) DO UPDATE SET epoch = ?4",
+                    did,
+                    r.collection,
+                    r.rkey,
+                    epoch
+                )
+            }
+        })
     }
 
-    async forgetLeft(_did: string, _epoch: number): Promise<void> {
-        throw new Error("not implemented")
+    async forgetLeft(did: string): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            for (const table of ["records", "rec_pending", "checks"]) {
+                this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
+            }
+            if (this.interestPolicy() === "registered") {
+                for (const table of ["pending", "revs", "holder_state", "deleted", "key_updates"]) {
+                    this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
+                }
+            }
+        })
     }
 
     // ---- SecondaryIndex ---------------------------------------------------
@@ -1578,6 +1640,7 @@ export class MonitorIngest
                 },
             },
             didDocuments: this,
+            interest: this,
             nowMs: () => Date.now(),
         }
     }
@@ -1844,6 +1907,21 @@ export class MonitorIngest
                 ["unregisters", () => this.applyExpiredUnregisters(Date.now())],
                 ["registration reconcile", () => this.reconcileRegistrations(Date.now())],
                 ["registered leaves", () => this.queueRegisteredLeaves()],
+                [
+                    "interest transitions",
+                    () =>
+                        applyInterestTransitions(
+                            {
+                                interest: this,
+                                index: this,
+                                snapshot: kvSnapshotStore(this.env),
+                                secondaries: monitorCollections(this.env),
+                                didDocuments: this,
+                                nowMs: () => Date.now(),
+                            },
+                            this.envInt(this.env.INTEREST_BATCH, 64)
+                        ),
+                ],
             ] as const) {
                 try {
                     await step()

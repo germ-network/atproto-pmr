@@ -52,11 +52,16 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const attempted = new Map<string, number>()
     const completed: Array<{ cid: string; verifiedWith: string }> = []
     const revs = new Map<string, string>()
-    const pending = new Map<string, { rev: string; attempts: number; notBeforeMs: number }>()
+    const pending = new Map<
+        string,
+        { rev: string; attempts: number; notBeforeMs: number; quiet: boolean }
+    >()
     const records = new Map<string, SnapshotEntry>()
     const windows = new Map<string, Uint8Array>()
     const members = new Map<number, Set<string>>()
     const deleted = new Set<string>()
+    const quietDeletions: string[] = []
+    const quietCompletions: string[] = []
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
@@ -71,7 +76,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         readCursor: async () => null,
         intake: async ({ did, rev }) => {
             if (revs.get(did) === rev) return { outcome: "duplicate" }
-            pending.set(did, { rev, attempts: 0, notBeforeMs: 0 })
+            pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false })
             return { outcome: "accepted" }
         },
         complete: async (did, rev, observedAtMs, verified) => {
@@ -81,10 +86,18 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             pending.delete(did)
             deleted.delete(did)
         },
-        completeDeletion: async (did, observedAtMs, permanent) => {
+        completeDeletion: async (did, observedAtMs, permanent, quiet) => {
             if (permanent) deleted.add(did)
-            addToWindow(did, observedAtMs)
+            if (quiet !== true) addToWindow(did, observedAtMs)
+            else quietDeletions.push(did)
             pending.delete(did)
+        },
+        completeQuietly: async (did, rev, _at, verified) => {
+            completed.push(verified)
+            revs.set(did, rev)
+            quietCompletions.push(did)
+            pending.delete(did)
+            deleted.delete(did)
         },
         isDeleted: async (did) => deleted.has(did),
         duePending: async (nowMs) =>
@@ -98,7 +111,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
-        owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0 }),
+        owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
         clearPending: async (did) => void pending.delete(did),
         markAttempted: async (did, at) => void attempted.set(did, at),
         isWatched: async (did) =>
@@ -131,10 +144,11 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             record.signingKey === null
                 ? { kind: "unverifiable" }
                 : { kind: "verified", key: record.signingKey, rev: fetchedRev, cid: CID },
+        interest: { inInterest: async () => true, interestEpoch: async () => 0 },
         nowMs: () => 1_000_000,
         ...depOverrides,
     }
-    return { deps, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
+    return { deps, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake", () => {
@@ -685,7 +699,7 @@ describe("settle keeps the stored DID document", () => {
     it("records the fetched document as of its fetch time less FETCH_AS_OF_SKEW_MS on a stored outcome", async () => {
         const s = sink()
         const h = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(s.writes).toEqual([
             { did: DID, document: DOCUMENT, asOfMs: FETCHED_AT - FETCH_AS_OF_SKEW_MS },
@@ -861,7 +875,7 @@ describe("settle verifies at ingest", () => {
         const h = harness({ verify: unverifiable, onChange })
         h.revs.set(DID, "3m1")
         h.records.set(DID, storedEntry())
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("unverifiable")
         expect(h.records.get(DID)?.rev).toBe("3m1")
         expect(h.revs.get(DID)).toBe("3m1")
@@ -904,7 +918,7 @@ describe("settle verifies at ingest", () => {
             fetchRecord: async () => withDocument(),
             didDocuments: s,
         })
-        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0 })
+        h.pending.set(DID, { rev: "3m2", attempts: 0, notBeforeMs: 0, quiet: false })
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(s.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
             DID,

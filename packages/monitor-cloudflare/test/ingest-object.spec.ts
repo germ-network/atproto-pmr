@@ -95,6 +95,7 @@ function withFetch(
         ;(obj as unknown as { fetchRecord: typeof fetchRecord }).fetchRecord = fetchRecord
         return settleDue({
             index: obj,
+            interest: obj,
             snapshot: kvSnapshotStore(testEnv),
             fetchRecord,
             verify: stubVerify,

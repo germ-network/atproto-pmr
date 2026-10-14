@@ -105,7 +105,7 @@ export interface IngestDeps {
      * outside it is ignored; and a settle whose DID left interest after the
      * fetch began (its epoch moved) stores nothing.
      */
-    interest?: Pick<InterestIndex, "inInterest" | "interestEpoch">
+    interest: Pick<InterestIndex, "inInterest" | "interestEpoch">
     nowMs(): number
 }
 
@@ -176,7 +176,13 @@ export async function intake(
  * a failed verification, there is no record left to have an opinion
  * about — the source confirmed it is gone.
  */
-export type SettleOutcome = "stored" | "rejected" | "deleted" | "unverifiable"
+export type SettleOutcome =
+    | "stored"
+    | "rejected"
+    | "deleted"
+    | "unverifiable"
+    /** The DID's interest changed during the fetch: nothing stored, the obligation untouched. */
+    | "left"
 
 /**
  * What checking a fetched CAR against the signing key of the DID document
@@ -202,11 +208,12 @@ export type VerifyOutcome =
 export async function settleDeletion(
     deps: IngestDeps,
     did: string,
-    permanent: boolean
+    permanent: boolean,
+    quiet = false
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
-    await deps.index.completeDeletion(did, deps.nowMs(), permanent)
-    await deps.onDelete?.(did)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet)
+    if (!quiet) await deps.onDelete?.(did)
 }
 
 /**
@@ -235,19 +242,23 @@ export interface SettleOptions {
 export async function settle(
     deps: IngestDeps,
     did: string,
-    _opts: SettleOptions = {}
+    opts: SettleOptions = {}
 ): Promise<SettleOutcome> {
+    const quiet = opts.quiet === true
+    const epoch = await deps.interest.interestEpoch(did)
+    const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
         record = await deps.fetchRecord(did)
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
-        await settleDeletion(deps, did, err.permanent)
+        if (await moved()) return "left"
+        await settleDeletion(deps, did, err.permanent, quiet)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    const outcome = await settleFetched(deps, did, record)
+    const outcome = await settleFetched(deps, did, record, quiet, moved)
     // A DID left unwatched has nothing keeping its document current: stop
     // vouching for the one this fetch stored.
     if (!(await deps.index.isWatched(did))) {
@@ -259,9 +270,12 @@ export async function settle(
 async function settleFetched(
     deps: IngestDeps,
     did: string,
-    record: FetchedRecord
+    record: FetchedRecord,
+    quiet: boolean,
+    moved: () => Promise<boolean>
 ): Promise<SettleOutcome> {
     const verified = await deps.verify(did, record)
+    if (await moved()) return "left"
     if (verified.kind === "unverifiable") {
         await settleUnverifiable(deps, did, record)
         return "unverifiable"
@@ -278,7 +292,7 @@ async function settleFetched(
     if (verified.kind === "verified-absent") {
         // The repo is alive and signed to hold no such record. Reversible,
         // because the account may publish it again.
-        await settleDeletion(deps, did, false)
+        await settleDeletion(deps, did, false, quiet)
         return "deleted"
     }
 
@@ -310,10 +324,12 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
     })
-    await deps.index.complete(did, verified.rev, observedAtMs, {
-        cid: verified.cid,
-        verifiedWith: verified.key,
-    })
+    const written = { cid: verified.cid, verifiedWith: verified.key }
+    if (quiet) {
+        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written)
+        return "stored"
+    }
+    await deps.index.complete(did, verified.rev, observedAtMs, written)
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"
@@ -414,7 +430,7 @@ export async function settleDue(
     let settled = 0
     for (const p of due) {
         try {
-            if ((await settle(deps, p.did)) === "stored") settled += 1
+            if ((await settle(deps, p.did, { quiet: p.quiet })) === "stored") settled += 1
         } catch {
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only

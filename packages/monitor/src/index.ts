@@ -127,6 +127,7 @@ export {
 export {
     intake,
     settle,
+    settleDeletion,
     settleDue,
     type FetchedDidDocument,
     type FetchedRecord,

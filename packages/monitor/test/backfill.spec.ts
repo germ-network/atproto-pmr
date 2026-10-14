@@ -27,6 +27,7 @@ function fakeIndex(overrides: Partial<MonitorIndex> = {}): {
         isWatched: async () => false,
         complete: async () => {},
         completeDeletion: async () => {},
+        completeQuietly: async () => {},
         isDeleted: async () => false,
         duePending: async () => [],
         deferPending: async () => {},

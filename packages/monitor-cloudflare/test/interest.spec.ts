@@ -6,9 +6,20 @@
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
-import { intakePlcEvent, settle, type PlcExportEvent } from "@germ-network/atproto-pmr-monitor"
-import type { MonitorEnv } from "../src/env"
+import {
+    applyInterestTransitions,
+    intakePlcEvent,
+    settle,
+    settleDeletion,
+    settleDue,
+    type FetchedRecord,
+    type IngestDeps,
+    type PlcExportEvent,
+    type VerifyOutcome,
+} from "@germ-network/atproto-pmr-monitor"
+import { monitorCollections, type MonitorEnv } from "../src/env"
 import type { MonitorIngest } from "../src/ingest-object"
+import { RegisteredMonitorIngest } from "./worker"
 import { kvSnapshotStore } from "../src/snapshot-store"
 
 const testEnv = env as unknown as MonitorEnv & {
@@ -242,6 +253,7 @@ describe("interest set and policy", () => {
             const outcome = await settle(
                 {
                     index: obj,
+                    interest: obj,
                     snapshot: kvSnapshotStore(testEnv),
                     didDocuments: obj,
                     fetchRecord: async () => ({
@@ -438,10 +450,18 @@ describe("registration RPC and reconcile", () => {
     })
 
     it("an object configured for registered without pmrDirectory refuses to start", async () => {
-        const ns = (env as unknown as { ingestUnbound: DurableObjectNamespace<MonitorIngest> }).ingestUnbound
-        await expect(
-            ns.get(ns.idFromName("unbound")).isRegistered("did:plc:a")
-        ).rejects.toThrow(/pmrDirectory/)
+        await runInDurableObject(registeredStub(), async (_obj, state) => {
+            let startup: Promise<unknown> | undefined
+            Object.defineProperty(state, "blockConcurrencyWhile", {
+                value: (fn: () => Promise<unknown>) => {
+                    startup = fn()
+                    startup.catch(() => {})
+                    return startup
+                },
+            })
+            new RegisteredMonitorIngest(state, { ...testEnv, pmrDirectory: undefined })
+            await expect(startup).rejects.toThrow(/pmrDirectory/)
+        })
     })
 
     it("a reconcile that has never run runs on the first alarm", async () => {
@@ -453,12 +473,12 @@ describe("registration RPC and reconcile", () => {
         await alarm(stub)
         await inObj(stub, async (obj) => {
             expect(await obj.isRegistered("did:plc:listed")).toBe(true)
-            // Done, so the next call inside the day lists nothing.
-            withDirectory(obj, directory([]))
+            // Done, so a call inside the day lists nothing.
+            withDirectory(obj, directory(["did:plc:later"]))
             await reg(obj).reconcileRegistrations(Date.now() + 1_000)
-            expect(await obj.isRegistered("did:plc:listed")).toBe(true)
+            expect(await obj.isRegistered("did:plc:later")).toBe(false)
             await reg(obj).reconcileRegistrations(FAR() + 86_400_000)
-            expect(await obj.isRegistered("did:plc:listed")).toBe(false)
+            expect(await obj.isRegistered("did:plc:later")).toBe(true)
         })
     })
 
@@ -513,20 +533,398 @@ describe("registration RPC and reconcile", () => {
     })
 })
 
+type Internals = {
+    fetchRecord: (did: string) => Promise<FetchedRecord>
+    verifyRecord: (did: string, record: FetchedRecord) => Promise<VerifyOutcome>
+    onChange: (did: string, rev: string) => Promise<void>
+    onDelete: (did: string) => Promise<void>
+    deps(): IngestDeps
+}
+const KEY = "zKey"
+const PROFILE = "app.bsky.actor.profile"
+let d = 0
+const uniqDid = () => `did:plc:s2c${(d += 1)}x${crypto.randomUUID().slice(0, 8)}`
+
+/** Swap the authoritative fetch and record the pushes the object would send. */
+function drive(obj: MonitorIngest, fetch: (did: string) => Promise<{ rev: string }>) {
+    const o = obj as unknown as Internals
+    const pushed: string[] = []
+    o.fetchRecord = async (did) => {
+        const { rev } = await fetch(did)
+        return {
+            car: new Uint8Array([1]),
+            source: "https://pds.example",
+            signingKey: KEY,
+            didDocument: { document: { id: did }, fetchedAtMs: Date.now() },
+            rev,
+        } as FetchedRecord
+    }
+    o.verifyRecord = async (_did, record) => ({
+        kind: "verified",
+        key: KEY,
+        rev: (record as FetchedRecord & { rev: string }).rev,
+        cid: "bafyreistub",
+    })
+    o.onChange = async (did) => void pushed.push(`change ${did}`)
+    o.onDelete = async (did) => void pushed.push(`delete ${did}`)
+    return { o, pushed }
+}
+
+const applyTransitions = (obj: MonitorIngest) =>
+    applyInterestTransitions(
+        {
+            interest: obj,
+            index: obj,
+            snapshot: kvSnapshotStore(testEnv),
+            secondaries: monitorCollections(obj.env),
+            didDocuments: obj,
+            nowMs: () => Date.now(),
+        },
+        64
+    )
+const settleOwed = (obj: MonitorIngest) => settleDue((obj as unknown as Internals).deps(), 32)
+const rows = <R extends Record<string, unknown>>(
+    stub: DurableObjectStub<MonitorIngest>,
+    sql: string
+) =>
+    runInDurableObject(stub, (_o, state) => state.storage.sql.exec<R>(sql).toArray()) as Promise<R[]>
+
 describe("joining and leaving interest", () => {
-    it.todo("joining owes declaration and secondaries")
-    it.todo("leaving disposes all snapshots without a push")
+    it("joining owes declaration and secondaries", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            expect(await applyTransitions(obj)).toBe(1)
+            expect(await obj.dueTransitions(10)).toEqual([])
+        })
+        expect(await rows(stub, `SELECT did, rev, quiet FROM pending`)).toEqual([{ did, rev: "", quiet: 1 }])
+        expect(await rows(stub, `SELECT did, collection, rkey, rev, epoch FROM rec_pending`)).toEqual([
+            { did, collection: PROFILE, rkey: "self", rev: "", epoch: 1 },
+        ])
+    })
+
+    it("a holder already indexed is not re-owed its declaration on joining", async () => {
+        const stub = everyoneStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.complete(did, "3m1", 1_000, VERIFIED)
+            ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec(
+                "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) VALUES (?, ?, 'self', '3m0', 'c', 'k')",
+                did,
+                PROFILE
+            )
+            await applyTransitions(obj)
+        })
+        expect(await rows(stub, `SELECT did FROM pending`)).toEqual([])
+        expect(await rows(stub, `SELECT rev FROM rec_pending`)).toEqual([{ rev: "3m0" }])
+    })
+
+    async function withSnapshots(obj: MonitorIngest, did: string) {
+        const store = kvSnapshotStore(testEnv)
+        const entry = {
+            rev: "3m1",
+            car: new Uint8Array([7]),
+            observedAtMs: 1,
+            source: "s",
+            signingKey: KEY,
+            verifiedWith: KEY,
+            cid: "bafyreistub",
+        }
+        await store.putRecord(did, entry)
+        await store.putSecondary({ did, collection: PROFILE, rkey: "self" }, entry)
+        await store.putSecondaryCheck({ did, collection: PROFILE, rkey: "self" }, { rev: "3m1", checkedAtMs: 5 })
+        await obj.complete(did, "3m1", 1_000, VERIFIED)
+        ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec(
+            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) VALUES (?, ?, 'self', '3m1', 'c', 'k')",
+            did,
+            PROFILE
+        )
+    }
+
+    it("leaving disposes all snapshots without a push", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        let pushed: string[] = []
+        await inObj(stub, async (obj) => {
+            pushed = drive(obj, async () => ({ rev: "3m1" })).pushed
+            await obj.setRegistered(did, true, 1)
+            await withSnapshots(obj, did)
+            await obj.owe(did, "3m2")
+            await obj.markChecked(did, 5)
+            await obj.oweKeyUpdate(did, { kind: "delete" })
+            await applyTransitions(obj) // the join
+            await obj.setRegistered(did, false, 2)
+            expect(await applyTransitions(obj)).toBe(1)
+            const store = kvSnapshotStore(testEnv)
+            expect(await store.getRecord(did)).toBeNull()
+            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await env.records.get(`chk:${PROFILE}/self:${did}`)).toBeNull()
+        })
+        expect(pushed).toEqual([])
+        for (const t of ["records", "rec_pending", "checks", "pending", "revs", "holder_state", "key_updates"]) {
+            expect(await rows(stub, `SELECT did FROM ${t} WHERE did = '${did}'`)).toEqual([])
+        }
+    })
+
+    it("under everyone a leave keeps pending, revs and holder_state", async () => {
+        const stub = everyoneStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.complete(did, "3m1", 1_000, VERIFIED)
+            await applyTransitions(obj)
+            await obj.completeDeletion(did, 2_000, false)
+            await obj.owe(did, "3m2")
+            await applyTransitions(obj)
+        })
+        expect(await rows(stub, `SELECT did FROM revs WHERE did = '${did}'`)).toHaveLength(1)
+        expect(await rows(stub, `SELECT did FROM pending WHERE did = '${did}'`)).toHaveLength(1)
+        expect(await rows(stub, `SELECT state FROM holder_state WHERE did = '${did}'`)).toEqual([
+            { state: "gone-reversible" },
+        ])
+    })
+
     it.todo("a secondary settle for a DID not in interest stores nothing")
-    it.todo("a declaration deletion keeps the profile of a DID still in interest")
-    it.todo("leaving withdraws the stored DID document")
-    it.todo("a fetch in flight across a leave stores nothing")
-    it.todo("a non-holder's join settle is quiet")
-    it.todo("a holder's join settle is quiet unless a real commit coalesced into it")
-    it.todo("leaving under registered drops the deleted row so the document stops being followed")
-    it.todo("a reactivation owed between a gone settle and its leave is still settled (everyone)")
-    it.todo("a join settle that finds the declaration gone records gone-reversible without a window entry or onDelete")
-    it.todo("a leave then a join before the alarm disposes nothing")
-    it.todo("a quiet join settle with a permanent not-found writes deleted with no push")
+
+    it("a declaration deletion keeps the profile of a DID still in interest", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await withSnapshots(obj, did)
+            await settleDeletion((obj as unknown as Internals).deps(), did, false)
+            const store = kvSnapshotStore(testEnv)
+            expect(await store.getRecord(did)).toBeNull()
+            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect((await obj.recordsOf(did)).map((r) => r.collection)).toEqual([PROFILE])
+        })
+    })
+
+    it("leaving withdraws the stored DID document", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await obj.recordDidDocument(did, { id: did }, Date.now() - 1_000)
+            await applyTransitions(obj)
+            await obj.setRegistered(did, false, 2)
+            await applyTransitions(obj)
+        })
+        const [row] = await rows<{ confirmed_at: number }>(
+            stub,
+            `SELECT confirmed_at FROM did_documents WHERE did = '${did}'`
+        )
+        expect(row!.confirmed_at).toBe(0)
+    })
+
+    it("a fetch in flight across a leave stores nothing", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            const { o } = drive(obj, async () => {
+                await obj.setRegistered(did, false, 2)
+                return { rev: "3m1" }
+            })
+            const outcome = await settle(o.deps(), did, { quiet: true })
+            expect(outcome).toBe("left")
+            expect(await kvSnapshotStore(testEnv).getRecord(did)).toBeNull()
+            expect(await obj.revOf(did)).toBeNull()
+        })
+    })
+
+    it("a not-found across a leave stores nothing", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            const { o } = drive(obj, async () => {
+                await obj.setRegistered(did, false, 2)
+                throw new RecordNotFoundError("gone", true)
+            })
+            expect(await settle(o.deps(), did, { quiet: true })).toBe("left")
+            expect(await obj.isDeleted(did)).toBe(false)
+            expect(await obj.holderStateOf(did)).toBeNull()
+        })
+    })
+
+    it("a real obligation clears the quiet mark of a join's", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            expect((await obj.duePending(Date.now(), 10))[0]!.quiet).toBe(true)
+            await obj.owe(did, "3m1")
+            expect((await obj.duePending(Date.now(), 10))[0]!.quiet).toBe(false)
+        })
+    })
+
+    it("a register arriving while a leave disposes does not strand the index ahead of the bytes", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await withSnapshots(obj, did)
+            await obj.setRegistered(did, false, 2)
+            await applyInterestTransitions(
+                {
+                    interest: obj,
+                    index: obj,
+                    snapshot: kvSnapshotStore(testEnv),
+                    secondaries: monitorCollections(obj.env),
+                    didDocuments: {
+                        markDidDocumentStale: async () => {
+                            await obj.register(did)
+                        },
+                    } as never,
+                    nowMs: () => Date.now(),
+                },
+                64
+            )
+            expect(await obj.revOf(did)).toBeNull()
+            expect(await obj.dueTransitions(10)).toEqual([{ did, change: "join", epoch: 3 }])
+            await applyTransitions(obj)
+            expect((await obj.duePending(Date.now(), 10)).map((p) => p.did)).toEqual([did])
+        })
+    })
+
+    const windowCount = (stub: DurableObjectStub<MonitorIngest>) =>
+        rows<{ n: number }>(stub, "SELECT COUNT(*) AS n FROM window_members").then((r) => r[0]!.n)
+
+    it("a non-holder's join settle is quiet", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        let pushed: string[] = []
+        await inObj(stub, async (obj) => {
+            pushed = drive(obj, async () => ({ rev: "3m1" })).pushed
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await settleOwed(obj)
+            expect(await obj.revOf(did)).toBe("3m1")
+            expect(await kvSnapshotStore(testEnv).getRecord(did)).not.toBeNull()
+            expect(await obj.holderStateOf(did)).toBe("held")
+        })
+        expect(pushed).toEqual([])
+        expect(await windowCount(stub)).toBe(0)
+        expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+    })
+
+    it("a holder's join settle is quiet unless a real commit coalesced into it", async () => {
+        for (const coalesced of [false, true]) {
+            const stub = everyoneStub()
+            const did = uniqDid()
+            let pushed: string[] = []
+            await inObj(stub, async (obj) => {
+                pushed = drive(obj, async () => ({ rev: "3m2" })).pushed
+                await obj.complete(did, "3m1", 1_000, VERIFIED)
+                await kvSnapshotStore(testEnv).putRecord(did, {
+                    rev: "3m1",
+                    car: new Uint8Array([1]),
+                    observedAtMs: 1,
+                    source: "s",
+                    signingKey: KEY,
+                    verifiedWith: KEY,
+                    cid: "bafyreistub",
+                })
+                ;(obj as unknown as { db: DurableObjectStorage }).db.sql.exec(
+                    "DELETE FROM window_members; INSERT INTO pending (did, rev, quiet) VALUES (?, '3m1', 1)",
+                    did
+                )
+                if (coalesced) await obj.intake({ did, rev: "3m2" }, "9")
+                await settleOwed(obj)
+                expect(await obj.revOf(did)).toBe("3m2")
+            })
+            expect(pushed).toEqual(coalesced ? [`change ${did}`] : [])
+            expect(await windowCount(stub)).toBe(coalesced ? 1 : 0)
+        }
+    })
+
+    it("leaving under registered drops the deleted row so the document stops being followed", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await obj.complete(did, "3m1", 1_000, VERIFIED)
+            await obj.completeDeletion(did, 2_000, true)
+            expect(await obj.isDeleted(did)).toBe(true)
+            await obj.setRegistered(did, false, 2)
+            await applyTransitions(obj)
+            await applyTransitions(obj)
+            expect(await obj.isDeleted(did)).toBe(false)
+            expect(await obj.revOf(did)).toBeNull()
+            expect(await obj.isWatched(did)).toBe(false)
+        })
+    })
+
+    it("a reactivation owed between a gone settle and its leave is still settled (everyone)", async () => {
+        const stub = everyoneStub()
+        const did = uniqDid()
+        await inObj(stub, async (obj) => {
+            drive(obj, async () => ({ rev: "3m2" }))
+            await obj.complete(did, "3m1", 1_000, VERIFIED)
+            await applyTransitions(obj)
+            await obj.completeDeletion(did, 2_000, false)
+            await obj.owe(did, "3m2")
+            await applyTransitions(obj) // the leave
+            await settleOwed(obj)
+            expect(await obj.revOf(did)).toBe("3m2")
+            expect(await obj.inInterest(did)).toBe(true)
+        })
+    })
+
+    it("a join settle that finds the declaration gone records gone-reversible without a window entry or onDelete", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        let pushed: string[] = []
+        await inObj(stub, async (obj) => {
+            pushed = drive(obj, async () => {
+                throw new RecordNotFoundError("no record", false)
+            }).pushed
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await settleOwed(obj)
+            expect(await obj.holderStateOf(did)).toBe("gone-reversible")
+            expect(await obj.isDeleted(did)).toBe(false)
+        })
+        expect(pushed).toEqual([])
+        expect(await windowCount(stub)).toBe(0)
+        expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+    })
+
+    it("a leave then a join before the alarm disposes nothing", async () => {
+        const did = uniqDid()
+        await inObj(registeredStub(), async (obj) => {
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await withSnapshots(obj, did)
+            await obj.setRegistered(did, false, 2)
+            await obj.setRegistered(did, true, 3)
+            await applyTransitions(obj)
+            const store = kvSnapshotStore(testEnv)
+            expect(await store.getRecord(did)).not.toBeNull()
+            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect(await obj.revOf(did)).toBe("3m1")
+        })
+    })
+
+    it("a quiet join settle with a permanent not-found writes deleted with no push", async () => {
+        const stub = registeredStub()
+        const did = uniqDid()
+        let pushed: string[] = []
+        await inObj(stub, async (obj) => {
+            pushed = drive(obj, async () => {
+                throw new RecordNotFoundError("repo gone", true)
+            }).pushed
+            await obj.setRegistered(did, true, 1)
+            await applyTransitions(obj)
+            await settleOwed(obj)
+            expect(await obj.isDeleted(did)).toBe(true)
+        })
+        expect(pushed).toEqual([])
+        expect(await windowCount(stub)).toBe(0)
+    })
 })
 
 describe("head checks follow interest", () => {

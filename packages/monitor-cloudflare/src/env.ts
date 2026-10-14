@@ -59,6 +59,9 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      */
     UNREGISTER_GRACE_MS?: string
 
+    /** Interest transitions applied per alarm, default 64. */
+    INTEREST_BATCH?: string
+
     /**
      * The relay's directory of registered DIDs (bare `<did>` keys), read only:
      * the daily reconcile lists it to repair a missed register or unregister.
