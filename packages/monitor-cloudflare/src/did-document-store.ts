@@ -44,9 +44,9 @@ function sortKeys(value: unknown): unknown {
 
 /**
  * The relay's read: `storedSigningKeyResolver`'s `documents`. A malformed
- * entry reads as none. A DID that leaves the watched set (settle
- * rejected it before it was ever indexed) keeps its last entry until it ages
- * past trust, so a direct reader must apply the same trust rule.
+ * entry reads as none. A DID that leaves the monitor's watched set is
+ * given no more updates, so an entry for it ages out: a direct reader must
+ * apply the same trust rule.
  */
 export function kvDidDocuments<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>

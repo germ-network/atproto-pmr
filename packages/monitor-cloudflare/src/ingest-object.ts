@@ -443,9 +443,9 @@ export class MonitorIngest
      * directory. Rows selected:
      * any whose version differs from the published one; then any confirmed
      * at least half of `STORED_DID_DOCUMENT_MAX_AGE_MS` after what KV holds
-     * (so an unchanged document costs at most two KV writes a day); then any
-     * whose KV confirmation predates the stream's current unbroken run while
-     * its stored one does not. Marks published the version and confirmation
+     * (so an unchanged document costs at most two KV writes a day, plus one
+     * when a new unbroken run begins); then any whose KV confirmation predates
+     * the stream's current unbroken run while its stored one does not. Marks published the version and confirmation
      * it put, not whatever the row holds by then. A KV failure leaves the row
      * for the next call. Resolves `{published, remaining, coveredThroughMs}`:
      * `remaining` counts content changes (staleness included) unpublished

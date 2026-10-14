@@ -674,7 +674,7 @@ describe("settle keeps the stored DID document", () => {
         ])
     })
 
-    it("records the fetched document even when verification rejects the record", async () => {
+    it("records the fetched document when verification rejects the record, then withdraws trust in it", async () => {
         const s = sink()
         const h = harness({
             fetchRecord: async () => withDocument(),
@@ -683,6 +683,19 @@ describe("settle keeps the stored DID document", () => {
         })
         expect(await settle(h.deps, DID)).toBe("rejected")
         expect(s.writes).toHaveLength(1)
+        expect(s.didDocuments.markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(
+            DID,
+            FETCHED_AT - FETCH_AS_OF_SKEW_MS
+        )
+    })
+
+    it("marks nothing stale when the record settles or the fetch carried no document", async () => {
+        const s = sink()
+        const stored = harness({ fetchRecord: async () => withDocument(), didDocuments: s.didDocuments })
+        await settle(stored.deps, DID)
+        const bare = harness({ verify: async () => false, didDocuments: s.didDocuments })
+        await settle(bare.deps, DID)
+        expect(s.didDocuments.markDidDocumentStale).not.toHaveBeenCalled()
     })
 
     it("records the fetched document even when the rev regressed", async () => {

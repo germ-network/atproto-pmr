@@ -75,7 +75,7 @@ does not extend to a read that has to fall through to the PDS.
 | The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
 | Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
 | A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](key-transparency.md#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
-| PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([key transparency](key-transparency.md#the-signing-key-cache)) |
+| PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](key-transparency.md#the-signing-key-cache), [stored documents](key-transparency.md#the-stored-did-document)) |
 | Pushing **counterpart** record changes to devices | **not yet built** |
 | A device-facing read API, and so the 24-hour rule for device reads | **not yet built** |
 | `did:web` document proxying | **not yet built** |

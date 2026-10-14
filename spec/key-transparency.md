@@ -425,7 +425,8 @@ store: the document, when the monitor last confirmed it current, and whether
 it came from `did:plc` or `did:web`. A document the monitor cannot vouch for —
 a tombstone, or one whose latest operation it could not render — is published
 as the absence of `doc:<did>`, so a reader asks the directory. An unchanged
-document is re-confirmed at most twice a day.
+document is re-confirmed at most twice a day, and once more when a new coverage
+run begins.
 
 **Coverage.** The export stream cannot say a document is *current*, only that
 no operation was missed: `plc:coverage` records the stream's URL, when its
@@ -433,32 +434,39 @@ current unbroken run began, and the `createdAt` through which every operation
 accepted since that run began has reached the published documents. A run
 begins with the first frame after a start without a usable cursor — first
 configuration, a tip start after `OutdatedCursor` or `FutureCursor`, a changed
-URL, or a frame the monitor failed to take in — and a restart that resumes from
-the stored cursor continues the same run, because the stream replays the gap.
-The marker advances only after a publish pass leaves no unpublished change, and
-is written only once the run is stored with the cursor, so an eviction cannot
-lose a run the marker claims.
+URL — and a restart that resumes from the stored cursor continues the same run,
+because the stream replays the gap. A frame the monitor fails to take in keeps
+the cursor but ends the run, and the next frame with a readable `createdAt`
+begins a new one. The marker advances only after a publish pass leaves no
+unpublished change, and is written only once the run is stored with the cursor,
+so an eviction cannot lose a run the marker claims. When a run ends the old
+marker stays in the records store, so what it covered stays trusted until it
+is ten minutes old, which is the bound it was published under.
 
 **How a relay trusts it.** A stored `did:plc` document is trusted for 24 hours
 from when it was confirmed only if that confirmation falls inside the marker's
 current run and the marker's `coveredThroughMs` is no more than ten minutes
 old. Any other stored document — `did:web`, or `did:plc` without such coverage
 — is trusted for ten minutes, the same as a direct fetch, and past its window
-the relay asks the directory. A missing or unreadable marker is no coverage.
+the relay falls back to its signing-key cache and then the directory. A missing or unreadable marker is no coverage.
 The staleness bound of the covered case is the stream's lag plus one alarm
-interval plus the records store's propagation delay (about a minute).
+interval plus the records store's propagation delay (about a minute), and
+never more than the ten-minute coverage lag plus that delay.
 
 A DID confirmed permanently deleted owes no re-fetch and no key update, but its
 stored document still follows the stream, because a relay would otherwise trust
-a superseded key for the rest of the 24 hours.
+a superseded key for the rest of the 24 hours. A record a verification hook
+rejects leaves its DID unwatched, so the document its fetch stored is withdrawn
+at once (published as absent) rather than left to age.
 
 **Cost.** Per alarm, at most 64 `doc:` writes and one `plc:coverage` write.
 Per day, per watched DID: about two `doc:` writes plus one for each change to
-its document, plus 720 `plc:coverage` writes for the whole monitor; at 1,754
-watched DIDs that is about 3,500 writes a day, which needs a paid plan. The
-export stream is a second outbound socket beside the one to Jetstream. A
-monitor serving many tenants sizes this per tenant's watched DIDs, not for the
-network.
+its document (and one more for each new coverage run), plus one `plc:coverage`
+write per alarm for the whole monitor — 720 a day at a two-minute alarm. For a
+monitor watching 1,754 DIDs that is about 4,200 writes a day plus changes,
+which needs a paid plan. The export stream is a second outbound socket beside
+the one to Jetstream. The cost scales with the watched set, not with the
+network, so size it from the DIDs the monitor is configured to watch.
 
 ### Keeping the snapshot current
 

@@ -131,10 +131,12 @@ read the old document just before an operation landed can be written after the
 stream's update and keep the old key for up to one TTL. See
 [`key-transparency.md` §The signing-key cache](key-transparency.md#the-signing-key-cache).
 A relay may instead read the DID document the monitor stores for the sender,
-which orders its writes so that race cannot occur, and trusts it by case: a
+which orders its writes so that race does not arise within the clock-skew
+margin it allows for, and trusts it by case: a
 `did:plc` document confirmed inside the export stream's current unbroken run,
 with the stream caught up, for up to 24 hours (its staleness is the stream's
-lag, plus one alarm interval, plus the propagation delay of about a minute);
+lag, plus one alarm interval, plus the propagation delay of about a minute,
+never more than ten minutes' lag plus that delay);
 a `did:web` document, or a `did:plc` document without that coverage, for ten
 minutes, after which the relay asks the directory as above, with the same
 stale-if-error behaviour. See

@@ -207,7 +207,10 @@ export async function settle(deps: IngestDeps, did: string): Promise<SettleOutco
 
     if (deps.verify !== undefined && !(await deps.verify(did, record))) {
         // Not evidence of anything the monitor may serve. Terminal, not
-        // transient: the same bytes will fail again next time.
+        // transient: the same bytes will fail again next time. The DID is
+        // left unwatched, so nothing will keep its document current: stop
+        // vouching for it.
+        await withdrawFetchedDocument(deps, did, record.didDocument)
         await deps.index.clearPending(did)
         return "rejected"
     }
@@ -270,6 +273,24 @@ export async function recordFetchedDocument(
         await deps.didDocuments.recordDidDocument(
             did,
             fetched.document,
+            fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
+        )
+    } catch {}
+}
+
+/**
+ * Withdraws trust in the stored document `fetched` just wrote, ordered with
+ * that write, for a DID no one will keep current.
+ */
+async function withdrawFetchedDocument(
+    deps: Pick<IngestDeps, "didDocuments">,
+    did: string,
+    fetched: FetchedDidDocument | undefined
+): Promise<void> {
+    if (fetched === undefined || deps.didDocuments === undefined) return
+    try {
+        await deps.didDocuments.markDidDocumentStale(
+            did,
             fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
         )
     } catch {}
