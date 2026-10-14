@@ -297,6 +297,12 @@ export {
 // The proxy cache's stores, what a monitor watches, and the device read API's bodies.
 export { type FollowEdge, type FollowEdgeStore } from "./follow-edges"
 export {
+    type GraphChangeLog,
+    type GraphChangeReason,
+    type GraphChangeRow,
+    type InterestReader,
+} from "./graph"
+export {
     type CachedDidDocument,
     type DidDocument,
     type DidDocumentCache,
@@ -305,7 +311,9 @@ export {
     type DidVerificationMethod,
 } from "./did-document"
 export {
+    parseInterestPolicy,
     parseMonitorCollections,
+    type InterestPolicy,
     type WatchedCollection,
     type WatchedDidSet,
     type WatchedRecord,

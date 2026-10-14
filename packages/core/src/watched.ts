@@ -1,7 +1,9 @@
 /**
  * What a monitor watches. A `WatchedRecord` is a singleton record snapshotted
  * for every watched DID; a `WatchedCollection` is a whole collection, such as
- * follows, subscribed with a set of DIDs as the subscription's own filter.
+ * follows, whose events are kept only for DIDs in the monitor's interest set.
+ * The interest set is the monitor's allow list, chosen by its
+ * `InterestPolicy`; the subscription itself is filtered by collection only.
  */
 
 import { DECLARATION_COLLECTION_NSID } from "./declaration"
@@ -11,8 +13,27 @@ export interface WatchedRecord {
     rkey: string
 }
 
-/** The DIDs a collection is subscribed for: every DID carrying a Germ declaration. */
-export type WatchedDidSet = "declarations"
+/** The DIDs a collection is kept for: the monitor's interest set. */
+export type WatchedDidSet = "interest"
+
+/**
+ * Who a monitor watches. `registered`: its registered users and every DID
+ * they follow, so a self-hosted or multi-tenant relay pays per user.
+ * `everyone`: every DID carrying a Germ declaration, and every one of their
+ * social graphs.
+ */
+export type InterestPolicy = "registered" | "everyone"
+
+/**
+ * Parses `INTEREST_POLICY`. Unset or empty is `registered`; anything else
+ * throws, naming the value, so a typo cannot silently widen or
+ * narrow what a monitor watches.
+ */
+export function parseInterestPolicy(raw: string | undefined): InterestPolicy {
+    if (raw === undefined || raw === "") return "registered"
+    if (raw === "registered" || raw === "everyone") return raw
+    throw new Error(`INTEREST_POLICY must be "registered" or "everyone", got "${raw}"`)
+}
 
 export interface WatchedCollection {
     collection: string

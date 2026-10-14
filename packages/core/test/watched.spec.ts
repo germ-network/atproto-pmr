@@ -4,7 +4,7 @@
  * anything it cannot read exactly, and says which entry it refused.
  */
 import { describe, expect, it } from "vitest"
-import { parseMonitorCollections } from "../src/watched"
+import { parseInterestPolicy, parseMonitorCollections } from "../src/watched"
 
 /** The error must quote the offending entry. */
 function refuses(raw: string, entry: string): void {
@@ -75,5 +75,23 @@ describe("parseMonitorCollections", () => {
             "app.bsky.actor.profile/self,app.bsky.actor.profile/self",
             "app.bsky.actor.profile/self"
         )
+    })
+})
+
+describe("parseInterestPolicy", () => {
+    it("unset or empty policy is registered", () => {
+        expect(parseInterestPolicy(undefined)).toBe("registered")
+        expect(parseInterestPolicy("")).toBe("registered")
+    })
+
+    it("everyone parses", () => {
+        expect(parseInterestPolicy("everyone")).toBe("everyone")
+        expect(parseInterestPolicy("registered")).toBe("registered")
+    })
+
+    it("unknown policy throws naming the value", () => {
+        expect(() => parseInterestPolicy("Everyone")).toThrow('"Everyone"')
+        expect(() => parseInterestPolicy("all")).toThrow('"all"')
+        expect(() => parseInterestPolicy(" everyone")).toThrow('" everyone"')
     })
 })
