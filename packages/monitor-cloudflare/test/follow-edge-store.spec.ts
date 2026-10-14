@@ -1,0 +1,402 @@
+/**
+ * The follow-edge index in D1: the single writer's edge and membership
+ * writes with their change rows, and the read surfaces the graph routes use.
+ */
+import { env } from "cloudflare:test"
+import { beforeEach, describe, expect, it } from "vitest"
+import {
+    D1_ROWS_PER_STATEMENT,
+    type GraphMirrorRow,
+    type GraphMirrorTransition,
+} from "@germ-network/atproto-pmr-monitor"
+import type { MonitorEnv } from "../src/env"
+import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
+import { d1GraphChangeLog } from "../src/graph-change-log"
+import { d1InterestReader } from "../src/interest-reader"
+import { MonitorIngest } from "../src/ingest-object"
+import { runInDurableObject } from "cloudflare:test"
+
+const testEnv = env as unknown as MonitorEnv & { graph: D1Database }
+const db = testEnv.graph
+
+const none: GraphMirrorRow = {
+    did: "",
+    owner: false,
+    holder: false,
+    member: false,
+    registered: false,
+}
+const row = (did: string, flags: Partial<GraphMirrorRow> = {}): GraphMirrorRow => ({
+    ...none,
+    did,
+    ...flags,
+})
+const to = (now: GraphMirrorRow, mirrored: GraphMirrorRow | null = null): GraphMirrorTransition => ({
+    now,
+    mirrored,
+})
+
+const writer = (limit = 1000) => d1FollowEdgeWriter(db, statementBudget(limit))
+const mirror = (...transitions: GraphMirrorTransition[]) => writer().mirror(transitions)
+
+async function all<T>(sql: string, ...binds: unknown[]): Promise<T[]> {
+    return (await db.prepare(sql).bind(...binds).all<T>()).results
+}
+const edgeCount = async (follower: string) =>
+    (await all<{ n: number }>("SELECT COUNT(*) AS n FROM follows WHERE follower = ?", follower))[0]!.n
+const changes = () =>
+    all<{ did: string; reason: string }>("SELECT did, reason FROM graph_changes ORDER BY seq")
+const reasonsFor = async (did: string) =>
+    (await changes()).filter((c) => c.did === did).map((c) => c.reason)
+
+/** Make `did` served, a holder, or both, without change rows. */
+async function seed(did: string, flags: { owner?: boolean; holder?: boolean }) {
+    if (flags.owner) await db.prepare("INSERT INTO graph_owners (did) VALUES (?)").bind(did).run()
+    if (flags.holder) await db.prepare("INSERT INTO graph_holders (did) VALUES (?)").bind(did).run()
+}
+const edge = (follower: string, rkey: string, subject: string) => ({ follower, rkey, subject })
+
+beforeEach(async () => {
+    await db.batch(
+        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+            db.prepare(`DELETE FROM ${t}`)
+        )
+    )
+    await db.exec("DELETE FROM sqlite_sequence WHERE name = 'graph_changes'")
+})
+
+describe("follow-edge index writer and reads", () => {
+    it("following and followers serve only a served graph, filtered to holders", async () => {
+        await seed("did:a", { owner: true, holder: true })
+        await seed("did:b", { holder: true })
+        await seed("did:c", { owner: true })
+        await writer().putEdges(
+            [
+                edge("did:a", "1", "did:b"),
+                edge("did:a", "2", "did:c"),
+                edge("did:b", "3", "did:a"),
+                edge("did:c", "4", "did:a"),
+                edge("did:b", "5", "did:x"),
+            ],
+            1
+        )
+        const store = d1FollowEdgeStore(db)
+        // a is served: its subjects keep only the holder b.
+        expect(await store.following("did:a")).toEqual([edge("did:a", "1", "did:b")])
+        // followers of a: only holders (b, not c).
+        expect(await store.followers("did:a")).toEqual([edge("did:b", "3", "did:a")])
+        // b is a holder but not served; c is served and answers both ways, filtered to holders.
+        expect(await store.following("did:b")).toEqual([])
+        expect(await store.followers("did:b")).toEqual([])
+        expect(await store.following("did:c")).toEqual([edge("did:c", "4", "did:a")])
+        expect(await store.followers("did:c")).toEqual([edge("did:a", "2", "did:c")])
+    })
+
+    it("sweep removes rows older than the listing generation", async () => {
+        const w = writer()
+        await w.putEdges([edge("did:a", "old", "did:s1")], 1)
+        await w.putEdges([edge("did:a", "new", "did:s2"), edge("did:b", "other", "did:s3")], 2)
+        const result = await writer().sweep("did:a", 2)
+        expect(result.subjects).toEqual(["did:s1"])
+        expect(await all("SELECT rkey FROM follows ORDER BY rkey")).toEqual([
+            { rkey: "new" },
+            { rkey: "other" },
+        ])
+    })
+
+    it("prune removes every edge of a follower", async () => {
+        const w = writer()
+        await w.putEdges(
+            [edge("did:a", "1", "did:s1"), edge("did:a", "2", "did:s2"), edge("did:b", "3", "did:s1")],
+            1
+        )
+        const result = await writer().pruneFollower("did:a")
+        expect(result.subjects.sort()).toEqual(["did:s1", "did:s2"])
+        expect(await edgeCount("did:a")).toBe(0)
+        expect(await edgeCount("did:b")).toBe(1)
+    })
+
+    it("put is idempotent on (follower, rkey)", async () => {
+        await writer().putEdges([edge("did:a", "1", "did:s1")], 1)
+        await writer().putEdges([edge("did:a", "1", "did:s2")], 2)
+        await writer().putEdges([edge("did:a", "1", "did:s2")], 2)
+        expect(await all("SELECT follower, rkey, subject, gen FROM follows")).toEqual([
+            { follower: "did:a", rkey: "1", subject: "did:s2", gen: 2 },
+        ])
+        const deleted = await writer().deleteEdges([
+            { follower: "did:a", rkey: "1" },
+            { follower: "did:a", rkey: "absent" },
+        ])
+        expect(deleted.subjects).toEqual(["did:s2"])
+        expect(await edgeCount("did:a")).toBe(0)
+    })
+
+    it("edge writes and their change rows commit in one batch", async () => {
+        await seed("did:a", { owner: true })
+        await seed("did:s1", { holder: true })
+        const calls: number[] = []
+        const counting = {
+            prepare: (sql: string) => db.prepare(sql),
+            batch: async (statements: D1PreparedStatement[]) => {
+                calls.push(statements.length)
+                return db.batch(statements)
+            },
+        } as unknown as D1Database
+        await d1FollowEdgeWriter(counting, statementBudget(100)).putEdges(
+            [edge("did:a", "1", "did:s1")],
+            1
+        )
+        await d1FollowEdgeWriter(counting, statementBudget(100)).deleteEdges([
+            { follower: "did:a", rkey: "1" },
+        ])
+        await d1FollowEdgeWriter(counting, statementBudget(100)).mirror([
+            to(row("did:m", { holder: true, member: true })),
+        ])
+        // One batch per write, holding the rows and every change row.
+        expect(calls).toHaveLength(3)
+        expect(calls.every((n) => n > 1)).toBe(true)
+        expect(await reasonsFor("did:a")).toEqual(["following", "following"])
+        expect(await reasonsFor("did:s1")).toEqual(["followers", "followers"])
+        expect(await reasonsFor("did:m")).toEqual(["holder-add"])
+    })
+
+    it("a followers change row is written only for a holder subject", async () => {
+        await seed("did:holder", { holder: true })
+        await writer().putEdges(
+            [edge("did:a", "1", "did:holder"), edge("did:a", "2", "did:plain")],
+            1
+        )
+        expect(await reasonsFor("did:holder")).toEqual(["followers"])
+        expect(await reasonsFor("did:plain")).toEqual([])
+        await writer().deleteEdges([
+            { follower: "did:a", rkey: "1" },
+            { follower: "did:a", rkey: "2" },
+        ])
+        expect(await reasonsFor("did:holder")).toEqual(["followers", "followers"])
+        expect(await reasonsFor("did:plain")).toEqual([])
+        // A follower that is not served gets no following row.
+        expect(await reasonsFor("did:a")).toEqual([])
+    })
+
+    it("holder-add and served-add fan out per affected DID", async () => {
+        await seed("did:holder", { holder: true })
+        await seed("did:f1", { owner: true })
+        await writer().putEdges(
+            [
+                edge("did:f1", "1", "did:x"), // f1 -> x : x gains holder
+                edge("did:x", "2", "did:holder"), // x -> holder
+                edge("did:g", "3", "did:x"),
+            ],
+            1
+        )
+        await db.exec("DELETE FROM graph_changes")
+        await mirror(to(row("did:x", { holder: true, member: true })))
+        // holder-add for x; f1 (served, follows x) gets following; the holder
+        // subject x follows gets followers.
+        expect(await reasonsFor("did:x")).toEqual(["holder-add"])
+        expect(await reasonsFor("did:f1")).toEqual(["following"])
+        expect(await reasonsFor("did:holder")).toEqual(["followers"])
+
+        await db.exec("DELETE FROM graph_changes")
+        await mirror(to(row("did:g", { owner: true, member: true })))
+        expect(await reasonsFor("did:g")).toEqual(["served-add"])
+        // g -> x with x a holder: x's followers answer changes.
+        expect(await reasonsFor("did:x")).toEqual(["followers"])
+    })
+
+    it("holder or owner removal writes per-affected-DID fan-out rows", async () => {
+        await mirror(to(row("did:holder", { holder: true, member: true })))
+        await mirror(to(row("did:x", { holder: true, member: true })))
+        await mirror(to(row("did:f1", { owner: true, member: true })))
+        await writer().putEdges(
+            [edge("did:f1", "1", "did:x"), edge("did:x", "2", "did:holder")],
+            1
+        )
+        await db.exec("DELETE FROM graph_changes")
+
+        await mirror(
+            to(row("did:x", { holder: false, member: true }), row("did:x", { holder: true, member: true }))
+        )
+        expect(await reasonsFor("did:x")).toEqual(["holder-remove"])
+        expect(await reasonsFor("did:f1")).toEqual(["following"])
+        expect(await reasonsFor("did:holder")).toEqual(["followers"])
+        // A holder that merely stops being a holder keeps its edges.
+        expect(await edgeCount("did:x")).toBe(1)
+
+        await db.exec("DELETE FROM graph_changes")
+        await mirror(
+            to(row("did:f1", { owner: false, member: true }), row("did:f1", { owner: true, member: true }))
+        )
+        expect(await reasonsFor("did:f1")).toEqual(["served-remove"])
+        expect(await edgeCount("did:f1")).toBe(0)
+    })
+
+    it("served-add and served-remove rows track graph_owners", async () => {
+        await mirror(to(row("did:o", { owner: true, member: true })))
+        expect(await all("SELECT did FROM graph_owners")).toEqual([{ did: "did:o" }])
+        expect(await reasonsFor("did:o")).toEqual(["served-add"])
+        await mirror(to(row("did:o", { member: true }), row("did:o", { owner: true, member: true })))
+        expect(await all("SELECT did FROM graph_owners")).toEqual([])
+        expect(await reasonsFor("did:o")).toEqual(["served-add", "served-remove"])
+    })
+
+    it("a prune, sweep or fan-out is a constant number of statements", async () => {
+        const spend = async (n: number) => {
+            const fill = async () => {
+                await db.exec("DELETE FROM follows")
+                await writer().putEdges(
+                    Array.from({ length: n }, (_, i) => edge("did:a", `${i}`, `did:s${i}`)),
+                    1
+                )
+            }
+            const cost = async (run: (w: ReturnType<typeof d1FollowEdgeWriter>) => Promise<unknown>) => {
+                await fill()
+                const budget = statementBudget(1000)
+                await run(d1FollowEdgeWriter(db, budget))
+                return 1000 - budget.remaining
+            }
+            return [
+                await cost((w) => w.pruneFollower("did:a")),
+                await cost((w) => w.sweep("did:a", 2)),
+                await cost((w) =>
+                    w.mirror([to(row("did:a", { member: false }), row("did:a", { member: true }))])
+                ),
+            ]
+        }
+        const small = await spend(2)
+        expect(await spend(200)).toEqual(small)
+        expect(small.every((c) => c > 0 && c < 15)).toBe(true)
+    })
+
+    it("re-mirroring an unchanged DID writes no change rows", async () => {
+        const standing = row("did:h", { holder: true, owner: true, member: true, registered: true })
+        await mirror(to(standing))
+        const first = await changes()
+        expect(first.map((c) => c.reason).sort()).toEqual(["holder-add", "served-add"])
+        await mirror(to(standing, standing))
+        await mirror(to(standing, null))
+        expect(await changes()).toEqual(first)
+        expect(await all("SELECT did, registered FROM interest")).toEqual([
+            { did: "did:h", registered: 1 },
+        ])
+    })
+
+    it("inserts chunk at 25 rows per statement", async () => {
+        const inserts: string[] = []
+        const recording = {
+            prepare: (sql: string) => {
+                if (sql.startsWith("INSERT INTO follows")) inserts.push(sql)
+                return db.prepare(sql)
+            },
+            batch: (statements: D1PreparedStatement[]) => db.batch(statements),
+        } as unknown as D1Database
+        const edges = Array.from({ length: 60 }, (_, i) => edge("did:a", `${i}`, `did:s${i}`))
+        await d1FollowEdgeWriter(recording, statementBudget(1000)).putEdges(edges, 1)
+        expect(D1_ROWS_PER_STATEMENT).toBe(25)
+        const tuples = inserts.map((sql) => (sql.match(/\(\?/g) ?? []).length)
+        expect(tuples).toEqual([25, 25, 10])
+        expect(await edgeCount("did:a")).toBe(60)
+    })
+
+    it("a write the statement budget cannot cover sends nothing", async () => {
+        await expect(
+            d1FollowEdgeWriter(db, statementBudget(1)).putEdges(
+                [edge("did:a", "1", "did:s1"), edge("did:a", "2", "did:s2")],
+                1
+            )
+        ).rejects.toThrow(/budget/)
+        expect(await edgeCount("did:a")).toBe(0)
+        expect(await changes()).toEqual([])
+        const budget = statementBudget(3)
+        expect(budget.take(2)).toBe(true)
+        expect(budget.remaining).toBe(1)
+        expect(budget.take(2)).toBe(false)
+        expect(budget.remaining).toBe(1)
+    })
+
+    it("the object fails at startup without the graph binding", async () => {
+        const stub = testEnv.ingest.get(testEnv.ingest.idFromName("graph-binding"))
+        await runInDurableObject(stub, async (_obj, state) => {
+            let startup: Promise<unknown> | undefined
+            Object.assign(state, {
+                blockConcurrencyWhile(fn: () => Promise<unknown>) {
+                    startup = fn()
+                    return startup
+                },
+            })
+            new MonitorIngest(state, { ...testEnv, graph: undefined })
+            await expect(startup).rejects.toThrow(/graph/)
+        })
+    })
+})
+
+describe("graph change log", () => {
+    it("readSince pages by seq and returns maxSeq from the same batch", async () => {
+        await db.batch(
+            [1, 2, 3, 4, 5].map((n) =>
+                db
+                    .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES (?, 'following', ?)")
+                    .bind(`did:${n}`, n)
+            )
+        )
+        const log = d1GraphChangeLog(db)
+        const first = await log.readSince(0, 2)
+        expect(first.rows.map((r) => [r.seq, r.did, r.reason, r.atMs])).toEqual([
+            [1, "did:1", "following", 1],
+            [2, "did:2", "following", 2],
+        ])
+        expect(first.maxSeq).toBe(5)
+        const rest = await log.readSince(2, 10)
+        expect(rest.rows.map((r) => r.seq)).toEqual([3, 4, 5])
+        expect((await log.readSince(5, 10)).rows).toEqual([])
+    })
+
+    it("maxSeq does not go backwards after the prune empties the log", async () => {
+        await db.batch(
+            [1, 2, 3].map((n) =>
+                db
+                    .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES (?, 'following', ?)")
+                    .bind(`did:${n}`, n)
+            )
+        )
+        const log = d1GraphChangeLog(db)
+        expect((await log.readSince(0, 10)).maxSeq).toBe(3)
+        // The writer's prune never deletes the newest row, so MAX(seq) stays
+        // right too; a raw emptying shows the high-water mark is what counts.
+        expect(await writer().pruneChanges(100, 10)).toBe(2)
+        expect((await log.readSince(0, 10)).maxSeq).toBe(3)
+        await db.exec("DELETE FROM graph_changes")
+        expect(await log.readSince(0, 10)).toEqual({ rows: [], maxSeq: 3 })
+        await db
+            .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:n', 'following', 9)")
+            .run()
+        expect((await log.readSince(0, 10)).rows.map((r) => r.seq)).toEqual([4])
+    })
+})
+
+describe("interest reader", () => {
+    it("InterestReader serves, isRegistered and servedGraphs read the mirrored tables", async () => {
+        await mirror(
+            to(row("did:a", { owner: true, member: true, registered: true })),
+            to(row("did:b", { member: true })),
+            to(row("did:c", { owner: true, member: true }))
+        )
+        const reader = d1InterestReader(db)
+        expect(await reader.serves("did:a")).toBe(true)
+        expect(await reader.serves("did:b")).toBe(true)
+        expect(await reader.serves("did:nobody")).toBe(false)
+        expect(await reader.isRegistered("did:a")).toBe(true)
+        expect(await reader.isRegistered("did:b")).toBe(false)
+        expect(await reader.isRegistered("did:nobody")).toBe(false)
+        expect(await reader.servedGraphs(null, 1)).toEqual({ dids: ["did:a"], cursor: "did:a" })
+        expect(await reader.servedGraphs("did:a", 1)).toEqual({ dids: ["did:c"], cursor: null })
+    })
+})
+
+describe("sqlite_sequence", () => {
+    it("is readable, so maxSeq needs no fallback", async () => {
+        await db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:q', 'following', 1)").run()
+        const [r] = await all<{ seq: number }>("SELECT seq FROM sqlite_sequence WHERE name = 'graph_changes'")
+        expect(r!.seq).toBeGreaterThan(0)
+    })
+})

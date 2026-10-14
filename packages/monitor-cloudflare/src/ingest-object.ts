@@ -50,6 +50,9 @@ import {
     type SigningKeyUpdate,
     type VerifiedWrite,
     type VerifyOutcome,
+    type GraphMirrorIndex,
+    type GraphMirrorRow,
+    type GraphMirrorTransition,
 } from "@germ-network/atproto-pmr-monitor"
 import {
     RepoProofError,
@@ -168,6 +171,7 @@ export class MonitorIngest
         SecondaryIndex,
         SecondaryIntakeIndex,
         FollowStreamIndex,
+        GraphMirrorIndex,
         MonitorRegistrationNotify
 {
     private readonly db: DurableObjectStorage
@@ -296,6 +300,13 @@ export class MonitorIngest
                 CREATE TABLE IF NOT EXISTS listing_requeue (
                     did TEXT PRIMARY KEY,
                     queued_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS graph_mirrored (
+                    did TEXT PRIMARY KEY,
+                    owner INTEGER NOT NULL,
+                    holder INTEGER NOT NULL,
+                    member INTEGER NOT NULL,
+                    registered INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS checks (
                     did TEXT PRIMARY KEY,
@@ -1173,11 +1184,15 @@ export class MonitorIngest
 
     /**
      * Startup check: an unknown `INTEREST_POLICY` throws, and so does
-     * `registered` without the `pmrDirectory` it reconciles against.
+     * `registered` without the `pmrDirectory` it reconciles against, or any
+     * policy without the `graph` D1 binding.
      */
     assertConfig(): void {
         if (this.interestPolicy() === "registered" && this.env.pmrDirectory === undefined) {
             throw new Error("INTEREST_POLICY=registered requires a pmrDirectory binding")
+        }
+        if (this.env.graph === undefined) {
+            throw new Error("the graph D1 binding is required")
         }
     }
 
@@ -1729,6 +1744,27 @@ export class MonitorIngest
             String(nowMs)
         )
         this.followConnectedAt = nowMs
+    }
+
+    // ---- GraphMirrorIndex -----------------------------------------------
+
+    async dueMirror(_limit: number): Promise<GraphMirrorTransition[]> {
+        throw new Error("not implemented")
+    }
+
+    async markMirrored(_rows: readonly GraphMirrorRow[]): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async standingOf(_did: string): Promise<GraphMirrorRow> {
+        throw new Error("not implemented")
+    }
+
+    async mirroredPage(
+        _cursor: string | null,
+        _limit: number
+    ): Promise<{ rows: GraphMirrorRow[]; cursor: string | null }> {
+        throw new Error("not implemented")
     }
 
     // ---- ingest -----------------------------------------------------------

@@ -68,6 +68,13 @@ export {
     type SecondaryIntakeOutcome,
     type SecondarySnapshotStore,
     type SecondaryWriteAnswer,
+    D1_ROWS_PER_STATEMENT,
+    type EdgeRef,
+    type EdgeWriteResult,
+    type FollowEdgeWriter,
+    type GraphMirrorRow,
+    type GraphMirrorTransition,
+    type StatementBudget,
 } from "./storage"
 
 // The allow list and the secondary records it keeps.
@@ -93,6 +100,17 @@ export {
     type FollowStreamIndex,
     type NewEdgeOp,
 } from "./follow-stream"
+
+// The follow-edge index: the mirrored standing.
+export {
+    GRAPH_CHANGE_RETENTION_MS,
+    mirrorGraph,
+    pruneGraphChanges,
+    reconcileGraphMirror,
+    type GraphMirrorDeps,
+    type GraphMirrorIndex,
+    type MirrorReconcileCursor,
+} from "./graph-mirror"
 
 // The change digest.
 export {
