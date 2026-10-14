@@ -9,6 +9,8 @@
  * requirement is stated on the operation rather than left to be inferred.
  */
 
+import type { SummaryIndex } from "./summary.js"
+
 /**
  * Whatever an adapter needs to reach one relay's store: an object
  * identifier, a primary key, or the DID itself.
@@ -331,6 +333,19 @@ export interface PMRStore {
      */
     readWatchState(): Promise<WatchState>
     writeWatchState(state: WatchState): Promise<void>
+
+    /**
+     * The summary index served under `token` (`summary.ts`). Keeps only the
+     * most recently served `SUMMARY_TOKENS_KEPT`; storing one past that drops
+     * the oldest. Each index is its own entry, so storing one never rewrites
+     * another. Private to this registration.
+     */
+    putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void>
+    /**
+     * Null for a token never served here or since dropped. The token is
+     * client-supplied: one that cannot be a key is simply not held.
+     */
+    getSummaryIndex(token: string): Promise<SummaryIndex | null>
 
     /**
      * Fold one re-check outcome into this registration's watch state — the
