@@ -25,6 +25,7 @@ import {
     type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
+    SUMMARY_TOKENS_KEPT,
     type SummaryIndex,
     type SyntheticBehavior,
     type SyntheticState,
@@ -53,6 +54,18 @@ const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
+
+/** One served summary state per entry, so storing one never rewrites another. */
+const SUMMARY_PREFIX = "summary:"
+const summaryKey = (token: string) => SUMMARY_PREFIX + token
+/** Which served states are held, oldest first; small, so a put never reads an index. */
+const KEY_SUMMARY_ORDER = "summaryOrder"
+interface SummaryOrder {
+    token: string
+    order: number
+}
+/** Durable Object storage rejects a key longer than 2 KiB. */
+const MAX_KEY_BYTES = 2048
 
 /**
  * The key families — which *kind of record* this is, an axis orthogonal to
@@ -378,12 +391,29 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_WATCH, state)
     }
 
+    /**
+     * Read-modify-write of the recency list and the entries, atomic under the
+     * Durable Object's input gate: nothing here awaits anything but storage.
+     */
     async putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void> {
-        throw new Error("not implemented")
+        const held = (await this.db.get<SummaryOrder[]>(KEY_SUMMARY_ORDER)) ?? []
+        // Recency is a strictly increasing order, so equal or regressing
+        // clock readings cannot reorder what was served.
+        const latest = held.reduce((max, e) => Math.max(max, e.order), 0)
+        const kept = held.filter((e) => e.token !== token)
+        const next = [...kept, { token, order: Math.max(servedAtMs, latest + 1) }].sort(
+            (a, b) => a.order - b.order
+        )
+        const dropped = next.slice(0, Math.max(0, next.length - SUMMARY_TOKENS_KEPT))
+        await this.db.put(summaryKey(token), index)
+        await this.db.put(KEY_SUMMARY_ORDER, next.slice(dropped.length))
+        if (dropped.length > 0) await this.db.delete(dropped.map((e) => summaryKey(e.token)))
     }
 
     async getSummaryIndex(token: string): Promise<SummaryIndex | null> {
-        throw new Error("not implemented")
+        // A client names the token, so one too long to be a key is simply not held.
+        if (new TextEncoder().encode(summaryKey(token)).length > MAX_KEY_BYTES) return null
+        return (await this.db.get<SummaryIndex>(summaryKey(token))) ?? null
     }
 
     /**

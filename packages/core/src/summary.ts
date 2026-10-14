@@ -7,8 +7,9 @@
  * state on the owner's registration.
  */
 
-import type { GraphProjectionStore } from "./device-read.js"
+import { encodeGraphReadResponse, type GraphProjectionStore } from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
+import { readRecordFromCar } from "./repo-proof.js"
 import type { RecordSnapshotStore } from "./snapshot-read.js"
 import type { WatchedRecord } from "./watched.js"
 
@@ -79,8 +80,60 @@ export async function buildSummary(
     did: string,
     deps: SummaryDeps
 ): Promise<{ index: SummaryIndex; records: SummaryRecord[] } | null> {
-    throw new Error("not implemented")
+    const graph = await deps.projections.get(did)
+    if (!graph) return null
+    const dids = [
+        ...new Set([did, ...graph.following.map((e) => e.did), ...graph.followers.map((e) => e.did)]),
+    ]
+    const held = await Promise.all(
+        dids.flatMap((d) => deps.watched.map((w) => readSummaryRecord(d, w, deps.records)))
+    )
+    const records = held
+        .filter((r): r is SummaryRecord => r !== null)
+        .sort(
+            (a, b) =>
+                compareStrings(a.did, b.did) ||
+                compareStrings(a.collection, b.collection) ||
+                compareStrings(a.rkey, b.rkey)
+        )
+    return {
+        index: {
+            graph,
+            records: records.map(({ car: _car, ...entry }) => entry),
+        },
+        records,
+    }
 }
+
+async function readSummaryRecord(
+    did: string,
+    watched: WatchedRecord,
+    store: RecordSnapshotStore
+): Promise<SummaryRecord | null> {
+    const snapshot = await store.get(did, watched.collection, watched.rkey)
+    if (!snapshot || snapshot.verifiedWith === null) return null
+    let parsed
+    try {
+        parsed = readRecordFromCar(snapshot.car, watched.collection, watched.rkey)
+    } catch {
+        return null
+    }
+    if (!parsed || parsed.did !== did) return null
+    return {
+        did,
+        collection: watched.collection,
+        rkey: watched.rkey,
+        cid: parsed.cid,
+        verifiedWith: snapshot.verifiedWith,
+        car: snapshot.car,
+    }
+}
+
+function compareStrings(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0
+}
+
+const refKey = (r: SummaryRecordRef) => JSON.stringify([r.did, r.collection, r.rkey])
 
 /**
  * What changed from `base` to `current`. With no `base`, everything changed
@@ -95,7 +148,29 @@ export function diffSummaryIndex(
     changed: SummaryIndexEntry[]
     removed: SummaryRecordRef[]
 } {
-    throw new Error("not implemented")
+    if (!base) {
+        return { full: true, graphChanged: true, changed: current.records, removed: [] }
+    }
+    const before = new Map(base.records.map((e) => [refKey(e), e]))
+    const after = new Set(current.records.map(refKey))
+    return {
+        full: false,
+        graphChanged: !equalBytes(
+            encodeGraphReadResponse(base.graph),
+            encodeGraphReadResponse(current.graph)
+        ),
+        changed: current.records.filter((e) => {
+            const prior = before.get(refKey(e))
+            return !prior || prior.cid !== e.cid || prior.verifiedWith !== e.verifiedWith
+        }),
+        removed: base.records
+            .filter((e) => !after.has(refKey(e)))
+            .map(({ did, collection, rkey }) => ({ did, collection, rkey })),
+    }
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, i) => byte === b[i])
 }
 
 /**
