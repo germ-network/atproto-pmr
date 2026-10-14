@@ -1,8 +1,8 @@
 ---
-"@germ-network/atproto-pmr-core": minor
-"@germ-network/atproto-pmr-cloudflare": minor
-"@germ-network/atproto-pmr-monitor": minor
-"@germ-network/atproto-pmr-monitor-cloudflare": minor
+"@germ-network/atproto-pmr-core": patch
+"@germ-network/atproto-pmr-cloudflare": patch
+"@germ-network/atproto-pmr-monitor": patch
+"@germ-network/atproto-pmr-monitor-cloudflare": patch
 ---
 
 Keep a relay's cached did:plc signing keys current from the PLC directory's export stream.
