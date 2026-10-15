@@ -9,20 +9,20 @@ import {
     type SummaryDelta,
     type SummaryPageDeps,
 } from "../src/summary"
-import type { GraphReadResponse } from "../src/read-api"
+import type { OwnerGraph } from "../src/owner-graph"
 
 const OWNER = "did:plc:owner"
 const COLL = "app.example.thing"
 
-const graphOf = (following: string[], followers: string[] = []): GraphReadResponse => ({
+const graphOf = (following: string[], followers: string[] = []): OwnerGraph => ({
     did: OWNER,
-    following: following.map((did) => ({ did, rkey: "r", mutual: false })),
-    followers: followers.map((did) => ({ did, rkey: "r", mutual: false })),
+    following: following.map((did) => ({ did, mutual: false })),
+    followers: followers.map((did) => ({ did, mutual: false })),
 })
 
 /** A world where only the DIDs in `held` have a record. */
-const depsFor = (graph: GraphReadResponse, held: string[]): SummaryPageDeps => ({
-    projections: { get: async () => graph },
+const depsFor = (graph: OwnerGraph, held: string[]): SummaryPageDeps => ({
+    graph: { ownGraph: async () => graph },
     blocks: { ownBlocks: async () => [{ blocker: OWNER, rkey: "b1", subject: "did:plc:blocked" }] },
     index: {
         entries: async (refs) =>
@@ -37,7 +37,7 @@ const depsFor = (graph: GraphReadResponse, held: string[]): SummaryPageDeps => (
     nowMs: () => 0,
 })
 
-const build = async (graph: GraphReadResponse, held: string[]) =>
+const build = async (graph: OwnerGraph, held: string[]) =>
     (await buildSummaryIndex(OWNER, depsFor(graph, held)))!.index
 
 describe("summary without a graph", () => {

@@ -12,7 +12,7 @@ import { encodeOkpEd25519Key } from "../src/cose/key"
 import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
 import { signRequest } from "../src/http-sig/sign"
 import { handleSummaryRead, type OwnerDeps } from "../src/owner/endpoints"
-import type { GraphReadResponse } from "../src/read-api"
+import type { OwnerGraph } from "../src/owner-graph"
 import { readRecordFromCar } from "../src/repo-proof"
 import type { RecordSnapshotStore } from "../src/snapshot-read"
 import type { ChallengeStore, Directory, Locator, PMRStore, RegistrationFields } from "../src/storage"
@@ -153,9 +153,10 @@ describe("summary read", () => {
         // What the monitor holds: a record per DID at a version; absent unless set.
         const versions = new Map<string, number>()
         const key = makeKey()
-        const projections = new Map<string, GraphReadResponse>()
+        const ownGraphs = new Map<string, OwnerGraph>()
         const blocks = new Map<string, { blocker: string; rkey: string; subject: string }[]>()
         const blocksFail = new Set<string>()
+        const graphFail = new Set<string>()
         const notServed = new Set<string>()
         const reads: string[] = []
         const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
@@ -206,13 +207,9 @@ describe("summary read", () => {
                 })
             },
         }
-        const edge = (did: string): GraphReadResponse["following"][number] => ({
-            did,
-            rkey: "r1",
-            mutual: false,
-        })
-        projections.set(OWNER, { did: OWNER, following: [edge(PEER)], followers: [] })
-        projections.set(OTHER_OWNER, { did: OTHER_OWNER, following: [], followers: [] })
+        const edge = (did: string): OwnerGraph["following"][number] => ({ did, mutual: false })
+        ownGraphs.set(OWNER, { did: OWNER, following: [edge(PEER)], followers: [] })
+        ownGraphs.set(OTHER_OWNER, { did: OTHER_OWNER, following: [], followers: [] })
         versions.set(OWNER, 1)
         versions.set(OTHER_OWNER, 1)
         versions.set(PEER, 1)
@@ -225,7 +222,12 @@ describe("summary read", () => {
             store,
             nowSeconds: T0,
             discardWindowSeconds: 3600,
-            projections: { get: async (did) => projections.get(did) ?? null },
+            graph: {
+                ownGraph: async (did) => {
+                    if (graphFail.has(did)) throw new Error("d1 down")
+                    return ownGraphs.get(did) ?? null
+                },
+            },
             blocks: {
                 ownBlocks: async (did) => {
                     if (blocksFail.has(did)) throw new Error("d1 down")
@@ -254,9 +256,10 @@ describe("summary read", () => {
             directory,
             challenges,
             versions,
-            projections,
+            ownGraphs,
             blocks,
             blocksFail,
+            graphFail,
             notServed,
             served,
             puts,
@@ -520,12 +523,38 @@ describe("summary read", () => {
             expect(res.headers.get("Retry-After")).not.toBeNull()
             expect(heldTokens(w)).toEqual(held)
         })
+
+        it("answers 409 + Retry-After when the owner's graph is not served (graph.ownGraph null)", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.ownGraphs.delete(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(409)
+            expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0)
+            expect(heldTokens(w)).toEqual(held)
+        })
+
+        it("answers 503 + Retry-After and leaves the stored baseline untouched when graph.ownGraph throws", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.graphFail.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(503)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+            w.graphFail.delete(OWNER)
+            expect((await read(await get(first.token))).token).toBe(first.token)
+        })
     })
 
-    it("an owner with no projection yet is 409 with Retry-After", async () => {
+    it("an owner whose graph is not served yet is 409 with Retry-After", async () => {
         const w = summaryWorld()
         const get = await owner(w, OWNER)
-        w.projections.delete(OWNER)
+        w.ownGraphs.delete(OWNER)
         const res = await get()
         expect(res.status).toBe(409)
         expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0)
@@ -546,8 +575,8 @@ describe("summary read", () => {
         const peers = [1, 2, 3, 4].map((i) => `did:plc:page${i}00000000000000000`)
         function pagedWorld(pageRecords = 2) {
             const w = summaryWorld()
-            const edge = (did: string) => ({ did, rkey: "r1", mutual: false })
-            w.projections.set(OWNER, { did: OWNER, following: peers.map(edge), followers: [] })
+            const edge = (did: string) => ({ did, mutual: false })
+            w.ownGraphs.set(OWNER, { did: OWNER, following: peers.map(edge), followers: [] })
             for (const p of peers) w.versions.set(p, 1)
             w.deps.pageRecords = pageRecords
             return w
@@ -619,10 +648,9 @@ describe("summary read", () => {
             const w = pagedWorld()
             const many = Array.from({ length: SUMMARY_MAX_RECORDS + 1 }, (_, i) => ({
                 did: `did:plc:many${String(i).padStart(6, "0")}`,
-                rkey: "r",
                 mutual: false,
             }))
-            w.projections.set(OWNER, { did: OWNER, following: many, followers: [] })
+            w.ownGraphs.set(OWNER, { did: OWNER, following: many, followers: [] })
             const get = await owner(w, OWNER)
             expect((await read(await get())).truncated).toBe(true)
         })

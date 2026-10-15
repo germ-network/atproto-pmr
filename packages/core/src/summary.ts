@@ -8,9 +8,9 @@
  */
 
 import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
-import type { GraphProjectionStore } from "./device-read.js"
 import type { BlockEdgeStore } from "./block-edges.js"
-import { OWN_BLOCK_KEYS, type GraphReadResponse, type OwnBlock } from "./read-api.js"
+import type { MonitorOwnGraphRequest, OwnerGraph } from "./owner-graph.js"
+import { OWN_BLOCK_KEYS, type OwnBlock } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
@@ -117,7 +117,12 @@ export interface SummaryIndexReader {
 }
 
 export interface SummaryPageDeps {
-    projections: GraphProjectionStore
+    /**
+     * The owner's graph, from which the summary chooses its contacts. Throws
+     * when it cannot be read, and returns null when the owner's graph is not
+     * served; neither is ever an empty graph.
+     */
+    graph: MonitorOwnGraphRequest
     /**
      * The owner's own blocks. Throws when they cannot be read, and returns
      * null when the owner's graph is not served; neither is ever an empty list.
@@ -137,11 +142,14 @@ export interface SummaryPageDeps {
     nowMs: () => number
 }
 
-/** The owner's blocks could not be read, so no summary can be built without losing them. */
-export class SummaryOwnBlocksError extends Error {
+/**
+ * The owner's graph or blocks could not be read, so no summary can be built
+ * without choosing contacts from an empty graph or losing the blocks.
+ */
+export class SummaryOwnerReadError extends Error {
     constructor(cause: unknown) {
-        super("the owner's blocks could not be read", { cause })
-        this.name = "SummaryOwnBlocksError"
+        super("the owner's graph or blocks could not be read", { cause })
+        this.name = "SummaryOwnerReadError"
     }
 }
 
@@ -152,7 +160,7 @@ export class SummaryOwnBlocksError extends Error {
  */
 export function summaryContacts(
     owner: string,
-    graph: GraphReadResponse,
+    graph: OwnerGraph,
     maxContacts: number
 ): { dids: string[]; truncated: boolean } {
     const mutuals = graph.following.filter((e) => e.mutual).map((e) => e.did)
@@ -171,25 +179,23 @@ export function summaryContacts(
 }
 
 /**
- * The summary's index as held now: the owner's projection and the entry of
- * every watched record of each covered contact that is held, verified at
- * ingest and servable under rotation. Reads no CAR. Null when the owner has
- * no projection yet or their graph is not served for blocks. Throws
- * `SummaryOwnBlocksError` when the blocks cannot be read.
+ * The summary's index as held now: the entry of every watched record of the
+ * owner and each covered contact that is held, verified at ingest and
+ * servable under rotation. Reads no CAR. Null when the owner's graph is not
+ * served. Throws `SummaryOwnerReadError` when the graph or the blocks cannot
+ * be read.
  */
 export async function buildSummaryIndex(
     did: string,
     deps: SummaryPageDeps
 ): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
-    const graph = await deps.projections.get(did)
-    if (!graph) return null
-    let blocks
+    let graph, blocks
     try {
-        blocks = await deps.blocks.ownBlocks(did)
+        ;[graph, blocks] = await Promise.all([deps.graph.ownGraph(did), deps.blocks.ownBlocks(did)])
     } catch (error) {
-        throw new SummaryOwnBlocksError(error)
+        throw new SummaryOwnerReadError(error)
     }
-    if (blocks === null) return null
+    if (graph === null || blocks === null) return null
     const ownBlocks = blocks
         .map((b) => ({ did: b.subject, rkey: b.rkey }))
         .sort((a, b) => compareStrings(a.rkey, b.rkey) || compareStrings(a.did, b.did))

@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest"
 import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
-import type { GraphReadResponse } from "../src/read-api"
+import type { OwnerGraph } from "../src/owner-graph"
 import type { ReadSigningKey } from "../src/read-signing-key"
 import { SNAPSHOT_MAX_AGE_MS } from "../src/snapshot-read"
 import {
@@ -28,16 +28,16 @@ const OWNER = "did:plc:owner"
 const NOW = 10_000_000_000
 const COLL = "app.example.thing"
 
-const edge = (did: string, rkey = "r", mutual = false) => ({ did, rkey, mutual })
+const edge = (did: string, mutual = false) => ({ did, mutual })
 const graphOf = (
-    following: GraphReadResponse["following"],
-    followers: GraphReadResponse["followers"] = []
-): GraphReadResponse => ({ did: OWNER, following, followers })
+    following: OwnerGraph["following"],
+    followers: OwnerGraph["followers"] = []
+): OwnerGraph => ({ did: OWNER, following, followers })
 
 describe("summaryContacts", () => {
     it("orders the owner, then mutuals, following and followers, each by DID", () => {
         const graph = graphOf(
-            [edge("did:plc:f2"), edge("did:plc:m2", "r", true), edge("did:plc:f1"), edge("did:plc:m1", "r", true)],
+            [edge("did:plc:f2"), edge("did:plc:m2", true), edge("did:plc:f1"), edge("did:plc:m1", true)],
             [edge("did:plc:g2"), edge("did:plc:g1")]
         )
         expect(summaryContacts(OWNER, graph, 100)).toEqual({
@@ -48,8 +48,8 @@ describe("summaryContacts", () => {
 
     it("a DID in several groups appears once, in its highest group", () => {
         const graph = graphOf(
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge("did:plc:b", "r2")],
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge(OWNER)]
+            [edge("did:plc:a"), edge("did:plc:b", true), edge("did:plc:b")],
+            [edge("did:plc:a"), edge("did:plc:b", true), edge(OWNER)]
         )
         expect(summaryContacts(OWNER, graph, 100).dids).toEqual([OWNER, "did:plc:b", "did:plc:a"])
     })
@@ -67,7 +67,7 @@ describe("summaryContacts", () => {
 
 function indexWorld(
     options: {
-        graph?: GraphReadResponse | null
+        graph?: OwnerGraph | null
         watched?: SummaryPageDeps["watched"]
         held?: (SummaryHeldEntry | null)[] | ((did: string, collection: string, rkey: string) => SummaryHeldEntry | null)
         keys?: (did: string) => ReadSigningKey | undefined
@@ -79,7 +79,7 @@ function indexWorld(
     const recordReads: string[] = []
     const watched = options.watched ?? [{ collection: COLL, rkey: "self" }]
     const deps: SummaryPageDeps = {
-        projections: { get: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        graph: { ownGraph: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
         blocks: { ownBlocks: async () => [] },
         index: {
             entries: async (refs) => {
@@ -125,7 +125,7 @@ const held = (did: string, collection = COLL, rkey = "self", over: Partial<Summa
 })
 
 describe("buildSummaryIndex", () => {
-    it("is null when the owner has no projection", async () => {
+    it("is null when the owner's graph is not served", async () => {
         const w = indexWorld({ graph: null })
         expect(await buildSummaryIndex(OWNER, w.deps)).toBeNull()
         expect(w.asked).toEqual([])
