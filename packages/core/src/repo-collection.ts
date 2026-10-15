@@ -37,6 +37,7 @@ export type RepoCollectionErrorCode =
     | "block-missing"
     | "byte-cap-exceeded"
     | "node-cap-exceeded"
+    | "record-cap-exceeded"
 
 export class RepoCollectionError extends Error {
     constructor(
@@ -60,6 +61,26 @@ export interface RepoCollectionExpectation {
     maxBytes: number
     /** Refuse once this many MST nodes are held. */
     maxNodes: number
+    /**
+     * Refuse once this many of the collection's record blocks are held,
+     * during the read rather than after it. Unbounded when absent.
+     */
+    maxRecords?: number
+    /**
+     * Called once the read ends, before the walk, with what it kept: the
+     * kept blocks (commit, MST nodes, the collection's records) and their
+     * total bytes. The walk holds no other block bytes. Not counted: the
+     * map's CID keys, the read's transient buffers and the walk's decoded
+     * records.
+     */
+    onRetained?: (retained: RetainedBlocks) => void
+}
+
+/** What the read kept for the walk. */
+export interface RetainedBlocks {
+    bytes: number
+    nodes: number
+    records: number
 }
 
 export interface CollectionRecord {
@@ -92,6 +113,7 @@ export async function verifyRepoCollection(
 ): Promise<VerifiedCollection> {
     try {
         const kept = await readKeptBlocks(car, expected)
+        expected.onRetained?.(kept.retained)
         return walkCollection(kept, expected)
     } catch (error) {
         if (error instanceof RepoProofError) {
@@ -104,6 +126,7 @@ export async function verifyRepoCollection(
 interface KeptBlocks {
     root: string
     blocks: Map<string, Uint8Array>
+    retained: RetainedBlocks
 }
 
 /**
@@ -125,6 +148,8 @@ async function readKeptBlocks(
     let total = 0
     let root: Uint8Array | null = null
     let nodes = 0
+    let records = 0
+    let retainedBytes = 0
     const blocks = new Map<string, Uint8Array>()
 
     const consume = (): void => {
@@ -175,7 +200,16 @@ async function readKeptBlocks(
                     "too many MST nodes"
                 )
             }
-            blocks.set(cidToString(cid), data.slice())
+            const key = cidToString(cid)
+            if (blocks.has(key)) continue
+            if (kind === "record" && ++records > (expected.maxRecords ?? Infinity)) {
+                throw new RepoCollectionError(
+                    "record-cap-exceeded",
+                    "too many records"
+                )
+            }
+            retainedBytes += data.length
+            blocks.set(key, data.slice())
         }
         pending = pending.slice(offset)
     }
@@ -209,7 +243,11 @@ async function readKeptBlocks(
     if (pending.length + incomingLength > 0) {
         throw new RepoProofError("car-malformed", "truncated section")
     }
-    return { root: cidToString(root), blocks }
+    return {
+        root: cidToString(root),
+        blocks,
+        retained: { bytes: retainedBytes, nodes, records },
+    }
 }
 
 function tryReadVarint(

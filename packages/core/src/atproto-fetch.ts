@@ -14,6 +14,8 @@
  * sender's PDS that a message is being sent.
  */
 
+import { BodyTooLargeError } from "./util"
+
 /**
  * DID -> DID document -> PDS -> declaration, per atproto-pmr.md's own
  * algorithm. `fetchImpl` is injected so tests never make a real network
@@ -387,6 +389,111 @@ export async function guardedFetchBytes(
         return await readCappedBytes(response, options.maxBytes ?? MAX_CAR_BYTES)
     } finally {
         clearTimeout(timer)
+    }
+}
+
+/** `guardedFetchStream`'s timeout fired, before the headers or mid-body. */
+export class FetchTimeoutError extends Error {
+    constructor() {
+        super("fetch timed out")
+        this.name = "FetchTimeoutError"
+    }
+}
+
+/**
+ * The same guards, handing the body over as a stream — for
+ * `com.atproto.sync.getRepo`, whose CAR can run to tens of megabytes and is
+ * consumed by a streaming verifier, so it is never buffered whole. The
+ * timeout covers the whole read, not just the headers, and raises
+ * `FetchTimeoutError`; a body past `maxBytes` ends the stream with
+ * `BodyTooLargeError`. A consumer that stops early (the verifier throws)
+ * cancels the body and clears the timer through the iterator's `return()`.
+ * The timeout relies on aborting the fetch's signal to reject a pending body
+ * read, as the Fetch standard specifies.
+ */
+export async function guardedFetchStream(
+    url: string,
+    fetchImpl: typeof fetch,
+    options: {
+        timeoutMs: number
+        maxBytes: number
+        terminalErrorNames?: readonly string[]
+        permanentErrorNames?: readonly string[]
+    }
+): Promise<AsyncIterable<Uint8Array>> {
+    let parsed: URL
+    try {
+        parsed = new URL(url)
+    } catch {
+        throw new Error("malformed endpoint URL")
+    }
+    if (parsed.protocol !== "https:") {
+        throw new Error(`refusing non-https endpoint: ${parsed.protocol}`)
+    }
+
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+    }, options.timeoutMs)
+    const failure = (error: unknown): unknown =>
+        timedOut ? new FetchTimeoutError() : error
+
+    let response: Response
+    try {
+        response = await fetchImpl(url, {
+            signal: controller.signal,
+            // See guardedFetchJSON: "error" throws on Cloudflare Workers.
+            redirect: "manual",
+            headers: { accept: "application/vnd.ipld.car" },
+        })
+        if (isRedirect(response)) {
+            throw new Error("refusing a redirect")
+        }
+        if (!response.ok) {
+            if (options.terminalErrorNames !== undefined) {
+                const name = await tryReadXrpcErrorName(response)
+                if (name !== null && options.terminalErrorNames.includes(name)) {
+                    const permanent =
+                        options.permanentErrorNames === undefined ||
+                        options.permanentErrorNames.includes(name)
+                    throw new RecordNotFoundError(name, permanent, name)
+                }
+            }
+            throw new Error(`endpoint answered ${response.status}`)
+        }
+    } catch (error) {
+        clearTimeout(timer)
+        throw failure(error)
+    }
+
+    const body = response.body
+    return {
+        async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array> {
+            if (body === null) {
+                clearTimeout(timer)
+                return
+            }
+            const reader = body.getReader()
+            let total = 0
+            try {
+                for (;;) {
+                    const { done, value } = await reader.read()
+                    if (done) return
+                    total += value.byteLength
+                    if (total > options.maxBytes) {
+                        throw new BodyTooLargeError()
+                    }
+                    yield value
+                }
+            } catch (error) {
+                throw failure(error)
+            } finally {
+                clearTimeout(timer)
+                await reader.cancel().catch(() => undefined)
+            }
+        },
     }
 }
 
