@@ -103,18 +103,18 @@ PDSes.
 
 Limits at the defaults, per two-minute alarm (720 a day):
 
-- **D1 drain.** Listings may take 400 of the alarm's 1,000 statements (`FOLLOW_LISTING_STATEMENT_RESERVE`), about 4,950 edges (follows and blocks together), or 3.56 million a day.
+- **D1 drain.** Listings may take 400 of the alarm's 1,000 statements (`FOLLOW_LISTING_STATEMENT_RESERVE`), about 2,450 edges (follows and blocks together), or 1.76 million a day.
 - **`getRepo`.** At most 4 fetches an alarm, one at a time (`FOLLOW_BACKFILL_REPOS`), so 2,880 a day or 20,160 a week.
-- **`listRecords`.** At most 200 pages an alarm. A mutual listing reads at least two pages (follows, then blocks) and costs 2 to 5 statements, so 80 to 100 finish per alarm (the statement bound is 80 to 200; the page bound is 100): 57,600 to 72,000 a day.
+- **`listRecords`.** At most 200 pages an alarm. A mutual listing reads at least two pages (follows, then blocks) and costs 4 to 10 statements, so 40 to 100 finish per alarm: 29,000 to 72,000 a day.
 - **Latency.** Listings run one at a time, so throughput is the lower of the statement and the latency bound.
 
 **Per tenant under `registered`**, for each registered user:
 
-- *Once, on registration:* one `getRepo` (median 3 MB, its blocks included), about 700 followees each with a declaration and a profile fetch, about 700 mutual listings of two pages each, one of follows and one of blocks (about 140 MB of `listRecords` for the follows), and 1,500 to 3,600 D1 statements. A user's own blocks are typically tens to hundreds, one row each; accounts that follow block-list tooling can hold tens of thousands. The owner listing is served within an alarm or two. The mutual hints complete in about 15 minutes.
+- *Once, on registration:* one `getRepo` (median 3 MB, its blocks included), about 700 followees each with a declaration and a profile fetch, about 700 mutual listings of two pages each, one of follows and one of blocks (about 140 MB of `listRecords` for the follows), and 2,000 to 6,000 D1 statements. A user's own blocks are typically tens to hundreds, one row each; accounts that follow block-list tooling can hold tens of thousands. The owner listing is served within an alarm or two. The mutual hints complete in about half an hour.
 - *Every `FOLLOW_RELIST_AFTER_MS` (7 days):* the same listings again, spread across the week by a top-up that fills only the capacity joins and registrations leave.
-- *Tenant ceiling.* The weekly mutual re-list needs about 700 listings per registered user once followees are deduplicated across tenants. At 80 to 100 listings per alarm (403,200 to 504,000 a week) the ceiling is roughly 580 to 720 registered users. Past it, joins and registrations are unaffected because they sort ahead of re-lists; only the effective re-list interval grows. Raising `FOLLOW_RELIST_AFTER_MS` to 30 days lifts the ceiling about fourfold, since the live stream keeps hints current and a gap re-list covers outages.
+- *Tenant ceiling.* The weekly mutual re-list needs about 700 listings per registered user once followees are deduplicated across tenants. At 40 to 100 listings per alarm (201,600 to 504,000 a week) the ceiling is roughly 290 to 720 registered users. Past it, joins and registrations are unaffected because they sort ahead of re-lists; only the effective re-list interval grows. Raising `FOLLOW_RELIST_AFTER_MS` to 30 days lifts the ceiling about fourfold, since the live stream keeps hints current and a gap re-list covers outages.
 
-**Private deployment under `everyone`:** about 1,750 holders with 1.4 million edges (about 200 MB in D1). The first wave is about 14 GB of `getRepo`, bound by the fetch rate (1,750 repos at 4 an alarm) at roughly 15 hours; the D1 drain alone would take about 9.5 hours; the weekly re-list repeats it, spread by the top-up. Holders whose repos are deactivated or taken down are not retried.
+**Private deployment under `everyone`:** about 1,750 holders with 1.4 million edges (about 200 MB in D1). The first wave is about 14 GB of `getRepo`, bound by the D1 drain at roughly 19 hours; the weekly re-list repeats it, spread by the top-up. Holders whose repos are deactivated or taken down are not retried.
 
 An owner past `FOLLOW_MAX_REPO_BYTES` (32 MiB), `MAX_FOLLOWS` follow records (20,000), `MAX_BLOCKS` block records (20,000) or three consecutive timeouts is listed by `listRecords` pages instead, with unverified rows, and stays on pages: an owner with more blocks than `MAX_BLOCKS` is listed by pages for follows as well. A mutual listing stops reading a collection at its cap and keeps what it has.
 
