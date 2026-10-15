@@ -379,6 +379,7 @@ export {
 export {
     appendPlcLogEntry,
     parsePlcAuditLog,
+    PlcLogError,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,

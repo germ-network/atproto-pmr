@@ -168,7 +168,7 @@ export function decodeCbor(bytes: Uint8Array): unknown {
 }
 
 /** Canonical DAG-CBOR re-encoding: length-first key order, CID links as tag 42. */
-function encodeDagCbor(value: unknown): Uint8Array {
+export function encodeDagCbor(value: unknown): Uint8Array {
     return encode(value, {
         typeEncoders: {
             Object: (obj: unknown) => {
@@ -196,10 +196,15 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 const B32 = "abcdefghijklmnopqrstuvwxyz234567"
 
 export function cidToString(cid: Uint8Array): string {
+    return `b${base32Lower(cid)}`
+}
+
+/** RFC 4648 base32, lower case, unpadded. */
+export function base32Lower(bytes: Uint8Array): string {
     let out = ""
     let acc = 0
     let bits = 0
-    for (const byte of cid) {
+    for (const byte of bytes) {
         acc = (acc << 8) | byte
         bits += 8
         while (bits >= 5) {
@@ -209,7 +214,7 @@ export function cidToString(cid: Uint8Array): string {
         acc &= (1 << bits) - 1
     }
     if (bits > 0) out += B32[(acc << (5 - bits)) & 31]
-    return `b${out}`
+    return out
 }
 
 export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
@@ -361,6 +366,30 @@ function base58Decode(text: string): Uint8Array | null {
         out.push(0)
     }
     return Uint8Array.from(out.reverse())
+}
+
+/**
+ * Whether `sig` (64 bytes, r then s) is a canonical low-S ECDSA-SHA256
+ * signature of `message` under a compressed secp256k1 or P-256 multikey
+ * (`z…`). False for any other key, rather than a throw.
+ */
+export function verifyMultikeySignature(
+    multikey: string,
+    message: Uint8Array,
+    sig: Uint8Array
+): boolean {
+    const decoded = multikey.startsWith("z") ? base58Decode(multikey.slice(1)) : null
+    if (!decoded || decoded.length !== 35) return false
+    const publicKey = decoded.subarray(2)
+    let curve: typeof secp256k1 | typeof p256
+    if (decoded[0] === 0xe7 && decoded[1] === 0x01) curve = secp256k1
+    else if (decoded[0] === 0x80 && decoded[1] === 0x24) curve = p256
+    else return false
+    try {
+        return curve.verify(sig, message, publicKey, { lowS: true, prehash: true })
+    } catch {
+        return false
+    }
 }
 
 export function verifyCommitSignature(commit: Commit, signingKey: string): void {
