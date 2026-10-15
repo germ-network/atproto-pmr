@@ -4,9 +4,11 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import type { CachedDidDocument } from "@germ-network/atproto-pmr-core"
+import { DECLARATION_COLLECTION_NSID, type CachedDidDocument } from "@germ-network/atproto-pmr-core"
+import type { SnapshotEntry } from "@germ-network/atproto-pmr-monitor"
 import { DID_DOCUMENT_PREFIX, PLC_COVERAGE_KEY, kvReadSigningKeys } from "../src/did-document-store"
 import type { MonitorEnv } from "../src/env"
+import { kvSnapshotStore, kvSummaryIndexReader } from "../src/snapshot-store"
 
 const testEnv = env as unknown as MonitorEnv
 const NOW = 2_000_000_000_000
@@ -103,9 +105,83 @@ describe("kvReadSigningKeys", () => {
     })
 })
 
+const PROFILE = "app.example.profile"
+const entry = (rev: string, over: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
+    rev,
+    car: new Uint8Array([1, 2, 3]),
+    observedAtMs: 1_000,
+    source: "https://pds.example",
+    signingKey: "zKey",
+    verifiedWith: "zKey",
+    cid: "bafyreicid",
+    ...over,
+})
+const uniq = () => `did:plc:${crypto.randomUUID().replaceAll("-", "").slice(0, 24)}`
+
 describe("kvSummaryIndexReader", () => {
-    it.todo("returns each ref's cid, verifiedWith and freshAtMs from metadata, in ref order")
-    it.todo("freshAtMs takes a chk: confirmation only at the same rev")
-    it.todo("an entry with no verified metadata or no cid reads null")
-    it.todo("reads keys in bulks of at most 100")
+    it("returns each ref's cid, verifiedWith and freshAtMs from metadata, in ref order", async () => {
+        const [a, b] = [uniq(), uniq()]
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord(a, entry("3m1", { cid: "cid-a" }))
+        await store.putSecondary({ did: b, collection: PROFILE, rkey: "self" }, entry("3m2", { cid: "cid-b", verifiedWith: "zOther" }))
+        const refs = [
+            { did: b, collection: PROFILE, rkey: "self" },
+            { did: a, collection: DECLARATION_COLLECTION_NSID, rkey: "self" },
+            { did: uniq(), collection: PROFILE, rkey: "self" },
+        ]
+        expect(await kvSummaryIndexReader(testEnv).entries(refs)).toEqual([
+            { ...refs[0], cid: "cid-b", verifiedWith: "zOther", freshAtMs: 1_000 },
+            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", freshAtMs: 1_000 },
+            null,
+        ])
+    })
+
+    it("freshAtMs takes a chk: confirmation only at the same rev", async () => {
+        const [a, b] = [uniq(), uniq()]
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord(a, entry("3m1"))
+        await store.putCheck(a, { rev: "3m1", checkedAtMs: 9_000 })
+        await store.putRecord(b, entry("3m1"))
+        await store.putCheck(b, { rev: "3m0", checkedAtMs: 9_000 })
+        const refs = [a, b].map((did) => ({ did, collection: DECLARATION_COLLECTION_NSID, rkey: "self" }))
+        const read = await kvSummaryIndexReader(testEnv).entries(refs)
+        expect(read.map((e) => e?.freshAtMs)).toEqual([9_000, 1_000])
+    })
+
+    it("an entry with no verified metadata or no cid reads null", async () => {
+        const [unverified, noCid] = [uniq(), uniq()]
+        const store = kvSnapshotStore(testEnv)
+        await store.putRecord(unverified, entry("3m1", { verifiedWith: null }))
+        await store.putRecord(noCid, entry("3m1", { cid: null }))
+        const refs = [unverified, noCid].map((did) => ({
+            did,
+            collection: DECLARATION_COLLECTION_NSID,
+            rkey: "self",
+        }))
+        expect(await kvSummaryIndexReader(testEnv).entries(refs)).toEqual([null, null])
+    })
+
+    it("reads keys in bulks of at most 100", async () => {
+        const refs = Array.from({ length: 230 }, () => ({
+            did: uniq(),
+            collection: DECLARATION_COLLECTION_NSID,
+            rkey: "self",
+        }))
+        const bulk: number[] = []
+        const real = testEnv.records
+        const records = new Proxy(real, {
+            get(target, prop) {
+                const value = Reflect.get(target, prop) as unknown
+                if (prop === "get" || prop === "getWithMetadata") {
+                    return (keys: string | string[], ...rest: unknown[]) => {
+                        if (Array.isArray(keys)) bulk.push(keys.length)
+                        return (value as Function).call(target, keys, ...rest)
+                    }
+                }
+                return typeof value === "function" ? value.bind(target) : value
+            },
+        })
+        await kvSummaryIndexReader({ ...testEnv, records } as MonitorEnv).entries(refs)
+        expect(bulk.sort()).toEqual([100, 100, 100, 100, 30, 30])
+    })
 })

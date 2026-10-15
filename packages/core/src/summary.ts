@@ -16,8 +16,9 @@ import {
 } from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
-import type { ReadSigningKeys } from "./read-signing-key.js"
-import type { RecordSnapshotStore } from "./snapshot-read.js"
+import { servableUnderRotation, type ReadSigningKeys } from "./read-signing-key.js"
+import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
+import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import type { WatchedRecord } from "./watched.js"
 
 export interface SummaryRecordRef {
@@ -131,11 +132,23 @@ export interface SummaryPageDeps {
  * the watched count). `truncated` when any were left out.
  */
 export function summaryContacts(
-    _owner: string,
-    _graph: GraphReadResponse,
-    _maxContacts: number
+    owner: string,
+    graph: GraphReadResponse,
+    maxContacts: number
 ): { dids: string[]; truncated: boolean } {
-    throw new Error("not implemented")
+    const mutuals = graph.following.filter((e) => e.mutual).map((e) => e.did)
+    const following = graph.following.map((e) => e.did)
+    const followers = graph.followers.map((e) => e.did)
+    const seen = new Set<string>([owner])
+    const dids = [owner]
+    for (const group of [mutuals, following, followers]) {
+        for (const did of [...new Set(group)].sort(compareStrings)) {
+            if (seen.has(did)) continue
+            seen.add(did)
+            dids.push(did)
+        }
+    }
+    return { dids: dids.slice(0, maxContacts), truncated: dids.length > maxContacts }
 }
 
 /**
@@ -145,10 +158,39 @@ export function summaryContacts(
  * no projection yet.
  */
 export async function buildSummaryIndex(
-    _did: string,
-    _deps: SummaryPageDeps
+    did: string,
+    deps: SummaryPageDeps
 ): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
-    throw new Error("not implemented")
+    const graph = await deps.projections.get(did)
+    if (!graph) return null
+    const maxContacts = Math.floor(SUMMARY_MAX_RECORDS / Math.max(1, deps.watched.length))
+    const { dids, truncated } = summaryContacts(did, graph, maxContacts)
+    const refs = dids.flatMap((d) =>
+        deps.watched.map((w) => ({ did: d, collection: w.collection, rkey: w.rkey }))
+    )
+    const held = await deps.index.entries(refs)
+    const heldDids = [...new Set(held.flatMap((e) => (e === null ? [] : [e.did])))]
+    const keys = heldDids.length === 0 ? new Map() : await deps.signingKeys.keysFor(heldDids)
+    const now = deps.nowMs()
+    const lapsed = new Set<string>()
+    const records: SummaryIndexEntry[] = []
+    for (const entry of held) {
+        if (entry === null) continue
+        const key = keys.get(entry.did) ?? { kind: "unknown" as const }
+        if (!servableUnderRotation(entry.verifiedWith, key)) continue
+        if (
+            entry.collection === DECLARATION_COLLECTION_NSID &&
+            entry.rkey === "self" &&
+            !(now - entry.freshAtMs <= SNAPSHOT_MAX_AGE_MS)
+        ) {
+            lapsed.add(entry.did)
+        }
+        const { freshAtMs: _freshAtMs, ...indexed } = entry
+        records.push(indexed)
+    }
+    for (const lapse of lapsed) deps.onLapse(lapse)
+    records.sort(compareRefs)
+    return { index: { graph, records }, truncated }
 }
 
 /**
@@ -243,6 +285,14 @@ async function readSummaryRecord(
 
 function compareStrings(a: string, b: string): number {
     return a < b ? -1 : a > b ? 1 : 0
+}
+
+function compareRefs(a: SummaryRecordRef, b: SummaryRecordRef): number {
+    return (
+        compareStrings(a.did, b.did) ||
+        compareStrings(a.collection, b.collection) ||
+        compareStrings(a.rkey, b.rkey)
+    )
 }
 
 /** Identifies a record across summaries. */

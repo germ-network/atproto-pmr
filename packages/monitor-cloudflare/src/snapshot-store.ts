@@ -260,11 +260,46 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
  * metadata reads as null, as does one with no `cid`.
  */
 export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorIngest>(
-    _env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>
 ): SummaryIndexReader {
     return {
-        async entries() {
-            throw new Error("not implemented")
+        async entries(refs) {
+            const keys = refs.map((r) => snapshotKeys(r.did, r.collection, r.rkey))
+            const records = new Map<string, StoredMeta | null>()
+            const checks = new Map<string, SnapshotCheck | null>()
+            for (let i = 0; i < keys.length; i += KV_BULK_READ_MAX) {
+                const chunk = keys.slice(i, i + KV_BULK_READ_MAX)
+                const [recs, chks] = await Promise.all([
+                    env.records.getWithMetadata<StoredMeta>(
+                        chunk.map((k) => k.record),
+                        "text"
+                    ),
+                    env.records.get<SnapshotCheck>(
+                        chunk.map((k) => k.check),
+                        "json"
+                    ),
+                ])
+                for (const [key, entry] of recs) records.set(key, entry?.metadata ?? null)
+                for (const [key, check] of chks) checks.set(key, check)
+            }
+            return refs.map((ref, i) => {
+                const metadata = records.get(keys[i]!.record)
+                if (!metadata) return null
+                const { verifiedWith, cid } = metadata
+                if (verifiedWith === null || verifiedWith === undefined) return null
+                if (cid === null || cid === undefined) return null
+                const check = checks.get(keys[i]!.check) ?? null
+                const confirmedAtMs = check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
+                return {
+                    ...ref,
+                    cid,
+                    verifiedWith,
+                    freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+                }
+            })
         },
     }
 }
+
+/** Keys one KV bulk read accepts. */
+const KV_BULK_READ_MAX = 100
