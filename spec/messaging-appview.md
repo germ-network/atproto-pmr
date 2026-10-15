@@ -21,7 +21,7 @@ and its diff baseline, never for protecting public data. This is about reads
 of cached atproto state. The mailbox closure rules
 ([P3](trust-model.md#p3--closure)) protect mailbox state and are unchanged.
 
-Two consequences follow for the read surface:
+Two consequences for the read surface:
 
 - **Cheap to serve.** Public reads come from stored bytes, with no per-read
   verification and no per-caller work. Anything that would cost the host

@@ -16,7 +16,8 @@ a relay operator is encouraged but not required to run alongside one.
 
 ## The goal
 
-Atproto users can reliably publish user-controlled keys via the atmosphere. For E2EE messaging, this assures that people are messaging
+Atproto users can reliably publish user-controlled keys via the atmosphere. For E2EE messaging, this assures people
+that they are messaging
 to keys honestly issued by the intended remote party.
 
 The mechanism is a consistent, observed view of **the repo record in which
@@ -44,15 +45,6 @@ third parties recording what they observe.
 | relying party | a messaging peer, verifying the record's CAR proof |
 | auditor | the client, cross-checking its monitors against each other |
 | the append-only log | a later enhancement — see [the appendix](#appendix-the-append-only-ledger-non-normative) |
-
-Two honest differences from CT:
-
-- **Freshness is stronger than CT's.** CT has no freshness story at all.
-  A monitor is on the firehose, so its view is near-real-time, and its
-  `rev` tracking is what turns replay of a stale-but-genuine record
-  into a detectable event.
-- **There is no inclusion gate.** CT relying parties can require an SCT —
-  proof a certificate was logged — before trusting it. Here, because of freshness and self-certifying data, clients can directly consult key monitors.
 
 ## What authenticated transfer gives, and what the monitor adds
 
