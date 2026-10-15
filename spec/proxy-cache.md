@@ -72,6 +72,9 @@ does not extend to a read that has to fall through to the PDS.
 | The monitor's periodic re-confirmation of held snapshots | **built** |
 | The monitor's **interest policy**: an allow list of DIDs it keeps records for, `registered` (the default: registered users and, once follow edges are written, the DIDs they follow) or `everyone` (every declaration holder), set by `INTEREST_POLICY` | **built** — `registered` needs a `pmrDirectory` binding, and only `everyone` runs the relay backfill and takes in declaration commits for DIDs it does not already follow. DIDs join and leave the list with an epoch check, so nothing is stored for a DID that left while a fetch was in flight; under `registered` the declaration socket ignores commits outside it |
 | The monitor's **profile snapshot**: the records named in `MONITOR_COLLECTIONS` (for example `app.bsky.actor.profile/self`; none when unset), verified and kept quietly beside the declaration for every DID in the allow list | **built** — no digest-window entry and no push. A holder's profile is head-checked hourly with its declaration; a DID that holds no declaration (a followee) is checked every 24 hours (`REFRESH_NONHOLDER_STALE_AFTER_MS`), with live profile events from the follow/profile stream keeping it current in between |
+| The monitor's **follow-edge index**: who each graph owner follows, in D1, with the follower counts the interest policy needs | **built** — an owner is a registered user under `registered`, a declaration holder under `everyone`. Live follow events keep it current; an owner listing (one verified `getRepo`, or `listRecords` pages for a repo past the walk's caps) writes it in full. A graph is served only after its owner listing completes; until then the read surface answers "not served" |
+| **Mutual hints**: for each non-owner in interest, its follows of registered users, from `listRecords` | **built** — under `registered`, a followee's follows of a registered user are the hint that the followee follows them back |
+| **Mixed provenance** of edges | **built** — rows from a verified `getRepo` listing are proven under the owner's signing key; paged-owner, mutual-hint and live rows are not. Every edge is a hint a device verifies for itself |
 | A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path only; exposed on no endpoint |
 | The `sd` + `dc` hint on delivered messages | **built** |
 | The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
@@ -82,3 +85,22 @@ does not extend to a read that has to fall through to the PDS.
 | A device-facing read API, and so the 24-hour rule for device reads | **not yet built** |
 | `did:web` document proxying | **not yet built** |
 | The user setting that routes PLC queries through the PMR | **not yet built** |
+
+## Sizing the follow-edge index
+
+Limits at the defaults, per two-minute alarm (720 a day):
+
+- **D1 drain.** Listings may take 400 of the alarm's 1,000 statements (`FOLLOW_LISTING_STATEMENT_RESERVE`), about 2,475 edges, or 1.8 million a day.
+- **`getRepo`.** At most 4 fetches an alarm, one at a time (`FOLLOW_BACKFILL_REPOS`), so 2,880 a day or 20,160 a week.
+- **`listRecords`.** At most 200 pages an alarm. A one-page mutual listing costs 3 to 8 statements, so 50 to 130 finish per alarm: 36,000 to 94,000 a day.
+- **Latency.** Listings run one at a time, so throughput is the lower of the statement and the latency bound.
+
+**Per tenant under `registered`**, for each registered user:
+
+- *Once, on registration:* one `getRepo` (median 3 MB), about 700 followees each with a declaration and a profile fetch, about 700 mutual listings of one page each (about 140 MB of `listRecords`), and 2,000 to 6,000 D1 statements. The owner listing is served within an alarm or two. The mutual hints complete in about half an hour.
+- *Every `FOLLOW_RELIST_AFTER_MS` (7 days):* the same listings again, spread across the week by a top-up that fills only the capacity joins and registrations leave.
+- *Tenant ceiling.* The weekly mutual re-list needs about 700 listings per registered user once followees are deduplicated across tenants. At 50 to 130 listings per alarm (252,000 to 655,000 a week) the ceiling is roughly 360 to 930 registered users. Past it, joins and registrations are unaffected because they sort ahead of re-lists; only the effective re-list interval grows. Raising `FOLLOW_RELIST_AFTER_MS` to 30 days lifts the ceiling about fourfold, since the live stream keeps hints current and a gap re-list covers outages.
+
+**Private deployment under `everyone`:** about 1,750 holders with 1.4 million edges (about 200 MB in D1). The first wave is about 14 GB of `getRepo`, bound by the D1 drain at roughly 19 hours; the weekly re-list repeats it, spread by the top-up. Holders whose repos are deactivated or taken down are not retried.
+
+An owner past `FOLLOW_MAX_REPO_BYTES` (32 MiB), `MAX_FOLLOWS` records (20,000) or three consecutive timeouts is listed by `listRecords` pages instead, with unverified rows.

@@ -271,7 +271,10 @@ export interface ListingIndex {
     /** When `did` was last listed, or null if never. */
     lastListedAt(did: string): Promise<number | null>
     queueListing(did: string, atMs: number, reason: ListingQueueReason): Promise<void>
-    /** Queue every graph owner's and every other interest DID's listing; returns how many. */
+    /**
+     * Queue every graph owner's and every other interest DID's listing;
+     * returns how many interest DIDs are now queued and not unlistable.
+     */
     queueAllListings(atMs: number, reason: "upgrade" | "gap"): Promise<number>
     /**
      * Queue up to `limit` listings last run before `listedBeforeMs`, skipping
@@ -779,7 +782,7 @@ export async function fetchListingPages(
         try {
             pds = await deps.resolvePds(did)
         } catch (error) {
-            const outcome = await deferStep(deps, config, listing, null, {
+            const outcome = await deferStep(deps, config, listing, held?.gen ?? null, {
                 timedOut: false,
                 permanent: isPermanent(error),
             })

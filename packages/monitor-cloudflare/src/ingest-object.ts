@@ -60,24 +60,48 @@ import {
     type OwnerFollowedIndex,
     type QueuedRecount,
     type RecountQueueIndex,
+    type FetchedRepo,
+    type FollowPage,
+    type FollowRecord,
+    type ListingIndex,
+    type ListingKind,
+    type ListingQueueReason,
+    type QueuedListing,
+    type StartedListing,
     drainRecounts,
+    fetchRepoCar,
     flushEdgeOps,
     flushLimit,
+    followGapExceeded,
+    listFollowRecords,
     mirrorGraph,
     pruneGraphChanges,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
+    relistStale,
+    runListings,
 } from "@germ-network/atproto-pmr-monitor"
-import type { StatementBudget } from "@germ-network/atproto-pmr-monitor"
+import type {
+    FollowBackfillConfig,
+    FollowBackfillDeps,
+    ListingProgress,
+    StatementBudget,
+} from "@germ-network/atproto-pmr-monitor"
 import { d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
 import {
+    DEFAULT_MAX_MST_NODES,
+    fetchDidDocument,
+    pdsResolutionFromDocument,
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyRecordProofOutcome,
+    verifyRepoCollection,
     type DidDocument,
     type InterestPolicy,
     type MonitorRegistrationNotify,
     type PlcCoverage,
+    type RepoCollectionExpectation,
+    type VerifiedCollection,
     type WatchedRecord,
 } from "@germ-network/atproto-pmr-core"
 import {
@@ -130,6 +154,18 @@ const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
 const MIRROR_STATEMENTS_PER_DID = 10
 const RECOUNT_DRAIN_BATCH = 1000
 const OWNER_RECONCILE_BATCH = 200
+/** `listRecords` pages all listings together take per alarm. */
+const LISTING_PAGES_PER_ALARM = 200
+/** `listRecords` listings (mutual, and at most one paged owner) in progress at once. */
+const LISTRECORDS_IN_PROGRESS = 100
+/** Stale listings queued per alarm, counting what is already due. */
+const STALE_RELIST_PER_ALARM = 200
+/** Consecutive getRepo timeouts after which an owner is listed by pages; for a `listRecords` listing, fetch failures after which it is unlistable. */
+const FOLLOW_TIMEOUTS_BEFORE_PAGED = 3
+/** Consecutive permanent-class failures after which a listing is unlistable. */
+const FOLLOW_UNLISTABLE_AFTER = 5
+const LISTING_RETRY_BASE_MS = 60_000
+const LISTING_RETRY_MAX_MS = 86_400_000
 
 interface MirrorSqlRow extends Record<string, SqlStorageValue> {
     did: string
@@ -145,6 +181,43 @@ interface PriorSqlRow extends Record<string, SqlStorageValue> {
     m_member: number
     m_registered: number
 }
+
+interface QueueSqlRow extends Record<string, SqlStorageValue> {
+    did: string
+    attempts: number
+    not_before: number
+    timeouts: number
+    permanent_failures: number
+    paged: number
+    progress_kind: string | null
+    progress_gen: number | null
+    progress_phase: string | null
+    progress_cursor: string | null
+    progress_pds: string | null
+    progress_began_at: number | null
+    progress_pages: number
+}
+
+const queuedListing = (r: QueueSqlRow): QueuedListing => ({
+    did: r.did,
+    attempts: r.attempts,
+    notBeforeMs: r.not_before,
+    timeouts: r.timeouts,
+    permanentFailures: r.permanent_failures,
+    paged: r.paged === 1,
+    inProgress:
+        r.progress_kind === null
+            ? null
+            : ({
+                  kind: r.progress_kind,
+                  gen: r.progress_gen,
+                  phase: r.progress_phase,
+                  cursor: r.progress_cursor,
+                  pds: r.progress_pds,
+                  beganAtMs: r.progress_began_at,
+                  pages: r.progress_pages,
+              } as ListingProgress),
+})
 
 const mirrorRow = (r: MirrorSqlRow): GraphMirrorRow => ({
     did: r.did,
@@ -216,6 +289,7 @@ export class MonitorIngest
         SecondaryIndex,
         SecondaryIntakeIndex,
         FollowStreamIndex,
+        ListingIndex,
         EdgeOpsIndex,
         GraphMirrorIndex,
         OwnerFollowedIndex,
@@ -349,6 +423,27 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     queued_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS listings (
+                    did TEXT PRIMARY KEY,
+                    listed_at INTEGER,
+                    owner_listed_at INTEGER,
+                    paged INTEGER NOT NULL DEFAULT 0,
+                    progress_kind TEXT,
+                    progress_gen INTEGER,
+                    progress_phase TEXT,
+                    progress_cursor TEXT,
+                    progress_pds TEXT,
+                    progress_began_at INTEGER,
+                    progress_pages INTEGER NOT NULL DEFAULT 0,
+                    last_kind TEXT
+                );
+                CREATE INDEX IF NOT EXISTS listings_by_listed_at ON listings (listed_at);
+                CREATE TABLE IF NOT EXISTS listing_stage (
+                    did TEXT NOT NULL,
+                    rkey TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    PRIMARY KEY (did, rkey)
+                );
                 CREATE TABLE IF NOT EXISTS recount_queue (
                     did TEXT PRIMARY KEY,
                     queued_at INTEGER NOT NULL
@@ -374,9 +469,31 @@ export class MonitorIngest
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
             }
+            for (const column of [
+                "attempts",
+                "not_before",
+                "timeouts",
+                "permanent_failures",
+                "unlistable",
+                "low_priority",
+            ]) {
+                if (
+                    this.db.sql
+                        .exec(
+                            "SELECT 1 FROM pragma_table_info('listing_requeue') WHERE name = ?",
+                            column
+                        )
+                        .toArray().length === 0
+                ) {
+                    this.db.sql.exec(
+                        `ALTER TABLE listing_requeue ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`
+                    )
+                }
+            }
             this.assertConfig()
             this.seedHolderState()
             this.seedInterest()
+            this.seedListings()
         })
     }
 
@@ -853,6 +970,15 @@ export class MonitorIngest
         })
     }
 
+    /** Once: every interest DID is queued for its first listing. */
+    private seedListings(): void {
+        if (this.metaOf("listings_seeded") !== undefined) return
+        this.ctx.storage.transactionSync(() => {
+            this.queueAllListingsSync(Date.now(), "upgrade")
+            this.setMeta("listings_seeded", "1")
+        })
+    }
+
     /**
      * Recompute `did`'s membership from the policy and write a change: the
      * epoch moves and the join or leave is queued, replacing any still-queued
@@ -861,7 +987,7 @@ export class MonitorIngest
      * leave still disposes. Membership is judged under the policy in force, so
      * the policy must not change for the life of the object.
      */
-    private reevaluateInterest(did: string, atMs: number): void {
+    private reevaluateInterest(did: string, atMs: number, ownedBefore: boolean): void {
         const row = this.db.sql
             .exec<{ registered: number; owner_followers: number; member: number; epoch: number }>(
                 "SELECT registered, owner_followers, member, epoch FROM interest WHERE did = ?",
@@ -874,25 +1000,46 @@ export class MonitorIngest
                 ? registered || (row?.owner_followers ?? 0) > 0
                 : registered || this.holderStateSync(did) === "held"
         const current = (row?.member ?? 0) === 1
-        if (want === current) return
-        const epoch = (row?.epoch ?? 0) + 1
-        this.db.sql.exec(
-            "INSERT INTO interest (did, member, epoch, since) VALUES (?1, ?2, ?3, ?4) " +
-                "ON CONFLICT(did) DO UPDATE SET member = ?2, epoch = ?3, " +
-                "since = CASE WHEN ?2 = 1 THEN ?4 ELSE since END",
-            did,
-            want ? 1 : 0,
-            epoch,
-            atMs
-        )
-        const change = want ? "join" : "leave"
-        this.db.sql.exec(
-            "INSERT INTO interest_transitions (did, change, epoch) VALUES (?, ?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET change = excluded.change, epoch = excluded.epoch",
-            did,
-            change,
-            epoch
-        )
+        if (want !== current) {
+            const epoch = (row?.epoch ?? 0) + 1
+            this.db.sql.exec(
+                "INSERT INTO interest (did, member, epoch, since) VALUES (?1, ?2, ?3, ?4) " +
+                    "ON CONFLICT(did) DO UPDATE SET member = ?2, epoch = ?3, " +
+                    "since = CASE WHEN ?2 = 1 THEN ?4 ELSE since END",
+                did,
+                want ? 1 : 0,
+                epoch,
+                atMs
+            )
+            const change = want ? "join" : "leave"
+            this.db.sql.exec(
+                "INSERT INTO interest_transitions (did, change, epoch) VALUES (?, ?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET change = excluded.change, epoch = excluded.epoch",
+                did,
+                change,
+                epoch
+            )
+            if (want) this.queueListingSync(did, atMs, "join")
+            else this.dropListingSync(did)
+        }
+        const owns = this.ownsSync(did)
+        if (owns === ownedBefore) return
+        if (!owns) {
+            this.db.sql.exec("UPDATE listings SET owner_listed_at = NULL WHERE did = ?", did)
+        }
+        if (want) this.queueListingSync(did, atMs, "ownership")
+    }
+
+    /** Ownership of a graph by policy: registered under `registered`, held under `everyone`. */
+    private ownsSync(did: string): boolean {
+        if (this.interestPolicy() === "registered") {
+            return (
+                this.db.sql
+                    .exec("SELECT 1 FROM interest WHERE did = ? AND registered = 1", did)
+                    .toArray().length > 0
+            )
+        }
+        return this.holderStateSync(did) === "held"
     }
 
     private holderStateSync(did: string): HolderState | null {
@@ -938,6 +1085,7 @@ export class MonitorIngest
         observedAtMs: number,
         verified: VerifiedWrite
     ): void {
+        const ownedBefore = this.ownsSync(did)
         this.db.sql.exec(
             "INSERT INTO revs (did, rev, observed_at) VALUES (?, ?, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, observed_at = excluded.observed_at",
@@ -965,7 +1113,7 @@ export class MonitorIngest
             did,
             observedAtMs
         )
-        this.reevaluateInterest(did, observedAtMs)
+        this.reevaluateInterest(did, observedAtMs, ownedBefore)
     }
 
     /**
@@ -978,6 +1126,7 @@ export class MonitorIngest
     }
 
     private setGoneState(did: string, permanent: boolean): void {
+        const ownedBefore = this.ownsSync(did)
         // A DID already permanently gone stays so under a reversible answer.
         this.db.sql.exec(
             "INSERT INTO holder_state (did, state) VALUES (?1, ?2) " +
@@ -987,7 +1136,7 @@ export class MonitorIngest
             did,
             permanent ? "gone-permanent" : "gone-reversible"
         )
-        this.reevaluateInterest(did, Date.now())
+        this.reevaluateInterest(did, Date.now(), ownedBefore)
     }
 
     /**
@@ -1466,13 +1615,14 @@ export class MonitorIngest
     }
 
     private setRegisteredSync(did: string, registered: boolean, atMs: number): void {
+        const ownedBefore = this.ownsSync(did)
         this.db.sql.exec(
             "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
                 "ON CONFLICT(did) DO UPDATE SET registered = ?2",
             did,
             registered ? 1 : 0
         )
-        this.reevaluateInterest(did, atMs)
+        this.reevaluateInterest(did, atMs, ownedBefore)
     }
 
     async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
@@ -1489,7 +1639,7 @@ export class MonitorIngest
                 did,
                 count
             )
-            this.reevaluateInterest(did, atMs)
+            this.reevaluateInterest(did, atMs, this.ownsSync(did))
         })
     }
 
@@ -1764,12 +1914,7 @@ export class MonitorIngest
 
     async requeueListing(did: string, cursor: Cursor): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            this.db.sql.exec(
-                "INSERT INTO listing_requeue (did, queued_at) VALUES (?, ?) " +
-                    "ON CONFLICT(did) DO UPDATE SET queued_at = excluded.queued_at",
-                did,
-                Date.now()
-            )
+            this.queueListingSync(did, Date.now(), "sync")
             this.raiseFollowCursor(cursor)
         })
     }
@@ -1803,6 +1948,480 @@ export class MonitorIngest
             String(nowMs)
         )
         this.followConnectedAt = nowMs
+    }
+
+    // ---- ListingIndex -----------------------------------------------------
+    // State: `listing_requeue` is the queue (`attempts`, `not_before`,
+    // `timeouts`, `permanent_failures`, `unlistable`, and `low_priority` for a
+    // `stale` row, which sorts after the other reasons); `listings` holds
+    // each DID's `listed_at`, `owner_listed_at`, sticky `paged` and, while one
+    // runs, the `progress_*` columns; `listing_stage` holds the rows a
+    // listing read until it completes. `dropEdgeOps` deletes the staged rows
+    // its batch names (a live op is newer than the snapshot). The ownership
+    // hook stamps the queue row and clears `owner_listed_at` when ownership
+    // is lost; progress and staging are cleared by an interest leave and by
+    // `sync`, `gap` and `registration` restarts. `meta.listing_gen` is the
+    // generation counter, `meta.gap_requeued_for` the `last_connected_at` a
+    // gap re-queue was done for.
+
+    /** Scans `listing_requeue` (a queue of at most a few hundred due rows beside the idle ones), so it is not indexed. */
+    async dueListings(nowMs: number, limit: number): Promise<QueuedListing[]> {
+        return this.db.sql
+            .exec<QueueSqlRow>(
+                "SELECT q.did AS did, q.attempts, q.not_before, q.timeouts, q.permanent_failures, " +
+                    "COALESCE(l.paged, 0) AS paged, l.progress_kind, l.progress_gen, " +
+                    "l.progress_phase, l.progress_cursor, l.progress_pds, l.progress_began_at, l.progress_pages " +
+                    "FROM listing_requeue q LEFT JOIN listings l ON l.did = q.did " +
+                    "WHERE q.unlistable = 0 AND q.not_before <= ?1 " +
+                    "ORDER BY l.progress_kind IS NULL, q.low_priority, " +
+                    "COALESCE(l.progress_began_at, q.queued_at), q.queued_at, q.did LIMIT ?2",
+                nowMs,
+                limit
+            )
+            .toArray()
+            .map(queuedListing)
+    }
+
+    async inProgressCounts(): Promise<Record<ListingKind, number>> {
+        const counts: Record<ListingKind, number> = { "owner-repo": 0, "owner-paged": 0, mutual: 0 }
+        const rows = this.db.sql
+            .exec<{ kind: ListingKind; n: number }>(
+                "SELECT l.progress_kind AS kind, COUNT(*) AS n FROM listings l " +
+                    "JOIN listing_requeue q ON q.did = l.did " +
+                    "WHERE l.progress_kind IS NOT NULL AND q.unlistable = 0 " +
+                    "AND (q.not_before <= ?1 OR EXISTS (SELECT 1 FROM listing_stage s WHERE s.did = l.did)) " +
+                    "GROUP BY l.progress_kind",
+                Date.now()
+            )
+            .toArray()
+        for (const r of rows) counts[r.kind] = r.n
+        return counts
+    }
+
+    async dueQueuedCount(nowMs: number): Promise<number> {
+        return this.db.sql
+            .exec<{ n: number }>(
+                "SELECT COUNT(*) AS n FROM listing_requeue q " +
+                    "WHERE q.unlistable = 0 AND q.not_before <= ? AND NOT EXISTS " +
+                    "(SELECT 1 FROM listings l WHERE l.did = q.did AND l.progress_kind IS NOT NULL)",
+                nowMs
+            )
+            .one().n
+    }
+
+    async beginListing(
+        did: string,
+        kind: ListingKind,
+        nowMs: number,
+        pds: string | null,
+        notBeforeMs: number
+    ): Promise<StartedListing> {
+        return this.ctx.storage.transactionSync(() => {
+            const gen = this.nextGenSync()
+            const queued = this.db.sql
+                .exec<{ queued_at: number }>("SELECT queued_at FROM listing_requeue WHERE did = ?", did)
+                .toArray()[0]
+            // A DID whose queue row is gone (it left interest) begins nothing.
+            if (queued === undefined) return { gen, beganAtMs: nowMs }
+            const beganAtMs = Math.max(nowMs, queued.queued_at)
+            const previous = this.db.sql
+                .exec<{ last_kind: string | null }>("SELECT last_kind FROM listings WHERE did = ?", did)
+                .toArray()[0]?.last_kind
+            if (previous !== undefined && previous !== null && previous !== kind) {
+                this.db.sql.exec("UPDATE listing_requeue SET timeouts = 0 WHERE did = ?", did)
+            }
+            this.db.sql.exec(
+                "INSERT INTO listings (did, progress_kind, progress_gen, progress_phase, " +
+                    "progress_cursor, progress_pds, progress_began_at, progress_pages, last_kind) " +
+                    "VALUES (?1, ?2, ?3, 'fetch', NULL, ?4, ?5, 0, ?2) " +
+                    "ON CONFLICT(did) DO UPDATE SET progress_kind = ?2, progress_gen = ?3, " +
+                    "progress_phase = 'fetch', progress_cursor = NULL, progress_pds = ?4, " +
+                    "progress_began_at = ?5, progress_pages = 0, last_kind = ?2",
+                did,
+                kind,
+                gen,
+                pds,
+                beganAtMs
+            )
+            this.db.sql.exec("DELETE FROM listing_stage WHERE did = ?", did)
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET attempts = attempts + 1, not_before = ?2, low_priority = 0 " +
+                    "WHERE did = ?1",
+                did,
+                notBeforeMs
+            )
+            return { gen, beganAtMs }
+        })
+    }
+
+    private nextGenSync(): number {
+        const gen = Number(this.metaOf("listing_gen") ?? 0) + 1
+        this.setMeta("listing_gen", String(gen))
+        return gen
+    }
+
+    /** Whether `did`'s stored progress is the one at `gen`. */
+    private progressIsSync(did: string, gen: number): boolean {
+        return (
+            this.db.sql
+                .exec("SELECT 1 FROM listings WHERE did = ? AND progress_gen = ?", did, gen)
+                .toArray().length > 0
+        )
+    }
+
+    private commitStepSync(did: string): void {
+        this.db.sql.exec(
+            "UPDATE listing_requeue SET attempts = 0, not_before = 0, timeouts = 0, permanent_failures = 0 " +
+                "WHERE did = ?",
+            did
+        )
+    }
+
+    async resumeListing(did: string, gen: number, notBeforeMs: number): Promise<boolean> {
+        return this.ctx.storage.transactionSync(() => {
+            if (!this.progressIsSync(did, gen)) return false
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET attempts = attempts + 1, not_before = ? WHERE did = ?",
+                notBeforeMs,
+                did
+            )
+            return true
+        })
+    }
+
+    async stageRows(
+        did: string,
+        gen: number,
+        rows: readonly FollowRecord[],
+        fetchCursor: string | null,
+        done: boolean
+    ): Promise<boolean> {
+        return this.ctx.storage.transactionSync(() => {
+            if (!this.progressIsSync(did, gen)) return false
+            for (const r of rows) {
+                this.db.sql.exec(
+                    "INSERT INTO listing_stage (did, rkey, subject) VALUES (?1, ?2, ?3) " +
+                        "ON CONFLICT(did, rkey) DO UPDATE SET subject = ?3",
+                    did,
+                    r.rkey,
+                    r.subject
+                )
+            }
+            this.db.sql.exec(
+                "UPDATE listings SET progress_pages = progress_pages + 1 " +
+                    "WHERE did = ? AND progress_kind <> 'owner-repo'",
+                did
+            )
+            this.db.sql.exec(
+                done
+                    ? "UPDATE listings SET progress_phase = 'drain', progress_cursor = NULL WHERE did = ?"
+                    : "UPDATE listings SET progress_cursor = ?2 WHERE did = ?1",
+                ...(done ? [did] : [did, fetchCursor])
+            )
+            this.commitStepSync(did)
+            return true
+        })
+    }
+
+    async stagedRows(did: string, after: string | null, limit: number): Promise<FollowRecord[]> {
+        return this.db.sql
+            .exec<{ rkey: string; subject: string }>(
+                "SELECT rkey, subject FROM listing_stage WHERE did = ?1 AND (?2 IS NULL OR rkey > ?2) " +
+                    "ORDER BY rkey LIMIT ?3",
+                did,
+                after,
+                limit
+            )
+            .toArray()
+    }
+
+    async saveDrainProgress(
+        did: string,
+        gen: number,
+        cursor: string,
+        subjects: readonly string[]
+    ): Promise<boolean> {
+        return this.ctx.storage.transactionSync(() => {
+            if (!this.progressIsSync(did, gen)) return false
+            this.db.sql.exec("UPDATE listings SET progress_cursor = ? WHERE did = ?", cursor, did)
+            this.commitStepSync(did)
+            this.queueRecountSync(subjects, Date.now())
+            return true
+        })
+    }
+
+    async switchToPaged(did: string, gen: number, nowMs: number): Promise<boolean> {
+        return this.ctx.storage.transactionSync(() => {
+            if (!this.progressIsSync(did, gen)) return false
+            this.db.sql.exec("UPDATE listings SET paged = 1 WHERE did = ?", did)
+            this.clearProgressSync(did)
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET attempts = 0, not_before = 0, timeouts = 0, " +
+                    "permanent_failures = 0, queued_at = MAX(?2, queued_at + 1) WHERE did = ?1",
+                did,
+                nowMs
+            )
+            return true
+        })
+    }
+
+    private clearProgressSync(did: string): void {
+        this.db.sql.exec(
+            "UPDATE listings SET progress_kind = NULL, progress_gen = NULL, progress_phase = NULL, " +
+                "progress_cursor = NULL, progress_pds = NULL, progress_began_at = NULL, progress_pages = 0 WHERE did = ?",
+            did
+        )
+        this.db.sql.exec("DELETE FROM listing_stage WHERE did = ?", did)
+    }
+
+    async completeListing(
+        did: string,
+        gen: number,
+        done: { beganAtMs: number; nowMs: number; subjects: readonly string[] }
+    ): Promise<boolean> {
+        return this.ctx.storage.transactionSync(() => {
+            const progress = this.db.sql
+                .exec<{ kind: ListingKind; first: number }>(
+                    "SELECT progress_kind AS kind, owner_listed_at IS NULL AS first FROM listings " +
+                        "WHERE did = ? AND progress_gen = ?",
+                    did,
+                    gen
+                )
+                .toArray()[0]
+            if (progress === undefined) return false
+            const ownerKind = progress.kind !== "mutual"
+            const owns = ownerKind && this.ownsSync(did)
+            this.db.sql.exec(
+                "UPDATE listings SET listed_at = ?2, owner_listed_at = CASE " +
+                    "WHEN ?3 = 'mutual' THEN NULL WHEN ?4 = 1 THEN ?2 ELSE owner_listed_at END WHERE did = ?1",
+                did,
+                done.nowMs,
+                progress.kind,
+                owns ? 1 : 0
+            )
+            if (owns && progress.first === 1 && this.registeredSync(did)) {
+                this.queueFolloweeListingsSync(did, done.nowMs)
+            }
+            if (ownerKind !== this.ownsSync(did)) {
+                // The kind this listing ran as is no longer the DID's: keep it
+                // queued so the kind is decided again.
+                this.db.sql.exec(
+                    "UPDATE listing_requeue SET queued_at = MAX(?2, ?3, queued_at + 1) WHERE did = ?1",
+                    did,
+                    done.nowMs,
+                    done.beganAtMs + 1
+                )
+            } else {
+                this.db.sql.exec(
+                    "DELETE FROM listing_requeue WHERE did = ? AND queued_at <= ?",
+                    did,
+                    done.beganAtMs
+                )
+            }
+            this.clearProgressSync(did)
+            this.queueRecountSync(done.subjects, done.nowMs)
+            return true
+        })
+    }
+
+    private registeredSync(did: string): boolean {
+        return (
+            this.db.sql
+                .exec("SELECT 1 FROM interest WHERE did = ? AND registered = 1", did)
+                .toArray().length > 0
+        )
+    }
+
+    /**
+     * A first completed owner listing widens the mutual filter of its
+     * followees that are in interest, so each is listed again, unless it
+     * owns a graph (an owner listing keeps every follow already).
+     */
+    private queueFolloweeListingsSync(owner: string, atMs: number): void {
+        // A follow whose staged row a flush already dropped is not read here,
+        // which is fine: that live create queued its own followee join.
+        const everyone = this.interestPolicy() === "everyone"
+        const subjects = this.db.sql
+            .exec<{ did: string }>(
+                "SELECT DISTINCT s.subject AS did FROM listing_stage s " +
+                    "JOIN interest i ON i.did = s.subject AND i.member = 1 " +
+                    "LEFT JOIN holder_state h ON h.did = s.subject " +
+                    "WHERE s.did = ?1 AND s.subject <> ?1 AND " +
+                    (everyone ? "COALESCE(h.state, '') <> 'held'" : "i.registered = 0"),
+                owner
+            )
+            .toArray()
+        for (const { did } of subjects) this.queueListingSync(did, atMs, "registration")
+    }
+
+    async deferListing(
+        did: string,
+        gen: number | null,
+        notBeforeMs: number,
+        cause: { timedOut: boolean; permanent: boolean },
+        permanentFailuresBeforeUnlistable: number
+    ): Promise<"deferred" | "unlistable" | "superseded"> {
+        return this.ctx.storage.transactionSync(() => {
+            const row = this.db.sql
+                .exec<{ kind: ListingKind | null; timeouts: number; failures: number }>(
+                    "SELECT l.progress_kind AS kind, q.timeouts AS timeouts, " +
+                        "q.permanent_failures AS failures FROM listing_requeue q " +
+                        "LEFT JOIN listings l ON l.did = q.did WHERE q.did = ? AND " +
+                        (gen === null ? "l.progress_kind IS NULL" : "l.progress_gen = ?"),
+                    ...(gen === null ? [did] : [did, gen])
+                )
+                .toArray()[0]
+            if (row === undefined) return "superseded" as const
+            const failures = cause.permanent ? row.failures + 1 : 0
+            const listRecords = row.kind === "owner-paged" || row.kind === "mutual"
+            const timeouts = cause.timedOut ? row.timeouts + 1 : 0
+            if (
+                failures >= permanentFailuresBeforeUnlistable ||
+                (listRecords && cause.timedOut && timeouts >= FOLLOW_TIMEOUTS_BEFORE_PAGED)
+            ) {
+                this.db.sql.exec("UPDATE listing_requeue SET unlistable = 1 WHERE did = ?", did)
+                this.clearProgressSync(did)
+                return "unlistable" as const
+            }
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET not_before = ?2, timeouts = ?3, permanent_failures = ?4 " +
+                    "WHERE did = ?1",
+                did,
+                notBeforeMs,
+                timeouts,
+                failures
+            )
+            const staged = this.db.sql
+                .exec("SELECT 1 FROM listing_stage WHERE did = ? LIMIT 1", did)
+                .toArray()
+            if (staged.length === 0) this.clearProgressSync(did)
+            return "deferred" as const
+        })
+    }
+
+    async dropListing(did: string): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.dropListingSync(did))
+    }
+
+    private dropListingSync(did: string): void {
+        this.db.sql.exec("DELETE FROM listing_requeue WHERE did = ?", did)
+        this.clearProgressSync(did)
+        this.db.sql.exec("UPDATE listings SET owner_listed_at = NULL WHERE did = ?", did)
+    }
+
+    async lastListedAt(did: string): Promise<number | null> {
+        return (
+            this.db.sql
+                .exec<{ listed_at: number | null }>("SELECT listed_at FROM listings WHERE did = ?", did)
+                .toArray()[0]?.listed_at ?? null
+        )
+    }
+
+    async queueListing(did: string, atMs: number, reason: ListingQueueReason): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.queueListingSync(did, atMs, reason))
+    }
+
+    private queueListingSync(did: string, atMs: number, reason: ListingQueueReason): void {
+        const row = this.db.sql
+            .exec<{ unlistable: number; began: number | null }>(
+                "SELECT q.unlistable AS unlistable, l.progress_began_at AS began " +
+                    "FROM listing_requeue q LEFT JOIN listings l ON l.did = q.did WHERE q.did = ?",
+                did
+            )
+            .toArray()[0]
+        if (row === undefined) {
+            this.db.sql.exec(
+                "INSERT INTO listing_requeue (did, queued_at, low_priority) VALUES (?, ?, ?)",
+                did,
+                atMs,
+                reason === "stale" ? 1 : 0
+            )
+            return
+        }
+        if (row.unlistable === 1) {
+            if (reason === "stale" || reason === "upgrade" || reason === "gap") return
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET unlistable = 0, attempts = 0, not_before = 0, " +
+                    "timeouts = 0, permanent_failures = 0, low_priority = 0, queued_at = ?2 WHERE did = ?1",
+                did,
+                atMs
+            )
+            return
+        }
+        if (reason === "sync") {
+            this.db.sql.exec(
+                "UPDATE listing_requeue SET timeouts = 0, permanent_failures = 0 WHERE did = ?",
+                did
+            )
+        }
+        if (reason !== "stale") {
+            this.db.sql.exec("UPDATE listing_requeue SET low_priority = 0 WHERE did = ?", did)
+        }
+        if (row.began === null) return
+        if (reason === "join" || reason === "stale" || reason === "upgrade") return
+        // Forward-only: Date.now() does not advance without I/O in workerd, so
+        // a same-millisecond stamp is normal and must still outrank the begin.
+        this.db.sql.exec(
+            "UPDATE listing_requeue SET queued_at = MAX(?2, ?3, queued_at + 1) WHERE did = ?1",
+            did,
+            atMs,
+            row.began + 1
+        )
+        if (reason !== "ownership") this.clearProgressSync(did)
+    }
+
+    async queueAllListings(atMs: number, reason: "upgrade" | "gap"): Promise<number> {
+        return this.ctx.storage.transactionSync(() => this.queueAllListingsSync(atMs, reason))
+    }
+
+    private queueAllListingsSync(atMs: number, reason: "upgrade" | "gap"): number {
+        this.db.sql.exec(
+            "INSERT INTO listing_requeue (did, queued_at) SELECT did, ? FROM interest WHERE member = 1 " +
+                "ON CONFLICT(did) DO NOTHING",
+            atMs
+        )
+        this.db.sql.exec(
+            "UPDATE listing_requeue SET low_priority = 0 WHERE low_priority = 1 AND unlistable = 0 " +
+                "AND did IN (SELECT did FROM interest WHERE member = 1)"
+        )
+        if (reason === "gap") {
+            const running = this.db.sql
+                .exec<{ did: string }>(
+                    "SELECT l.did AS did FROM listings l JOIN listing_requeue q ON q.did = l.did " +
+                        "WHERE l.progress_kind IS NOT NULL AND q.unlistable = 0"
+                )
+                .toArray()
+            for (const { did } of running) this.queueListingSync(did, atMs, "gap")
+        }
+        return this.db.sql
+            .exec<{ n: number }>(
+                "SELECT COUNT(*) AS n FROM interest i JOIN listing_requeue q ON q.did = i.did " +
+                    "WHERE i.member = 1 AND q.unlistable = 0"
+            )
+            .one().n
+    }
+
+    async queueStaleListings(
+        listedBeforeMs: number,
+        limit: number,
+        atMs: number
+    ): Promise<number> {
+        const queuedCount = () =>
+            this.db.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM listing_requeue").one().n
+        return this.ctx.storage.transactionSync(() => {
+            const before = queuedCount()
+            this.db.sql.exec(
+                "INSERT INTO listing_requeue (did, queued_at, low_priority) " +
+                    "SELECT l.did, ?3, 1 FROM listings l JOIN interest i ON i.did = l.did AND i.member = 1 " +
+                    "WHERE l.listed_at IS NOT NULL AND l.listed_at < ?1 AND l.progress_kind IS NULL " +
+                    "AND NOT EXISTS (SELECT 1 FROM listing_requeue q WHERE q.did = l.did) " +
+                    "ORDER BY l.listed_at LIMIT ?2",
+                listedBeforeMs,
+                limit,
+                atMs
+            )
+            return queuedCount() - before
+        })
     }
 
     // ---- EdgeOpsIndex -----------------------------------------------------
@@ -1847,6 +2466,11 @@ export class MonitorIngest
 
     async dropEdgeOps(throughSeq: number, subjects: readonly string[]): Promise<void> {
         this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "DELETE FROM listing_stage WHERE (did, rkey) IN " +
+                    "(SELECT follower, rkey FROM edge_ops WHERE seq <= ?)",
+                throughSeq
+            )
             this.db.sql.exec("DELETE FROM edge_ops WHERE seq <= ?", throughSeq)
             this.queueRecountSync(subjects, Date.now())
         })
@@ -1863,16 +2487,26 @@ export class MonitorIngest
 
     /**
      * Every DID's standing now, as the DO's tables have it. `owner` is the
-     * served flag: no listing sets it yet, so no graph is served.
+     * served flag: ownership by policy and a completed owner listing
+     * (`listings.owner_listed_at`).
      */
-    private static readonly STANDING =
-        "SELECT c.did AS did, 0 AS owner, " +
-        "COALESCE(h.state = 'held', 0) AS holder, " +
-        "COALESCE(i.member, 0) AS member, COALESCE(i.registered, 0) AS registered " +
-        "FROM (SELECT did FROM interest UNION SELECT did FROM holder_state " +
-        "UNION SELECT did FROM graph_mirrored) c " +
-        "LEFT JOIN holder_state h ON h.did = c.did " +
-        "LEFT JOIN interest i ON i.did = c.did "
+    private standingSql(): string {
+        const owns =
+            this.interestPolicy() === "registered"
+                ? "COALESCE(i.registered, 0)"
+                : "COALESCE(h.state = 'held', 0)"
+        return (
+            "SELECT c.did AS did, " +
+            `CASE WHEN l.owner_listed_at IS NOT NULL AND ${owns} = 1 THEN 1 ELSE 0 END AS owner, ` +
+            "COALESCE(h.state = 'held', 0) AS holder, " +
+            "COALESCE(i.member, 0) AS member, COALESCE(i.registered, 0) AS registered " +
+            "FROM (SELECT did FROM interest UNION SELECT did FROM holder_state " +
+            "UNION SELECT did FROM graph_mirrored) c " +
+            "LEFT JOIN holder_state h ON h.did = c.did " +
+            "LEFT JOIN interest i ON i.did = c.did " +
+            "LEFT JOIN listings l ON l.did = c.did "
+        )
+    }
 
     /**
      * Scans every DID in `interest`, `holder_state` and `graph_mirrored` on
@@ -1883,7 +2517,7 @@ export class MonitorIngest
             .exec<MirrorSqlRow & PriorSqlRow>(
                 "SELECT s.*, m.did AS m_did, m.owner AS m_owner, m.holder AS m_holder, " +
                     "m.member AS m_member, m.registered AS m_registered FROM (" +
-                    MonitorIngest.STANDING +
+                    this.standingSql() +
                     ") s LEFT JOIN graph_mirrored m ON m.did = s.did " +
                     "WHERE COALESCE(m.inflight, 0) = 1 OR s.owner <> COALESCE(m.owner, 0) " +
                     "OR s.holder <> COALESCE(m.holder, 0) " +
@@ -1947,7 +2581,7 @@ export class MonitorIngest
     async standingOf(did: string): Promise<GraphMirrorRow> {
         const found = this.db.sql
             .exec<MirrorSqlRow>(
-                "SELECT * FROM (" + MonitorIngest.STANDING + ") WHERE did = ?",
+                "SELECT * FROM (" + this.standingSql() + ") WHERE did = ?",
                 did
             )
             .toArray()[0]
@@ -1983,20 +2617,33 @@ export class MonitorIngest
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
         const edges = d1FollowEdgeWriter(this.env.graph!, budget)
-        const deps = { index: this, edges, nowMs: () => Date.now(), budget }
+        const deps = { index: this, listings: this, edges, nowMs: () => Date.now(), budget }
         const owners = { edges, interest: this, nowMs: deps.nowMs }
+        const reserve = this.listingReserve()
         for (const [name, step] of [
             [
                 "graph mirror",
                 () =>
                     mirrorGraph(
                         deps,
-                        Math.min(
-                            this.envInt(this.env.GRAPH_MIRROR_BATCH, 50),
-                            Math.floor(budget.remaining / MIRROR_STATEMENTS_PER_DID)
+                        Math.max(
+                            0,
+                            Math.min(
+                                this.envInt(this.env.GRAPH_MIRROR_BATCH, 50),
+                                Math.floor((budget.remaining - reserve) / MIRROR_STATEMENTS_PER_DID)
+                            )
                         )
                     ),
             ],
+            [
+                "listing re-queue",
+                () =>
+                    relistStale(deps, {
+                        relistAfterMs: this.envInt(this.env.FOLLOW_RELIST_AFTER_MS, 604_800_000),
+                        maxPerAlarm: STALE_RELIST_PER_ALARM,
+                    }),
+            ],
+            ["listings", () => runListings(this.listingDeps(edges, budget), this.listingConfig())],
             [
                 "edge flush",
                 () =>
@@ -2024,6 +2671,40 @@ export class MonitorIngest
             } catch (err) {
                 console.error(`monitor: ${name} failed`, err)
             }
+        }
+    }
+
+    private listingReserve(): number {
+        return this.envInt(this.env.FOLLOW_LISTING_STATEMENT_RESERVE, 400)
+    }
+
+    private listingConfig(): FollowBackfillConfig {
+        return {
+            repos: this.envInt(this.env.FOLLOW_BACKFILL_REPOS, 4),
+            listRecordsInProgress: LISTRECORDS_IN_PROGRESS,
+            statementReserve: this.listingReserve(),
+            maxFollows: this.envInt(this.env.MAX_FOLLOWS, 20_000),
+            maxRepoBytes: this.envInt(this.env.FOLLOW_MAX_REPO_BYTES, 33_554_432),
+            maxMstNodes: DEFAULT_MAX_MST_NODES,
+            pagesPerAlarm: LISTING_PAGES_PER_ALARM,
+            timeoutsBeforePaged: FOLLOW_TIMEOUTS_BEFORE_PAGED,
+            retryBaseMs: LISTING_RETRY_BASE_MS,
+            retryMaxMs: LISTING_RETRY_MAX_MS,
+            permanentFailuresBeforeUnlistable: FOLLOW_UNLISTABLE_AFTER,
+        }
+    }
+
+    private listingDeps(edges: FollowBackfillDeps["edges"], budget: StatementBudget): FollowBackfillDeps {
+        return {
+            listings: this,
+            interest: this,
+            edges,
+            budget,
+            fetchRepo: (did) => this.fetchRepo(did),
+            verifyRepo: (car, expected) => this.verifyRepo(car, expected),
+            resolvePds: (did) => this.resolvePds(did),
+            listFollows: (pds, did, cursor) => this.listFollows(pds, did, cursor),
+            nowMs: () => Date.now(),
         }
     }
 
@@ -2206,6 +2887,46 @@ export class MonitorIngest
     /** `verifyRecord` for a secondary record's own path. */
     protected verifyRecordAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
         return this.verifyAt(ref, record)
+    }
+
+    /**
+     * An owner listing's `getRepo`, streamed. Has a working default over the
+     * global `fetch` (`fetchRepoCar`, bounded by `FOLLOW_FETCH_TIMEOUT_MS`
+     * and the repo byte cap); protected so a deployment or a test can stand
+     * in.
+     */
+    protected fetchRepo(did: string): Promise<FetchedRepo> {
+        return fetchRepoCar(did, {
+            timeoutMs: this.envInt(this.env.FOLLOW_FETCH_TIMEOUT_MS, 30_000),
+            maxBytes: this.envInt(this.env.FOLLOW_MAX_REPO_BYTES, 33_554_432),
+        })
+    }
+
+    /**
+     * Core `verifyRepoCollection` under the repo byte and MST node caps.
+     * Protected so a test can stand in for placeholder CARs.
+     */
+    protected verifyRepo(
+        car: AsyncIterable<Uint8Array>,
+        expected: RepoCollectionExpectation
+    ): Promise<VerifiedCollection> {
+        return verifyRepoCollection(car, expected)
+    }
+
+    /**
+     * The DID's PDS from a freshly fetched document, once per `listRecords`
+     * listing (mutual or paged owner). Protected so a test can stand in.
+     */
+    protected async resolvePds(did: string): Promise<string> {
+        return pdsResolutionFromDocument(await fetchDidDocument(did, fetch)).endpoint
+    }
+
+    /**
+     * One `listRecords` page of `did`'s follows at `pds` after rkey `cursor`,
+     * for a mutual or paged owner listing (`listFollowRecords`).
+     */
+    protected listFollows(pds: string, did: string, cursor: string | null): Promise<FollowPage> {
+        return listFollowRecords(did, cursor, { pds })
     }
 
     /**
@@ -2458,6 +3179,7 @@ export class MonitorIngest
      */
     async connectFollow(): Promise<void> {
         if (this.followSocket !== null) return
+        this.requeueOnGap(Date.now())
         const cursor = await this.readFollowCursor()
         const url = new URL(this.env.JETSTREAM_URL)
         const collections = [
@@ -2479,6 +3201,25 @@ export class MonitorIngest
         }
         ws.addEventListener("close", drop)
         ws.addEventListener("error", drop)
+    }
+
+    /**
+     * An outage longer than Jetstream replays may have lost follows, so every
+     * listing is queued again, once per outage: `gap_requeued_for` holds the
+     * `last_connected_at` it was done for, which failed reconnects keep seeing.
+     * Runs before a reconnect stamps a new open time, whichever caller got here.
+     */
+    private requeueOnGap(nowMs: number): void {
+        // An open but silent socket counts as connected only as often as
+        // frames refresh `last_connected_at`.
+        const stored = this.metaOf("last_connected_at")
+        if (stored === undefined || this.metaOf("gap_requeued_for") === stored) return
+        const lookbackMs = this.envInt(this.env.JETSTREAM_LOOKBACK_MS, 129_600_000)
+        if (!followGapExceeded(Number(stored), nowMs, lookbackMs)) return
+        this.ctx.storage.transactionSync(() => {
+            this.queueAllListingsSync(nowMs, "gap")
+            this.setMeta("gap_requeued_for", stored)
+        })
     }
 
     /**

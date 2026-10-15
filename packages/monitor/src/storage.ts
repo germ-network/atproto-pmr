@@ -1,6 +1,6 @@
 /**
  * The monitor's storage seam, split the way the data's own properties split
- * it (`docs/monitor-ingest.md`, "State partition").
+ * it (`spec/key-transparency.md`, "Keeping the snapshot current").
  *
  * Two stores, because two access patterns — and, since the DO-read-offload,
  * two *processes*: `SnapshotStore` is the only thing a request handler may
@@ -340,8 +340,8 @@ export interface MonitorIndex {
     dropWindow(window: number): Promise<void>
 
     /**
-     * Progress through tier 3's baseline build (`docs/monitor-ingest.md`,
-     * "Reconciliation") — a second position, distinct from `Cursor` (the
+     * Progress through tier 3's baseline build (`spec/key-transparency.md`,
+     * "Keeping the snapshot current") — a second position, distinct from `Cursor` (the
      * live tail): this monitor's own place in a relay's enumeration of
      * every DID carrying the collection.
      *
@@ -359,8 +359,7 @@ export interface MonitorIndex {
  * left off, uninterpreted" shape as `Cursor`. `done: true` is terminal:
  * the relay's enumeration was exhausted, so nothing remains to discover
  * this way. (Re-sweeping periodically, to catch a relay that withholds a
- * DID from one pass, is `docs/monitor-ingest.md`'s separate "Withholding
- * sweep" — not implemented by this baseline-build pass.)
+ * DID from one pass, is a separate sweep, not implemented by this baseline-build pass.)
  */
 export type BackfillProgress =
     | { done: false; cursor: string | null }

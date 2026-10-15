@@ -86,6 +86,49 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     GRAPH_RECONCILE_BATCH?: string
 
     /**
+     * getRepo owner listings fetched per alarm (one at a time) and in
+     * progress at once, default 4. Bounds the verifying walk's memory and
+     * the staging; `listRecords` listings are bounded by pages and the
+     * statement reserve instead.
+     */
+    FOLLOW_BACKFILL_REPOS?: string
+
+    /**
+     * D1 statements the follow listings may take per alarm, out of
+     * `GRAPH_STATEMENT_BUDGET`, default 400. The graph mirror is capped to
+     * leave it.
+     */
+    FOLLOW_LISTING_STATEMENT_RESERVE?: string
+
+    /**
+     * Follow records the verifying getRepo walk holds before it refuses and
+     * the owner is listed by `listRecords` pages instead, default 20_000;
+     * also where a mutual listing stops.
+     */
+    MAX_FOLLOWS?: string
+
+    /**
+     * CAR bytes past which an owner is listed by `listRecords` pages across
+     * alarms instead of one verified getRepo, default 33_554_432 (32 MiB).
+     * Bounds what the verifying walk retains in the isolate; raise it only
+     * on a measured heap.
+     */
+    FOLLOW_MAX_REPO_BYTES?: string
+
+    /** Bound (ms) on one listing's `getRepo`, body included, default 30_000. */
+    FOLLOW_FETCH_TIMEOUT_MS?: string
+
+    /**
+     * How far back (ms) Jetstream replays, default 36 h. A follow stream down
+     * longer than this, judged from `last_connected_at`, re-queues every
+     * listing.
+     */
+    JETSTREAM_LOOKBACK_MS?: string
+
+    /** A listing older than this (ms) is re-queued, default 7 days. */
+    FOLLOW_RELIST_AFTER_MS?: string
+
+    /**
      * The relay's directory of registered DIDs (bare `<did>` keys), read only:
      * the daily reconcile lists it to repair a missed register or unregister.
      * Required under `registered` (the object fails at startup without it);

@@ -626,6 +626,28 @@ describe("follow listings", () => {
         expect(h.listings.calls.defer[0]!.gen).toBeNull()
     })
 
+    it("a failed PDS resolve on a kind change defers under the stored progress's gen", async () => {
+        const h = harness({
+            resolvePds: async () => {
+                throw new Error("nope")
+            },
+        })
+        h.listings.queue("did:plc:m", {
+            inProgress: {
+                kind: "owner-repo",
+                gen: 7,
+                phase: "drain",
+                cursor: null,
+                pds: null,
+                beganAtMs: 1,
+                pages: 0,
+            },
+        })
+        await run(h)
+        expect(h.listings.calls.begin).toEqual([])
+        expect(h.listings.calls.defer[0]!.gen).toBe(7)
+    })
+
     it("a superseded step neither defers nor switches the restarted listing", async () => {
         const restart = async (h: Harness) => {
             await h.listings.index.beginListing("did:plc:x", "owner-repo", NOW, null, 0)

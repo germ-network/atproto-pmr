@@ -2,7 +2,7 @@
  * Ingest: turning a wake signal into a verified snapshot entry.
  *
  * The shape is two transactions bracketing a fetch, and the ordering is the
- * whole design (`docs/monitor-ingest.md`):
+ * whole design (`spec/key-transparency.md`, "Keeping the snapshot current"):
  *
  *   1. intake     — dedupe, record the obligation, advance the cursor
  *   2. (async)    — fetch from the DID's own PDS, verify, write the bytes
