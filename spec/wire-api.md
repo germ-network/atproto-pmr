@@ -1214,8 +1214,9 @@ the relay stored for one) MUST read without `since` when it first reads `b`, and
 drop its held tokens: a relay that stored a state for it counts the list as
 delivered, so naming that token would report the list as unchanged.
 
-The block list is private to the owner: it appears only here, never in the
-graph or on any public route, and is diffed independently of the graph, so a
+The block list is the owner's own: it appears only here, not in the graph or
+on any public route (no device reads another DID's block list, and serving
+them would cost), and is diffed independently of the graph, so a
 change to blocks alone issues a new token. Each entry names the block record's
 rkey in the owner's repo, so a device can verify it against the signed record
 before relying on it; like graph edges, a block is a hint until then. These are

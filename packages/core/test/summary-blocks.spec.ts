@@ -1,4 +1,4 @@
-/** The owner's own blocks in the authenticated summary, and nowhere public. */
+/** The owner's own blocks in the authenticated summary, and not in the graph. */
 import { describe, expect, it } from "vitest"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../src/cose/cbor"
 import {

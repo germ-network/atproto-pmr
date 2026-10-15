@@ -1,6 +1,7 @@
--- The block index, written only by MonitorIngest. Never projected or listed
--- publicly: the owner reads their own blocks through the authenticated
--- summary; other DIDs' blocks only answer whether one DID blocks another.
+-- The block index, written only by MonitorIngest. Not projected or served
+-- publicly (no device reads other DIDs' block lists, and serving them would
+-- cost): the owner reads their own blocks through the authenticated summary;
+-- other DIDs' blocks only answer whether one DID blocks another.
 
 -- Every block of a served graph's owner, plus a non-owner in interest's
 -- blocks of registered DIDs. `gen` is the listing generation that last wrote

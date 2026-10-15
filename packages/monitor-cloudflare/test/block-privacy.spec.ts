@@ -1,4 +1,4 @@
-/** Blocks never reach a public surface: no change rows, no projection change. */
+/** Blocks feed no public projection: no change rows, no projection change. */
 import { env } from "cloudflare:test"
 import { beforeEach, describe, expect, it } from "vitest"
 import { decodeEvent, flushEdgeOps, routeFollowEvent, runGraphProjector } from "@germ-network/atproto-pmr-monitor"
@@ -65,7 +65,7 @@ async function blockActivity(obj: MonitorIngest, listing = true): Promise<void> 
     ])
 }
 
-describe("blocks stay private", () => {
+describe("blocks reach no public projection", () => {
     it("block ops by socket, listing and mirror prune write no graph_changes rows", async () => {
         const s = registeredStub("bp")
         await inObj(s, blockActivity)
@@ -75,7 +75,7 @@ describe("blocks stay private", () => {
     })
 
     it("block ops by socket, listing and mirror prune leave the KV graph:<did> value unchanged", async () => {
-        // O follows a holder that O also blocks, so a block leaking into the
+        // O follows a holder that O also blocks, so a block reaching the
         // projection would change its bytes.
         await db.batch([
             db.prepare("INSERT INTO graph_owners (did) VALUES (?)").bind(O),

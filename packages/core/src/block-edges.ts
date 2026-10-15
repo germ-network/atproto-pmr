@@ -2,9 +2,10 @@
  * The block index: `app.bsky.graph.block` records of the DIDs a monitor
  * keeps them for — every block of a served graph's owner, and a non-owner
  * in interest's blocks of registered DIDs. Unlike follows, block lists are
- * never published: an owner reads their own only through the authenticated
- * summary, and other DIDs' blocks only answer whether one DID blocks
- * another. Rows are hints, not proof — a device checks one against the
+ * not projected or served publicly, since no device reads another DID's and
+ * serving them would cost: an owner reads their own through the
+ * authenticated summary, and other DIDs' blocks only answer whether one DID
+ * blocks another. Rows are hints, not proof — a device checks one against the
  * blocker's signed record before relying on it.
  */
 
@@ -37,7 +38,7 @@ export interface BlockEdgeStore {
  * The monitor ingest object's RPC for the owner's own blocks, reached across
  * Workers by the relay's summary read.
  *
- * This is the pattern for any owner-private read the monitor holds: one
+ * This is the pattern for any owner-scoped read the monitor holds: one
  * request interface here; one ingest-object method implementing it, which
  * reads D1 directly and lets a failure throw; and one relay adapter that
  * forwards over the `MONITOR_INGEST` binding and throws on a missing binding

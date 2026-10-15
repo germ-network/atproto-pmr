@@ -43,8 +43,8 @@ export interface SummaryIndex {
     graph: GraphReadResponse
     /**
      * The owner's own `app.bsky.graph.block` records, by rkey (not the
-     * relay's blocked senders); they never appear in the graph or on a public
-     * route.
+     * relay's blocked senders); they are kept apart from the graph, which is
+     * projected publicly.
      */
     ownBlocks: OwnBlock[]
     records: SummaryIndexEntry[]
