@@ -128,29 +128,29 @@ lagging or gapped stream; the KV propagation delay (about a minute) and the
 stale-if-error window add to either bound. A `did:web` entry follows its TTL,
 shortened by the monitor's identity-event hint. One race remains: a fetch that
 read the old document just before an operation landed can be written after the
-stream's update and keep the old key for up to one TTL. See
-[`key-transparency.md` §The signing-key cache](key-transparency.md#the-signing-key-cache).
+stream's update and keep the old key for up to one TTL.
 A relay may instead read the DID document the monitor stores for the sender,
 which orders its writes so that race does not arise within the clock-skew
 margin it allows for, and trusts it by case: a
 `did:plc` document confirmed inside the export stream's current unbroken run,
-with the stream caught up, for up to 24 hours (its staleness is the stream's
-lag, plus one alarm interval, plus the propagation delay of about a minute,
-never more than ten minutes' lag plus that delay);
+while the run is no more than ten minutes behind (its staleness is the
+stream's lag, plus the propagation delay of about a minute)
+([key-transparency](key-transparency.md#the-coverage-watermarks));
 a `did:web` document, or a `did:plc` document without that coverage, for ten
 minutes, after which the relay asks the directory as above, with the same
-stale-if-error behaviour. See
-[`key-transparency.md` §The stored DID document](key-transparency.md#the-stored-did-document).
+stale-if-error behaviour.
 It does not take the
 declaration from the sender's PDS on a put, for two reasons: an inline fetch
 tells the sender's PDS when the sender sends, and a read from the party
 whose claim is being checked is not independent of it. The cost is
-freshness: the relay's view is the monitor's view, bounded by the monitor's
-periodic re-confirmation of every held snapshot. A rotation or revocation
-the monitor has not yet observed is accepted until it is.
+freshness: the relay's view is the monitor's view, current as of the
+monitor's firehose coverage
+([key-transparency](key-transparency.md#freshness-comes-from-coverage-not-polling)).
+A rotation or revocation the monitor has not yet observed is accepted until it is.
 
-**One bounded exception.** A held snapshot the monitor has not confirmed for
-24 hours means the monitor has fallen behind. The relay then reads the
+**One bounded exception.** A held snapshot whose freshness (the monitor's
+coverage watermark, or that DID's last direct fetch if later) is more than
+24 hours old means the monitor has fallen behind. The relay then reads the
 sender's PDS to check whether the declaration record is still the same
 — it compares the record CID and nothing else, and never takes the PDS's
 bytes as the declaration. Unchanged, the snapshot stands. Changed or gone,

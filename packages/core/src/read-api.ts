@@ -1,5 +1,5 @@
 /**
- * The device read API's response bodies (`spec/proxy-cache.md`, "Reads and
+ * The device read API's response bodies (`spec/key-transparency.md`, "Reads and
  * the 24-hour rule"). A record is served as its proof CAR, never as a parsed
  * value: the PMR is trusted for privacy, not for content, so the device
  * verifies what it is given.

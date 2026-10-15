@@ -271,7 +271,7 @@ makes fullness self-referential — see below.
 ## Mailboxes, cardinality, and lifecycle
 
 A PMR operates mailboxes — both kinds, always
-([`README.md`](README.md#what-an-atproto-pmr-is)). There is no capability
+([`README.md`](README.md#what-is-an-atproto-pmr)). There is no capability
 list and nothing to declare: a relay serves them or it is not a relay. What
 *does* vary, and what this section is the normative detail for, is how each
 kind is reached, how many of each a user has, and how grant issuance is
@@ -529,8 +529,8 @@ reveals — whether this relay's monitor observes the sender's declaration —
 the monitor already publishes per DID.
 
 A sender that receives `409` SHOULD retry after `Retry-After` with backoff.
-A `409` that persists beyond the monitor's refresh interval means this
-relay's monitor does not observe the sender's declaration (or the sender's
+A `409` that persists beyond the monitor's coverage lag (a stream gap plus
+its resync) means this relay's monitor does not observe the sender's declaration (or the sender's
 signing is wrong); the sender SHOULD surface that rather than retry forever.
 
 `5xx` is reserved for genuine relay faults — a store the relay cannot reach
@@ -1110,7 +1110,7 @@ sender's PDS.
 ### Device reads — records and summary
 
 A relay bound to a monitor answers its devices' reads of atproto state from
-the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
+the monitor's verified cache ([`key-transparency.md`](key-transparency.md#serving-held-snapshots-and-documents-to-devices)), so a
 device normally reaches its contacts' records without reaching their PDSes.
 Four routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
 with the short keys below. A decoder MUST ignore keys it does not know.
@@ -1131,7 +1131,9 @@ relay, and a device reads only the results.
 
 `200` whether or not a record is found, `400` for a malformed path. Found:
 `f`=true, `c` the CAR byte for byte as held, `r` the commit's `rev`, `i` the
-record's CID, `t` when the relay last confirmed the snapshot current (ms). Not
+record's CID, `t` the snapshot's freshness (ms): the later of the monitor's
+coverage watermark and the DID's last direct fetch
+([key-transparency](key-transparency.md#the-coverage-watermarks)). Not
 found: `f`=false, `e` a code, `m` a reason. `rev` and `i` are hints a device
 re-derives from the CAR.
 
@@ -1158,12 +1160,12 @@ DID's records stay `unverifiable` until its repo's next commit. A client that
 rotates its `#atproto` key SHOULD rewrite its declaration afterwards. A
 restart of the monitor's PLC stream without a usable cursor resets its
 continuous coverage, which leaves `did:plc` snapshots `unverifiable` until
-they are confirmed again. A declaration that fails this check requests no
-re-check.
+the monitor's resync confirms them again. A declaration that fails this check
+does not move the resync forward.
 
-The response never waits on the PDS. A declaration past 24 hours is served as
-held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#reads-and-the-24-hour-rule)).
-The residual leak is that re-check: the PDS learns someone is interested in
+The response never waits on the PDS. A declaration whose freshness is past 24 hours is served as
+held and moved forward in the monitor's resync ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
+The residual leak is that read: the PDS learns someone is interested in
 that DID.
 
 #### Can-message verdict
@@ -1356,7 +1358,7 @@ woken consumer achieves the same coverage at a latency floor of its wake
 cadence. Either way it is a different workload from answering requests,
 which is the practical reason the two separate cleanly.
 
-Its surface — registration and the own-DID push, domain deltas, the
+Its surface — registration and the own-DID push, the
 unauthenticated change digest, and the community-view record fetch — is
 specified in [`key-transparency.md`](key-transparency.md).
 
