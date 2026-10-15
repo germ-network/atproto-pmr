@@ -97,7 +97,7 @@ import type {
     ListingProgress,
     StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
-import { d1BlockEdgeWriter } from "./block-edge-store"
+import { d1BlockEdgeStore, d1BlockEdgeWriter } from "./block-edge-store"
 import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
 import { d1GraphChangeLog } from "./graph-change-log"
 import { kvGraphProjections } from "./graph-projection-store"
@@ -112,9 +112,11 @@ import {
     verifyPlcLog,
     verifyRecordProofOutcome,
     verifyRepoCollections,
+    type BlockEdge,
     type DidDocument,
     type InterestPolicy,
     type MonitorRegistrationNotify,
+    type MonitorOwnBlocksRequest,
     type MonitorRecheckRequest,
     type PlcLog,
     type PlcLogEntry,
@@ -328,7 +330,8 @@ export class MonitorIngest
         OwnerFollowedIndex,
         RecountQueueIndex,
         MonitorRegistrationNotify,
-        MonitorRecheckRequest
+        MonitorRecheckRequest,
+        MonitorOwnBlocksRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -1471,6 +1474,18 @@ export class MonitorIngest
             }
             return dids
         })
+    }
+
+    /**
+     * The owner's own blocks, for the relay's authenticated summary read over
+     * the cross-Worker binding. This is the pattern for any owner-private
+     * read the monitor holds: one request interface in core, one method here
+     * that reads D1 directly (outside the alarm's statement budget) and lets
+     * a failure throw, and one relay adapter that throws too, so a failed
+     * read is never delivered as an empty answer.
+     */
+    async ownBlocks(did: string): Promise<BlockEdge[] | null> {
+        return d1BlockEdgeStore(this.env.graph!).ownBlocks(did)
     }
 
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {

@@ -1,4 +1,4 @@
-import type { BlockEdgeStore } from "@germ-network/atproto-pmr-core"
+import type { BlockEdgeStore, MonitorOwnBlocksRequest } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
 
 /**
@@ -7,9 +7,24 @@ import type { PMREnv } from "./env"
  * it throws when no monitor is bound or the call fails, so the summary
  * answers 503 rather than delivering an empty list that would clear every
  * device's blocks.
+ *
+ * This is the relay half of the owner-private read pattern: the request
+ * interface lives in core, the ingest object implements it, and an adapter
+ * like this one forwards over `MONITOR_INGEST` and never swallows a failure.
  */
 export function monitorOwnBlocks(
-    _env: Pick<PMREnv, "MONITOR_INGEST" | "MONITOR_INGEST_NAME">
+    env: Pick<PMREnv, "MONITOR_INGEST" | "MONITOR_INGEST_NAME">
 ): Pick<BlockEdgeStore, "ownBlocks"> {
-    throw new Error("monitorOwnBlocks: not implemented")
+    return {
+        async ownBlocks(did) {
+            const { MONITOR_INGEST, MONITOR_INGEST_NAME } = env
+            if (MONITOR_INGEST === undefined || MONITOR_INGEST_NAME === undefined) {
+                throw new Error("no monitor is bound to read the owner's blocks from")
+            }
+            const monitor = MONITOR_INGEST.get(
+                MONITOR_INGEST.idFromName(MONITOR_INGEST_NAME)
+            ) as unknown as MonitorOwnBlocksRequest
+            return monitor.ownBlocks(did)
+        },
+    }
 }
