@@ -33,7 +33,7 @@ const blockFrame = (operation: string, rkey: string, subject?: string) =>
     })
 
 /** Block activity by the socket, a listing and a mirror prune, for an owner with one served graph. */
-async function blockActivity(obj: MonitorIngest): Promise<void> {
+async function blockActivity(obj: MonitorIngest, listing = true): Promise<void> {
     await obj.setRegistered(O, true, 1)
     const route = (raw: string) =>
         routeFollowEvent({ index: obj, secondaries: monitorCollections(obj.env) }, decodeEvent(raw)!, "1")
@@ -51,8 +51,10 @@ async function blockActivity(obj: MonitorIngest): Promise<void> {
         },
         100
     )
-    stubNet(obj, { repos: { [O]: [] }, blockRepos: { [O]: [{ rkey: "listed", subject: "did:plc:z" }] } })
-    await step(obj)
+    if (listing) {
+        stubNet(obj, { repos: { [O]: [] }, blockRepos: { [O]: [{ rkey: "listed", subject: "did:plc:z" }] } })
+        await step(obj)
+    }
     await db.prepare("INSERT INTO interest (did, registered) VALUES ('did:m', 0)").run()
     await db.prepare("INSERT INTO blocks (blocker, rkey, subject, gen) VALUES ('did:m', '1', 'did:plc:z', 1)").run()
     await d1FollowEdgeWriter(db, statementBudget(11)).mirror([
@@ -73,27 +75,35 @@ describe("blocks stay private", () => {
     })
 
     it("block ops by socket, listing and mirror prune leave the KV graph:<did> value unchanged", async () => {
+        // O follows a holder that O also blocks, so a block leaking into the
+        // projection would change its bytes.
+        await db.batch([
+            db.prepare("INSERT INTO graph_owners (did) VALUES (?)").bind(O),
+            db.prepare("INSERT INTO graph_holders (did) VALUES ('did:plc:z')"),
+            db.prepare("INSERT INTO follows (follower, rkey, subject, gen) VALUES (?, 'f', 'did:plc:z', 1)").bind(O),
+        ])
         const projections = kvGraphProjections(testEnv)
-        await projections.put({ did: O, following: [], followers: [] })
-        const before = await env.records.get(`graph:${O}`, "arrayBuffer")
-        expect(before).not.toBeNull()
-        await inObj(registeredStub("bp"), blockActivity)
-        const budget = statementBudget(1000)
-        await runGraphProjector(
-            {
-                index: {
-                    projectorCursor: async () => ({ kind: "tail", seq: 0 }),
-                    setProjectorCursor: async () => {},
-                    mirroredGraphStanding: async () => "served",
-                    servedGraphsMirrored: async () => ({ dids: [], cursor: null }),
+        const project = () =>
+            runGraphProjector(
+                {
+                    index: {
+                        projectorCursor: async () => ({ kind: "rebuild", asOfSeq: 0, phase: "project", page: null }),
+                        setProjectorCursor: async () => {},
+                        mirroredGraphStanding: async () => "served",
+                        servedGraphsMirrored: async () => ({ dids: [O], cursor: null }),
+                    },
+                    changes: d1GraphChangeLog(db),
+                    edges: d1FollowEdgeStore(db),
+                    projections,
+                    budget: statementBudget(1000),
                 },
-                changes: d1GraphChangeLog(db),
-                edges: d1FollowEdgeStore(db),
-                projections,
-                budget,
-            },
-            200
-        )
+                200
+            )
+        await project()
+        const before = await env.records.get(`graph:${O}`, "arrayBuffer")
+        expect((await projections.get(O))!.following).toHaveLength(1)
+        await inObj(registeredStub("bp"), (obj) => blockActivity(obj, false))
+        await project()
         const after = await env.records.get(`graph:${O}`, "arrayBuffer")
         expect(new Uint8Array(after!)).toEqual(new Uint8Array(before!))
     })

@@ -56,7 +56,7 @@ describe("graph mirror — blocks", () => {
                 mirrored: row("did:o", { owner: true, member: true, registered: true }),
             },
         ])
-        expect(budget.remaining).toBeGreaterThanOrEqual(0)
+        expect(budget.remaining).toBe(0)
         expect(await blocksOf("did:o")).toEqual([])
 
         const s = registeredStub("bm")
