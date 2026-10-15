@@ -1,6 +1,6 @@
 /**
  * The follow-edge index in D1: the single writer's edge and membership
- * writes with their change rows, and the read surfaces the graph routes use.
+ * writes with their change rows, and the owner's edge read.
  */
 import { env } from "cloudflare:test"
 import { beforeEach, describe, expect, it } from "vitest"
@@ -68,7 +68,7 @@ beforeEach(async () => {
 })
 
 describe("follow-edge index writer and reads", () => {
-    it("following and followers serve only a served graph, filtered to holders", async () => {
+    it("ownEdges serves only a served graph, filtered to holders", async () => {
         await seed("did:a", { owner: true, holder: true })
         await seed("did:b", { holder: true })
         await seed("did:c", { owner: true })
@@ -83,15 +83,18 @@ describe("follow-edge index writer and reads", () => {
             1
         )
         const store = d1FollowEdgeStore(db)
-        // a is served: its subjects keep only the holder b.
-        expect(await store.following("did:a")).toEqual([edge("did:a", "1", "did:b")])
-        // followers of a: only holders (b, not c).
-        expect(await store.followers("did:a")).toEqual([edge("did:b", "3", "did:a")])
-        // b is a holder but not served; c is served and answers both ways, filtered to holders.
-        expect(await store.following("did:b")).toEqual([])
-        expect(await store.followers("did:b")).toEqual([])
-        expect(await store.following("did:c")).toEqual([edge("did:c", "4", "did:a")])
-        expect(await store.followers("did:c")).toEqual([edge("did:a", "2", "did:c")])
+        // a is served: its subjects keep only the holder b, and so do its followers.
+        expect(await store.ownEdges("did:a")).toEqual({
+            following: [edge("did:a", "1", "did:b")],
+            followers: [edge("did:b", "3", "did:a")],
+        })
+        // b is a holder but not served.
+        expect(await store.ownEdges("did:b")).toBeNull()
+        // c is served and answers both ways, filtered to holders.
+        expect(await store.ownEdges("did:c")).toEqual({
+            following: [edge("did:c", "4", "did:a")],
+            followers: [edge("did:a", "2", "did:c")],
+        })
     })
 
     it("sweep removes rows older than the listing generation", async () => {

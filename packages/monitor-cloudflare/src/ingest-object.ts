@@ -56,11 +56,7 @@ import {
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
-    runGraphProjector,
-    type GraphProjectorIndex,
-    type MirroredGraphStanding,
     type PlcLogIndex,
-    type ProjectorCursor,
     type GraphMirrorRow,
     type GraphMirrorTransition,
     type MirrorReconcileCursor,
@@ -99,8 +95,6 @@ import type {
 } from "@germ-network/atproto-pmr-monitor"
 import { d1BlockEdgeStore, d1BlockEdgeWriter } from "./block-edge-store"
 import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
-import { d1GraphChangeLog } from "./graph-change-log"
-import { kvGraphProjections } from "./graph-projection-store"
 import {
     DEFAULT_MAX_MST_NODES,
     appendPlcLogEntry,
@@ -328,7 +322,6 @@ export class MonitorIngest
         ListingIndex,
         EdgeOpsIndex,
         GraphMirrorIndex,
-        GraphProjectorIndex,
         PlcLogIndex,
         OwnerFollowedIndex,
         RecountQueueIndex,
@@ -1927,53 +1920,6 @@ export class MonitorIngest
         return { published, remaining }
     }
 
-    // ---- GraphProjectorIndex ----------------------------------------------
-
-    async projectorCursor(): Promise<ProjectorCursor | null> {
-        const stored = this.metaOf("graph_projector_cursor")
-        if (stored === undefined) return null
-        try {
-            const cursor = JSON.parse(stored) as ProjectorCursor | null
-            return cursor?.kind === "tail" || cursor?.kind === "rebuild" ? cursor : null
-        } catch {
-            // A corrupt cursor rebuilds rather than wedging the projector.
-            return null
-        }
-    }
-
-    async setProjectorCursor(cursor: ProjectorCursor): Promise<void> {
-        this.setMeta("graph_projector_cursor", JSON.stringify(cursor))
-    }
-
-    async mirroredGraphStanding(did: string): Promise<MirroredGraphStanding> {
-        const row = this.db.sql
-            .exec<{ owner: number; inflight: number }>(
-                "SELECT owner, inflight FROM graph_mirrored WHERE did = ?",
-                did
-            )
-            .toArray()[0]
-        if (row === undefined) return "not-served"
-        if (row.inflight === 1) return "in-flight"
-        return row.owner === 1 ? "served" : "not-served"
-    }
-
-    async servedGraphsMirrored(
-        cursor: string | null,
-        limit: number
-    ): Promise<{ dids: string[]; cursor: string | null }> {
-        const dids = this.db.sql
-            .exec<{ did: string }>(
-                "SELECT did FROM graph_mirrored WHERE (owner = 1 OR inflight = 1) " +
-                    "AND (?1 IS NULL OR did > ?1) ORDER BY did LIMIT ?2",
-                cursor,
-                limit + 1
-            )
-            .toArray()
-            .map((r) => r.did)
-        const page = dids.slice(0, limit)
-        return { dids: page, cursor: dids.length > limit ? page[page.length - 1]! : null }
-    }
-
     async isGraphOwner(did: string): Promise<boolean> {
         if (this.interestPolicy() === "registered") return this.isRegistered(did)
         return this.holderStateSync(did) === "held"
@@ -3008,8 +2954,8 @@ export class MonitorIngest
     }
 
     /**
-     * The graph mirror, edge-log flush, re-count drain, graph projector,
-     * change-log prune and the daily reconciles, sharing one D1 statement budget. Each runs
+     * The graph mirror, edge-log flush, re-count drain, change-log
+     * prune and the daily reconciles, sharing one D1 statement budget. Each runs
      * alone: a D1 outage costs neither the other steps nor the alarm's
      * re-arm.
      */
@@ -3055,23 +3001,6 @@ export class MonitorIngest
             [
                 "recount drain",
                 () => drainRecounts({ ...owners, queue: this, budget }, RECOUNT_DRAIN_BATCH),
-            ],
-            [
-                "graph projector",
-                () =>
-                    runGraphProjector(
-                        {
-                            index: this,
-                            changes: d1GraphChangeLog(this.env.graph!),
-                            edges: d1FollowEdgeStore(this.env.graph!),
-                            projections: kvGraphProjections(this.env),
-                            budget,
-                        },
-                        // Each DID costs a KV write; they share the alarm's 1,000 KV
-                        // operations with the DID-document publish, coverage and
-                        // snapshot writes.
-                        this.envInt(this.env.GRAPH_PROJECTOR_BATCH, 200)
-                    ),
             ],
             [
                 "graph change prune",

@@ -1,14 +1,11 @@
-/** Blocks feed no public projection: no change rows, no projection change. */
-import { env } from "cloudflare:test"
+/** Blocks feed no follow graph: no change rows, and the owner's graph is the same with or without them. */
 import { beforeEach, describe, expect, it } from "vitest"
-import { decodeEvent, flushEdgeOps, routeFollowEvent, runGraphProjector } from "@germ-network/atproto-pmr-monitor"
+import { decodeEvent, flushEdgeOps, routeFollowEvent } from "@germ-network/atproto-pmr-monitor"
 import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { monitorCollections } from "../src/env"
-import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
-import { d1GraphChangeLog } from "../src/graph-change-log"
-import { kvGraphProjections } from "../src/graph-projection-store"
+import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
-import { all, clearGraph, db, inObj, registeredStub, step, stubNet, testEnv } from "./listing-harness"
+import { all, clearGraph, db, inObj, registeredStub, step, stubNet } from "./listing-harness"
 
 const O = "did:plc:owner"
 
@@ -65,7 +62,7 @@ async function blockActivity(obj: MonitorIngest, listing = true): Promise<void> 
     ])
 }
 
-describe("blocks reach no public projection", () => {
+describe("blocks reach no follow graph", () => {
     it("block ops by socket, listing and mirror prune write no graph_changes rows", async () => {
         const s = registeredStub("bp")
         await inObj(s, blockActivity)
@@ -74,37 +71,19 @@ describe("blocks reach no public projection", () => {
         expect(await all("SELECT * FROM graph_changes")).toEqual([])
     })
 
-    it("block ops by socket, listing and mirror prune leave the KV graph:<did> value unchanged", async () => {
-        // O follows a holder that O also blocks, so a block reaching the
-        // projection would change its bytes.
+    it("block ops by socket, listing and mirror prune leave ownGraph(owner) unchanged", async () => {
+        // O blocks holder y (live) and holder z blocks O, while O follows z: a
+        // block reaching the graph would add y as an edge or change z's mutual flag.
         await db.batch([
             db.prepare("INSERT INTO graph_owners (did) VALUES (?)").bind(O),
             db.prepare("INSERT INTO graph_holders (did) VALUES ('did:plc:z')"),
+            db.prepare("INSERT INTO graph_holders (did) VALUES ('did:plc:y')"),
+            db.prepare("INSERT INTO blocks (blocker, rkey, subject, gen) VALUES ('did:plc:z', 'b', ?, 1)").bind(O),
             db.prepare("INSERT INTO follows (follower, rkey, subject, gen) VALUES (?, 'f', 'did:plc:z', 1)").bind(O),
         ])
-        const projections = kvGraphProjections(testEnv)
-        const project = () =>
-            runGraphProjector(
-                {
-                    index: {
-                        projectorCursor: async () => ({ kind: "rebuild", asOfSeq: 0, phase: "project", page: null }),
-                        setProjectorCursor: async () => {},
-                        mirroredGraphStanding: async () => "served",
-                        servedGraphsMirrored: async () => ({ dids: [O], cursor: null }),
-                    },
-                    changes: d1GraphChangeLog(db),
-                    edges: d1FollowEdgeStore(db),
-                    projections,
-                    budget: statementBudget(1000),
-                },
-                200
-            )
-        await project()
-        const before = await env.records.get(`graph:${O}`, "arrayBuffer")
-        expect((await projections.get(O))!.following).toHaveLength(1)
+        const before = await inObj(registeredStub("bp"), (obj) => obj.ownGraph(O))
+        expect(before!.following).toHaveLength(1)
         await inObj(registeredStub("bp"), (obj) => blockActivity(obj, false))
-        await project()
-        const after = await env.records.get(`graph:${O}`, "arrayBuffer")
-        expect(new Uint8Array(after!)).toEqual(new Uint8Array(before!))
+        expect(await inObj(registeredStub("bp"), (obj) => obj.ownGraph(O))).toEqual(before)
     })
 })

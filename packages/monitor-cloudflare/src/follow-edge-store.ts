@@ -10,13 +10,12 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 
 /**
- * The follow-edge index's reads, over the D1 `graph` database. Both serve
- * only a DID whose graph is served (in `graph_owners`), and nothing
- * otherwise: `following(did)` its edges to subjects in `graph_holders`,
- * `followers(did)` the edges into it from followers in `graph_holders`. The
- * filters are in the query, so no caller can serve an edge outside the
- * declaration set or for a graph not served. `ownEdges(did)` answers both
- * lists and the served bit from one `db.batch`, so they agree.
+ * The follow-edge index's read, over the D1 `graph` database. `ownEdges(did)`
+ * serves only a DID whose graph is served (in `graph_owners`), and nothing
+ * otherwise: its edges to subjects in `graph_holders` and the edges into it
+ * from followers in `graph_holders`, with the served bit, from one
+ * `db.batch` so they agree. The filters are in the query, so no caller can
+ * serve an edge outside the declaration set or for a graph not served.
  */
 export function d1FollowEdgeStore(db: D1Database): FollowEdgeStore {
     const served = "EXISTS (SELECT 1 FROM graph_owners WHERE did = ?1)"
@@ -40,20 +39,6 @@ export function d1FollowEdgeStore(db: D1Database): FollowEdgeStore {
                 following: following!.results as unknown as FollowEdge[],
                 followers: followers!.results as unknown as FollowEdge[],
             }
-        },
-        async following(did: string): Promise<FollowEdge[]> {
-            const { results } = await db
-                .prepare(followingQuery)
-                .bind(did)
-                .all<FollowEdge>()
-            return results
-        },
-        async followers(did: string): Promise<FollowEdge[]> {
-            const { results } = await db
-                .prepare(followersQuery)
-                .bind(did)
-                .all<FollowEdge>()
-            return results
         },
     }
 }
