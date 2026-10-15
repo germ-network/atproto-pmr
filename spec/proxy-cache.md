@@ -1,54 +1,16 @@
-# The PMR as a proxy cache of atproto state
+# The PMR as a messaging appview
 
-## Intended model — not yet built
+A PMR can offload the role of computing network state, serving as an appview
+for messaging. In this role it provides
 
-_Where the specification so far has a relay read atproto state only through
-the key monitor, this document describes the intended direction: a PMR that
-keeps a verified cache of the atproto records and DID documents of the DIDs
-it serves, and answers its devices' reads of them. It is a statement of
-intent, not a contract. Each element below is marked **built** (present in
-the current implementation) or **not yet built**, and nothing marked
-not-yet-built is a requirement on a conforming relay today._
+* immediate and efficient updates to keys and DID documents (already covered by the key monitor)
+* efficient updates of bluesky profiles (display name and profile picture)
+* efficient updates of who the user can message
 
-## The model
+This appview also allows the atproto PMR to efficiently adjudicate which
+DID to DID messages it may accept.
 
-A PMR holds, for the DIDs it serves, a cache of:
-
-- **atproto records, as CAR** — kept current by the Jetstream firehose, and
-  backfilled by a direct query of the DID's PDS;
-- **DID documents** — kept current by the PLC export stream (for `did:plc`),
-  and backfilled by a direct query of the directory.
-
-Devices are **pushed** changes to counterpart records over the events socket
-and the catch-up endpoint, and **backfill by direct query**, normally to the
-PMR rather than to the PDS or the directory.
-
-The cache is only worth keeping if a device can use it without trusting it.
-It therefore stays a **cache of signed things**: records are CAR, verified
-against the DID document, and DID documents are checked against PLC. This is
-the same posture the rest of the specification takes toward a monitor —
-[as untrusted as any relay](key-transparency.md#the-record-fetch), for the
-authenticity reasons in
-[trust-model P2](trust-model.md#p2--relayed-repo-records-are-car) — and it is why [the hint](trust-model.md#p8--the-relays-verdict-is-a-hint) is
-a freshness cue and never evidence.
-
-## "Trusted proxy" means trusted for privacy, not for content
-
-Routing a device's reads through its PMR is a privacy measure: the PDS and a
-`did:web` host do not learn which DIDs a device is looking at, or when. That
-is the whole of the trust. A device still verifies every CAR against the DID
-document itself, and never takes the PMR's word for a record's content or for
-a key. A PMR that served a wrong record would be caught by that verification,
-the same as any other source.
-
-## Who a PMR serves, and what its public reads are for
-
-A PMR is a host for its users: one user self-hosting, or several sharing a
-host to save cost. Germ, as a deployment, may serve everyone, but a PMR is not
-a public service for non-users. Its interest set is its users and the DIDs
-they follow.
-
-The data a PMR caches is public in principle. Records and DID documents are
+The data the PMR appview caches is public in principle. Records and DID documents are
 public atproto state. So is the fact that a user is hosted on a given PMR,
 since a relay is reached through the user's DID document
 ([P9](trust-model.md#p9--user-controlled-discovery)). A PMR's unauthenticated reads
