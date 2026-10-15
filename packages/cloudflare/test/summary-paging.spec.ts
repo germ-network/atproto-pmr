@@ -21,6 +21,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
 
 const small = (n: number, more = false): SummaryIndex => ({
     graph: { did: "did:plc:me", following: [], followers: [] },
+    ownBlocks: [],
     records: [
         {
             did: "did:plc:a",
@@ -42,6 +43,7 @@ function large(records: number, edges: number): SummaryIndex {
             following: Array.from({ length: edges }, (_, i) => ({ did: did("f", i), rkey: `r${i}`, mutual: i % 2 === 0 })),
             followers: Array.from({ length: edges }, (_, i) => ({ did: did("g", i), rkey: `r${i}`, mutual: false })),
         },
+        ownBlocks: [],
         records: Array.from({ length: records }, (_, i) => ({
             did: did("c", i),
             collection: "app.example.thing",

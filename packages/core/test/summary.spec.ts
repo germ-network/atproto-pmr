@@ -43,13 +43,18 @@ describe("diffSummaryIndex", () => {
         following: n ? [{ did: "did:plc:a", rkey: `r${n}`, mutual: false }] : [],
         followers: [],
     })
-    const idx = (records: ReturnType<typeof entry>[], graph = g()): SummaryIndex => ({ graph, records })
+    const idx = (records: ReturnType<typeof entry>[], graph = g()): SummaryIndex => ({
+        graph,
+        ownBlocks: [],
+        records,
+    })
 
     it("with no base, everything changed and full is set", () => {
         const current = idx([entry("did:plc:a"), entry("did:plc:b")])
         expect(diffSummaryIndex(null, current)).toEqual({
             full: true,
             graphChanged: true,
+            blocksChanged: true,
             changed: current.records,
             removed: [],
         })
@@ -61,6 +66,7 @@ describe("diffSummaryIndex", () => {
         expect(diffSummaryIndex(base, current)).toEqual({
             full: false,
             graphChanged: false,
+            blocksChanged: false,
             changed: [],
             removed: [],
         })
@@ -159,6 +165,9 @@ describe("summary read", () => {
         const versions = new Map<string, number>()
         const key = makeKey()
         const projections = new Map<string, GraphReadResponse>()
+        const blocks = new Map<string, { blocker: string; rkey: string; subject: string }[]>()
+        const blocksFail = new Set<string>()
+        const notServed = new Set<string>()
         const reads: string[] = []
         const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
         const repoOf = (did: string, collection: string, rkey: string) => {
@@ -228,6 +237,12 @@ describe("summary read", () => {
             nowSeconds: T0,
             discardWindowSeconds: 3600,
             projections: { get: async (did) => projections.get(did) ?? null },
+            blocks: {
+                ownBlocks: async (did) => {
+                    if (blocksFail.has(did)) throw new Error("d1 down")
+                    return blocks.get(did) ?? (notServed.has(did) ? null : [])
+                },
+            },
             records,
             index,
             signingKeys: {
@@ -244,7 +259,21 @@ describe("summary read", () => {
             },
             nowMs: () => T0 * 1000 + n,
         }
-        return { deps, registrations, directory, challenges, versions, projections, served, puts, reads, unreadable }
+        return {
+            deps,
+            registrations,
+            directory,
+            challenges,
+            versions,
+            projections,
+            blocks,
+            blocksFail,
+            notServed,
+            served,
+            puts,
+            reads,
+            unreadable,
+        }
     }
 
     async function owner(w: ReturnType<typeof summaryWorld>, did: string) {
@@ -318,6 +347,7 @@ describe("summary read", () => {
             token: first.token,
             full: false,
             graph: null,
+            ownBlocks: null,
             records: [],
             removed: [],
             more: false,
@@ -433,6 +463,60 @@ describe("summary read", () => {
         expect(held.size).toBe(SUMMARY_TOKENS_KEPT)
         expect(held.has(tokens[0])).toBe(false)
         for (const t of tokens.slice(1)) expect(held.has(t)).toBe(true)
+    })
+
+    describe("own blocks", () => {
+        const heldTokens = (w: ReturnType<typeof summaryWorld>) =>
+            (w.served.get(`loc:${OWNER}`) ?? []).map((e) => e.token)
+
+        it("a full read carries the owner's blocks, and an unchanged read sends b null under the same token", async () => {
+            const w = summaryWorld()
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const second = await read(await get(first.token))
+            expect(second.ownBlocks).toBeNull()
+            expect(second.token).toBe(first.token)
+        })
+
+        it("a change to blocks alone issues a new token with the whole list", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks).toEqual([])
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const second = await read(await get(first.token))
+            expect(second.token).not.toBe(first.token)
+            expect(second).toMatchObject({ full: false, graph: null, records: [], removed: [] })
+            expect(second.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+        })
+
+        it("answers 503 with Retry-After when the blocks cannot be read, keeping the held states", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.blocksFail.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(503)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+            w.blocksFail.delete(OWNER)
+            expect((await read(await get(first.token))).token).toBe(first.token)
+        })
+
+        it("answers 409 when the owner's graph is not served, keeping the held states", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.notServed.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(409)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+        })
     })
 
     it("an owner with no projection yet is 409 with Retry-After", async () => {
@@ -577,6 +661,7 @@ describe("summary codec", () => {
         more: false,
         truncated: false,
         graph: { did: "did:plc:me", following: [{ did: "did:plc:a", rkey: "r1", mutual: true }], followers: [] },
+        ownBlocks: [{ did: "did:plc:x", rkey: "3k1" }],
         records: [
             {
                 did: "did:plc:a",
@@ -592,7 +677,7 @@ describe("summary codec", () => {
 
     it("a delta round-trips through encode and decode", () => {
         expect(decodeSummaryDelta(encodeSummaryDelta(delta))).toEqual(delta)
-        const unchangedGraph = { ...delta, graph: null, records: [], removed: [] }
+        const unchangedGraph = { ...delta, graph: null, ownBlocks: null, records: [], removed: [] }
         expect(decodeSummaryDelta(encodeSummaryDelta(unchangedGraph))).toEqual(unchangedGraph)
     })
 
@@ -633,7 +718,11 @@ describe("summary codec", () => {
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])
         expect(decodeSummaryDelta(encodeCose(base())).token).toBe("t")
-        const optional: string[] = [SUMMARY_DELTA_KEYS.more, SUMMARY_DELTA_KEYS.truncated]
+        const optional: string[] = [
+            SUMMARY_DELTA_KEYS.more,
+            SUMMARY_DELTA_KEYS.truncated,
+            SUMMARY_DELTA_KEYS.ownBlocks,
+        ]
         for (const key of Object.values(SUMMARY_DELTA_KEYS)) {
             if (optional.includes(key)) continue
             const m = base()

@@ -62,8 +62,8 @@ const summaryKey = (token: string) => SUMMARY_PREFIX + token
 const KEY_SUMMARY_ORDER = "summaryOrder"
 
 /**
- * An index is stored as a header under `summaryKey` and its edges and
- * entries in parts under `summaryPartKey`, each part far below the 2 MB value
+ * An index is stored as a header under `summaryKey` and its edges, own
+ * blocks and entries in parts under `summaryPartKey`, each part far below the 2 MB value
  * limit however large the owner's graph. A distinct prefix keeps a
  * client-named token from addressing a part.
  */
@@ -81,7 +81,7 @@ interface SummaryHeader {
 }
 
 interface SummaryPart {
-    field: "following" | "followers" | "records"
+    field: "following" | "followers" | "ownBlocks" | "records"
     items: unknown[]
 }
 interface SummaryOrder {
@@ -471,6 +471,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         if (!header || typeof header.parts !== "number") return null
         const index: SummaryIndex = {
             graph: { did: header.graphDid, following: [], followers: [] },
+            ownBlocks: [],
             records: [],
             ...(header.more ? { more: true } : {}),
         }
@@ -481,6 +482,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 const part = read.get(key)
                 if (!part) return null
                 if (part.field === "records") index.records.push(...(part.items as SummaryIndex["records"]))
+                else if (part.field === "ownBlocks") {
+                    index.ownBlocks.push(...(part.items as SummaryIndex["ownBlocks"]))
+                }
                 else index.graph[part.field].push(...(part.items as SummaryIndex["graph"]["following"]))
             }
         }
@@ -1055,6 +1059,7 @@ function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
     for (const [field, items] of [
         ["following", index.graph.following],
         ["followers", index.graph.followers],
+        ["ownBlocks", index.ownBlocks],
         ["records", index.records],
     ] as const) {
         let current: unknown[] = []

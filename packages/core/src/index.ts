@@ -418,6 +418,7 @@ export {
     buildSummaryIndex,
     readSummaryPage,
     summaryContacts,
+    SummaryOwnBlocksError,
     SUMMARY_MAX_RECORDS,
     SUMMARY_PAGE_RECORDS,
     type SummaryHeldEntry,
