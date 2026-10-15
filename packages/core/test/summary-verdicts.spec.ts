@@ -69,13 +69,13 @@ describe("indexPolicySource", () => {
 
 const DECL_REF = { collection: DECLARATION_COLLECTION_NSID, rkey: "self" }
 const THIRD = "did:plc:third000000000000000000"
-const open = { found: true, policies: ["open"] } as const
-const clear = { blocks: "no", follows: "no" } as const
+const follows = { found: true, policies: ["bsky-follows"] } as const
+const clear = { blocks: "no", follows: "yes" } as const
 
-/** A world that watches declarations, where the owner follows PEER, who declares `open`. */
+/** A world that watches declarations, where the owner follows PEER, who declares `bsky-follows`. */
 function world(extra: { collection: string; rkey: string }[] = []) {
     const w = summaryWorld({ watched: [DECL_REF, ...extra] })
-    w.declared.set(PEER, open)
+    w.declared.set(PEER, follows)
     w.senderFacts.set(`${OWNER}|${PEER}`, clear)
     return w
 }
@@ -85,14 +85,14 @@ const verdictOf = (d: { verdicts: { did: string; verdict: unknown }[] }, did: st
 describe("summary verdicts", () => {
     it("a full summary carries a verdict for every covered contact with a held declaration, and none for the owner", async () => {
         const w = world()
-        w.declared.set(OWNER, open)
+        w.declared.set(OWNER, follows)
         w.ownGraphs.get(OWNER)!.followers.push({ did: THIRD, mutual: false })
         w.versions.set(THIRD, 1)
-        w.declared.set(THIRD, open)
+        w.declared.set(THIRD, follows)
         w.senderFacts.set(`${OWNER}|${THIRD}`, clear)
         const delta = await read(await (await owner(w, OWNER))())
         expect(delta.verdicts.map((v) => v.did)).toEqual([PEER, THIRD].sort())
-        expect(verdictOf(delta, PEER)).toEqual({ verdict: "yes", via: ["open"] })
+        expect(verdictOf(delta, PEER)).toEqual({ verdict: "yes", via: ["bsky-follows"] })
     })
 
     it("an unchanged verdict is absent from the delta", async () => {
@@ -125,7 +125,7 @@ describe("summary verdicts", () => {
         const w = world()
         w.ownGraphs.get(OWNER)!.followers.push({ did: THIRD, mutual: false })
         w.versions.set(THIRD, 1)
-        w.declared.set(THIRD, open)
+        w.declared.set(THIRD, follows)
         w.senderFacts.set(`${OWNER}|${THIRD}`, clear)
         const get = await owner(w, OWNER)
         const first = await read(await get())
@@ -142,7 +142,7 @@ describe("summary verdicts", () => {
     // The sender-graph fake answers only for sender === owner, so a swapped direction fails.
     it("asks forSender for (owner, the contacts with a servable declaration), excluding the owner", async () => {
         const w = world()
-        w.declared.set(OWNER, open)
+        w.declared.set(OWNER, follows)
         w.ownGraphs.get(OWNER)!.followers.push({ did: THIRD, mutual: false })
         await buildSummaryIndex(OWNER, w.deps)
         expect(w.senderAsked).toEqual([{ sender: OWNER, recipients: [PEER] }])
@@ -153,7 +153,7 @@ describe("summary verdicts", () => {
         const first = "did:plc:aaa000000000000000000000"
         w.ownGraphs.get(OWNER)!.followers.push({ did: first, mutual: false })
         w.versions.set(first, 1)
-        w.declared.set(first, open)
+        w.declared.set(first, follows)
         w.senderFacts.set(`${OWNER}|${first}`, clear)
         const built = await buildSummaryIndex(OWNER, w.deps)
         expect(built!.index.verdicts.map((v) => v.did)).toEqual([first, PEER])
@@ -203,7 +203,7 @@ describe("summary verdicts", () => {
 
     it("index records carry no policies field", async () => {
         const w = world()
-        w.declared.set(OWNER, open)
+        w.declared.set(OWNER, follows)
         const built = await buildSummaryIndex(OWNER, w.deps)
         expect(built!.index.records.length).toBeGreaterThan(0)
         for (const record of built!.index.records) expect(record).not.toHaveProperty("policies")
@@ -278,7 +278,7 @@ describe("summary verdicts", () => {
         const w = world([{ collection: COLLECTION, rkey: "self" }])
         w.ownGraphs.get(OWNER)!.followers.push({ did: THIRD, mutual: false })
         w.versions.set(THIRD, 1)
-        w.declared.set(THIRD, open)
+        w.declared.set(THIRD, follows)
         w.senderFacts.set(`${OWNER}|${THIRD}`, clear)
         w.deps.pageRecords = 1
         const get = await owner(w, OWNER)

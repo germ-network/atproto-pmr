@@ -1256,7 +1256,8 @@ at all shows the recipient's declaration is held.
 Policy and reason codes are open strings; a decoder MUST keep codes it does
 not know. Reasons for `no`: `no-declaration`, `blocked`, `not-admitted`. For
 `unknown`: `declaration-unavailable`, `policy-undecodable`,
-`policy-unrecognized`, `graph-incomplete`, `block-unknown`.
+`policy-unrecognized`, `graph-incomplete`, `block-unknown`,
+`policy-not-enabled`.
 
 The recipient's policies are the signed `AnchorPolicy` in the declaration's
 `keyPackage`: `closed` declares none, `follows` is `bsky-follows` (the
@@ -1280,11 +1281,19 @@ Evaluated in order:
    (`bsky-follows` with the follow unknown, `graph-incomplete`; any other
    policy, `policy-unrecognized`).
 4. Block known absent: any admitting policy gives `yes`, listing all of them
-   in declared order; else any pending gives `unknown`; else
+   in declared order, except that a relay admits only through `bsky-follows`
+   for now (see below). Otherwise any pending gives `unknown`; else
    `no [not-admitted]`, which includes a declaration with no policies.
 5. Block unknown: admitting and pending policies together give `unknown`
    with `block-unknown` first among the reasons; if there are none,
    `no [not-admitted]`.
+
+A relay does not yet admit strangers, so a verdict that only `open` admits is
+`unknown [policy-not-enabled]` with `a` absent and the admitting and pending
+policies listed as pending, on this route, in the owner's summary and at
+receive-time admission alike. A policy a relay can evaluate but does not yet
+honour would read the same way. A client treats it as it treats any `unknown`:
+the recipient's device decides on first contact.
 
 #### Summary
 

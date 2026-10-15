@@ -37,6 +37,8 @@ export type CanMessageNoReason = "no-declaration" | "blocked" | "not-admitted" |
  * - `policy-unrecognized` — a policy B declares is not one this relay evaluates.
  * - `graph-incomplete` — a follow the policy depends on is not kept for this pair.
  * - `block-unknown` — whether B blocks A is not kept for this pair.
+ * - `policy-not-enabled` — B's policies admit A, but only through `open`,
+ *   which this relay does not yet honour (see {@link admitsThroughBoundedPolicy}).
  */
 export type CanMessageUnknownReason =
     | "declaration-unavailable"
@@ -44,6 +46,7 @@ export type CanMessageUnknownReason =
     | "policy-unrecognized"
     | "graph-incomplete"
     | "block-unknown"
+    | typeof POLICY_NOT_ENABLED
     | (string & {})
 
 export type CanMessageVerdict =
@@ -94,6 +97,21 @@ export interface CanMessageFacts {
     followed: PairFact
 }
 
+/** Unknown reason for a yes that only a policy this relay does not yet honour admits. */
+export const POLICY_NOT_ENABLED = "policy-not-enabled"
+
+/**
+ * The relay admits only through policies it knows bound what an admitted
+ * sender can cost: `bsky-follows`, which admits people the recipient follows.
+ * A yes admitted only by a policy that admits strangers (`open`), or by one
+ * the relay does not know, is held back as unknown until the relay bounds
+ * admitted senders (mailbox depth and push wakes) as the recovery pool does.
+ * Every surface that reports a yes, and receive-time admission, applies this.
+ */
+export function admitsThroughBoundedPolicy(via: readonly string[]): boolean {
+    return via.some((policy) => policy === "bsky-follows")
+}
+
 /** The verdict for one pair. Pure. */
 export function evaluateCanMessage(facts: CanMessageFacts): CanMessageVerdict {
     const { declared, blocked, followed } = facts
@@ -125,7 +143,11 @@ export function evaluateCanMessage(facts: CanMessageFacts): CanMessageVerdict {
     }
 
     if (blocked === "no") {
-        if (admitting.length > 0) return { verdict: "yes", via: admitting }
+        if (admitting.length > 0) {
+            return admitsThroughBoundedPolicy(admitting)
+                ? { verdict: "yes", via: admitting }
+                : { verdict: "unknown", pending: [...admitting, ...pending], why: [POLICY_NOT_ENABLED] }
+        }
         if (pending.length > 0) return { verdict: "unknown", pending, why: reasons }
         return { verdict: "no", why: ["not-admitted"] }
     }

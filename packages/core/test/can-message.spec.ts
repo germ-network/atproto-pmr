@@ -64,8 +64,12 @@ describe("evaluateCanMessage", () => {
         expect(evalWith(found())).toEqual({ verdict: "no", why: ["not-admitted"] })
     })
 
-    it("open admits: yes via [open]", () => {
-        expect(evalWith(found("open"))).toEqual({ verdict: "yes", via: ["open"] })
+    it("open alone is held back: unknown pending [open] [policy-not-enabled]", () => {
+        expect(evalWith(found("open"))).toEqual({
+            verdict: "unknown",
+            pending: ["open"],
+            why: ["policy-not-enabled"],
+        })
     })
 
     it("bsky-follows admits when B follows A: yes via [bsky-follows]", () => {
@@ -101,10 +105,15 @@ describe("evaluateCanMessage", () => {
         })
     })
 
-    it("one admitting policy wins over another pending one: yes, not unknown", () => {
+    it("one admitting policy wins over another pending one: unknown only for the policy the relay holds back", () => {
         expect(evalWith(found("open", "bsky-follows", "future"), "no", "unknown")).toEqual({
+            verdict: "unknown",
+            pending: ["open", "bsky-follows", "future"],
+            why: ["policy-not-enabled"],
+        })
+        expect(evalWith(found("open", "bsky-follows", "future"), "no", "yes")).toEqual({
             verdict: "yes",
-            via: ["open"],
+            via: ["open", "bsky-follows"],
         })
     })
 
@@ -400,8 +409,9 @@ describe("handleCanMessageRead", () => {
         expect(res.headers.get("content-type")).toBe("application/cbor")
         expect(res.headers.get("cache-control")).toBe("no-store")
         expect(decodeCanMessageVerdict(new Uint8Array(await res.arrayBuffer()))).toEqual({
-            verdict: "yes",
-            via: ["open"],
+            verdict: "unknown",
+            pending: ["open"],
+            why: ["policy-not-enabled"],
         })
     })
 
