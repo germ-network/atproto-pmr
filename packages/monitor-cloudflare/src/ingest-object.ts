@@ -13,6 +13,7 @@ import {
     routeFollowEvent,
     listReposByCollection,
     plcCursorAfterClose,
+    BLOCK_COLLECTION_NSID,
     FOLLOW_COLLECTION_NSID,
     fetchHeadRev,
     pushDeclarationChange,
@@ -96,6 +97,7 @@ import type {
     ListingProgress,
     StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
+import { d1BlockEdgeWriter } from "./block-edge-store"
 import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
 import { d1GraphChangeLog } from "./graph-change-log"
 import { kvGraphProjections } from "./graph-projection-store"
@@ -2943,6 +2945,7 @@ export class MonitorIngest
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
         const edges = d1FollowEdgeWriter(this.env.graph!, budget)
+        const blocks = d1BlockEdgeWriter(this.env.graph!, budget)
         const deps = { index: this, listings: this, edges, nowMs: () => Date.now(), budget }
         const owners = { edges, interest: this, nowMs: deps.nowMs }
         const reserve = this.listingReserve()
@@ -2974,7 +2977,7 @@ export class MonitorIngest
                 "edge flush",
                 () =>
                     flushEdgeOps(
-                        { ops: this, edges, budget, interest: this },
+                        { ops: this, edges, blocks, budget, interest: this },
                         flushLimit(Math.floor((budget.remaining * 3) / 4))
                     ),
             ],
@@ -3519,7 +3522,7 @@ export class MonitorIngest
 
     /**
      * Open the follow/profile stream: a second Jetstream socket on
-     * `collections` = the follow collection plus the secondaries'
+     * `collections` = the follow and block collections plus the secondaries'
      * collections, with no `dids`, from `meta.follow_cursor` (µs), or the tip
      * on first run. `meta.last_connected_at` is the last time the socket was
      * known open: written when it opens and refreshed while it stays open, at
@@ -3535,6 +3538,7 @@ export class MonitorIngest
         const url = new URL(this.env.JETSTREAM_URL)
         const collections = [
             FOLLOW_COLLECTION_NSID,
+            BLOCK_COLLECTION_NSID,
             ...new Set(monitorCollections(this.env).map((r) => r.collection)),
         ]
         url.searchParams.set("collections", collections.join(","))

@@ -13,8 +13,8 @@ import {
     type RecountQueueIndex,
 } from "../src/follow-flush"
 import type { EdgeOp } from "../src/follow-stream"
-import type { EdgeRef, FollowEdgeWriter, StatementBudget } from "../src/storage"
-import type { FollowEdge } from "@germ-network/atproto-pmr-core"
+import type { BlockEdgeWriter, EdgeRef, FollowEdgeWriter, StatementBudget } from "../src/storage"
+import type { BlockEdge, FollowEdge } from "@germ-network/atproto-pmr-core"
 
 const create = (seq: number, follower: string, rkey: string, subject = "did:s"): EdgeOp => ({
     seq,
@@ -25,6 +25,14 @@ const create = (seq: number, follower: string, rkey: string, subject = "did:s"):
     subject,
     rev: "r",
     cursor: "1",
+})
+const blockCreate = (seq: number, blocker: string, rkey: string, subject = "did:s"): EdgeOp => ({
+    ...create(seq, blocker, rkey, subject),
+    collection: "block",
+})
+const blockDel = (seq: number, blocker: string, rkey: string): EdgeOp => ({
+    ...del(seq, blocker, rkey),
+    collection: "block",
 })
 const del = (seq: number, follower: string, rkey: string): EdgeOp => ({
     seq,
@@ -60,19 +68,45 @@ describe("coalesceEdgeOps", () => {
     })
 
     it("an empty read has nothing to flush", () => {
-        expect(coalesceEdgeOps([])).toEqual({ creates: [], deletes: [], throughSeq: 0 })
+        expect(coalesceEdgeOps([])).toEqual({
+            creates: [],
+            deletes: [],
+            blockCreates: [],
+            blockDeletes: [],
+            throughSeq: 0,
+        })
+    })
+})
+
+describe("coalesceEdgeOps — blocks", () => {
+    it("a follow op and a block op sharing an rkey neither coalesce nor cancel", () => {
+        const out = coalesceEdgeOps([
+            create(1, "a", "1", "did:f"),
+            blockCreate(2, "a", "1", "did:b"),
+            blockDel(3, "a", "1"),
+        ])
+        expect(out.creates).toEqual([{ follower: "a", rkey: "1", subject: "did:f" }])
+        expect(out.blockCreates).toEqual([])
+        expect(out.blockDeletes).toEqual([{ blocker: "a", rkey: "1" }])
+        expect(out.deletes).toEqual([])
     })
 })
 
 describe("statement costs", () => {
     it("flushStatements is 5 per 25 creates and 3 per 25 deletes, rounded up", () => {
-        expect(flushStatements(0, 0)).toBe(0)
-        expect(flushStatements(1, 0)).toBe(5)
-        expect(flushStatements(25, 0)).toBe(5)
-        expect(flushStatements(26, 0)).toBe(10)
-        expect(flushStatements(0, 1)).toBe(3)
-        expect(flushStatements(0, 26)).toBe(6)
-        expect(flushStatements(26, 26)).toBe(16)
+        expect(flushStatements(0, 0, 0, 0)).toBe(0)
+        expect(flushStatements(1, 0, 0, 0)).toBe(5)
+        expect(flushStatements(25, 0, 0, 0)).toBe(5)
+        expect(flushStatements(26, 0, 0, 0)).toBe(10)
+        expect(flushStatements(0, 1, 0, 0)).toBe(3)
+        expect(flushStatements(0, 26, 0, 0)).toBe(6)
+        expect(flushStatements(26, 26, 0, 0)).toBe(16)
+    })
+
+    it("flushStatements counts one per 25 block creates and one per 25 block deletes", () => {
+        expect(flushStatements(0, 0, 1, 0)).toBe(1)
+        expect(flushStatements(0, 0, 26, 25)).toBe(3)
+        expect(flushStatements(26, 1, 26, 26)).toBe(10 + 3 + 2 + 2)
     })
 
     it("recountStatements is one per 50 subjects, rounded up", () => {
@@ -82,16 +116,23 @@ describe("statement costs", () => {
         expect(recountStatements(51)).toBe(2)
     })
 
-    it("flushLimit sizes a read whose worst case fits, whatever the create/delete split", () => {
+    it("flushLimit sizes a read whose worst case fits, whatever the follow and block split", () => {
         expect(flushLimit(0)).toBe(0)
-        expect(flushLimit(7)).toBe(0)
-        for (const remaining of [8, 13, 100, 1000]) {
+        expect(flushLimit(9)).toBe(0)
+        for (const remaining of [10, 13, 100, 1000]) {
             const n = flushLimit(remaining)
             expect(n).toBeGreaterThan(0)
             for (let c = 0; c <= n; c++) {
-                expect(flushStatements(c, n - c)).toBeLessThanOrEqual(remaining)
+                for (let d = 0; c + d <= n; d += 1 + Math.floor(n / 12)) {
+                    for (let bc = 0; c + d + bc <= n; bc += 1 + Math.floor(n / 12)) {
+                        expect(flushStatements(c, d, bc, n - c - d - bc)).toBeLessThanOrEqual(remaining)
+                    }
+                }
             }
+            expect(flushStatements(n - 3, 1, 1, 1)).toBeLessThanOrEqual(remaining)
         }
+        expect(flushLimit(10)).toBe(25)
+        expect(flushStatements(22, 1, 1, 1)).toBe(10)
     })
 })
 
@@ -184,15 +225,61 @@ function memoryOps(initial: EdgeOp[]) {
     }
 }
 
+/** A block writer over an in-memory table keyed by (blocker, rkey). */
+function memoryBlocks() {
+    const rows = new Map<string, BlockEdge & { gen: number }>()
+    const key = (blocker: string, rkey: string) => `${blocker}\u0000${rkey}`
+    const writer: BlockEdgeWriter = {
+        async putBlocks(blocks, gen) {
+            for (const b of blocks) rows.set(key(b.blocker, b.rkey), { ...b, gen })
+        },
+        async deleteBlocks(refs) {
+            for (const r of refs) rows.delete(key(r.blocker, r.rkey))
+        },
+        async sweepBlocks() {},
+    }
+    return { writer, rows }
+}
+
 const flushDeps = (
     log: ReturnType<typeof memoryOps>,
     store: ReturnType<typeof memoryEdges>,
-    inInterest: (did: string) => boolean = () => true
+    inInterest: (did: string) => boolean = () => true,
+    blocks: ReturnType<typeof memoryBlocks> = memoryBlocks()
 ): EdgeFlushDeps => ({
     ops: log.ops,
     edges: store.edges,
+    blocks: blocks.writer,
     budget: budgetOf(1000),
     interest: { inInterest: async (did) => inInterest(did) },
+})
+
+describe("flushEdgeOps — blocks", () => {
+    it("writes block creates and deletes through the block writer and queues no re-count", async () => {
+        const log = memoryOps([
+            blockCreate(1, "a", "1", "did:x"),
+            blockCreate(2, "a", "2", "did:y"),
+            blockDel(3, "a", "1"),
+            blockCreate(4, "b", "1", "did:z"),
+        ])
+        const store = memoryEdges()
+        const blocks = memoryBlocks()
+        expect(await flushEdgeOps(flushDeps(log, store, () => true, blocks), 10)).toBe(4)
+        expect([...blocks.rows.values()]).toEqual([
+            { blocker: "a", rkey: "2", subject: "did:y", gen: 7 },
+            { blocker: "b", rkey: "1", subject: "did:z", gen: 7 },
+        ])
+        expect(store.calls).toEqual([])
+        expect(log.dropped).toEqual([{ throughSeq: 4, subjects: [] }])
+    })
+
+    it("a block create by a blocker no longer in interest is not written, and clears the block it would have replaced", async () => {
+        const log = memoryOps([blockCreate(1, "gone", "1", "did:new"), blockCreate(2, "here", "1")])
+        const blocks = memoryBlocks()
+        await blocks.writer.putBlocks([{ blocker: "gone", rkey: "1", subject: "did:old" }], 1)
+        await flushEdgeOps(flushDeps(log, memoryEdges(), (d) => d === "here", blocks), 10)
+        expect([...blocks.rows.values()].map((r) => r.blocker)).toEqual(["here"])
+    })
 })
 
 describe("flushEdgeOps", () => {

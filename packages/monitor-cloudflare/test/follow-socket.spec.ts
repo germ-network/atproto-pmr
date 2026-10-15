@@ -12,6 +12,7 @@ const testEnv = env as unknown as MonitorEnv & {
     ingestRegistered: DurableObjectNamespace<MonitorIngest>
 }
 const FOLLOW = "app.bsky.graph.follow"
+const BLOCK = "app.bsky.graph.block"
 const PROFILE = "app.bsky.actor.profile"
 
 let n = 0
@@ -98,12 +99,12 @@ const route = (obj: MonitorIngest, raw: string, cursor = "1000") =>
     routeFollowEvent({ index: obj, secondaries: monitorCollections(obj.env) }, event(raw), cursor)
 
 describe("follow/profile socket", () => {
-    it("socket subscribes to follow and profile collections without dids", async () => {
+    it("socket subscribes to follow, block and profile collections without dids", async () => {
         jet = stubJetstream()
         const stub = registeredStub()
         await inObj(stub, (obj) => obj.connectFollow())
         const [req] = jet.followRequests()
-        expect(req!.searchParams.get("collections")!.split(",").sort()).toEqual([FOLLOW, PROFILE].sort())
+        expect(req!.searchParams.get("collections")!.split(",").sort()).toEqual([FOLLOW, BLOCK, PROFILE].sort())
         expect(req!.searchParams.has("dids")).toBe(false)
         expect(req!.searchParams.has("wantedDids")).toBe(false)
         expect(req!.searchParams.has("cursor")).toBe(false)
