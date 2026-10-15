@@ -70,22 +70,27 @@ they MUST NOT be kept current by re-listing repos on a schedule.
 ## Inbound blocks at registration
 
 The block index keeps a non-owner's blocks of registered DIDs only, and nothing
-re-lists on a timer. So when a user registers, the blocks of them made earlier
-by DIDs the index already lists would never arrive. The user's followees are
-covered, because registration queues their listings. Everyone else is covered
-by a **backlink lookup**:
+re-lists on a timer. So when a user registers, the blocks of them that DIDs
+the index already lists made earlier do not arrive. The user's followees are
+covered, because registration queues their listings. For anyone else, the
+block shows up only at the blocker's next block event or listing.
 
-- At registration the appview asks a backlink index for the
-  `app.bsky.graph.block` records whose `subject` is the user. That index is
-  any service that indexes atproto records by the DIDs they reference.
-- For each blocker in interest, the appview reads that block record from the
-  blocker's repo and verifies it before keeping it. The backlink index is
-  untrusted: it can only point at a record. A record it fails to return is
-  missed until the blocker's next block event or listing.
-- Blockers outside interest are not kept, because no verdict the appview
-  serves depends on them.
-- The lookup tells the backlink index that someone is interested in the user's
-  blockers when they register, but not who.
+A missed block only affects a prediction. The user's own summary may say they
+can message someone who blocks them. The block is still enforced at the
+recipient: a PMR keeps every block of its own users and adjudicates at receive
+time. The send is refused there, and the prediction corrects itself.
 
-**Not yet built.** Until then, a block made before registration by an
-in-interest DID that is not one of the user's followees is not caught.
+**Optional: a backlink lookup.** A deployment MAY make the prediction complete
+at registration:
+
+- Ask a backlink index (any service that indexes atproto records by the DIDs
+  they reference) for the `app.bsky.graph.block` records whose `subject` is
+  the user.
+- For each blocker in interest, read that block record from the blocker's repo
+  and verify it before keeping it. The index is untrusted: it can only point at
+  a record.
+- Keep no blockers outside interest, because no verdict the appview serves
+  depends on them.
+
+The lookup tells the backlink index that someone is interested in the user's
+blockers when they register, but not who. **Not yet built.**
