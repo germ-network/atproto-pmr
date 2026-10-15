@@ -18,7 +18,7 @@ import {
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api.js"
-import type { ReadSigningKeys } from "./read-signing-key.js"
+import { servableUnderRotation, type ReadSigningKeys } from "./read-signing-key.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { toResponseBody } from "./util.js"
@@ -86,9 +86,9 @@ const RECHECK_MEMO_MAX = 1024
  * byte for byte, in a CBOR {@link RecordReadResponse}; `200` whether found or
  * not, with `cache-control: no-store` and no validators, so no cache can tell
  * one caller that another read the record. Held bytes are served without a
- * per-read signature check: `rev` and `cid` come from a non-verifying parse,
- * and an entry ingest did not verify, or that does not parse, reads as
- * `unverifiable`; a held CAR proving the record absent reads as `not-held`.
+ * per-read signature check: `rev` and `cid` are the ones ingest verified (a
+ * parse of the CAR only for an entry stored without them), and an entry
+ * ingest did not verify reads as `unverifiable`.
  * The declaration is always in the watched set, but like any record it is
  * served only for DIDs the deployment serves.
  */
@@ -119,21 +119,32 @@ export async function handleRecordRead(
     if (snapshot.verifiedWith === null) {
         return recordResponse(unverifiable("ingest did not verify this snapshot"))
     }
-    let parsed
-    try {
-        parsed = readRecordFromCar(snapshot.car, collection, rkey)
-    } catch {
-        return recordResponse(unverifiable("snapshot does not parse"))
+    const key = (await deps.signingKeys.keysFor([did])).get(did) ?? { kind: "unknown" as const }
+    if (!servableUnderRotation(snapshot.verifiedWith, key)) {
+        return recordResponse(unverifiable("snapshot is not under the DID's current signing key"))
     }
-    if (parsed && parsed.did !== did) {
-        return recordResponse(unverifiable("snapshot is for another DID"))
-    }
-    if (!parsed) {
-        return recordResponse({
-            found: false,
-            code: "not-held",
-            reason: "the held snapshot proves the record absent",
-        })
+    let verified: { rev: string; cid: string }
+    if (snapshot.rev !== null && snapshot.cid !== null) {
+        verified = { rev: snapshot.rev, cid: snapshot.cid }
+    } else {
+        // An entry stored without its metadata: derive it from the CAR.
+        let parsed
+        try {
+            parsed = readRecordFromCar(snapshot.car, collection, rkey)
+        } catch {
+            return recordResponse(unverifiable("snapshot does not parse"))
+        }
+        if (parsed && parsed.did !== did) {
+            return recordResponse(unverifiable("snapshot is for another DID"))
+        }
+        if (!parsed) {
+            return recordResponse({
+                found: false,
+                code: "not-held",
+                reason: "the held snapshot proves the record absent",
+            })
+        }
+        verified = { rev: parsed.rev, cid: parsed.cid }
     }
     if (
         isDeclaration(collection, rkey) &&
@@ -148,8 +159,8 @@ export async function handleRecordRead(
     return recordResponse({
         found: true,
         car: snapshot.car,
-        rev: parsed.rev,
-        cid: parsed.cid,
+        rev: verified.rev,
+        cid: verified.cid,
         freshAtMs: snapshot.freshAtMs,
     })
 }

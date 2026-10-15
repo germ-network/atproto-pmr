@@ -54,6 +54,8 @@ function setup(
         watched?: RecordReadDeps["watched"]
         declaration?: boolean
         commitDid?: string
+        /** Ingest's rev/cid metadata; null models an entry stored without it. */
+        metadata?: null
     } = {}
 ) {
     const collection = options.declaration ? DECLARATION_COLLECTION_NSID : COLLECTION
@@ -73,6 +75,8 @@ function setup(
                   car: options.car ?? repo.car,
                   freshAtMs: options.freshAtMs ?? NOW,
                   verifiedWith: options.verifiedWith === undefined ? key.multikey : options.verifiedWith,
+                  rev: options.metadata === null ? null : (options.rev ?? "3kaaaaaaaaaaa"),
+                  cid: options.metadata === null ? null : repo.recordCids[`${collection}/${rkey}`]!,
               }
     const asked: string[] = []
     const deps: RecordReadDeps = {
@@ -83,6 +87,10 @@ function setup(
             },
         },
         serves: async () => options.serves ?? true,
+        signingKeys: {
+            keysFor: async (dids) =>
+                new Map(dids.map((d) => [d, { kind: "trusted", key: key.multikey } as const])),
+        },
         watched: options.watched ?? [{ collection: COLLECTION, rkey: RKEY }],
         nowMs: () => NOW,
         requestRecheck: async () => {},
@@ -107,7 +115,7 @@ function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
 }
 
 describe("record read", () => {
-    it("serves the held CAR byte for byte, with rev and cid from a non-verifying parse and freshAtMs", async () => {
+    it("serves the held CAR byte for byte, with the verified rev and cid and freshAtMs", async () => {
         const { deps, repo } = setup({ rev: "3kbbbbbbbbbbb", freshAtMs: NOW - 5 })
         const res = await handleRecordRead(get(PATH_OK), deps)
         const body = decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer()))
@@ -199,7 +207,7 @@ describe("record read", () => {
     })
 
     it("a snapshot whose commit is for another DID is unverifiable", async () => {
-        const { deps } = setup({ commitDid: "did:plc:bob12345678901234567890123" })
+        const { deps } = setup({ commitDid: "did:plc:bob12345678901234567890123", metadata: null })
         expect(await miss(PATH_OK, deps)).toMatchObject({ code: "unverifiable" })
     })
 
@@ -220,12 +228,12 @@ describe("record read", () => {
     })
 
     it("a held CAR that does not parse is unverifiable", async () => {
-        const { deps } = setup({ car: Uint8Array.of(1, 2, 3) })
+        const { deps } = setup({ car: Uint8Array.of(1, 2, 3), metadata: null })
         expect(await miss(PATH_OK, deps)).toMatchObject({ code: "unverifiable" })
     })
 
     it("a held CAR proving the record absent is not-held", async () => {
-        const { deps } = setup({ records: { [`${COLLECTION}/else`]: record(2) } })
+        const { deps } = setup({ records: { [`${COLLECTION}/else`]: record(2) }, metadata: null })
         expect(await miss(PATH_OK, deps)).toMatchObject({ code: "not-held" })
     })
 

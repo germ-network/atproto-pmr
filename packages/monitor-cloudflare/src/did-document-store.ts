@@ -1,10 +1,11 @@
-import type {
-    CachedDidDocument,
-    DidDocument,
-    DidDocumentCache,
-    PlcCoverage,
-    PlcLogStore,
-    ReadSigningKeys,
+import {
+    readSigningKeyFrom,
+    type CachedDidDocument,
+    type DidDocument,
+    type DidDocumentCache,
+    type PlcCoverage,
+    type PlcLogStore,
+    type ReadSigningKeys,
 } from "@germ-network/atproto-pmr-core"
 import type { MonitorEnv } from "./env"
 import type { MonitorIngest } from "./ingest-object"
@@ -61,6 +62,22 @@ export function kvDidDocuments<TIngest extends MonitorIngest = MonitorIngest>(
     }
 }
 
+function parseCoverage(text: string | null): PlcCoverage | null {
+    if (text === null) return null
+    let value: unknown
+    try {
+        value = JSON.parse(text)
+    } catch {
+        return null
+    }
+    if (typeof value !== "object" || value === null) return null
+    const { url, continuousSinceMs, coveredThroughMs } = value as Record<string, unknown>
+    if (typeof url !== "string") return null
+    if (typeof continuousSinceMs !== "number" || !Number.isFinite(continuousSinceMs)) return null
+    if (typeof coveredThroughMs !== "number" || !Number.isFinite(coveredThroughMs)) return null
+    return { url, continuousSinceMs, coveredThroughMs }
+}
+
 function parseCached(text: string): CachedDidDocument | null {
     let value: unknown
     try {
@@ -83,15 +100,40 @@ function parseCached(text: string): CachedDidDocument | null {
  * Never reaches the network.
  */
 export function kvReadSigningKeys<TIngest extends MonitorIngest = MonitorIngest>(
-    _env: MonitorEnv<TIngest>,
-    _nowMs: () => number = Date.now
+    env: MonitorEnv<TIngest>,
+    nowMs: () => number = Date.now
 ): ReadSigningKeys {
     return {
-        async keysFor() {
-            throw new Error("not implemented")
+        async keysFor(dids) {
+            const unique = [...new Set(dids)]
+            const plc = unique.filter((did) => !did.startsWith("did:web:"))
+            const documents = new Map<string, CachedDidDocument | null>()
+            for (let i = 0; i < plc.length; i += KV_BULK_READ_MAX) {
+                const chunk = plc.slice(i, i + KV_BULK_READ_MAX)
+                const texts = await env.records.get(
+                    chunk.map((did) => DID_DOCUMENT_PREFIX + did),
+                    "text"
+                )
+                for (const did of chunk) {
+                    const text = texts.get(DID_DOCUMENT_PREFIX + did) ?? null
+                    documents.set(did, text === null ? null : parseCached(text))
+                }
+            }
+            const coverage =
+                plc.length === 0 ? null : parseCoverage(await env.records.get(PLC_COVERAGE_KEY))
+            const now = nowMs()
+            return new Map(
+                unique.map((did) => [
+                    did,
+                    readSigningKeyFrom(did, documents.get(did) ?? null, coverage, now),
+                ])
+            )
         },
     }
 }
+
+/** Keys one KV bulk read accepts. */
+const KV_BULK_READ_MAX = 100
 
 /**
  * The DID-document route's logs: `plclog:<did>` in the `records` namespace,
@@ -125,20 +167,5 @@ export function kvDidDocumentWriter<TIngest extends MonitorIngest = MonitorInges
 export function kvPlcCoverage<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): () => Promise<PlcCoverage | null> {
-    return async () => {
-        const text = await env.records.get(PLC_COVERAGE_KEY)
-        if (text === null) return null
-        let value: unknown
-        try {
-            value = JSON.parse(text)
-        } catch {
-            return null
-        }
-        if (typeof value !== "object" || value === null) return null
-        const { url, continuousSinceMs, coveredThroughMs } = value as Record<string, unknown>
-        if (typeof url !== "string") return null
-        if (typeof continuousSinceMs !== "number" || !Number.isFinite(continuousSinceMs)) return null
-        if (typeof coveredThroughMs !== "number" || !Number.isFinite(coveredThroughMs)) return null
-        return { url, continuousSinceMs, coveredThroughMs }
-    }
+    return async () => parseCoverage(await env.records.get(PLC_COVERAGE_KEY))
 }

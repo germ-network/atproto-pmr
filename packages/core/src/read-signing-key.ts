@@ -6,7 +6,12 @@
  * which no stream covers.
  */
 
-import type { CachedDidDocument, PlcCoverage } from "./did-document"
+import { extractSigningKey, SIGNING_KEY_TTL_MS } from "./atproto-fetch"
+import {
+    PLC_COVERAGE_MAX_LAG_MS,
+    type CachedDidDocument,
+    type PlcCoverage,
+} from "./did-document"
 
 /**
  * `trusted`: the key the cached DID document carries, while the document is
@@ -35,20 +40,32 @@ export interface ReadSigningKeys {
  * given the DID's current key: only if the key is trusted and the same, or
  * the DID is not checked.
  */
-export function servableUnderRotation(_verifiedWith: string, _key: ReadSigningKey): boolean {
-    throw new Error("not implemented")
+export function servableUnderRotation(verifiedWith: string, key: ReadSigningKey): boolean {
+    if (key.kind === "unchecked") return true
+    return key.kind === "trusted" && key.key === verifiedWith
 }
 
 /**
  * One DID's {@link ReadSigningKey} from its cached document (null if none is
  * held) and the published stream coverage (null if uncovered), under the
- * trust rule {@link ReadSigningKeys.keysFor} states.
+ * trust rule {@link ReadSigningKeys.keysFor} states. Timestamps are the
+ * monitor's and `nowMs` the relay's, so the windows assume the two clocks
+ * differ by far less than the coverage lag bound.
  */
 export function readSigningKeyFrom(
-    _did: string,
-    _cached: CachedDidDocument | null,
-    _coverage: PlcCoverage | null,
-    _nowMs: number
+    did: string,
+    cached: CachedDidDocument | null,
+    coverage: PlcCoverage | null,
+    nowMs: number
 ): ReadSigningKey {
-    throw new Error("not implemented")
+    if (did.startsWith("did:web:")) return { kind: "unchecked" }
+    if (cached === null) return { kind: "unknown" }
+    const covered =
+        cached.source === "plc" &&
+        coverage !== null &&
+        cached.fetchedAtMs >= coverage.continuousSinceMs &&
+        nowMs - coverage.coveredThroughMs <= PLC_COVERAGE_MAX_LAG_MS
+    if (!covered && !(nowMs - cached.fetchedAtMs <= SIGNING_KEY_TTL_MS)) return { kind: "unknown" }
+    const key = extractSigningKey({ ...cached.doc })
+    return key === null ? { kind: "unknown" } : { kind: "trusted", key }
 }
