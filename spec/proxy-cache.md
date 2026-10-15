@@ -41,6 +41,37 @@ document itself, and never takes the PMR's word for a record's content or for
 a key. A PMR that served a wrong record would be caught by that verification,
 the same as any other source.
 
+## Who a PMR serves, and what its public reads are for
+
+A PMR is a host for its users: one user self-hosting, or several sharing a
+host to save cost. Germ, as a deployment, may serve everyone, but a PMR is not
+a public service for non-users. Its interest set is its users and the DIDs
+they follow.
+
+The data a PMR caches is public in principle. Records and DID documents are
+public atproto state. So is the fact that a user is hosted on a given PMR,
+since a relay is reached through the user's DID document
+([P9](trust-model.md#p9--user-controlled-discovery)). A PMR's unauthenticated reads
+exist so the PMR **cannot identify the caller**, not to keep the data secret.
+Each one gives every caller the same answer and authenticates no one.
+Authentication is for per-user state, such as a user's own catch-up summary
+and its diff baseline, never for protecting public data. This is about reads
+of cached atproto state. The mailbox closure rules
+([P3](trust-model.md#p3--closure)) protect mailbox state and are unchanged.
+
+Two consequences follow for the read surface:
+
+- **Cheap to serve.** Public reads come from stored bytes, with no per-read
+  verification and no per-caller work. Anything that would cost the host
+  more than it saves its users is left out.
+- **Computed results, not raw material.** A device consumes what it acts on:
+  its user's own blocks, and for each contact whether the user can message
+  them, plus the contact's declaration and profile. The PMR does not publish
+  raw follow or block lists. This is not because they are secret. Devices
+  don't consume them, and keeping them projected for publication costs the
+  host writes. The public graph read and its projection, listed as built
+  below, are to be removed.
+
 ## Reads and the 24-hour rule
 
 A snapshot the cache has not been able to confirm for 24 hours is checked
