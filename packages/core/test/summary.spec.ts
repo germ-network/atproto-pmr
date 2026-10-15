@@ -17,132 +17,18 @@ import { readRecordFromCar } from "../src/repo-proof"
 import type { RecordSnapshotStore } from "../src/snapshot-read"
 import type { ChallengeStore, Directory, Locator, PMRStore, RegistrationFields } from "../src/storage"
 import {
-    buildSummary,
     decodeSummaryDelta,
     diffSummaryIndex,
     encodeSummaryDelta,
     SUMMARY_DELTA_KEYS,
+    SUMMARY_MAX_RECORDS,
     SUMMARY_RECORD_KEYS,
     SUMMARY_TOKENS_KEPT,
     type SummaryDelta,
-    type SummaryDeps,
+    type SummaryPageDeps,
     type SummaryIndex,
 } from "../src/summary"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
-
-describe("buildSummary", () => {
-    const ME = "did:plc:me"
-    const A = "did:plc:a"
-    const B = "did:plc:b"
-    const C = "did:plc:c"
-    const WATCHED = [
-        { collection: DECLARATION_COLLECTION_NSID, rkey: "self" },
-        { collection: "app.example.thing", rkey: "self" },
-    ]
-    const graph = (): GraphReadResponse => ({
-        did: ME,
-        following: [{ did: A, rkey: "r1", mutual: false }],
-        followers: [{ did: B, rkey: "r2", mutual: false }],
-    })
-
-    interface Held {
-        verifiedWith?: string | null
-        car?: Uint8Array
-        absent?: boolean
-        commitDid?: string
-    }
-    function setup(held: Record<string, Held> = {}, projection: GraphReadResponse | null = graph()) {
-        const key = makeKey()
-        const built = new Map<string, ReturnType<typeof buildRepoCar>>()
-        const asked: string[] = []
-        const deps: SummaryDeps = {
-            projections: { get: async () => projection },
-            watched: WATCHED,
-            records: {
-                get: async (did, collection, rkey) => {
-                    const id = `${did}|${collection}/${rkey}`
-                    asked.push(id)
-                    const h = held[id]
-                    if (!h) return null
-                    const repo = buildRepoCar({
-                        did,
-                        key,
-                        commitDid: h.commitDid,
-                        records: h.absent ? {} : { [`${collection}/${rkey}`]: { $type: collection, id } },
-                    })
-                    built.set(id, repo)
-                    return {
-                        car: h.car ?? repo.car,
-                        freshAtMs: 0,
-                        verifiedWith: h.verifiedWith === undefined ? key.multikey : h.verifiedWith,
-                    }
-                },
-            },
-        }
-        return { deps, built, key, asked }
-    }
-    const id = (did: string, c = "app.example.thing") => `${did}|${c}/self`
-
-    it("includes every watched record of the owner and of each DID in the owner's projection", async () => {
-        const { deps } = setup({
-            [id(ME)]: {},
-            [id(A)]: {},
-            [id(B)]: {},
-            [id(A, DECLARATION_COLLECTION_NSID)]: {},
-            [id(C)]: {},
-        })
-        const out = await buildSummary(ME, deps)
-        expect(out!.index.records.map((r) => `${r.did}|${r.collection}`)).toEqual([
-            `${A}|app.example.thing`,
-            `${A}|${DECLARATION_COLLECTION_NSID}`,
-            `${B}|app.example.thing`,
-            `${ME}|app.example.thing`,
-        ])
-        expect(out!.index.graph).toEqual(graph())
-    })
-
-    it("leaves out records not held, not verified at ingest, or whose CAR does not parse", async () => {
-        const { deps } = setup({
-            [id(ME)]: {},
-            [id(A)]: { verifiedWith: null },
-            [id(B)]: { car: Uint8Array.of(1, 2, 3) },
-            [id(A, DECLARATION_COLLECTION_NSID)]: { absent: true },
-            [id(ME, DECLARATION_COLLECTION_NSID)]: { commitDid: C },
-        })
-        const out = await buildSummary(ME, deps)
-        expect(out!.index.records.map((r) => r.did)).toEqual([ME])
-        expect(out!.records.map((r) => r.did)).toEqual([ME])
-    })
-
-    it("is null when the owner has no projection", async () => {
-        const { deps, asked } = setup({ [id(ME)]: {} }, null)
-        expect(await buildSummary(ME, deps)).toBeNull()
-        expect(asked).toEqual([])
-    })
-
-    it("never requests a recheck, even for a lapsed declaration", async () => {
-        // SummaryDeps carries no recheck seam, so a lapsed declaration is
-        // served from the store as held and the store is read once per record.
-        const { deps, asked } = setup({ [id(ME, DECLARATION_COLLECTION_NSID)]: {} })
-        const out = await buildSummary(ME, deps)
-        expect(out!.records.map((r) => r.collection)).toEqual([DECLARATION_COLLECTION_NSID])
-        expect(asked).toHaveLength(3 * WATCHED.length)
-        expect(new Set(asked).size).toBe(asked.length)
-    })
-
-    it("each record's CAR is the bytes whose cid and verifiedWith its index entry records", async () => {
-        const { deps, built, key } = setup({ [id(ME)]: {}, [id(A)]: { verifiedWith: "zOther" } })
-        const out = await buildSummary(ME, deps)
-        for (const record of out!.records) {
-            const repo = built.get(id(record.did))!
-            expect(record.car).toEqual(repo.car)
-            expect(record.cid).toBe(repo.recordCids["app.example.thing/self"])
-        }
-        expect(out!.index.records.map((r) => r.verifiedWith)).toEqual(["zOther", key.multikey])
-        expect(out!.index.records.map((r) => r.cid)).toEqual(out!.records.map((r) => r.cid))
-        for (const entry of out!.index.records) expect(entry).not.toHaveProperty("car")
-    })
-})
 
 describe("diffSummaryIndex", () => {
     const entry = (did: string, cid = "c1", verifiedWith = "k1") => ({
@@ -256,9 +142,11 @@ describe("summary read", () => {
         const store = (locator: Locator): PMRStore =>
             ({
                 load: async () => registrations.get(locator.slice(4)) ?? null,
-                async putSummaryIndex(token: string, index: SummaryIndex) {
+                async putSummaryIndex(token: string, index: SummaryIndex, _servedAtMs: number, replaces?: string) {
                     puts.push({ locator, token })
-                    const list = (served.get(locator) ?? []).filter((e) => e.token !== token)
+                    const list = (served.get(locator) ?? []).filter(
+                        (e) => e.token !== token && e.token !== replaces
+                    )
                     list.push({ token, index })
                     served.set(locator, list.slice(-SUMMARY_TOKENS_KEPT))
                 },
@@ -272,25 +160,52 @@ describe("summary read", () => {
         const key = makeKey()
         const projections = new Map<string, GraphReadResponse>()
         const reads: string[] = []
-        const cars = new Map<string, Uint8Array>()
+        const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
+        const repoOf = (did: string, collection: string, rkey: string) => {
+            const version = versions.get(did)
+            if (version === undefined) return null
+            const cacheKey = `${did}|${collection}/${rkey}@${version}`
+            if (!repos.has(cacheKey)) {
+                repos.set(
+                    cacheKey,
+                    buildRepoCar({
+                        did,
+                        key,
+                        records: { [`${collection}/${rkey}`]: { $type: collection, did, version } },
+                    })
+                )
+            }
+            return repos.get(cacheKey)!
+        }
+        const unreadable = new Set<string>()
         const records: RecordSnapshotStore = {
             async get(did, collection, rkey) {
-                const id = `${did}|${collection}/${rkey}`
-                reads.push(id)
-                const version = versions.get(did)
-                if (version === undefined) return null
-                const cacheKey = `${id}@${version}`
-                if (!cars.has(cacheKey)) {
-                    cars.set(
-                        cacheKey,
-                        buildRepoCar({
-                            did,
-                            key,
-                            records: { [`${collection}/${rkey}`]: { $type: collection, did, version } },
-                        }).car
-                    )
+                reads.push(`${did}|${collection}/${rkey}`)
+                if (unreadable.has(did)) return null
+                const repo = repoOf(did, collection, rkey)
+                if (!repo) return null
+                return {
+                    car: repo.car,
+                    freshAtMs: 0,
+                    verifiedWith: key.multikey,
+                    rev: "3kaaaaaaaaaaa",
+                    cid: repo.recordCids[`${collection}/${rkey}`]!,
                 }
-                return { car: cars.get(cacheKey)!, freshAtMs: 0, verifiedWith: key.multikey }
+            },
+        }
+        const index: SummaryPageDeps["index"] = {
+            async entries(refs) {
+                return refs.map((r) => {
+                    const repo = repoOf(r.did, r.collection, r.rkey)
+                    return repo === null
+                        ? null
+                        : {
+                              ...r,
+                              cid: repo.recordCids[`${r.collection}/${r.rkey}`]!,
+                              verifiedWith: key.multikey,
+                              freshAtMs: T0 * 1000,
+                          }
+                })
             },
         }
         const edge = (did: string): GraphReadResponse["following"][number] => ({
@@ -305,7 +220,7 @@ describe("summary read", () => {
         versions.set(PEER, 1)
 
         let n = 0
-        const deps: OwnerDeps & SummaryDeps & { randomBytes: (n: number) => Uint8Array; nowMs: () => number } = {
+        const deps: OwnerDeps & SummaryPageDeps & { randomBytes: (n: number) => Uint8Array; pageRecords?: number } = {
             challenges,
             directory,
             resolveLocator: (did) => directory.resolve(did),
@@ -314,6 +229,12 @@ describe("summary read", () => {
             discardWindowSeconds: 3600,
             projections: { get: async (did) => projections.get(did) ?? null },
             records,
+            index,
+            signingKeys: {
+                keysFor: async (dids) =>
+                    new Map(dids.map((d) => [d, { kind: "trusted", key: key.multikey } as const])),
+            },
+            onLapse: () => {},
             watched: WATCHED,
             randomBytes: (len) => {
                 n += 1
@@ -323,7 +244,7 @@ describe("summary read", () => {
             },
             nowMs: () => T0 * 1000 + n,
         }
-        return { deps, registrations, directory, challenges, versions, projections, served, puts, reads }
+        return { deps, registrations, directory, challenges, versions, projections, served, puts, reads, unreadable }
     }
 
     async function owner(w: ReturnType<typeof summaryWorld>, did: string) {
@@ -533,6 +454,120 @@ describe("summary read", () => {
         expect(b.full).toBe(true)
         expect(b.token).not.toBe(a.token)
     })
+
+    describe("paging", () => {
+        const peers = [1, 2, 3, 4].map((i) => `did:plc:page${i}00000000000000000`)
+        function pagedWorld(pageRecords = 2) {
+            const w = summaryWorld()
+            const edge = (did: string) => ({ did, rkey: "r1", mutual: false })
+            w.projections.set(OWNER, { did: OWNER, following: peers.map(edge), followers: [] })
+            for (const p of peers) w.versions.set(p, 1)
+            w.deps.pageRecords = pageRecords
+            return w
+        }
+
+        it("a first read with more changes than a page returns full, more, and a token", async () => {
+            const w = pagedWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first).toMatchObject({ full: true, more: true, truncated: false })
+            expect(first.records).toHaveLength(2)
+            expect(first.token).toBeTruthy()
+        })
+
+        it("reading since that token continues from what was delivered, not from current", async () => {
+            const w = pagedWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const second = await read(await get(first.token))
+            expect(second).toMatchObject({ full: false, more: true, graph: null })
+            expect(second.records).toHaveLength(2)
+            const third = await read(await get(second.token))
+            expect(third).toMatchObject({ full: false, more: false })
+            expect(third.records).toHaveLength(1)
+            const all = [...first.records, ...second.records, ...third.records].map((r) => r.did)
+            expect(new Set(all)).toEqual(new Set([OWNER, ...peers]))
+            expect(all).toHaveLength(5)
+        })
+
+        it("reading since the last page's token with nothing new returns that token, unchanged", async () => {
+            const w = pagedWorld(10)
+            const get = await owner(w, OWNER)
+            const only = await read(await get())
+            expect(only.more).toBe(false)
+            const again = await read(await get(only.token))
+            expect(again).toMatchObject({ token: only.token, full: false, more: false, records: [] })
+        })
+
+        it("an unchanged poll on a token that left more set finishes it and clears more", async () => {
+            const w = pagedWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.records.map((r) => r.did).sort()).toEqual([OWNER, peers[0]!].sort())
+            // What was left to deliver vanishes before the next read.
+            for (const p of peers.slice(1)) w.versions.delete(p)
+            const next = await read(await get(first.token))
+            expect(next).toMatchObject({ token: first.token, more: false, records: [], removed: [] })
+            const stored = [...w.served.values()][0]!.find((e) => e.token === first.token)!
+            expect(stored.index.more).toBeUndefined()
+        })
+
+        it("a page that delivers nothing but has more left does not return the named token", async () => {
+            const w = pagedWorld()
+            for (const p of peers) w.versions.delete(p)
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            // The peers appear in the index but their records cannot be read.
+            for (const p of peers) {
+                w.versions.set(p, 1)
+                w.unreadable.add(p)
+            }
+            w.deps.pageRecords = 1
+            const next = await read(await get(first.token))
+            expect(next).toMatchObject({ records: [], removed: [], more: true })
+            expect(next.token).not.toBe(first.token)
+        })
+
+        it("an owner with more contacts than the cap allows gets truncated set", async () => {
+            const w = pagedWorld()
+            const many = Array.from({ length: SUMMARY_MAX_RECORDS + 1 }, (_, i) => ({
+                did: `did:plc:many${String(i).padStart(6, "0")}`,
+                rkey: "r",
+                mutual: false,
+            }))
+            w.projections.set(OWNER, { did: OWNER, following: many, followers: [] })
+            const get = await owner(w, OWNER)
+            expect((await read(await get())).truncated).toBe(true)
+        })
+
+        it("a page read since a more token replaces that token's slot, so paging does not evict other tokens", async () => {
+            const w = pagedWorld()
+            const get = await owner(w, OWNER)
+            w.deps.pageRecords = 10
+            const device = await read(await get())
+            w.deps.pageRecords = 2
+            const p1 = await read(await get())
+            const p2 = await read(await get(p1.token))
+            const p3 = await read(await get(p2.token))
+            const held = [...w.served.values()][0]!.map((e) => e.token)
+            expect(held).toContain(device.token)
+            expect(held).toContain(p3.token)
+            expect(held).not.toContain(p1.token)
+            expect(held).not.toContain(p2.token)
+        })
+
+        it("a page read since a final token keeps it, for other devices", async () => {
+            const w = pagedWorld(10)
+            const get = await owner(w, OWNER)
+            const final = await read(await get())
+            w.versions.set(peers[0]!, 2)
+            const next = await read(await get(final.token))
+            expect(next.token).not.toBe(final.token)
+            const held = [...w.served.values()][0]!.map((e) => e.token)
+            expect(held).toEqual(expect.arrayContaining([final.token, next.token]))
+        })
+    })
+
 })
 
 describe("summary codec", () => {

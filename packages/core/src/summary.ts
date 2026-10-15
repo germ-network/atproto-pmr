@@ -16,8 +16,9 @@ import {
 } from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
-import type { ReadSigningKeys } from "./read-signing-key.js"
-import type { RecordSnapshotStore } from "./snapshot-read.js"
+import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
+import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
+import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import type { WatchedRecord } from "./watched.js"
 
 export interface SummaryRecordRef {
@@ -91,10 +92,12 @@ export const SUMMARY_TOKENS_KEPT = 4
 export const SUMMARY_MAX_RECORDS = 6_000
 
 /**
- * Records whose CARs one response carries. Each CAR is one store read, so
- * changes beyond this wait for the next page.
+ * Records whose CARs one response carries. Each is a record read and a
+ * confirmation read (two KV operations), on top of a full index build of
+ * about two hundred bulk reads at the contact cap, all within one
+ * invocation's thousand; changes beyond this wait for the next page.
  */
-export const SUMMARY_PAGE_RECORDS = 400
+export const SUMMARY_PAGE_RECORDS = 300
 
 /** A held, ingest-verified record's index entry, read without its CAR. */
 export interface SummaryHeldEntry extends SummaryIndexEntry {
@@ -131,11 +134,23 @@ export interface SummaryPageDeps {
  * the watched count). `truncated` when any were left out.
  */
 export function summaryContacts(
-    _owner: string,
-    _graph: GraphReadResponse,
-    _maxContacts: number
+    owner: string,
+    graph: GraphReadResponse,
+    maxContacts: number
 ): { dids: string[]; truncated: boolean } {
-    throw new Error("not implemented")
+    const mutuals = graph.following.filter((e) => e.mutual).map((e) => e.did)
+    const following = graph.following.map((e) => e.did)
+    const followers = graph.followers.map((e) => e.did)
+    const seen = new Set<string>([owner])
+    const dids = [owner]
+    for (const group of [mutuals, following, followers]) {
+        for (const did of [...new Set(group)].sort(compareStrings)) {
+            if (seen.has(did)) continue
+            seen.add(did)
+            dids.push(did)
+        }
+    }
+    return { dids: dids.slice(0, maxContacts), truncated: dids.length > maxContacts }
 }
 
 /**
@@ -145,10 +160,39 @@ export function summaryContacts(
  * no projection yet.
  */
 export async function buildSummaryIndex(
-    _did: string,
-    _deps: SummaryPageDeps
+    did: string,
+    deps: SummaryPageDeps
 ): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
-    throw new Error("not implemented")
+    const graph = await deps.projections.get(did)
+    if (!graph) return null
+    const maxContacts = Math.floor(SUMMARY_MAX_RECORDS / Math.max(1, deps.watched.length))
+    const { dids, truncated } = summaryContacts(did, graph, maxContacts)
+    const refs = dids.flatMap((d) =>
+        deps.watched.map((w) => ({ did: d, collection: w.collection, rkey: w.rkey }))
+    )
+    const held = await deps.index.entries(refs)
+    const heldDids = [...new Set(held.flatMap((e) => (e === null ? [] : [e.did])))]
+    const keys = heldDids.length === 0 ? new Map() : await deps.signingKeys.keysFor(heldDids)
+    const now = deps.nowMs()
+    const lapsed = new Set<string>()
+    const records: SummaryIndexEntry[] = []
+    for (const entry of held) {
+        if (entry === null) continue
+        const key = keys.get(entry.did) ?? { kind: "unknown" as const }
+        if (!servableUnderRotation(entry.verifiedWith, key)) continue
+        if (
+            entry.collection === DECLARATION_COLLECTION_NSID &&
+            entry.rkey === "self" &&
+            !(now - entry.freshAtMs <= SNAPSHOT_MAX_AGE_MS)
+        ) {
+            lapsed.add(entry.did)
+        }
+        const { freshAtMs: _freshAtMs, ...indexed } = entry
+        records.push(indexed)
+    }
+    for (const lapse of lapsed) deps.onLapse(lapse)
+    records.sort(compareRefs)
+    return { index: { graph, records }, truncated }
 }
 
 /**
@@ -161,81 +205,91 @@ export async function buildSummaryIndex(
  * which is what the page's token must name.
  */
 export async function readSummaryPage(
-    _base: SummaryIndex | null,
-    _current: SummaryIndex,
-    _deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
-    _limit: number
+    base: SummaryIndex | null,
+    current: SummaryIndex,
+    deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
+    limit: number
 ): Promise<{
     delivered: SummaryIndex
     page: Omit<SummaryDelta, "token" | "truncated">
 }> {
-    throw new Error("not implemented")
-}
+    const diff = diffSummaryIndex(base, current)
+    const owner = current.graph.did
+    const ordered = [...diff.changed].sort(
+        (a, b) =>
+            Number(b.did === owner) - Number(a.did === owner) || compareRefs(a, b)
+    )
+    const batch = ordered.slice(0, Math.max(1, limit))
+    const more = ordered.length > batch.length
 
-export interface SummaryDeps {
-    projections: GraphProjectionStore
-    records: RecordSnapshotStore
-    /** Every singleton this PMR snapshots, the declaration included. */
-    watched: WatchedRecord[]
+    const keys =
+        batch.length === 0
+            ? new Map<string, ReadSigningKey>()
+            : await deps.signingKeys.keysFor([...new Set(batch.map((e) => e.did))])
+    const reads = await Promise.all(
+        batch.map((entry) =>
+            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" })
+        )
+    )
+    const records = reads.filter((r): r is SummaryRecord => r !== null)
+    const dropped = batch
+        .filter((_, i) => reads[i] === null)
+        .map(({ did, collection, rkey }) => ({ did, collection, rkey }))
+    const kept = new Map(
+        (diff.full ? [] : base!.records).map((e) => [refKey(e), e] as const)
+    )
+    // A drop is a removal only for a record the client holds.
+    const removed = [...diff.removed, ...dropped.filter((r) => kept.has(refKey(r)))]
+    for (const gone of removed) kept.delete(refKey(gone))
+    for (const { car: _car, ...entry } of records) kept.set(refKey(entry), entry)
+    const delivered: SummaryIndex = {
+        graph: current.graph,
+        records: [...kept.values()].sort(compareRefs),
+        ...(more ? { more: true } : {}),
+    }
+    return {
+        delivered,
+        page: {
+            full: diff.full,
+            graph: diff.graphChanged ? current.graph : null,
+            records,
+            removed,
+            more,
+        },
+    }
 }
 
 /**
- * The summary for `did` as held now: the owner's projection, and every
- * watched record of the owner and of each DID in it that is held, was
- * verified at ingest and parses. `records` carries each one's CAR from the
- * same read that produced its index entry, so the bytes served always match
- * the index stored under the token. Null when the owner has no projection
- * yet. Never requests a re-check, whatever a declaration's age: one owner's
- * sync must not fan out to their peers' PDSes.
+ * The record as its own store read holds it: its entry is taken from that
+ * read, so the CAR served matches the index stored under the token. Null when
+ * nothing verified is held, it fails to parse, or it is no longer servable
+ * under the DID's current key. The parse only runs for an entry stored
+ * without its verified `rev` and `cid`.
  */
-export async function buildSummary(
-    did: string,
-    deps: SummaryDeps
-): Promise<{ index: SummaryIndex; records: SummaryRecord[] } | null> {
-    const graph = await deps.projections.get(did)
-    if (!graph) return null
-    const dids = [
-        ...new Set([did, ...graph.following.map((e) => e.did), ...graph.followers.map((e) => e.did)]),
-    ]
-    const held = await Promise.all(
-        dids.flatMap((d) => deps.watched.map((w) => readSummaryRecord(d, w, deps.records)))
-    )
-    const records = held
-        .filter((r): r is SummaryRecord => r !== null)
-        .sort(
-            (a, b) =>
-                compareStrings(a.did, b.did) ||
-                compareStrings(a.collection, b.collection) ||
-                compareStrings(a.rkey, b.rkey)
-        )
-    return {
-        index: {
-            graph,
-            records: records.map(({ car: _car, ...entry }) => entry),
-        },
-        records,
-    }
-}
-
 async function readSummaryRecord(
-    did: string,
-    watched: WatchedRecord,
-    store: RecordSnapshotStore
+    ref: SummaryRecordRef,
+    store: RecordSnapshotStore,
+    key: ReadSigningKey
 ): Promise<SummaryRecord | null> {
-    const snapshot = await store.get(did, watched.collection, watched.rkey)
+    const snapshot = await store.get(ref.did, ref.collection, ref.rkey)
     if (!snapshot || snapshot.verifiedWith === null) return null
-    let parsed
-    try {
-        parsed = readRecordFromCar(snapshot.car, watched.collection, watched.rkey)
-    } catch {
-        return null
+    if (!servableUnderRotation(snapshot.verifiedWith, key)) return null
+    let cid = snapshot.rev !== null ? snapshot.cid : null
+    if (cid === null) {
+        let parsed
+        try {
+            parsed = readRecordFromCar(snapshot.car, ref.collection, ref.rkey)
+        } catch {
+            return null
+        }
+        if (!parsed || parsed.did !== ref.did) return null
+        cid = parsed.cid
     }
-    if (!parsed || parsed.did !== did) return null
     return {
-        did,
-        collection: watched.collection,
-        rkey: watched.rkey,
-        cid: parsed.cid,
+        did: ref.did,
+        collection: ref.collection,
+        rkey: ref.rkey,
+        cid,
         verifiedWith: snapshot.verifiedWith,
         car: snapshot.car,
     }
@@ -243,6 +297,14 @@ async function readSummaryRecord(
 
 function compareStrings(a: string, b: string): number {
     return a < b ? -1 : a > b ? 1 : 0
+}
+
+function compareRefs(a: SummaryRecordRef, b: SummaryRecordRef): number {
+    return (
+        compareStrings(a.did, b.did) ||
+        compareStrings(a.collection, b.collection) ||
+        compareStrings(a.rkey, b.rkey)
+    )
 }
 
 /** Identifies a record across summaries. */
@@ -336,6 +398,8 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
                 }),
             ],
             [SUMMARY_DELTA_KEYS.removed, delta.removed.map(ref)],
+            [SUMMARY_DELTA_KEYS.more, delta.more],
+            [SUMMARY_DELTA_KEYS.truncated, delta.truncated],
         ])
     )
 }

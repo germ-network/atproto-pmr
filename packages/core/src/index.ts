@@ -401,7 +401,6 @@ export {
     type ReadSigningKeys,
 } from "./read-signing-key"
 export {
-    buildSummary,
     buildSummaryIndex,
     readSummaryPage,
     summaryContacts,
@@ -417,7 +416,6 @@ export {
     SUMMARY_RECORD_KEYS,
     SUMMARY_TOKENS_KEPT,
     type SummaryDelta,
-    type SummaryDeps,
     type SummaryIndex,
     type SummaryIndexEntry,
     type SummaryRecord,

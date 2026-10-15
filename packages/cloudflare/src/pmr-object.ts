@@ -58,8 +58,32 @@ const KEY_WATCH = "watch"
 /** One served summary state per entry, so storing one never rewrites another. */
 const SUMMARY_PREFIX = "summary:"
 const summaryKey = (token: string) => SUMMARY_PREFIX + token
-/** Which served states are held, oldest first; small, so a put never reads an index. */
+/** Which served states are held, oldest first; small, so a put never reads an index's parts. */
 const KEY_SUMMARY_ORDER = "summaryOrder"
+
+/**
+ * An index is stored as a header under `summaryKey` and its edges and
+ * entries in parts under `summaryPartKey`, each part far below the 2 MB value
+ * limit however large the owner's graph. A distinct prefix keeps a
+ * client-named token from addressing a part.
+ */
+const SUMMARY_PART_PREFIX = "summaryPart:"
+const summaryPartKey = (token: string, index: number) => `${SUMMARY_PART_PREFIX}${token}:${index}`
+/** Serialized characters per part: half the value limit, since a DID may run to 2 KiB. */
+const SUMMARY_PART_CHARS = 1_000_000
+/** Keys one storage `get`, `put` or `delete` accepts. */
+const STORAGE_BATCH = 128
+
+interface SummaryHeader {
+    graphDid: string
+    more?: boolean
+    parts: number
+}
+
+interface SummaryPart {
+    field: "following" | "followers" | "records"
+    items: unknown[]
+}
 interface SummaryOrder {
     token: string
     order: number
@@ -395,25 +419,72 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * Read-modify-write of the recency list and the entries, atomic under the
      * Durable Object's input gate: nothing here awaits anything but storage.
      */
-    async putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void> {
-        const held = (await this.db.get<SummaryOrder[]>(KEY_SUMMARY_ORDER)) ?? []
-        // Recency is a strictly increasing order, so equal or regressing
-        // clock readings cannot reorder what was served.
-        const latest = held.reduce((max, e) => Math.max(max, e.order), 0)
-        const kept = held.filter((e) => e.token !== token)
-        const next = [...kept, { token, order: Math.max(servedAtMs, latest + 1) }].sort(
-            (a, b) => a.order - b.order
-        )
-        const dropped = next.slice(0, Math.max(0, next.length - SUMMARY_TOKENS_KEPT))
-        await this.db.put(summaryKey(token), index)
-        await this.db.put(KEY_SUMMARY_ORDER, next.slice(dropped.length))
-        if (dropped.length > 0) await this.db.delete(dropped.map((e) => summaryKey(e.token)))
+    async putSummaryIndex(
+        token: string,
+        index: SummaryIndex,
+        servedAtMs: number,
+        replaces?: string
+    ): Promise<void> {
+        const parts = splitSummaryIndex(index)
+        await this.db.transaction(async (txn) => {
+            const held = (await txn.get<SummaryOrder[]>(KEY_SUMMARY_ORDER)) ?? []
+            // Recency is a strictly increasing order, so equal or regressing
+            // clock readings cannot reorder what was served.
+            const latest = held.reduce((max, e) => Math.max(max, e.order), 0)
+            const kept = held.filter((e) => e.token !== token && e.token !== replaces)
+            const next = [...kept, { token, order: Math.max(servedAtMs, latest + 1) }].sort(
+                (a, b) => a.order - b.order
+            )
+            const dropped = next.slice(0, Math.max(0, next.length - SUMMARY_TOKENS_KEPT))
+            const previous = await txn.get<SummaryHeader>(summaryKey(token))
+            const entries: [string, unknown][] = [
+                [
+                    summaryKey(token),
+                    {
+                        graphDid: index.graph.did,
+                        ...(index.more ? { more: true } : {}),
+                        parts: parts.length,
+                    } satisfies SummaryHeader,
+                ],
+                ...parts.map((part, i): [string, unknown] => [summaryPartKey(token, i), part]),
+            ]
+            for (const batch of chunk(entries, STORAGE_BATCH)) {
+                await txn.put(Object.fromEntries(batch))
+            }
+            await txn.put(KEY_SUMMARY_ORDER, next.slice(dropped.length))
+
+            const keys = previous ? summaryPartKeys(token, parts.length, previous.parts) : []
+            const gone = dropped.map((e) => e.token)
+            if (replaces !== undefined && replaces !== token) gone.push(replaces)
+            for (const goneToken of gone) {
+                const header = await txn.get<SummaryHeader>(summaryKey(goneToken))
+                keys.push(summaryKey(goneToken), ...summaryPartKeys(goneToken, 0, header?.parts ?? 0))
+            }
+            for (const batch of chunk(keys, STORAGE_BATCH)) await txn.delete(batch)
+        })
     }
 
     async getSummaryIndex(token: string): Promise<SummaryIndex | null> {
         // A client names the token, so one too long to be a key is simply not held.
         if (new TextEncoder().encode(summaryKey(token)).length > MAX_KEY_BYTES) return null
-        return (await this.db.get<SummaryIndex>(summaryKey(token))) ?? null
+        const header = await this.db.get<SummaryHeader>(summaryKey(token))
+        if (!header || typeof header.parts !== "number") return null
+        const index: SummaryIndex = {
+            graph: { did: header.graphDid, following: [], followers: [] },
+            records: [],
+            ...(header.more ? { more: true } : {}),
+        }
+        const keys = summaryPartKeys(token, 0, header.parts)
+        for (const batch of chunk(keys, STORAGE_BATCH)) {
+            const read = await this.db.get<SummaryPart>(batch)
+            for (const key of batch) {
+                const part = read.get(key)
+                if (!part) return null
+                if (part.field === "records") index.records.push(...(part.items as SummaryIndex["records"]))
+                else index.graph[part.field].push(...(part.items as SummaryIndex["graph"]["following"]))
+            }
+        }
+        return index
     }
 
     /**
@@ -967,4 +1038,38 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     async destroy(): Promise<void> {
         await this.db.deleteAll()
     }
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+    const out: T[][] = []
+    for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+    return out
+}
+
+function summaryPartKeys(token: string, from: number, to: number): string[] {
+    return Array.from({ length: Math.max(0, to - from) }, (_, i) => summaryPartKey(token, from + i))
+}
+
+function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
+    const parts: SummaryPart[] = []
+    for (const [field, items] of [
+        ["following", index.graph.following],
+        ["followers", index.graph.followers],
+        ["records", index.records],
+    ] as const) {
+        let current: unknown[] = []
+        let chars = 0
+        for (const item of items) {
+            const size = JSON.stringify(item).length
+            if (current.length > 0 && chars + size > SUMMARY_PART_CHARS) {
+                parts.push({ field, items: current })
+                current = []
+                chars = 0
+            }
+            current.push(item)
+            chars += size
+        }
+        if (current.length > 0) parts.push({ field, items: current })
+    }
+    return parts
 }

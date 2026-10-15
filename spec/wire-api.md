@@ -1107,6 +1107,108 @@ likewise: it parses and verifies the CAR it takes from the monitor, rather than 
 path through the commit's tree), and does not take the declaration from the
 sender's PDS.
 
+### Device reads — records, graph, and summary
+
+A relay bound to a monitor answers its devices' reads of atproto state from
+the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
+device normally reaches its contacts' records without reaching their PDSes.
+Three routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
+with the short keys below. A decoder MUST ignore keys it does not know.
+
+| method | path | auth | answers |
+|---|---|---|---|
+| `GET` | `/pmr/v1/records/{did}/{collection}/{rkey}` | none | one record's proof CAR |
+| `GET` | `/pmr/v1/graph/{did}` | none | a served DID's follow graph |
+| `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's graph and its contacts' records, as a delta |
+
+Nothing here is evidence. Records are CAR ([above](#records-are-car-wherever-they-are-relayed)):
+a device verifies each against the DID's signing key itself, and treats the
+graph as a hint it checks against the follower's signed follow record.
+
+#### Records
+
+`200` whether or not a record is found, `400` for a malformed path. Found:
+`f`=true, `c` the CAR byte for byte as held, `r` the commit's `rev`, `i` the
+record's CID, `t` when the relay last confirmed the snapshot current (ms). Not
+found: `f`=false, `e` a code, `m` a reason. `rev` and `i` are hints a device
+re-derives from the CAR.
+
+| code | meaning |
+|---|---|
+| `not-watched` | the relay does not serve that DID or does not snapshot that collection and rkey |
+| `not-held` | nothing is held for the DID |
+| `unverifiable` | a snapshot is held but is not served (below) |
+
+A relay serves a snapshot only if ingest verified it against the DID
+document's `#atproto` key and that is still the DID's **trusted current key**.
+The check **fails closed** for `did:plc`: a snapshot verified under any other
+key, or for a DID whose current key the relay cannot trust, reads
+`unverifiable`. A cached `did:plc` document is trusted while the monitor's PLC
+export stream has covered it continuously since the document was fetched and is
+no more than ten minutes behind, and otherwise for ten minutes after its fetch.
+A `did:web` DID has no stream covering it, so it is served on its ingest
+verdict alone: a `did:web` record signed under a key since rotated away
+remains served until its repo's next commit.
+
+A key rotation therefore needs a **re-publish** to restore service: a
+re-fetch after the rotation returns the commit signed under the old key, so a
+DID's records stay `unverifiable` until its repo's next commit. A client that
+rotates its `#atproto` key SHOULD rewrite its declaration afterwards. A
+restart of the monitor's PLC stream without a usable cursor resets its
+continuous coverage, which leaves `did:plc` snapshots `unverifiable` until
+they are confirmed again. A declaration that fails this check requests no
+re-check.
+
+The response never waits on the PDS. A declaration past 24 hours is served as
+held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#reads-and-the-24-hour-rule)).
+The residual leak is that re-check: the PDS learns someone is interested in
+that DID.
+
+#### Graph
+
+`200` with `d` the DID, `o` its `following` and `n` its `followers`, each an
+array of edges `{d: the other party, k: the follow record's rkey, u: mutual}`,
+sorted by `d` then `k`. `404` when the relay holds no projection for the DID,
+`400` for a malformed path. Edges are restricted to DIDs that carry a Germ
+declaration. The `404`/`200` split reveals which DIDs the relay serves a graph
+for; that set is not secret.
+
+#### Summary
+
+An owner reads the records of everyone in their graph with one request. A
+response is a delta against a state the client names by **token**:
+
+| key | field |
+|---|---|
+| `t` | `token`: name this on the next read |
+| `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` is empty |
+| `g` | `graph`: the owner's graph, absent (null) if unchanged |
+| `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
+| `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
+| `m` | `more`: changes remain; read again at once naming this token |
+| `n` | `truncated`: the graph has more contacts than a summary covers |
+
+A read with no `since`, or one naming an unknown or dropped token, gets the
+whole summary as `full`. A relay keeps the last four states it served an
+owner, so a second device or a lost response never leaves a client wrong.
+`409` with `Retry-After` while the owner has no projection yet.
+
+One response carries at most a page of records. When `m` is true the client
+reads again naming the response's token and continues from what that response
+delivered, not from the current state; pages are ordered with the owner's
+records first, then by DID, collection and rkey. A `full` page with `m` set is
+the first page of a replacement: the client MAY defer its replace-all until
+`m` clears. A lost page response means a `full` restart. A read that finds
+nothing changed returns the named token again. `n` means contacts were left out,
+lowest priority first (the owner, then mutual follows, following, followers),
+by a cap that scales inversely with the number of watched collections; a
+contact pushed past the cap arrives in `x` though its records still exist, and
+costs full CARs when it returns.
+
+A summary includes a record only if the relay holds it, ingest verified it and
+it passes the same trusted-current-key check as a record read, with the same
+exemption for `did:web`. A record that stops passing is reported in `x`.
+
 ### Monitoring — a separate component, not a relay surface
 
 A **key monitor** reports changes to the record in which a DID publishes a

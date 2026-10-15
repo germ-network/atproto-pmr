@@ -44,17 +44,27 @@ the same as any other source.
 ## Reads and the 24-hour rule
 
 A snapshot the cache has not been able to confirm for 24 hours is checked
-against the DID's PDS for change before it is served, comparing the record's
-CID only; if the PDS cannot be read the older snapshot stands, and if the
-record changed or is gone the read is refused until the cache catches up (the
-rule in [trust-model P5](trust-model.md#p5--sender-verification)). The model
-applies it to **every** read of a declaration, whichever party asked.
+against the DID's PDS for change, comparing the record's CID only, before a
+**relay** relies on it for a pair put: if the PDS cannot be read the older
+snapshot stands, and if the record changed or is gone the put is refused until
+the cache catches up (the rule in
+[trust-model P5](trust-model.md#p5--sender-verification)).
 
-This carries the P5 caveat with it. A device-triggered read past 24 hours
-causes a PMR→PDS read: the same bounded exception, with the same memo bound
-(an answer is remembered for ten minutes), and with the same cost — that DID's
-PDS learns that someone is interested in it. The privacy benefit of the proxy
-does not extend to a read that has to fall through to the PDS.
+A **device read** does not wait for that check. A lapsed declaration is served
+as held, and the read asks the monitor to re-check it afterwards: a re-check
+request only moves a DID that is already due toward the front of the monitor's
+refresh queue, never makes one due, and takes at most a quarter of a batch, so
+anonymous reads cannot pin failing sources at its head. The check against the
+PDS is the monitor's, off the response path. The pair-put rule is unchanged.
+
+This carries the P5 caveat with it, in a smaller form. The re-check makes the
+monitor read that DID's PDS, so the PDS learns that someone is interested in
+it, though not who or when, and a burst of reads costs one request. The
+privacy benefit of the proxy does not extend to a record whose snapshot has to
+be re-confirmed this way. A summary index also notes a held declaration past
+24 hours, as an operational alarm that the monitor has fallen behind, and never
+requests a re-check, so one owner's sync does not fan out to their contacts'
+PDSes.
 
 ## Which DID directory a device queries
 
@@ -77,14 +87,14 @@ does not extend to a read that has to fall through to the PDS.
 | The monitor's **re-check queue**: a device read of a declaration past the 24-hour rule asks the monitor to refresh that DID | **built** — a request only moves a DID that is already due toward the front (at most a quarter of a batch), never makes one due, and expires after a day |
 | **Mutual hints**: for each non-owner in interest, its follows of registered users, from `listRecords` | **built** — under `registered`, a followee's follows of a registered user are the hint that the followee follows them back |
 | **Mixed provenance** of edges | **built** — rows from a verified `getRepo` listing are proven under the owner's signing key; paged-owner, mutual-hint and live rows are not. Every edge is a hint a device verifies for itself |
-| A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path only; exposed on no endpoint |
+| A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path and exposed to devices by the [device read API](wire-api.md#device-reads--records-graph-and-summary) |
 | The `sd` + `dc` hint on delivered messages | **built** |
 | The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
 | Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
 | A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](key-transparency.md#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
 | PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](key-transparency.md#the-signing-key-cache), [stored documents](key-transparency.md#the-stored-did-document)) |
 | Pushing **counterpart** record changes to devices | **not yet built** |
-| A device-facing read API, and so the 24-hour rule for device reads | **not yet built** |
+| A device-facing read API, and so the 24-hour rule for device reads | **built** — public record and graph reads and the owner's summary ([wire API](wire-api.md#device-reads--records-graph-and-summary)); routes are mounted by the deploying Worker |
 | `did:web` document proxying | **not yet built** |
 | The user setting that routes PLC queries through the PMR | **not yet built** |
 

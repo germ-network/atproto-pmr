@@ -16,12 +16,12 @@ import type {
 } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import {
-    buildSummary,
-    diffSummaryIndex,
+    buildSummaryIndex,
     encodeSummaryDelta,
-    refKey,
+    readSummaryPage,
+    SUMMARY_PAGE_RECORDS,
     type SummaryDelta,
-    type SummaryDeps,
+    type SummaryPageDeps,
 } from "../summary.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
@@ -804,21 +804,31 @@ export async function handleMessagesAcks(
 /**
  * `GET /pmr/v1/summary?since=<token>` — what changed in the owner's summary
  * since the state named by `since`, or the whole summary when `since` is
- * absent or names no state still held (`summary.ts`). The served state is
- * stored under a fresh token, unless nothing changed since the named state,
- * when that token is returned again and re-stored as most recent, so polling
- * devices do not push each other's states out. `409` with `Retry-After` when the owner
- * has no projection yet. Never requests a re-check.
+ * absent or names no state still held (`summary.ts`). One response carries at
+ * most a page of changed records: `more` says to read again naming the
+ * response's token, and `truncated` that the owner's graph has more contacts
+ * than a summary covers. The state the client holds after the response (not
+ * the current one, while pages remain) is stored under its token. When nothing
+ * changed since the named state, that token is returned again and re-stored as
+ * most recent, so polling devices do not push each other's states out; a page
+ * read since a token that left `more` set takes over that token's slot, so a
+ * paged sync holds one. `409` with `Retry-After` when the owner has no
+ * projection yet. Never requests a re-check.
  */
 export async function handleSummaryRead(
     request: Request,
-    deps: OwnerDeps & SummaryDeps & { randomBytes: (n: number) => Uint8Array; nowMs: () => number }
+    deps: OwnerDeps &
+        SummaryPageDeps & {
+            randomBytes: (n: number) => Uint8Array
+            /** Records per response; `SUMMARY_PAGE_RECORDS` when unset. */
+            pageRecords?: number
+        }
 ): Promise<Response> {
     const a = await authed(request, deps)
     if (!a.ok) return a.response
     const { did, store } = a.auth
 
-    const built = await buildSummary(did, deps)
+    const built = await buildSummaryIndex(did, deps)
     if (!built) {
         return amortize(
             new Response(null, {
@@ -835,25 +845,29 @@ export async function handleSummaryRead(
 
     const since = new URL(request.url).searchParams.get("since")
     const base = since === null ? null : await store.getSummaryIndex(since)
-    const diff = diffSummaryIndex(base, built.index)
+    const { delivered, page } = await readSummaryPage(
+        base,
+        built.index,
+        deps,
+        deps.pageRecords ?? SUMMARY_PAGE_RECORDS
+    )
     const unchanged =
-        !diff.full && !diff.graphChanged && diff.changed.length === 0 && diff.removed.length === 0
+        base !== null &&
+        !page.full &&
+        page.graph === null &&
+        page.records.length === 0 &&
+        page.removed.length === 0 &&
+        !page.more
 
     const token = unchanged ? since! : binaryToBase64URL(deps.randomBytes(SUMMARY_TOKEN_BYTES))
-    await store.putSummaryIndex(token, built.index, deps.nowMs())
-
-    const changedKeys = new Set(diff.changed.map(refKey))
-    const delta: SummaryDelta = {
+    await store.putSummaryIndex(
         token,
-        full: diff.full,
-        graph: diff.graphChanged ? built.index.graph : null,
-        records: diff.full
-            ? built.records
-            : built.records.filter((r) => changedKeys.has(refKey(r))),
-        removed: diff.removed,
-        more: false,
-        truncated: false,
-    }
+        delivered,
+        deps.nowMs(),
+        !unchanged && base?.more === true ? since! : undefined
+    )
+
+    const delta: SummaryDelta = { token, ...page, truncated: built.truncated }
     return amortize(
         new Response(toResponseBody(encodeSummaryDelta(delta)), {
             status: 200,
