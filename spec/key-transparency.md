@@ -11,7 +11,7 @@ different keys to different audiences cannot do it quietly._
 
 This document specifies the key monitor: a component
 [separate](wire-api.md#monitoring--a-separate-component-not-a-relay-surface)
-from a [Personal Messaging Relay](README.md#what-an-atproto-pmr-is), which
+from a [Personal Messaging Relay](README.md#what-is-an-atproto-pmr), which
 a relay operator is encouraged but not required to run alongside one.
 
 ## The goal
@@ -93,11 +93,13 @@ A key monitor:
 - declares its **coverage**: the population of records it observes,
   typically everything visible on the firehose it consumes. Coverage is a
   published fact about the monitor, not a per-client setting.
-- **serves one record type and nothing else.** The redundancy model
+- **serves one record type and nothing else** on its own surfaces. The redundancy model
   depends on monitors being cheap enough to run several and simple enough
   for independent parties to operate; a general record-fetch interface
   erodes that. A conforming monitor MUST NOT require any capability beyond
-  this document.
+  this document. The relay-facing stores below (snapshots, DID documents
+  and the coverage watermarks) are what a co-located relay reads; they add no
+  surface.
 
 A host advertises a monitor through its
 [enabler document](wire-api.md#the-enabler-document): a `monitor`
@@ -198,7 +200,7 @@ the DID **as CAR**, never JSON, with the `rev`, `observedAt`, `source` (the
 PDS it came from) and `signingKey` (the key it verified under at ingest) it
 holds. A monitor is as untrusted as any relay
 ([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)), and its
-check does not replace the client's (Q-PMR-24). This is the community view. A
+check does not replace the client's. This is the community view. A
 client comparing it against its own fetch, other monitors and its relay MUST
 **compare under a common authority, or not at all**
 ([trust-model](trust-model.md#why-more-than-one-monitor-is-load-bearing)): check
@@ -237,20 +239,68 @@ PDS on a fixed schedule.
   commit), on an **exponential backoff**: the first interval is **one day**, it
   doubles after each confirmation that finds nothing changed, and it is capped
   at **30 days**. A firehose event for the
-  DID, which already prompts a direct fetch, resets the backoff. Each
+  DID, which already prompts a direct fetch, resets the backoff, and so does a
+  confirmation that finds a change. Each
   confirmation is **jittered** within its interval, which spreads the requests
   out and keeps their time of day from tracking when the DID last changed. A
-  quiet holder costs about one read a month.
+  quiet holder costs about one read a month. The other records a monitor
+  keeps for a DID, such as a profile, follow the same events, backoff and
+  resync.
 - **Gaps.** Resuming from a cursor inside the stream's replay window keeps
   coverage continuous. When a monitor cannot resume (its cursor fell out of the
   window, or the stream reset), its watermark stops at the last instant it
-  covered. It then **resyncs**, checking each held DID's repo head against the
-  `rev` it holds, and raises each DID's freshness as the check reaches it. A
-  resync costs one head read per holder, paid per gap.
+  covered. It then **resyncs**: for each held DID it reads the declaration
+  record and compares its CID with the one held, as the backoff does, and
+  raises the DID's freshness as the check reaches it. The watermark advances
+  again once the resync has reached every held DID. A resync costs one record
+  read per holder, paid per gap. A restart of the PLC export stream without a
+  usable cursor is a gap too: it ends the PLC coverage run, and the monitor
+  re-confirms each held `did:plc` document and operation log
+  ([below](#the-stored-did-document)).
 - **Beyond one monitor.** Neither the stream nor one monitor's backoff is the
   last line: several independent monitors on independent streams, and the
   device's own-DID push, are
   ([the two comparisons](#the-two-comparisons-and-their-different-weights)).
+
+### The stored DID document
+
+A monitor keeps a DID document for each DID it watches and publishes it where
+a relay reads it, so a relay can take a sender's signing key from the monitor
+instead of asking the directory
+([trust-model P5](trust-model.md#p5--sender-verification)).
+
+- **Sources.** Every DID-document fetch the monitor makes also stores the
+  document it resolved; that is the only source for `did:web`. For `did:plc`,
+  the PLC export stream is rendered into the document the directory serves and
+  stored when the directory sequences the operation. An operation the monitor
+  cannot render, or a tombstone, is published as the absence of a document, so
+  a relay asks the directory.
+- **Write order.** Writes are ordered by when the directory held the state:
+  a stream operation by its `createdAt`, a fetch by its start time less a
+  clock-skew margin. A write older than what is stored MUST be dropped, so a
+  fetch that read a document before an operation can never overwrite it.
+- **Operation log.** For a `did:plc` DID the monitor also keeps the signed
+  operation log, verified before it is stored, for a device to verify itself
+  ([wire API](wire-api.md#did-documents)).
+
+### The coverage watermarks
+
+A monitor publishes two watermarks beside its stores, and a relay judges what
+it reads by them, never by a per-DID refresh time:
+
+- **Firehose coverage.** The instant through which every declaration commit
+  and identity or account event the firehose sequenced has been applied. A
+  snapshot's freshness is the later of this and the DID's last direct fetch.
+- **PLC coverage run.** When the export stream's current unbroken run began,
+  and the `createdAt` through which every operation since then has reached the
+  stored documents. A run continues across a restart that resumes from the
+  stored cursor, and ends on a start without a usable cursor or on an
+  operation the monitor failed to take in.
+
+A relay trusts a stored `did:plc` document while the document was confirmed
+inside the current run and the run's covered-through time is no more than ten
+minutes old. Any other stored document is trusted for ten minutes, the same as
+a direct fetch. A missing or unreadable watermark is no coverage.
 
 ### Reads and the 24-hour rule
 
@@ -344,8 +394,7 @@ above are designed to admit it without change.
   cheaper alternative to the whole-population digest for a caller with a
   large, publicly-derivable interest set. Superseded for now by the
   change digest, which covers the same need without a second mechanism;
-  the `changedSince` seam it would have used was removed with the
-  DO-read-offload refactor since it had no production caller.
+  change digest, which covers the same need without a second mechanism.
 - **A stronger rotation anchor.** `signingKey` alone says *that* the
   authority differs, not *when* it changed relative to either observation.
   For `did:plc`, the PLC log's operation CID would place a rotation in

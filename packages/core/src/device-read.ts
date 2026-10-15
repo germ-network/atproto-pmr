@@ -1,5 +1,5 @@
 /**
- * The device read API's public record route (`spec/proxy-cache.md`), served
+ * The device read API's public record route (`spec/wire-api.md`, "Device reads"), served
  * from the monitor's processed KV output. It is unauthenticated and answers
  * every caller identically, so a response says nothing about who else has
  * asked. It never reaches a PDS on the response path.
