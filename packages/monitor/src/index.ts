@@ -152,6 +152,20 @@ export {
     type GraphMirrorIndex,
     type MirrorReconcileCursor,
 } from "./graph-mirror"
+export {
+    drainPlcLogs,
+    PLC_LOG_RETRY_MS,
+    type DrainPlcLogsDeps,
+    type PlcLogIndex,
+} from "./plc-log"
+export {
+    PROJECT_STATEMENTS_PER_DID,
+    runGraphProjector,
+    type GraphProjectorDeps,
+    type GraphProjectorIndex,
+    type MirroredGraphStanding,
+    type ProjectorCursor,
+} from "./graph-projector"
 export { listFollowRecords, type ListFollowRecordsOptions } from "./list-records"
 
 // The change digest.

@@ -26,6 +26,7 @@ export type {
     MessageId,
     MessageRef,
     MonitorRegistrationNotify,
+    MonitorRecheckRequest,
     Nonce,
     OpenMailboxesPage,
     PairMailboxKey,
@@ -376,7 +377,39 @@ export {
     type RecordReadDeps,
 } from "./device-read"
 export {
+    appendPlcLogEntry,
+    parsePlcAuditLog,
+    verifyPlcLog,
+    type PlcLog,
+    type PlcLogEntry,
+} from "./plc-log"
+export {
+    decodeDidDocReadResponse,
+    DID_DOC_READ_KEYS,
+    encodeDidDocReadResponse,
+    handleDidDocRead,
+    PLC_LOG_ENTRY_KEYS,
+    type DidDocReadDeps,
+    type DidDocReadMiss,
+    type DidDocReadResponse,
+    type PlcLogStore,
+} from "./did-doc-read"
+export {
+    readSigningKeyFrom,
+    servableUnderRotation,
+    type ReadSigningKey,
+    type ReadSigningKeys,
+} from "./read-signing-key"
+export {
     buildSummary,
+    buildSummaryIndex,
+    readSummaryPage,
+    summaryContacts,
+    SUMMARY_MAX_RECORDS,
+    SUMMARY_PAGE_RECORDS,
+    type SummaryHeldEntry,
+    type SummaryIndexReader,
+    type SummaryPageDeps,
     decodeSummaryDelta,
     diffSummaryIndex,
     encodeSummaryDelta,

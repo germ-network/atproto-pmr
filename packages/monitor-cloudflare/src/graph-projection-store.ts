@@ -31,5 +31,20 @@ export function kvGraphProjections(env: MonitorEnv): GraphProjectionWriter {
         async delete(did: string): Promise<void> {
             await env.records.delete(GRAPH_PREFIX + did)
         },
+
+        async listDids(
+            cursor: string | null,
+            limit: number
+        ): Promise<{ dids: string[]; cursor: string | null }> {
+            const page = await env.records.list({
+                prefix: GRAPH_PREFIX,
+                limit,
+                ...(cursor === null ? {} : { cursor }),
+            })
+            return {
+                dids: page.keys.map((k) => k.name.slice(GRAPH_PREFIX.length)),
+                cursor: page.list_complete ? null : page.cursor,
+            }
+        },
     }
 }

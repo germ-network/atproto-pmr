@@ -31,5 +31,6 @@
 
 export { PMRObject } from "./pmr-object"
 export { KVDirectory, pmrStore, kvBodyStore } from "./directory"
+export { monitorRecheck } from "./monitor-recheck"
 export { kvChallengeStore } from "./challenge-store"
 export type { PMREnv } from "./env"

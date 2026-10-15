@@ -3,6 +3,8 @@ import type {
     DidDocument,
     DidDocumentCache,
     PlcCoverage,
+    PlcLogStore,
+    ReadSigningKeys,
 } from "@germ-network/atproto-pmr-core"
 import type { MonitorEnv } from "./env"
 import type { MonitorIngest } from "./ingest-object"
@@ -73,6 +75,37 @@ function parseCached(text: string): CachedDidDocument | null {
     if (typeof fetchedAtMs !== "number" || !Number.isFinite(fetchedAtMs)) return null
     if (source !== "plc" && source !== "web") return null
     return value as CachedDidDocument
+}
+
+/**
+ * The read paths' rotation-check keys: `doc:` entries in bulk reads of up to
+ * a hundred, `plc:coverage` once per call, mapped by `readSigningKeyFrom`.
+ * Never reaches the network.
+ */
+export function kvReadSigningKeys<TIngest extends MonitorIngest = MonitorIngest>(
+    _env: MonitorEnv<TIngest>,
+    _nowMs: () => number = Date.now
+): ReadSigningKeys {
+    return {
+        async keysFor() {
+            throw new Error("not implemented")
+        },
+    }
+}
+
+/**
+ * The DID-document route's logs: `plclog:<did>` in the `records` namespace,
+ * published by the ingest object for kept did:plc DIDs. A malformed entry
+ * reads as none.
+ */
+export function kvPlcLogs<TIngest extends MonitorIngest = MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): PlcLogStore {
+    return {
+        async get() {
+            throw new Error("not implemented")
+        },
+    }
 }
 
 /** No expirationTtl: the reader enforces age from `fetchedAtMs`. */

@@ -16,6 +16,7 @@ import {
 } from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
+import type { ReadSigningKeys } from "./read-signing-key.js"
 import type { RecordSnapshotStore } from "./snapshot-read.js"
 import type { WatchedRecord } from "./watched.js"
 
@@ -39,6 +40,8 @@ export interface SummaryIndexEntry extends SummaryRecordRef {
 export interface SummaryIndex {
     graph: GraphReadResponse
     records: SummaryIndexEntry[]
+    /** Delivered by a page that left more: a client holding it is mid-sync. */
+    more?: boolean
 }
 
 export interface SummaryRecord extends SummaryIndexEntry {
@@ -61,10 +64,113 @@ export interface SummaryDelta {
     records: SummaryRecord[]
     /** Records in the named state no longer in the summary, including any no longer verified. */
     removed: SummaryRecordRef[]
+    /**
+     * More changes remain than one response carries: read again at once,
+     * naming this response's token. A `full` response that sets it is the
+     * first page of a replacement; the pages after it are ordinary deltas.
+     */
+    more: boolean
+    /**
+     * The owner's graph has more contacts than a summary covers, so the
+     * records of the lowest-priority contacts are left out (owner, then
+     * mutuals, following, followers).
+     */
+    truncated: boolean
 }
 
 /** How many served summary states a registration can name back. */
 export const SUMMARY_TOKENS_KEPT = 4
+
+/**
+ * Records a summary indexes. Contacts are capped at this over the watched
+ * count, so adding a watched collection cannot push an index build past an
+ * invocation's store reads (about a thousand; bulk reads of a hundred keys
+ * count as one). Each bulk metadata read also moves the CARs it discards,
+ * about 3 KB apiece.
+ */
+export const SUMMARY_MAX_RECORDS = 6_000
+
+/**
+ * Records whose CARs one response carries. Each CAR is one store read, so
+ * changes beyond this wait for the next page.
+ */
+export const SUMMARY_PAGE_RECORDS = 400
+
+/** A held, ingest-verified record's index entry, read without its CAR. */
+export interface SummaryHeldEntry extends SummaryIndexEntry {
+    freshAtMs: number
+}
+
+export interface SummaryIndexReader {
+    /**
+     * Each ref's entry, in order: null where nothing is held or ingest did
+     * not verify it. Never reads a CAR, so a whole index costs a few bulk reads.
+     */
+    entries(refs: readonly SummaryRecordRef[]): Promise<(SummaryHeldEntry | null)[]>
+}
+
+export interface SummaryPageDeps {
+    projections: GraphProjectionStore
+    index: SummaryIndexReader
+    /** Read once per delivered record, for its CAR. */
+    records: RecordSnapshotStore
+    signingKeys: ReadSigningKeys
+    /** Every singleton this PMR snapshots, the declaration included. */
+    watched: WatchedRecord[]
+    /**
+     * Told of a held declaration past `SNAPSHOT_MAX_AGE_MS`: the monitor is
+     * over a day behind, an operational alarm. Never a re-check request.
+     */
+    onLapse: (did: string) => void
+    nowMs: () => number
+}
+
+/**
+ * The DIDs a summary covers, the owner first, then mutuals, following and
+ * followers, each by DID; at most `maxContacts` (`SUMMARY_MAX_RECORDS` over
+ * the watched count). `truncated` when any were left out.
+ */
+export function summaryContacts(
+    _owner: string,
+    _graph: GraphReadResponse,
+    _maxContacts: number
+): { dids: string[]; truncated: boolean } {
+    throw new Error("not implemented")
+}
+
+/**
+ * The summary's index as held now: the owner's projection and the entry of
+ * every watched record of each covered contact that is held, verified at
+ * ingest and servable under rotation. Reads no CAR. Null when the owner has
+ * no projection yet.
+ */
+export async function buildSummaryIndex(
+    _did: string,
+    _deps: SummaryPageDeps
+): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
+    throw new Error("not implemented")
+}
+
+/**
+ * One page from `base` toward `current`: the graph if it changed, at most
+ * `limit` changed records with their CARs, and every removal. Each
+ * delivered record takes the entry of its own CAR read, so served bytes
+ * match the index; one gone or no longer servable by then is reported
+ * removed. Changed records go in `(did, collection, rkey)` order, the
+ * owner's first. `delivered` is the index the client holds after this page,
+ * which is what the page's token must name.
+ */
+export async function readSummaryPage(
+    _base: SummaryIndex | null,
+    _current: SummaryIndex,
+    _deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
+    _limit: number
+): Promise<{
+    delivered: SummaryIndex
+    page: Omit<SummaryDelta, "token" | "truncated">
+}> {
+    throw new Error("not implemented")
+}
 
 export interface SummaryDeps {
     projections: GraphProjectionStore
@@ -193,6 +299,8 @@ export const SUMMARY_DELTA_KEYS = {
     graph: "g",
     records: "r",
     removed: "x",
+    more: "m",
+    truncated: "n",
 } as const satisfies WireKeys<SummaryDelta>
 
 export const SUMMARY_RECORD_KEYS = {
@@ -273,5 +381,7 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
             }
         }),
         removed: items(D.removed).map(refOf),
+        more: map.get(D.more) === true,
+        truncated: map.get(D.truncated) === true,
     }
 }

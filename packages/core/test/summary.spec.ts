@@ -399,6 +399,8 @@ describe("summary read", () => {
             graph: null,
             records: [],
             removed: [],
+            more: false,
+            truncated: false,
         })
         expect(new Set(w.puts.map((p) => p.token))).toEqual(new Set([first.token]))
     })
@@ -537,6 +539,8 @@ describe("summary codec", () => {
     const delta: SummaryDelta = {
         token: "tok",
         full: false,
+        more: false,
+        truncated: false,
         graph: { did: "did:plc:me", following: [{ did: "did:plc:a", rkey: "r1", mutual: true }], followers: [] },
         records: [
             {
@@ -594,7 +598,9 @@ describe("summary codec", () => {
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])
         expect(decodeSummaryDelta(encodeCose(base())).token).toBe("t")
+        const optional: string[] = [SUMMARY_DELTA_KEYS.more, SUMMARY_DELTA_KEYS.truncated]
         for (const key of Object.values(SUMMARY_DELTA_KEYS)) {
+            if (optional.includes(key)) continue
             const m = base()
             m.delete(key)
             expect(() => decodeSummaryDelta(encodeCose(m))).toThrow()

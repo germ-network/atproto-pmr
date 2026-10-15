@@ -1,6 +1,7 @@
 import {
     DECLARATION_COLLECTION_NSID,
     type RecordSnapshotStore,
+    type SummaryIndexReader,
 } from "@germ-network/atproto-pmr-core"
 import type {
     DigestMarker,
@@ -20,10 +21,12 @@ import type { MonitorIngest } from "./ingest-object"
  * KV rather than Durable Object storage because the read paths are public,
  * cacheable, and want to run in plain Workers near the caller — the
  * community view should scale like the public data it is, not funnel
- * through one object in one location. **No request handler reaches the
- * ingest object at all** — every read here, including the digest marker,
- * is this store or nothing, which is what keeps a read from ever sharing
- * fate with a wedged, evicted, or reconnecting writer.
+ * through one object in one location. **No request handler reads through
+ * the ingest object** — every read here, including the digest marker, is
+ * this store or nothing, which is what keeps a read from ever sharing fate
+ * with a wedged, evicted, or reconnecting writer. A handler may signal the
+ * writer (a registration notify, a re-check request) but never reads
+ * through it.
  *
  * Eventual consistency is acceptable here and only here: a stale record
  * read is `rev` skew, which the trust model already treats as ordinary,
@@ -246,6 +249,22 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 rev: verifiedWith === null ? null : metadata.rev,
                 cid: verifiedWith === null ? null : (metadata.cid ?? null),
             }
+        },
+    }
+}
+
+/**
+ * The summary's index reads: each ref's `rec:` metadata and `chk:` entry in
+ * bulk reads of up to a hundred keys, never a CAR (a bulk read cannot return
+ * bytes, and the value is discarded). An entry stored without verified
+ * metadata reads as null, as does one with no `cid`.
+ */
+export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): SummaryIndexReader {
+    return {
+        async entries() {
+            throw new Error("not implemented")
         },
     }
 }

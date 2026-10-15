@@ -278,6 +278,15 @@ export interface MonitorRegistrationNotify {
     unregister(did: string): Promise<void>
 }
 
+/**
+ * A monitor that takes re-check requests from device reads of lapsed
+ * declarations. Best-effort: a request only reorders work already due, so a
+ * lost call only delays a refresh the monitor would make anyway.
+ */
+export interface MonitorRecheckRequest {
+    requestRefresh(did: string, requestedAtMs: number): Promise<void>
+}
+
 /** Global, small, read on every inbound request. */
 export interface Directory {
     /** Hot path: routes every pair put and every owner request. */
@@ -349,9 +358,16 @@ export interface PMRStore {
      * The summary index served under `token` (`summary.ts`). Keeps only the
      * most recently served `SUMMARY_TOKENS_KEPT`; storing one past that drops
      * the oldest. Each index is its own entry, so storing one never rewrites
-     * another. Private to this registration.
+     * another. Private to this registration. `replaces`: a token the client
+     * has paged past (its index has `more` set); the new token takes its
+     * slot, so a paged sync holds one slot however many pages it takes.
      */
-    putSummaryIndex(token: string, index: SummaryIndex, servedAtMs: number): Promise<void>
+    putSummaryIndex(
+        token: string,
+        index: SummaryIndex,
+        servedAtMs: number,
+        replaces?: string
+    ): Promise<void>
     /**
      * Null for a token never served here or since dropped. The token is
      * client-supplied: one that cannot be a key is simply not held.

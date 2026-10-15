@@ -53,6 +53,16 @@ export interface RefreshIndex {
      */
     markAttempted(did: string, attemptedAtMs: number): Promise<void>
     /**
+     * A device read found this DID's declaration past the 24-hour rule.
+     * Only reorders: a requested DID that `dueRefresh` would return anyway
+     * comes first, but a request never makes a DID due, and requested DIDs
+     * fill at most a quarter of a batch (at least one), so anonymous reads
+     * cannot pin failing sources at the head. Cleared when `dueRefresh`
+     * returns the DID, so every refresh outcome consumes it, when the DID
+     * leaves interest, or after a day unselected; repeated requests coalesce.
+     */
+    requestRefresh(did: string, requestedAtMs: number): Promise<void>
+    /**
      * The declaration is reversibly gone and already disposed of: re-assert
      * that state, with no digest-window entry and no push.
      */

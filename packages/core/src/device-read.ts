@@ -18,6 +18,7 @@ import {
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api.js"
+import type { ReadSigningKeys } from "./read-signing-key.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { toResponseBody } from "./util.js"
@@ -34,6 +35,11 @@ export interface RecordReadDeps {
     serves: (did: string) => Promise<boolean>
     /** Every singleton this PMR snapshots, the declaration included. */
     watched: WatchedRecord[]
+    /**
+     * The DID's current key: a snapshot ingest verified under any other key,
+     * or with no trusted current key for a `did:plc` DID, reads `unverifiable`.
+     */
+    signingKeys: ReadSigningKeys
     nowMs: () => number
     /**
      * Asks the monitor to re-check a declaration whose snapshot is past
@@ -342,6 +348,11 @@ export interface GraphProjectionStore {
 export interface GraphProjectionWriter extends GraphProjectionStore {
     put(projection: GraphReadResponse): Promise<void>
     delete(did: string): Promise<void>
+    /** Held projections' DIDs, paged, so a rebuild can sweep those no longer served. */
+    listDids(
+        cursor: string | null,
+        limit: number
+    ): Promise<{ dids: string[]; cursor: string | null }>
 }
 
 export interface GraphReadDeps {

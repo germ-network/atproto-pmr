@@ -58,9 +58,14 @@
 
 export { MonitorIngest } from "./ingest-object"
 export { kvMonitorRegistrationStore } from "./registration-store"
-export { kvSnapshotStore, kvDeclarationSnapshots, kvRecordSnapshots } from "./snapshot-store"
+export {
+    kvSnapshotStore,
+    kvDeclarationSnapshots,
+    kvRecordSnapshots,
+    kvSummaryIndexReader,
+} from "./snapshot-store"
 export { kvGraphProjections } from "./graph-projection-store"
-export { kvDidDocuments, kvPlcCoverage } from "./did-document-store"
+export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
 export { d1FollowEdgeStore } from "./follow-edge-store"
 export { d1GraphChangeLog } from "./graph-change-log"
