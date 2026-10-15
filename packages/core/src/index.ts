@@ -304,7 +304,10 @@ export {
     type RepoCollectionErrorCode,
     type RetainedBlocks,
     type RepoCollectionExpectation,
+    type RepoCollectionsExpectation,
     type VerifiedCollection,
+    type VerifiedCollections,
+    verifyRepoCollections,
 } from "./repo-collection"
 
 // The stored DID document a key monitor keeps per watched DID.
@@ -329,7 +332,13 @@ export {
 } from "./snapshot-read"
 
 // The proxy cache's stores, what a monitor watches, and the device read API's bodies.
-export { type FollowEdge, type FollowEdgeStore } from "./follow-edges"
+export { FOLLOW_COLLECTION_NSID, type FollowEdge, type FollowEdgeStore } from "./follow-edges"
+export {
+    BLOCK_COLLECTION_NSID,
+    type BlockEdge,
+    type BlockEdgeStore,
+    type MonitorOwnBlocksRequest,
+} from "./block-edges"
 export {
     type GraphChangeLog,
     type GraphChangeReason,
@@ -355,9 +364,11 @@ export {
 export {
     GRAPH_EDGE_KEYS,
     GRAPH_READ_KEYS,
+    OWN_BLOCK_KEYS,
     RECORD_READ_KEYS,
     type GraphEdge,
     type GraphReadResponse,
+    type OwnBlock,
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api"
@@ -407,6 +418,7 @@ export {
     buildSummaryIndex,
     readSummaryPage,
     summaryContacts,
+    SummaryOwnBlocksError,
     SUMMARY_MAX_RECORDS,
     SUMMARY_PAGE_RECORDS,
     type SummaryHeldEntry,

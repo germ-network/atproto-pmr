@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { listFollowRecords } from "../src/list-records"
+import { listEdgeRecords } from "../src/list-records"
 
 const DID = "did:plc:alice"
 const PDS = "https://pds.example"
@@ -15,13 +15,22 @@ function pdsReturning(body: unknown) {
     return { seen, fetchImpl }
 }
 
-describe("listFollowRecords", () => {
+describe("listEdgeRecords", () => {
+    it("requests the block collection when asked for blocks", async () => {
+        const f = pdsReturning({
+            records: [{ uri: "at://did:plc:alice/app.bsky.graph.block/3k1", value: { subject: "did:plc:b" } }],
+        })
+        const page = await listEdgeRecords(DID, "block", null, { pds: PDS, fetchImpl: f.fetchImpl })
+        expect(new URL(f.seen[0]!).searchParams.get("collection")).toBe("app.bsky.graph.block")
+        expect(page.records).toEqual([{ rkey: "3k1", subject: "did:plc:b" }])
+    })
+
     it("requests the follow collection at the PDS, ascending, after the given rkey", async () => {
         const f = pdsReturning({
             records: [{ uri: uri("a"), value: { subject: "did:plc:bob" } }],
             cursor: "a",
         })
-        const page = await listFollowRecords(DID, "9", { pds: PDS, fetchImpl: f.fetchImpl })
+        const page = await listEdgeRecords(DID, "follow", "9", { pds: PDS, fetchImpl: f.fetchImpl })
         const url = new URL(f.seen[0]!)
         expect(url.origin + url.pathname).toBe(`${PDS}/xrpc/com.atproto.repo.listRecords`)
         expect(Object.fromEntries(
@@ -36,7 +45,7 @@ describe("listFollowRecords", () => {
         expect(page).toEqual({ records: [{ rkey: "a", subject: "did:plc:bob" }], lastRkey: "a" })
 
         const first = pdsReturning({ records: [] })
-        const empty = await listFollowRecords(DID, null, { pds: PDS, limit: 10, fetchImpl: first.fetchImpl })
+        const empty = await listEdgeRecords(DID, "follow", null, { pds: PDS, limit: 10, fetchImpl: first.fetchImpl })
         const params = new URL(first.seen[0]!).searchParams
         expect(params.has("cursor")).toBe(false)
         expect(params.get("limit")).toBe("10")
@@ -51,7 +60,7 @@ describe("listFollowRecords", () => {
                 { uri: uri("c"), value: {} },
             ],
         })
-        const page = await listFollowRecords(DID, null, { pds: PDS, fetchImpl: f.fetchImpl })
+        const page = await listEdgeRecords(DID, "follow", null, { pds: PDS, fetchImpl: f.fetchImpl })
         expect(page.records).toEqual([{ rkey: "b", subject: "did:plc:bob" }])
     })
 
@@ -62,7 +71,7 @@ describe("listFollowRecords", () => {
                 { uri: uri("b"), value: { subject: null } },
             ],
         })
-        expect(await listFollowRecords(DID, null, { pds: PDS, fetchImpl: f.fetchImpl })).toEqual({
+        expect(await listEdgeRecords(DID, "follow", null, { pds: PDS, fetchImpl: f.fetchImpl })).toEqual({
             records: [],
             lastRkey: "b",
         })
@@ -71,7 +80,7 @@ describe("listFollowRecords", () => {
     it("refuses a non-https PDS", async () => {
         const f = pdsReturning({ records: [] })
         await expect(
-            listFollowRecords(DID, null, { pds: "http://pds.example", fetchImpl: f.fetchImpl })
+            listEdgeRecords(DID, "follow", null, { pds: "http://pds.example", fetchImpl: f.fetchImpl })
         ).rejects.toThrow(/non-https/)
         expect(f.seen).toEqual([])
     })

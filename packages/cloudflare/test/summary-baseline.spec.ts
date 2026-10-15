@@ -19,6 +19,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
 
 const index = (n: number): SummaryIndex => ({
     graph: { did: "did:plc:me", following: [], followers: [] },
+    ownBlocks: [],
     records: [
         {
             did: "did:plc:a",

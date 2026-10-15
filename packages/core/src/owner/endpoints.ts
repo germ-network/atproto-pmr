@@ -17,6 +17,7 @@ import type {
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import {
     buildSummaryIndex,
+    SummaryOwnBlocksError,
     encodeSummaryDelta,
     readSummaryPage,
     SUMMARY_PAGE_RECORDS,
@@ -813,7 +814,10 @@ export async function handleMessagesAcks(
  * most recent, so polling devices do not push each other's states out; a page
  * read since a token that left `more` set takes over that token's slot, so a
  * paged sync holds one. `409` with `Retry-After` when the owner has no
- * projection yet. Never requests a re-check.
+ * projection yet or their graph is not served for blocks, and `503` with
+ * `Retry-After` when their blocks cannot be read; either leaves the held
+ * state as it was. The summary carries the owner's own block list, null when
+ * unchanged. Never requests a re-check.
  */
 export async function handleSummaryRead(
     request: Request,
@@ -828,7 +832,23 @@ export async function handleSummaryRead(
     if (!a.ok) return a.response
     const { did, store } = a.auth
 
-    const built = await buildSummaryIndex(did, deps)
+    let built
+    try {
+        built = await buildSummaryIndex(did, deps)
+    } catch (error) {
+        if (!(error instanceof SummaryOwnBlocksError)) throw error
+        return amortize(
+            new Response(null, {
+                status: 503,
+                headers: {
+                    "Retry-After": String(SUMMARY_RETRY_AFTER_SECONDS),
+                    "cache-control": "no-store",
+                },
+            }),
+            did,
+            deps
+        )
+    }
     if (!built) {
         return amortize(
             new Response(null, {
@@ -855,6 +875,7 @@ export async function handleSummaryRead(
         base !== null &&
         !page.full &&
         page.graph === null &&
+        page.ownBlocks === null &&
         page.records.length === 0 &&
         page.removed.length === 0 &&
         !page.more

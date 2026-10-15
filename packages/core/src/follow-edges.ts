@@ -6,6 +6,8 @@
  * before relying on it.
  */
 
+export const FOLLOW_COLLECTION_NSID = "app.bsky.graph.follow"
+
 /** One `app.bsky.graph.follow` record: `follower` follows `subject`. */
 export interface FollowEdge {
     follower: string

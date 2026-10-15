@@ -80,6 +80,7 @@ function indexWorld(
     const watched = options.watched ?? [{ collection: COLL, rkey: "self" }]
     const deps: SummaryPageDeps = {
         projections: { get: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        blocks: { ownBlocks: async () => [] },
         index: {
             entries: async (refs) => {
                 asked.push([...refs])
@@ -227,6 +228,7 @@ const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey")
 })
 const indexOf = (records: ReturnType<typeof entryOf>[], graph = graphOf([]), more?: boolean): SummaryIndex => ({
     graph,
+    ownBlocks: [],
     records,
     ...(more ? { more } : {}),
 })
@@ -434,6 +436,7 @@ describe("summary delta codec", () => {
         token: "tok",
         full: false,
         graph: null,
+        ownBlocks: null,
         records: [],
         removed: [],
         more: true,

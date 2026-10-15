@@ -69,6 +69,8 @@ export {
     type SecondarySnapshotStore,
     type SecondaryWriteAnswer,
     D1_ROWS_PER_STATEMENT,
+    type BlockEdgeWriter,
+    type BlockRef,
     type EdgeRef,
     type EdgeWriteResult,
     type FollowEdgeWriter,
@@ -91,9 +93,11 @@ export {
 
 // The follow/profile stream.
 export {
+    BLOCK_COLLECTION_NSID,
     EDGE_OPS_TABLE,
     FOLLOW_COLLECTION_NSID,
     routeFollowEvent,
+    type EdgeCollection,
     type EdgeOp,
     type FollowRoute,
     type FollowRouteDeps,
@@ -118,6 +122,7 @@ export {
     type FollowBackfillDeps,
     type FollowPage,
     type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingOutcome,
@@ -166,7 +171,7 @@ export {
     type MirroredGraphStanding,
     type ProjectorCursor,
 } from "./graph-projector"
-export { listFollowRecords, type ListFollowRecordsOptions } from "./list-records"
+export { listEdgeRecords, type ListEdgeRecordsOptions } from "./list-records"
 
 // The change digest.
 export {
