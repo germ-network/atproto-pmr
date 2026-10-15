@@ -16,9 +16,11 @@ import {
     fetchDidDocument,
     fetchLatestRev,
     guardedFetchBytes,
+    guardedFetchStream,
     pdsResolutionFromDocument,
     type DidDocument,
 } from "@germ-network/atproto-pmr-core"
+import type { FetchedRepo } from "./follow-backfill"
 import type { FetchedDidDocument, FetchedRecord } from "./ingest"
 
 export interface FetchRecordOptions {
@@ -142,6 +144,48 @@ export async function fetchRecordCar(
     recordUrl.searchParams.set("rkey", options.rkey ?? "self")
 
     const car = await guardedFetchBytes(recordUrl.toString(), fetchImpl, {
+        terminalErrorNames: TERMINAL_XRPC_ERRORS,
+        permanentErrorNames: PERMANENT_XRPC_ERRORS,
+    })
+    return {
+        car,
+        source: pds,
+        signingKey,
+        didDocument: { document: document as unknown as DidDocument, fetchedAtMs },
+    }
+}
+
+export interface FetchRepoOptions {
+    /** Bounds the whole read, body included (`FOLLOW_FETCH_TIMEOUT_MS`). */
+    timeoutMs: number
+    /** The stream errors past this many bytes. */
+    maxBytes: number
+    fetchImpl?: typeof fetch
+    /** Stamps the returned `didDocument`. Defaults to `Date.now`. */
+    nowMs?: () => number
+}
+
+/**
+ * `com.atproto.sync.getRepo` at the DID's own PDS, as a stream for the
+ * verifying walk, with the document it was resolved through (read fresh, as
+ * `fetchRecordCar` does). A repo-level terminal answer raises
+ * `RecordNotFoundError` as the other fetches do.
+ */
+export async function fetchRepoCar(
+    did: string,
+    options: FetchRepoOptions
+): Promise<FetchedRepo> {
+    const fetchImpl = options.fetchImpl ?? fetch
+    const fetchedAtMs = (options.nowMs ?? Date.now)()
+    const document = await fetchDidDocument(did, fetchImpl)
+    const { endpoint: pds, signingKey } = pdsResolutionFromDocument(document)
+
+    const repoUrl = new URL(`${pds}/xrpc/com.atproto.sync.getRepo`)
+    repoUrl.searchParams.set("did", did)
+
+    const car = await guardedFetchStream(repoUrl.toString(), fetchImpl, {
+        timeoutMs: options.timeoutMs,
+        maxBytes: options.maxBytes,
         terminalErrorNames: TERMINAL_XRPC_ERRORS,
         permanentErrorNames: PERMANENT_XRPC_ERRORS,
     })

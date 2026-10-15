@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
-import { fetchHeadRev, fetchRecordCar } from "../src/fetch-record"
+import { fetchHeadRev, fetchRecordCar, fetchRepoCar } from "../src/fetch-record"
 
 const DID = "did:plc:alice"
 const PDS = "https://pds.example"
@@ -329,5 +329,42 @@ describe("fetchRecordCar without a rev read", () => {
         const f = fixture()
         await fetchRecordCar(DID, { collection: COLLECTION, fetchImpl: f.impl })
         expect(f.seen.some((u) => u.includes("sync.getLatestCommit"))).toBe(false)
+    })
+})
+
+describe("fetchRepoCar", () => {
+    const collect = async (car: AsyncIterable<Uint8Array>) => {
+        const out: number[] = []
+        for await (const chunk of car) out.push(...chunk)
+        return out
+    }
+
+    it("streams getRepo from the PDS the freshly fetched document names", async () => {
+        const f = fixture({
+            "sync.getRepo": () =>
+                new Response(CAR, { headers: { "content-type": "application/vnd.ipld.car" } }),
+        })
+        const got = await fetchRepoCar(DID, {
+            timeoutMs: 5_000,
+            maxBytes: 1_000,
+            fetchImpl: f.impl,
+            nowMs: () => 42,
+        })
+        expect(await collect(got.car)).toEqual([...CAR])
+        expect(got.source).toBe(PDS)
+        expect(got.signingKey).toBe(SIGNING_KEY)
+        expect(got.didDocument.fetchedAtMs).toBe(42)
+        expect(f.seen.at(-1)).toBe(`${PDS}/xrpc/com.atproto.sync.getRepo?did=${encodeURIComponent(DID)}`)
+        expect(f.seen.filter((u) => u.startsWith("https://plc.directory/"))).toHaveLength(1)
+    })
+
+    it("a repo-level terminal answer raises RecordNotFoundError", async () => {
+        const f = fixture({
+            "sync.getRepo": () =>
+                Response.json({ error: "RepoDeactivated", message: "gone" }, { status: 400 }),
+        })
+        await expect(
+            fetchRepoCar(DID, { timeoutMs: 5_000, maxBytes: 1_000, fetchImpl: f.impl })
+        ).rejects.toMatchObject({ name: "RecordNotFoundError", reason: "RepoDeactivated", permanent: false })
     })
 })
