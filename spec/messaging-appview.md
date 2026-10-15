@@ -62,27 +62,6 @@ snapshots and DID documents belong to the key monitor
 | The owner's summary: their own blocks, and each contact's declaration and profile | **built** — owner-authenticated ([wire API](wire-api.md#device-reads--records-and-summary)); routes are mounted by the deploying Worker |
 | The public "can A message B" verdict, and per-contact verdicts in the summary | **not yet built** |
 
-## Sizing the follow-edge index
+## Known gap
 
-Limits at the defaults, per two-minute alarm (720 a day):
-
-- **D1 drain.** Listings may take 400 of the alarm's 1,000 statements (`FOLLOW_LISTING_STATEMENT_RESERVE`), about 2,450 edges (follows and blocks together), or 1.76 million a day.
-- **`getRepo`.** At most 4 fetches an alarm, one at a time (`FOLLOW_BACKFILL_REPOS`), so 2,880 a day or 20,160 a week.
-- **`listRecords`.** At most 200 pages an alarm. A mutual listing reads at least two pages (follows, then blocks) and costs 4 to 10 statements, so 40 to 100 finish per alarm: 29,000 to 72,000 a day.
-- **Latency.** Listings run one at a time, so throughput is the lower of the statement and the latency bound.
-
-**Per tenant under `registered`**, for each registered user:
-
-- *Once, on registration:* one `getRepo` (median 3 MB, its blocks included), about 700 followees each with a declaration and a profile fetch, about 700 mutual listings of two pages each, one of follows and one of blocks (about 140 MB of `listRecords` for the follows), and 2,000 to 6,000 D1 statements. A user's own blocks are typically tens to hundreds, one row each; accounts that follow block-list tooling can hold tens of thousands. The owner listing is served within an alarm or two. The mutual hints complete in about half an hour.
-- *Every `FOLLOW_RELIST_AFTER_MS` (7 days):* the same listings again, spread across the week by a top-up that fills only the capacity joins and registrations leave.
-- *Tenant ceiling.* The weekly mutual re-list needs about 700 listings per registered user once followees are deduplicated across tenants. At 40 to 100 listings per alarm (201,600 to 504,000 a week) the ceiling is roughly 290 to 720 registered users. Past it, joins and registrations are unaffected because they sort ahead of re-lists; only the effective re-list interval grows. Raising `FOLLOW_RELIST_AFTER_MS` to 30 days lifts the ceiling about fourfold, since the live stream keeps hints current and a gap re-list covers outages.
-
-**Private deployment under `everyone`:** about 1,750 holders with 1.4 million edges (about 200 MB in D1). The first wave is about 14 GB of `getRepo`, bound by the D1 drain at roughly 19 hours; the weekly re-list repeats it, spread by the top-up. Holders whose repos are deactivated or taken down are not retried.
-
-An owner past `FOLLOW_MAX_REPO_BYTES` (32 MiB), `MAX_FOLLOWS` follow records (20,000), `MAX_BLOCKS` block records (20,000) or three consecutive timeouts is listed by `listRecords` pages instead, with unverified rows, and stays on pages: an owner with more blocks than `MAX_BLOCKS` is listed by pages for follows as well. A mutual listing stops reading a collection at its cap and keeps what it has.
-
-**Blocks, per summary read.** Each owner summary read costs the singleton ingest object one D1 read of that owner's blocks (a batch of two statements) over the cross-Worker binding, outside the alarm's statement budget, so polling devices add read load in proportion to their poll rate. A failed read answers the summary `503` rather than an empty list.
-
-**Deploy contract for blocks.** Apply migration `0002_blocks.sql` before deploying; the follow socket's URL gains the block collection once; `MAX_BLOCKS` is optional. The relay's summary needs `blocks: monitorOwnBlocks(env)` and so a bound `MONITOR_INGEST` and `MONITOR_INGEST_NAME`: without them every summary read answers `503`, where a relay without the monitor served the summary before. Relay state stored by this version holds a block-list part that an older relay cannot read, so a rollback fails summary reads until those states age out.
-
-**Known gap.** A newly registered user's existing inbound blocks from in-interest DIDs that are not their followees reach the index only at each blocker's next stale re-list (`FOLLOW_RELIST_AFTER_MS`); their followees' blocks are caught by the followee listings registration already queues.
+A newly registered user's existing inbound blocks from in-interest DIDs that are not their followees reach the index only at each blocker's next stale re-list (`FOLLOW_RELIST_AFTER_MS`); their followees' blocks are caught by the followee listings registration already queues.
