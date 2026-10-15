@@ -92,10 +92,12 @@ export const SUMMARY_TOKENS_KEPT = 4
 export const SUMMARY_MAX_RECORDS = 6_000
 
 /**
- * Records whose CARs one response carries. Each CAR is one store read, so
- * changes beyond this wait for the next page.
+ * Records whose CARs one response carries. Each is a record read and a
+ * confirmation read (two KV operations), on top of a full index build of
+ * about two hundred bulk reads at the contact cap, all within one
+ * invocation's thousand; changes beyond this wait for the next page.
  */
-export const SUMMARY_PAGE_RECORDS = 400
+export const SUMMARY_PAGE_RECORDS = 300
 
 /** A held, ingest-verified record's index entry, read without its CAR. */
 export interface SummaryHeldEntry extends SummaryIndexEntry {
@@ -288,75 +290,6 @@ async function readSummaryRecord(
         collection: ref.collection,
         rkey: ref.rkey,
         cid,
-        verifiedWith: snapshot.verifiedWith,
-        car: snapshot.car,
-    }
-}
-
-export interface SummaryDeps {
-    projections: GraphProjectionStore
-    records: RecordSnapshotStore
-    /** Every singleton this PMR snapshots, the declaration included. */
-    watched: WatchedRecord[]
-}
-
-/**
- * The summary for `did` as held now: the owner's projection, and every
- * watched record of the owner and of each DID in it that is held, was
- * verified at ingest and parses. `records` carries each one's CAR from the
- * same read that produced its index entry, so the bytes served always match
- * the index stored under the token. Null when the owner has no projection
- * yet. Never requests a re-check, whatever a declaration's age: one owner's
- * sync must not fan out to their peers' PDSes.
- */
-export async function buildSummary(
-    did: string,
-    deps: SummaryDeps
-): Promise<{ index: SummaryIndex; records: SummaryRecord[] } | null> {
-    const graph = await deps.projections.get(did)
-    if (!graph) return null
-    const dids = [
-        ...new Set([did, ...graph.following.map((e) => e.did), ...graph.followers.map((e) => e.did)]),
-    ]
-    const held = await Promise.all(
-        dids.flatMap((d) => deps.watched.map((w) => readWatchedRecord(d, w, deps.records)))
-    )
-    const records = held
-        .filter((r): r is SummaryRecord => r !== null)
-        .sort(
-            (a, b) =>
-                compareStrings(a.did, b.did) ||
-                compareStrings(a.collection, b.collection) ||
-                compareStrings(a.rkey, b.rkey)
-        )
-    return {
-        index: {
-            graph,
-            records: records.map(({ car: _car, ...entry }) => entry),
-        },
-        records,
-    }
-}
-
-async function readWatchedRecord(
-    did: string,
-    watched: WatchedRecord,
-    store: RecordSnapshotStore
-): Promise<SummaryRecord | null> {
-    const snapshot = await store.get(did, watched.collection, watched.rkey)
-    if (!snapshot || snapshot.verifiedWith === null) return null
-    let parsed
-    try {
-        parsed = readRecordFromCar(snapshot.car, watched.collection, watched.rkey)
-    } catch {
-        return null
-    }
-    if (!parsed || parsed.did !== did) return null
-    return {
-        did,
-        collection: watched.collection,
-        rkey: watched.rkey,
-        cid: parsed.cid,
         verifiedWith: snapshot.verifiedWith,
         car: snapshot.car,
     }
