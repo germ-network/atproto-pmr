@@ -13,6 +13,19 @@ export class MonitorIngestStub extends DurableObject {
         await this.record("unregister", did)
     }
 
+    async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
+        await this.ctx.storage.put("refreshes", [
+            ...(await this.refreshes()),
+            { did, requestedAtMs },
+        ])
+    }
+
+    async refreshes(): Promise<{ did: string; requestedAtMs: number }[]> {
+        return (
+            (await this.ctx.storage.get<{ did: string; requestedAtMs: number }[]>("refreshes")) ?? []
+        )
+    }
+
     /** Whether the DID's directory row existed when each call arrived, keyed `call:did`. */
     async rowSeen(): Promise<Record<string, boolean>> {
         return (await this.ctx.storage.get<Record<string, boolean>>("rowSeen")) ?? {}
