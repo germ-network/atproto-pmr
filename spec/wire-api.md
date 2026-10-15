@@ -1112,12 +1112,13 @@ sender's PDS.
 A relay bound to a monitor answers its devices' reads of atproto state from
 the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
 device normally reaches its contacts' records without reaching their PDSes.
-Three routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
+Four routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
 with the short keys below. A decoder MUST ignore keys it does not know.
 
 | method | path | auth | answers |
 |---|---|---|---|
 | `GET` | `/pmr/v1/records/{did}/{collection}/{rkey}` | none | one record's proof CAR |
+| `GET` | `/pmr/v1/can-message/{sender}/{recipient}` | none | whether the sender may message the recipient, [below](#can-message-verdict) |
 | `GET` | `/pmr/v1/did/{did}` | none | a DID document and its PLC log, [below](#did-documents) |
 | `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's contacts' records and own blocks, as a delta |
 
@@ -1164,6 +1165,60 @@ The response never waits on the PDS. A declaration past 24 hours is served as
 held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#reads-and-the-24-hour-rule)).
 The residual leak is that re-check: the PDS learns someone is interested in
 that DID.
+
+#### Can-message verdict
+
+`GET /pmr/v1/can-message/{sender}/{recipient}` answers one pair: may `sender`
+open a conversation with `recipient`? It is a hint; the recipient's device
+enforces its own policy on first contact. It serves a verdict, never a follow
+or block list.
+
+`200` with a CBOR map, `400` for a malformed path or DID, and one `404` when
+the relay holds no declaration snapshot for the recipient. The `404` is the
+same for a recipient the deployment does not serve and a served recipient
+with no snapshot yet, since neither is distinguishable from a declaration not
+yet fetched. It is a single not-found case, not a secrecy measure; a verdict
+at all shows the recipient's declaration is held.
+
+| key | field | value |
+|---|---|---|
+| `v` | verdict | `"yes"`, `"no"` or `"unknown"` |
+| `a` | via | `yes` only: every allow policy that admits the sender |
+| `p` | pending | `unknown` only: policies that could admit the sender but whose data is incomplete |
+| `r` | why | `no` and `unknown`: reason codes |
+
+Policy and reason codes are open strings; a decoder MUST keep codes it does
+not know. Reasons for `no`: `no-declaration`, `blocked`, `not-admitted`. For
+`unknown`: `declaration-unavailable`, `policy-undecodable`,
+`policy-unrecognized`, `graph-incomplete`, `block-unknown`.
+
+The recipient's policies are the signed `AnchorPolicy` in the declaration's
+`keyPackage`: `closed` declares none, `follows` is `bsky-follows` (the
+recipient follows the sender on `app.bsky.graph`), `open` is `open`; any other
+byte is a policy this relay reports as `policy-unrecognized`. The relay reads
+the byte without checking the keyPackage's signatures. `messageMe.showButtonTo`
+is a UI hint for other apps and is not read. A graph fact is `no` only when
+the recipient's graph is served, so its edges are complete; otherwise it is
+unknown.
+
+Evaluated in order:
+
+1. Declaration missing (only for a caller whose policy source reports it;
+   the route answers `404` instead): `no [no-declaration]`; snapshot unavailable:
+   `unknown [declaration-unavailable]`; policy unreadable:
+   `unknown [policy-undecodable]`.
+2. The recipient blocks the sender: `no [blocked]`, under every policy. Many
+   social graphs, one block graph.
+3. Each declared policy admits (`open`; `bsky-follows` when followed),
+   refuses (`bsky-follows` when known not followed), or is pending
+   (`bsky-follows` with the follow unknown, `graph-incomplete`; any other
+   policy, `policy-unrecognized`).
+4. Block known absent: any admitting policy gives `yes`, listing all of them
+   in declared order; else any pending gives `unknown`; else
+   `no [not-admitted]`, which includes a declaration with no policies.
+5. Block unknown: admitting and pending policies together give `unknown`
+   with `block-unknown` first among the reasons; if there are none,
+   `no [not-admitted]`.
 
 #### Summary
 

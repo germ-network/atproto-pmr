@@ -1,5 +1,8 @@
 import {
     DECLARATION_COLLECTION_NSID,
+    declaredPoliciesOf,
+    readRecordFromCar,
+    type StoredPolicies,
     type RecordSnapshotStore,
     type SummaryIndexReader,
 } from "@germ-network/atproto-pmr-core"
@@ -84,7 +87,8 @@ async function readEntry(
 async function writeEntry(
     env: { records: KVNamespace },
     key: string,
-    entry: SnapshotEntry
+    entry: SnapshotEntry,
+    policies?: StoredPolicies
 ): Promise<void> {
     // No expirationTtl, deliberately: an unchanged record must stay served
     // indefinitely.
@@ -97,6 +101,7 @@ async function writeEntry(
             verifiedWith: entry.verifiedWith,
             cid: entry.cid,
             seenKey: entry.seenKey ?? null,
+            ...(policies ? { policies } : {}),
         } satisfies StoredMeta,
     })
 }
@@ -117,6 +122,28 @@ interface StoredMeta {
     verifiedWith: string | null
     cid: string | null
     seenKey: string | null
+    /**
+     * The declaration's decoded policies; absent on entries stored before
+     * they were kept and on any entry ingest did not verify.
+     */
+    policies?: StoredPolicies
+}
+
+/**
+ * The policies `putRecord` stores beside a verified declaration CAR (only
+ * `putRecord`, never `putSecondary`), so a verdict read needs no CAR parse:
+ * `declaredPoliciesOf` over the CAR's record, or `undecodable` when the CAR
+ * holds no readable declaration.
+ */
+export function declarationPoliciesMeta(car: Uint8Array): StoredPolicies {
+    let record: unknown
+    try {
+        record = readRecordFromCar(car, DECLARATION_COLLECTION_NSID, "self")?.record
+    } catch {
+        return { found: false, code: "undecodable" }
+    }
+    const declared = declaredPoliciesOf(record)
+    return declared.found ? declared : { found: false, code: "undecodable" }
 }
 
 /**
@@ -132,7 +159,13 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     return {
         getRecord: (did) => readEntry(env, RECORD_PREFIX + did),
 
-        putRecord: (did, entry) => writeEntry(env, RECORD_PREFIX + did, entry),
+        putRecord: (did, entry) =>
+            writeEntry(
+                env,
+                RECORD_PREFIX + did,
+                entry,
+                entry.verifiedWith === null ? undefined : declarationPoliciesMeta(entry.car)
+            ),
 
         async deleteRecord(did: string): Promise<void> {
             await env.records.delete(RECORD_PREFIX + did)
@@ -248,6 +281,7 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 // An entry stored before ingest verified carries an unsigned rev.
                 rev: verifiedWith === null ? null : metadata.rev,
                 cid: verifiedWith === null ? null : (metadata.cid ?? null),
+                ...(metadata.policies ? { policies: metadata.policies } : {}),
             }
         },
     }
