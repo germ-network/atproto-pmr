@@ -123,6 +123,14 @@ import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
 
+/** A re-check request not selected within this much wall-clock time is dropped. */
+const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
+
+/** DIDs the refresh queue covers; `policy` names the bound parameter holding the interest policy. */
+const refreshCandidates = (policy: string) =>
+    "(SELECT did FROM interest WHERE member = 1 " +
+    `UNION SELECT did FROM holder_state WHERE state = 'gone-reversible' AND ${policy} = 'everyone')`
+
 /**
  * Bound on the Jetstream WebSocket upgrade, matching the fetch guards in
  * `@germ-network/atproto-pmr-core`'s `atproto-fetch.ts` (also 5s) — this
@@ -471,6 +479,10 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     checked_at INTEGER NOT NULL,
                     attempted_at INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS refresh_requests (
+                    did TEXT PRIMARY KEY,
+                    requested_at INTEGER NOT NULL
                 );
             `)
             if (
@@ -1320,43 +1332,75 @@ export class MonitorIngest
      * interval rather than on every alarm. Ordered by the later of the
      * confirmation and the last attempt, so such a DID queues behind the
      * healthy ones. A DID owed a fetch (a declaration, or a secondary) is left
-     * to that settle.
+     * to that settle. Requested DIDs (`requestRefresh`) that are due come
+     * first, at most a quarter of the batch (at least one), and a returned
+     * DID's request is cleared.
      */
     async dueRefresh(
         checkedBeforeMs: number,
         limit: number,
         nonHolderCheckedBeforeMs: number
     ): Promise<string[]> {
-        return this.db.sql
-            .exec<{ did: string }>(
-                "SELECT d.did AS did, " +
-                    "CASE WHEN h.did IS NOT NULL THEN ?1 ELSE ?2 END AS bound, " +
-                    "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0)) AS confirmed, " +
-                    "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0), " +
-                    "COALESCE(c.attempted_at, 0)) AS last " +
-                    "FROM (SELECT did FROM interest WHERE member = 1 " +
-                    "UNION SELECT did FROM holder_state WHERE state = 'gone-reversible' AND ?4 = 'everyone') d " +
-                    "LEFT JOIN revs r ON r.did = d.did " +
-                    "LEFT JOIN checks c ON c.did = d.did " +
-                    "LEFT JOIN interest i ON i.did = d.did " +
-                    "LEFT JOIN holder_state h ON h.did = d.did " +
-                    "WHERE d.did NOT IN (SELECT did FROM deleted) " +
-                    "AND d.did NOT IN (SELECT did FROM pending) " +
-                    "AND d.did NOT IN (SELECT did FROM rec_pending) " +
-                    "AND confirmed < bound " +
-                    "AND COALESCE(c.attempted_at, 0) < bound " +
-                    "ORDER BY last ASC LIMIT ?3",
-                checkedBeforeMs,
-                nonHolderCheckedBeforeMs,
-                limit,
-                this.interestPolicy()
+        const policy = this.interestPolicy()
+        const due = (tail: string, take: number): string[] =>
+            this.db.sql
+                .exec<{ did: string }>(
+                    "SELECT d.did AS did, " +
+                        "CASE WHEN h.did IS NOT NULL THEN ?1 ELSE ?2 END AS bound, " +
+                        "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0)) AS confirmed, " +
+                        "MAX(COALESCE(r.observed_at, 0), COALESCE(c.checked_at, 0), COALESCE(i.since, 0), " +
+                        "COALESCE(c.attempted_at, 0)) AS last " +
+                        "FROM " + refreshCandidates("?4") + " d " +
+                        "LEFT JOIN revs r ON r.did = d.did " +
+                        "LEFT JOIN checks c ON c.did = d.did " +
+                        "LEFT JOIN interest i ON i.did = d.did " +
+                        "LEFT JOIN holder_state h ON h.did = d.did " +
+                        "LEFT JOIN refresh_requests q ON q.did = d.did " +
+                        "WHERE d.did NOT IN (SELECT did FROM deleted) " +
+                        "AND d.did NOT IN (SELECT did FROM pending) " +
+                        "AND d.did NOT IN (SELECT did FROM rec_pending) " +
+                        "AND confirmed < bound " +
+                        "AND COALESCE(c.attempted_at, 0) < bound " +
+                        tail,
+                    checkedBeforeMs,
+                    nonHolderCheckedBeforeMs,
+                    take,
+                    policy
+                )
+                .toArray()
+                .map((r) => r.did)
+        return this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "DELETE FROM refresh_requests WHERE requested_at < ?",
+                Date.now() - REFRESH_REQUEST_MAX_AGE_MS
             )
-            .toArray()
-            .map((r) => r.did)
+            const requested = due(
+                "AND q.did IS NOT NULL ORDER BY q.requested_at ASC LIMIT ?3",
+                Math.min(limit, Math.max(1, Math.floor(limit / 4)))
+            )
+            const taken = new Set(requested)
+            const rest = due("ORDER BY last ASC LIMIT ?3", limit)
+                .filter((did) => !taken.has(did))
+                .slice(0, Math.max(0, limit - requested.length))
+            const dids = [...requested, ...rest]
+            for (const did of dids) {
+                this.db.sql.exec("DELETE FROM refresh_requests WHERE did = ?", did)
+            }
+            return dids
+        })
     }
 
-    async requestRefresh(_did: string, _requestedAtMs: number): Promise<void> {
-        throw new Error("not implemented")
+    async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
+        // A repeat keeps the earliest time, so steady requests neither jump the
+        // queue nor extend the request's one-day lifetime.
+        this.db.sql.exec(
+            "INSERT INTO refresh_requests (did, requested_at) " +
+                "SELECT ?1, ?2 WHERE ?1 IN " + refreshCandidates("?3") + " " +
+                "ON CONFLICT(did) DO UPDATE SET requested_at = MIN(requested_at, excluded.requested_at)",
+            did,
+            requestedAtMs,
+            this.interestPolicy()
+        )
     }
 
     async markChecked(did: string, checkedAtMs: number): Promise<void> {
@@ -1749,7 +1793,7 @@ export class MonitorIngest
 
     async forgetLeft(did: string): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            for (const table of ["records", "rec_pending", "checks"]) {
+            for (const table of ["records", "rec_pending", "checks", "refresh_requests"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
             if (this.interestPolicy() === "registered") {
@@ -3208,8 +3252,8 @@ export class MonitorIngest
      * stopped answering, and every route that RPC'd in here hung
      * indefinitely while plain KV reads stayed fast — this object was
      * blocked here, never reaching `alarm`'s `finally` to reschedule
-     * itself. No request handler reaches this object anymore, so a wedge
-     * here now only delays ingest, never a read.
+     * itself. No request handler reads through this object (they only signal
+     * it), so a wedge here can delay a write that notifies, never a read.
      */
     async connect(): Promise<void> {
         if (this.socket !== null) return
