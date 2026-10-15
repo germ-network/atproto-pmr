@@ -118,6 +118,13 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     MAX_FOLLOWS?: string
 
     /**
+     * Block records the verifying getRepo walk holds before it refuses and the
+     * owner is listed by `listRecords` pages instead, default 20_000; also
+     * where a mutual listing stops reading blocks.
+     */
+    MAX_BLOCKS?: string
+
+    /**
      * CAR bytes past which an owner is listed by `listRecords` pages across
      * alarms instead of one verified getRepo, default 33_554_432 (32 MiB).
      * Bounds what the verifying walk retains in the isolate; raise it only

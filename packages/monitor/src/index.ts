@@ -122,6 +122,7 @@ export {
     type FollowBackfillDeps,
     type FollowPage,
     type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingOutcome,
@@ -170,7 +171,7 @@ export {
     type MirroredGraphStanding,
     type ProjectorCursor,
 } from "./graph-projector"
-export { listFollowRecords, type ListFollowRecordsOptions } from "./list-records"
+export { listEdgeRecords, type ListEdgeRecordsOptions } from "./list-records"
 
 // The change digest.
 export {

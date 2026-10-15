@@ -72,7 +72,7 @@ import {
     type FetchedRepo,
     type ResolvedPds,
     type FollowPage,
-    type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingQueueReason,
@@ -83,7 +83,7 @@ import {
     flushEdgeOps,
     flushLimit,
     followGapExceeded,
-    listFollowRecords,
+    listEdgeRecords,
     mirrorGraph,
     pruneGraphChanges,
     reconcileGraphMirror,
@@ -111,7 +111,7 @@ import {
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyPlcLog,
     verifyRecordProofOutcome,
-    verifyRepoCollection,
+    verifyRepoCollections,
     type DidDocument,
     type InterestPolicy,
     type MonitorRegistrationNotify,
@@ -119,8 +119,8 @@ import {
     type PlcLog,
     type PlcLogEntry,
     type PlcCoverage,
-    type RepoCollectionExpectation,
-    type VerifiedCollection,
+    type RepoCollectionsExpectation,
+    type VerifiedCollections,
     type WatchedRecord,
 } from "@germ-network/atproto-pmr-core"
 import {
@@ -221,6 +221,7 @@ interface QueueSqlRow extends Record<string, SqlStorageValue> {
     progress_kind: string | null
     progress_gen: number | null
     progress_phase: string | null
+    progress_collection: EdgeCollection | null
     progress_cursor: string | null
     progress_pds: string | null
     progress_began_at: number | null
@@ -241,6 +242,7 @@ const queuedListing = (r: QueueSqlRow): QueuedListing => ({
                   kind: r.progress_kind,
                   gen: r.progress_gen,
                   phase: r.progress_phase,
+                  collection: r.progress_collection ?? "follow",
                   cursor: r.progress_cursor,
                   pds: r.progress_pds,
                   beganAtMs: r.progress_began_at,
@@ -464,6 +466,7 @@ export class MonitorIngest
                     progress_kind TEXT,
                     progress_gen INTEGER,
                     progress_phase TEXT,
+                    progress_collection TEXT,
                     progress_cursor TEXT,
                     progress_pds TEXT,
                     progress_began_at INTEGER,
@@ -473,9 +476,10 @@ export class MonitorIngest
                 CREATE INDEX IF NOT EXISTS listings_by_listed_at ON listings (listed_at);
                 CREATE TABLE IF NOT EXISTS listing_stage (
                     did TEXT NOT NULL,
+                    collection TEXT NOT NULL,
                     rkey TEXT NOT NULL,
                     subject TEXT NOT NULL,
-                    PRIMARY KEY (did, rkey)
+                    PRIMARY KEY (did, collection, rkey)
                 );
                 CREATE TABLE IF NOT EXISTS recount_queue (
                     did TEXT PRIMARY KEY,
@@ -514,6 +518,30 @@ export class MonitorIngest
                     .toArray().length === 0
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('listing_stage') WHERE name = 'collection'")
+                    .toArray().length === 0
+            ) {
+                // Staged rows predate block listings, and their primary key
+                // cannot gain a column: restart each listing from its queue row.
+                this.db.sql.exec("DROP TABLE listing_stage")
+                this.db.sql.exec(
+                    "CREATE TABLE listing_stage (did TEXT NOT NULL, collection TEXT NOT NULL, " +
+                        "rkey TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (did, collection, rkey))"
+                )
+                this.db.sql.exec(
+                    "UPDATE listings SET progress_kind = NULL, progress_gen = NULL, progress_phase = NULL, " +
+                        "progress_cursor = NULL, progress_pds = NULL, progress_began_at = NULL, progress_pages = 0"
+                )
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('listings') WHERE name = 'progress_collection'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE listings ADD COLUMN progress_collection TEXT")
             }
             if (
                 this.db.sql
@@ -2295,7 +2323,8 @@ export class MonitorIngest
             .exec<QueueSqlRow>(
                 "SELECT q.did AS did, q.attempts, q.not_before, q.timeouts, q.permanent_failures, " +
                     "COALESCE(l.paged, 0) AS paged, l.progress_kind, l.progress_gen, " +
-                    "l.progress_phase, l.progress_cursor, l.progress_pds, l.progress_began_at, l.progress_pages " +
+                    "l.progress_phase, l.progress_collection, l.progress_cursor, l.progress_pds, " +
+                    "l.progress_began_at, l.progress_pages " +
                     "FROM listing_requeue q LEFT JOIN listings l ON l.did = q.did " +
                     "WHERE q.unlistable = 0 AND q.not_before <= ?1 " +
                     "ORDER BY l.progress_kind IS NULL, q.low_priority, " +
@@ -2357,10 +2386,11 @@ export class MonitorIngest
             }
             this.db.sql.exec(
                 "INSERT INTO listings (did, progress_kind, progress_gen, progress_phase, " +
-                    "progress_cursor, progress_pds, progress_began_at, progress_pages, last_kind) " +
-                    "VALUES (?1, ?2, ?3, 'fetch', NULL, ?4, ?5, 0, ?2) " +
+                    "progress_collection, progress_cursor, progress_pds, progress_began_at, " +
+                    "progress_pages, last_kind) " +
+                    "VALUES (?1, ?2, ?3, 'fetch', 'follow', NULL, ?4, ?5, 0, ?2) " +
                     "ON CONFLICT(did) DO UPDATE SET progress_kind = ?2, progress_gen = ?3, " +
-                    "progress_phase = 'fetch', progress_cursor = NULL, progress_pds = ?4, " +
+                    "progress_phase = 'fetch', progress_collection = 'follow', progress_cursor = NULL, progress_pds = ?4, " +
                     "progress_began_at = ?5, progress_pages = 0, last_kind = ?2",
                 did,
                 kind,
@@ -2417,44 +2447,53 @@ export class MonitorIngest
     async stageRows(
         did: string,
         gen: number,
-        rows: readonly FollowRecord[],
-        fetchCursor: string | null,
+        rows: readonly StagedRow[],
+        fetch: { collection: EdgeCollection; cursor: string | null },
         done: boolean
     ): Promise<boolean> {
         return this.ctx.storage.transactionSync(() => {
             if (!this.progressIsSync(did, gen)) return false
             for (const r of rows) {
                 this.db.sql.exec(
-                    "INSERT INTO listing_stage (did, rkey, subject) VALUES (?1, ?2, ?3) " +
-                        "ON CONFLICT(did, rkey) DO UPDATE SET subject = ?3",
+                    "INSERT INTO listing_stage (did, collection, rkey, subject) VALUES (?1, ?2, ?3, ?4) " +
+                        "ON CONFLICT(did, collection, rkey) DO UPDATE SET subject = ?4",
                     did,
+                    r.collection,
                     r.rkey,
                     r.subject
                 )
             }
             this.db.sql.exec(
-                "UPDATE listings SET progress_pages = progress_pages + 1 " +
-                    "WHERE did = ? AND progress_kind <> 'owner-repo'",
-                did
+                "UPDATE listings SET progress_pages = CASE WHEN COALESCE(progress_collection, 'follow') = ?2 " +
+                    "THEN progress_pages + 1 ELSE 0 END " +
+                    "WHERE did = ?1 AND progress_kind <> 'owner-repo'",
+                did,
+                fetch.collection
             )
             this.db.sql.exec(
                 done
-                    ? "UPDATE listings SET progress_phase = 'drain', progress_cursor = NULL WHERE did = ?"
-                    : "UPDATE listings SET progress_cursor = ?2 WHERE did = ?1",
-                ...(done ? [did] : [did, fetchCursor])
+                    ? "UPDATE listings SET progress_phase = 'drain', progress_collection = ?2, " +
+                          "progress_cursor = NULL WHERE did = ?1"
+                    : "UPDATE listings SET progress_collection = ?2, progress_cursor = ?3 WHERE did = ?1",
+                ...(done ? [did, fetch.collection] : [did, fetch.collection, fetch.cursor])
             )
             this.commitStepSync(did)
             return true
         })
     }
 
-    async stagedRows(did: string, after: string | null, limit: number): Promise<FollowRecord[]> {
+    async stagedRows(
+        did: string,
+        after: { collection: EdgeCollection; rkey: string } | null,
+        limit: number
+    ): Promise<StagedRow[]> {
         return this.db.sql
-            .exec<{ rkey: string; subject: string }>(
-                "SELECT rkey, subject FROM listing_stage WHERE did = ?1 AND (?2 IS NULL OR rkey > ?2) " +
-                    "ORDER BY rkey LIMIT ?3",
+            .exec<{ collection: EdgeCollection; rkey: string; subject: string }>(
+                "SELECT collection, rkey, subject FROM listing_stage WHERE did = ?1 AND " +
+                    "(?2 IS NULL OR (collection, rkey) > (?2, ?3)) ORDER BY collection, rkey LIMIT ?4",
                 did,
-                after,
+                after?.collection ?? null,
+                after?.rkey ?? null,
                 limit
             )
             .toArray()
@@ -2463,12 +2502,17 @@ export class MonitorIngest
     async saveDrainProgress(
         did: string,
         gen: number,
-        cursor: string,
+        cursor: { collection: EdgeCollection; rkey: string },
         subjects: readonly string[]
     ): Promise<boolean> {
         return this.ctx.storage.transactionSync(() => {
             if (!this.progressIsSync(did, gen)) return false
-            this.db.sql.exec("UPDATE listings SET progress_cursor = ? WHERE did = ?", cursor, did)
+            this.db.sql.exec(
+                "UPDATE listings SET progress_collection = ?, progress_cursor = ? WHERE did = ?",
+                cursor.collection,
+                cursor.rkey,
+                did
+            )
             this.commitStepSync(did)
             this.queueRecountSync(subjects, Date.now())
             return true
@@ -2493,7 +2537,8 @@ export class MonitorIngest
     private clearProgressSync(did: string): void {
         this.db.sql.exec(
             "UPDATE listings SET progress_kind = NULL, progress_gen = NULL, progress_phase = NULL, " +
-                "progress_cursor = NULL, progress_pds = NULL, progress_began_at = NULL, progress_pages = 0 WHERE did = ?",
+                "progress_collection = NULL, progress_cursor = NULL, progress_pds = NULL, " +
+                "progress_began_at = NULL, progress_pages = 0 WHERE did = ?",
             did
         )
         this.db.sql.exec("DELETE FROM listing_stage WHERE did = ?", did)
@@ -2571,7 +2616,7 @@ export class MonitorIngest
                 "SELECT DISTINCT s.subject AS did FROM listing_stage s " +
                     "JOIN interest i ON i.did = s.subject AND i.member = 1 " +
                     "LEFT JOIN holder_state h ON h.did = s.subject " +
-                    "WHERE s.did = ?1 AND s.subject <> ?1 AND " +
+                    "WHERE s.did = ?1 AND s.collection = 'follow' AND s.subject <> ?1 AND " +
                     (everyone ? "COALESCE(h.state, '') <> 'held'" : "i.registered = 0"),
                 owner
             )
@@ -2795,8 +2840,8 @@ export class MonitorIngest
     async dropEdgeOps(throughSeq: number, subjects: readonly string[]): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
-                "DELETE FROM listing_stage WHERE (did, rkey) IN " +
-                    "(SELECT follower, rkey FROM edge_ops WHERE seq <= ?)",
+                "DELETE FROM listing_stage WHERE (did, collection, rkey) IN " +
+                    "(SELECT follower, collection, rkey FROM edge_ops WHERE seq <= ?)",
                 throughSeq
             )
             this.db.sql.exec("DELETE FROM edge_ops WHERE seq <= ?", throughSeq)
@@ -3030,6 +3075,7 @@ export class MonitorIngest
             listRecordsInProgress: LISTRECORDS_IN_PROGRESS,
             statementReserve: this.listingReserve(),
             maxFollows: this.envInt(this.env.MAX_FOLLOWS, 20_000),
+            maxBlocks: this.envInt(this.env.MAX_BLOCKS, 20_000),
             maxRepoBytes: this.envInt(this.env.FOLLOW_MAX_REPO_BYTES, 33_554_432),
             maxMstNodes: DEFAULT_MAX_MST_NODES,
             pagesPerAlarm: LISTING_PAGES_PER_ALARM,
@@ -3047,11 +3093,12 @@ export class MonitorIngest
             index: this,
             didDocuments: this,
             edges,
+            blocks: d1BlockEdgeWriter(this.env.graph!, budget),
             budget,
             fetchRepo: (did) => this.fetchRepo(did),
             verifyRepo: (car, expected) => this.verifyRepo(car, expected),
             resolvePds: (did) => this.resolvePds(did),
-            listFollows: (pds, did, cursor) => this.listFollows(pds, did, cursor),
+            listRecords: (pds, did, collection, cursor) => this.listRecords(pds, did, collection, cursor),
             nowMs: () => Date.now(),
         }
     }
@@ -3251,14 +3298,14 @@ export class MonitorIngest
     }
 
     /**
-     * Core `verifyRepoCollection` under the repo byte and MST node caps.
+     * Core `verifyRepoCollections` under the repo byte and MST node caps.
      * Protected so a test can stand in for placeholder CARs.
      */
     protected verifyRepo(
         car: AsyncIterable<Uint8Array>,
-        expected: RepoCollectionExpectation
-    ): Promise<VerifiedCollection> {
-        return verifyRepoCollection(car, expected)
+        expected: RepoCollectionsExpectation
+    ): Promise<VerifiedCollections> {
+        return verifyRepoCollections(car, expected)
     }
 
     /**
@@ -3275,11 +3322,16 @@ export class MonitorIngest
     }
 
     /**
-     * One `listRecords` page of `did`'s follows at `pds` after rkey `cursor`,
-     * for a mutual or paged owner listing (`listFollowRecords`).
+     * One `listRecords` page of `did`'s follows or blocks at `pds` after rkey
+     * `cursor`, for a mutual or paged owner listing (`listEdgeRecords`).
      */
-    protected listFollows(pds: string, did: string, cursor: string | null): Promise<FollowPage> {
-        return listFollowRecords(did, cursor, { pds })
+    protected listRecords(
+        pds: string,
+        did: string,
+        collection: EdgeCollection,
+        cursor: string | null
+    ): Promise<FollowPage> {
+        return listEdgeRecords(did, collection, cursor, { pds })
     }
 
     /**

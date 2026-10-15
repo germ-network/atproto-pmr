@@ -176,7 +176,7 @@ describe("gap and staleness re-list", () => {
                 A,
                 began
             )
-            sql(obj, "INSERT INTO listing_stage (did, rkey, subject) VALUES (?, 'x', 'did:plc:y')", A)
+            sql(obj, "INSERT INTO listing_stage (did, collection, rkey, subject) VALUES (?, 'follow', 'x', 'did:plc:y')", A)
             const future = Date.now() + HOUR
             sql(obj, "UPDATE listing_requeue SET attempts = 2, not_before = ?, queued_at = ? WHERE did = ?", future, began - 5, A)
             setConnectedAgo(obj, 40 * HOUR)

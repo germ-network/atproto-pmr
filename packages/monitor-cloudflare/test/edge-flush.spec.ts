@@ -15,6 +15,7 @@ import {
     type StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "../src/env"
+import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
 
@@ -80,6 +81,7 @@ const seedFollowee = (obj: MonitorIngest, did: string, count: number) =>
 const flushDeps = (obj: MonitorIngest, budget: StatementBudget) => ({
     ops: obj,
     edges: d1FollowEdgeWriter(db, budget),
+    blocks: d1BlockEdgeWriter(db, budget),
     budget,
     interest: obj,
 })
