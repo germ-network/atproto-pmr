@@ -1,6 +1,8 @@
 import { decodeCoseSequence, encodeCose, type CoseValue } from "./cose/cbor.js"
 import type { GrantLifecycle } from "./config.js"
 import { asMailboxKey } from "./mailbox-key.js"
+import type { BlockEdgeStore } from "./block-edges.js"
+import { syncOwnerBlocks } from "./block-sync.js"
 import type { BodyStore, MessageRef, PMRStore } from "./storage.js"
 
 /**
@@ -197,6 +199,8 @@ export function decodeAckFrame(bytes: Uint8Array): AckPayload {
 export interface EventsDeps {
     store: PMRStore
     bodies: BodyStore
+    /** The owner's Bsky blocks, mirrored before a drain delivers anything (`syncOwnerBlocks`). */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
 }
 
 /** Implementation-defined, like every other limit in this package. */
@@ -208,6 +212,9 @@ const DEFAULT_DRAIN_PAGE_SIZE = 50
  * there is one), then `#caughtUp` — always last, always sent, so the
  * client has an unconditional signal that backlog is over even when the
  * pool is empty.
+ *
+ * When `deps.blocks` is set the owner's Bsky blocks are mirrored first, so a
+ * newly blocked sender's queue is cleared before it is read.
  *
  * `#capabilities` leads because it frames how to read everything after it:
  * a client that does not yet know grants are draining cannot tell "nothing
@@ -229,6 +236,15 @@ export async function drainBacklog(
     pageSize: number = DEFAULT_DRAIN_PAGE_SIZE
 ): Promise<void> {
     send(encodeCapabilitiesFrame(capabilities))
+
+    if (deps.blocks !== undefined) {
+        // The owner is the registration this store holds; a failed load only
+        // skips the sync.
+        const owner = await deps.store.load().catch(() => null)
+        if (owner !== null) {
+            await syncOwnerBlocks(deps.store, owner.did, deps.blocks)
+        }
+    }
 
     let cursor: string | null = null
     do {

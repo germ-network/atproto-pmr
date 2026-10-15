@@ -1,3 +1,5 @@
+import type { BlockEdgeStore } from "../block-edges.js"
+import { syncOwnerBlocks } from "../block-sync.js"
 import { redeemChallenge } from "../challenge.js"
 import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
@@ -57,6 +59,11 @@ export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
+    /**
+     * The owner's Bsky blocks, mirrored (`syncOwnerBlocks`) before the
+     * message catch-up's first page and the pool listing.
+     */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
     /**
      * Supplied to amortize the mint: every authenticated response carries a
      * fresh challenge, so a client pays the mint round trip only on its
@@ -358,7 +365,10 @@ export async function handleRegistrationDelete(
 
 // MARK: - Blocks
 
-/** `GET /pmr/v1/blocks` — list blocked sender DIDs. */
+/**
+ * `GET /pmr/v1/blocks` — every blocked sender in `b`, and in `bs` those whose
+ * block mirrors a Bsky block, which a Bsky unblock lifts.
+ */
 export async function handleBlocksList(
     request: Request,
     deps: OwnerDeps
@@ -366,7 +376,8 @@ export async function handleBlocksList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
     const dids = await a.auth.store.listBlocked()
-    return amortize(cbor([["b", dids]]), a.auth.did, deps)
+    const bsky = await a.auth.store.listBskyBlocked()
+    return amortize(cbor([["b", dids], ["bs", bsky]]), a.auth.did, deps)
 }
 
 /**
@@ -391,7 +402,7 @@ export async function handleBlockSet(
         return new Response("Not a DID", { status: 400 })
     }
     if (blocked) {
-        await a.auth.store.block(senderDID, deps.nowSeconds)
+        await a.auth.store.block(senderDID, deps.nowSeconds, "device")
     } else {
         await a.auth.store.unblock(senderDID)
     }
@@ -402,7 +413,10 @@ export async function handleBlockSet(
 
 // MARK: - Pool
 
-/** `GET /pmr/v1/pool` — DIDs only, never bodies. */
+/**
+ * `GET /pmr/v1/pool` — DIDs only, never bodies. An entry the relay judged
+ * carries `v` (`no` | `unknown`) and `r` (reason codes).
+ */
 export async function handlePoolList(
     request: Request,
     deps: OwnerDeps
@@ -410,6 +424,7 @@ export async function handlePoolList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
+    await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
     const senders = await a.auth.store.poolSenders()
     return amortize(
         cbor([
@@ -419,6 +434,12 @@ export async function handlePoolList(
                 (s) => new Map<string, CoseValue>([
                     ["did", s.did],
                     ["n", s.count],
+                    ...(s.verdict !== undefined
+                        ? ([
+                              ["v", s.verdict.verdict],
+                              ["r", [...s.verdict.why]],
+                          ] as [string, CoseValue][])
+                        : []),
                 ])
             ),
         ],
@@ -723,6 +744,11 @@ export async function handleMessagesList(
     if (!a.ok) return a.response
 
     const cursor = new URL(request.url).searchParams.get("cursor")
+    // Once per catch-up, before anything is delivered; later pages read what
+    // the first page left.
+    if (cursor === null || cursor === "") {
+        await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
+    }
     const page = await a.auth.store.openMailboxes(cursor, deps.catchUpPageMailboxes)
 
     const ms: CoseValue[] = []

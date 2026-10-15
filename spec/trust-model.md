@@ -101,6 +101,12 @@ prioritizes not leaking the recipient's real activity over perfectly
 concealing the block. Full statement in
 [`wire-api.md` §Blocked senders](wire-api.md#blocked-senders).
 
+One transition is exempt from timing parity: when a relay first applies a
+block the recipient made on Bsky, the put that finds it also clears the
+sender's queued and pooled state, and may take measurably longer. The block
+record is public, so the sender could read the block directly and learns
+nothing from the delay.
+
 ### P5 — Sender verification
 
 **The pair-put verification algorithm MUST run in full: sender DID from the
