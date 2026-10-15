@@ -122,13 +122,18 @@ describe("statement costs", () => {
         for (const remaining of [5, 8, 100, 1000]) {
             const n = flushLimit(remaining)
             expect(n).toBeGreaterThan(0)
+            // A plain comparison: an expect() per case made this loop exceed the default timeout on CI.
+            const overBudget: number[][] = []
             for (let c = 0; c <= n; c++) {
                 for (let d = 0; c + d <= n; d += 1 + Math.floor(n / 12)) {
                     for (let bc = 0; c + d + bc <= n; bc += 1 + Math.floor(n / 12)) {
-                        expect(flushStatements(c, d, bc, n - c - d - bc)).toBeLessThanOrEqual(remaining)
+                        if (flushStatements(c, d, bc, n - c - d - bc) > remaining) {
+                            overBudget.push([c, d, bc, n - c - d - bc])
+                        }
                     }
                 }
             }
+            expect(overBudget).toEqual([])
             expect(flushStatements(n - 3, 1, 1, 1)).toBeLessThanOrEqual(remaining)
         }
         expect(flushLimit(5)).toBe(25)
