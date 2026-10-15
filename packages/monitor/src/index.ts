@@ -149,9 +149,7 @@ export {
     type RecountQueueIndex,
 } from "./follow-flush"
 export {
-    GRAPH_CHANGE_RETENTION_MS,
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     type GraphMirrorDeps,
     type GraphMirrorIndex,

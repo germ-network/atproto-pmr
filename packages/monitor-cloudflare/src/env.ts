@@ -88,8 +88,6 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * within plc.directory's limits.
      */
     PLC_LOG_DRAIN_BATCH?: string
-    /** `graph_changes` rows pruned per alarm, default 1000. */
-    GRAPH_PRUNE_BATCH?: string
     /** DIDs checked per page of the daily mirror reconcile, default 25. */
     GRAPH_RECONCILE_BATCH?: string
 

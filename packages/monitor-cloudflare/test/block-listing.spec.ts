@@ -139,27 +139,27 @@ describe("listings — blocks", () => {
         const s = registeredStub("b")
         await inObj(s, async (obj) => {
             await obj.register(O)
-            stubNet(obj, { repos: { [O]: entriesOf(3000) }, blockRepos: { [O]: entriesOf(3000, (i) => `did:plc:x${i}`) } })
+            stubNet(obj, { repos: { [O]: entriesOf(6000) }, blockRepos: { [O]: entriesOf(6000, (i) => `did:plc:x${i}`) } })
             expect(await step(obj)).toEqual(["in-progress"])
             await obj.logEdgeOp(
                 { collection: "block", kind: "create", follower: O, rkey: "live", subject: "did:plc:live", rev: "r", cursor: "1" },
                 "1"
             )
             await obj.logEdgeOp(
-                { collection: "block", kind: "delete", follower: O, rkey: rkeyOf(2990), rev: "r", cursor: "1" },
+                { collection: "block", kind: "delete", follower: O, rkey: rkeyOf(5990), rev: "r", cursor: "1" },
                 "1"
             )
             await flush(obj)
             expect(
-                rowsOf(obj, "SELECT 1 FROM listing_stage WHERE did = ? AND collection = 'block' AND rkey = ?", O, rkeyOf(2990))
+                rowsOf(obj, "SELECT 1 FROM listing_stage WHERE did = ? AND collection = 'block' AND rkey = ?", O, rkeyOf(5990))
             ).toEqual([])
             await drainAll(obj)
         })
         const rows = await blocksOf(O)
         expect(rows.find((r) => r.rkey === "live")?.subject).toBe("did:plc:live")
-        expect(rows.some((r) => r.rkey === rkeyOf(2990))).toBe(false)
-        expect(rows).toHaveLength(3000)
-        expect(await all("SELECT 1 FROM follows WHERE follower = ?", O)).toHaveLength(3000)
+        expect(rows.some((r) => r.rkey === rkeyOf(5990))).toBe(false)
+        expect(rows).toHaveLength(6000)
+        expect(await all("SELECT 1 FROM follows WHERE follower = ?", O)).toHaveLength(6000)
     })
 
     it("a follow and a block sharing an rkey stage, drain and sweep independently", async () => {
@@ -167,8 +167,8 @@ describe("listings — blocks", () => {
         await inObj(s, async (obj) => {
             await obj.register(O)
             stubNet(obj, {
-                repos: { [O]: entriesOf(3000, (i) => `did:plc:f${i}`) },
-                blockRepos: { [O]: entriesOf(3000, (i) => `did:plc:b${i}`) },
+                repos: { [O]: entriesOf(6000, (i) => `did:plc:f${i}`) },
+                blockRepos: { [O]: entriesOf(6000, (i) => `did:plc:b${i}`) },
             })
             expect(await step(obj)).toEqual(["in-progress"])
             await drainAll(obj)
@@ -178,8 +178,8 @@ describe("listings — blocks", () => {
             O
         )
         const rows = await blocksOf(O)
-        expect(follows).toHaveLength(3000)
-        expect(rows).toHaveLength(3000)
+        expect(follows).toHaveLength(6000)
+        expect(rows).toHaveLength(6000)
         expect(follows.every((f, i) => f.rkey === rows[i]!.rkey && f.subject !== rows[i]!.subject)).toBe(true)
     })
 

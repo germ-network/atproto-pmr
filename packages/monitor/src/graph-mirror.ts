@@ -2,13 +2,10 @@
  * The edge index's copy of the single writer's standing per DID: whose graph
  * is served (`graph_owners`), who holds a declaration (`graph_holders`), and
  * who is in interest (`interest`). Read routes consult the copy, never the
- * single writer, so it is pushed from the alarm, with change rows.
+ * single writer, so it is pushed from the alarm.
  */
 import type { ListingIndex } from "./follow-backfill"
 import type { FollowEdgeWriter, GraphMirrorRow, GraphMirrorTransition } from "./storage"
-
-/** How long `graph_changes` rows are kept; a consumer further behind rebuilds. */
-export const GRAPH_CHANGE_RETENTION_MS = 7 * 86_400_000
 
 /**
  * The single writer's side of the mirror: its standing per DID, and the
@@ -131,16 +128,4 @@ function sameStanding(a: GraphMirrorRow, b: GraphMirrorRow): boolean {
         a.member === b.member &&
         a.registered === b.registered
     )
-}
-
-/**
- * Delete up to `limit` change rows older than the retention, oldest first;
- * returns how many, so a large backlog is pruned across alarms.
- */
-export async function pruneGraphChanges(
-    deps: { edges: Pick<FollowEdgeWriter, "pruneChanges">; nowMs(): number },
-    limit: number,
-    retentionMs: number = GRAPH_CHANGE_RETENTION_MS
-): Promise<number> {
-    return deps.edges.pruneChanges(deps.nowMs() - retentionMs, limit)
 }

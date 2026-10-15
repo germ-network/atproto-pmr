@@ -731,8 +731,7 @@ export interface SecondarySnapshotStore {
 
 /**
  * Rows per bound-value D1 `INSERT`: 25 rows of `follows` (4 columns) is
- * exactly D1's 100 bound parameters. Change rows that follow from rows
- * already in D1 are never bound this way (see `FollowEdgeWriter`).
+ * exactly D1's 100 bound parameters.
  */
 export const D1_ROWS_PER_STATEMENT = 25
 
@@ -768,10 +767,10 @@ export interface BlockRef {
 }
 
 /**
- * The single writer's seam onto the block index. Blocks write no
- * `graph_changes` rows and move no follower count: nothing is projected
- * from them. Pruning on a DID's mirror transitions is `FollowEdgeWriter.mirror`'s,
- * in the same batch as its follows.
+ * The single writer's seam onto the block index. Blocks move no follower
+ * count: nothing is projected from them. Pruning on a DID's mirror
+ * transitions is `FollowEdgeWriter.mirror`'s, in the same batch as its
+ * follows.
  */
 export interface BlockEdgeWriter {
     /** Put blocks at listing generation `gen`; idempotent on `(blocker, rkey)`. */
@@ -801,9 +800,8 @@ export interface GraphMirrorRow {
 /**
  * A DID's standing now, beside the standing last mirrored for it (null if
  * never). The mirror acts on the difference: a prune when `owner` or `member`
- * went from true to false, change rows only for flags that moved. Recording
- * `now` as mirrored happens only after the D1 batch commits, so a retry
- * re-derives the same transition.
+ * went from true to false. Recording `now` as mirrored happens only after
+ * the D1 batch commits, so a retry re-derives the same transition.
  */
 export interface GraphMirrorTransition {
     now: GraphMirrorRow
@@ -814,18 +812,12 @@ export interface GraphMirrorTransition {
  * The write side of the follow-edge index (D1). The single writer is its
  * only caller. "Served" means in `graph_owners`.
  *
- * Every method commits its rows and their `graph_changes` rows in one
- * `db.batch`, drawing every statement from the budget the writer was built
- * with; a write the budget cannot cover throws before anything is sent.
- * Change rows are derived from the reads they invalidate (`FollowEdgeStore`):
- * a `following` row for a served follower, a `followers` row only for a
- * subject that holds a declaration. Bound-value inserts (`putEdges` and its
- * change rows) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
- * number of statements per DID. A
- * change row that depends on rows a delete removes (sweep, prune, the
- * holder/owner fan-out) is an `INSERT INTO graph_changes … SELECT … FROM
- * follows`, placed before that delete in the same batch, so a prune costs a
- * constant number of statements whatever the edge count.
+ * Every method sends its statements in one `db.batch`, drawing every
+ * statement from the budget the writer was built with; a write the budget
+ * cannot cover throws before anything is sent. Bound-value inserts
+ * (`putEdges`) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
+ * number of statements per DID, and a prune or sweep a constant number
+ * whatever the edge count.
  */
 export interface FollowEdgeWriter {
     /**
@@ -841,13 +833,10 @@ export interface FollowEdgeWriter {
     pruneFollower(follower: string): Promise<EdgeWriteResult>
     /**
      * Bring the mirrored `graph_owners`, `graph_holders` and `interest`
-     * rows from each transition's `mirrored` to its `now`, in one batch:
-     * `served-add`/`served-remove` and `holder-add`/`holder-remove` rows with
-     * their per-affected-DID fan-out (`following` for each follower,
-     * `followers` for each holder subject) on add and on remove, and the
-     * edges of a DID that stopped being served or left interest pruned.
-     * A flag unchanged between the two writes no change row, so re-mirroring
-     * an unchanged DID is a no-op. Returns the pruned edges' subjects.
+     * rows from each transition's `mirrored` to its `now`, in one batch, and
+     * prune the edges of a DID that stopped being served or left interest.
+     * Re-mirroring an unchanged DID is a no-op. Returns the pruned edges'
+     * subjects.
      */
     mirror(transitions: readonly GraphMirrorTransition[]): Promise<EdgeWriteResult>
     /** The mirrored DIDs, paged by DID, for the daily reconcile. */
@@ -859,9 +848,4 @@ export interface FollowEdgeWriter {
     mirroredOf(dids: readonly string[]): Promise<Map<string, GraphMirrorRow>>
     /** The followers of each subject, for the `owner_followers` re-count. */
     followersOf(subjects: readonly string[]): Promise<Map<string, string[]>>
-    /**
-     * Delete up to `limit` `graph_changes` rows written before `beforeMs`,
-     * oldest first; returns how many, so the caller can resume next alarm.
-     */
-    pruneChanges(beforeMs: number, limit: number): Promise<number>
 }

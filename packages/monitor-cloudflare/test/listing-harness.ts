@@ -73,7 +73,7 @@ export const putEdge = (follower: string, rkey: string, subject: string, gen = 1
         .run()
 export const clearGraph = () =>
     db.batch(
-        ["follows", "blocks", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "blocks", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )

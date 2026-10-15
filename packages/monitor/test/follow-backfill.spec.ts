@@ -391,13 +391,13 @@ function harness(overrides: Overrides = {}, budgetTotal = 1000): Harness {
         index: { isWatched: async (d) => !left.has(d) },
         edges: {
             async putEdges(edges: readonly FollowEdge[], gen: number) {
-                const cost = 4 * Math.ceil(edges.length / 25) + 1
+                const cost = 2 * Math.ceil(edges.length / 25)
                 if (!budget.take(cost)) throw new Error("D1 statement budget exceeded")
                 puts.push({ follower: edges[0]!.follower, rkeys: edges.map((e) => e.rkey), gen })
                 return result([...new Set(edges.map((e) => e.subject))])
             },
             async sweep(follower: string, gen: number) {
-                if (!budget.take(3)) throw new Error("D1 statement budget exceeded")
+                if (!budget.take(1)) throw new Error("D1 statement budget exceeded")
                 sweeps.push({ follower, gen })
                 return result(["did:plc:swept"])
             },
@@ -487,16 +487,16 @@ const pagesOf = (count: number) => {
 
 describe("follow listings", () => {
     it("one drain chunk's worst case plus the sweep fits the default reserve", () => {
-        expect(worstCaseDrainStatements(1, true)).toBe(10)
-        expect(worstCaseDrainStatements(25, false)).toBe(6)
-        expect(worstCaseDrainStatements(26, false)).toBe(10)
-        expect(worstCaseDrainStatements(0, true)).toBe(4)
-        expect(worstCaseDrainStatements(2_450, true)).toBe(398)
-        expect(worstCaseDrainStatements(2_451, true)).toBeGreaterThan(400)
+        expect(worstCaseDrainStatements(1, true)).toBe(5)
+        expect(worstCaseDrainStatements(25, false)).toBe(3)
+        expect(worstCaseDrainStatements(26, false)).toBe(5)
+        expect(worstCaseDrainStatements(0, true)).toBe(2)
+        expect(worstCaseDrainStatements(4_950, true)).toBe(399)
+        expect(worstCaseDrainStatements(4_951, true)).toBeGreaterThan(400)
     })
 
     it("drainChunkEdges is the largest chunk whose worst case fits", () => {
-        expect(drainChunkEdges(400)).toBe(2_450)
+        expect(drainChunkEdges(400)).toBe(4_950)
         for (let statements = 0; statements <= 450; statements++) {
             const edges = drainChunkEdges(statements)
             if (edges > 0) {
@@ -982,7 +982,7 @@ describe("follow listings", () => {
             },
         })
         h.listings.stage("did:plc:m", 3)
-        expect(await run(h, { statementReserve: 4 })).toEqual(["over-budget"])
+        expect(await run(h, { statementReserve: 2 })).toEqual(["over-budget"])
         expect(h.listings.calls.resume).toEqual([])
         expect(row.attempts).toBe(1)
     })
@@ -1161,7 +1161,7 @@ describe("follow listings", () => {
         expect(h.puts.flatMap((p) => p.rkeys).length).toBeGreaterThan(2_000)
         expect(h.sweeps).toEqual([])
 
-        const none = harness({}, 3)
+        const none = harness({}, 1)
         none.listings.queue("did:plc:m", {
             inProgress: {
                 kind: "mutual",

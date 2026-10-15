@@ -126,8 +126,9 @@ FOLLOW_RELIST_AFTER_MS = "604800000"
 	binding = "registrations"
 	id = "PROVISION_BEFORE_DEPLOY"
 
-# The follow-edge index, written only by MonitorIngest and read by the graph
-# routes. Required: the object fails at startup without it. Apply the
+# The follow-edge index, written only by MonitorIngest and read by its owner
+# graph and block RPCs and, through `d1InterestReader`, by read routes.
+# Required: the object fails at startup without it. Apply the
 # migrations before deploying. migrations_dir is relative to this file; from
 # the npm package, point it at
 # node_modules/@germ-network/atproto-pmr-monitor-cloudflare/migrations.

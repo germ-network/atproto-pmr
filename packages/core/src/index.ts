@@ -346,9 +346,6 @@ export {
     type OwnerGraphEdge,
 } from "./owner-graph"
 export {
-    type GraphChangeLog,
-    type GraphChangeReason,
-    type GraphChangeRow,
     type InterestReader,
 } from "./graph"
 export {

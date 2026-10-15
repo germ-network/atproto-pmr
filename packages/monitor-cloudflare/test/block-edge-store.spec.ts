@@ -26,7 +26,7 @@ const interest = (did: string, registered: number) =>
 
 beforeEach(async () => {
     await db.batch(
-        ["blocks", "follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["blocks", "follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
@@ -80,16 +80,6 @@ describe("d1BlockEdgeWriter", () => {
             ["did:a", "new"],
             ["did:b", "old"],
         ])
-    })
-
-    it("writes no graph_changes rows", async () => {
-        await serve("did:a")
-        await writer().putBlocks([block("did:a", "1", "did:x")], 1)
-        await writer().putBlocks([block("did:a", "1", "did:y")], 2)
-        await writer().sweepBlocks("did:a", 3)
-        await writer().putBlocks([block("did:a", "1", "did:y")], 3)
-        await writer().deleteBlocks([{ blocker: "did:a", rkey: "1" }])
-        expect(await all("SELECT * FROM graph_changes")).toEqual([])
     })
 })
 

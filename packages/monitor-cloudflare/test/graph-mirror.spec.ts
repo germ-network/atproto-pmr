@@ -6,7 +6,6 @@ import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { beforeEach, describe, expect, it } from "vitest"
 import {
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     type GraphMirrorDeps,
     type MirrorReconcileCursor,
@@ -65,10 +64,6 @@ async function alarm(s: DurableObjectStub<MonitorIngest>) {
 async function all<T>(sql: string, ...binds: unknown[]): Promise<T[]> {
     return (await db.prepare(sql).bind(...binds).all<T>()).results
 }
-const reasons = async (did: string) =>
-    (await all<{ reason: string }>("SELECT reason FROM graph_changes WHERE did = ? ORDER BY seq", did)).map(
-        (r) => r.reason
-    )
 const dids = async (table: string) =>
     (await all<{ did: string }>(`SELECT did FROM ${table} ORDER BY did`)).map((r) => r.did)
 const edgeCount = async (follower: string) =>
@@ -101,7 +96,7 @@ beforeEach(async () => {
     await Promise.all([...listedDids].map((d) => testEnv.pmrDirectory.delete(d)))
     listedDids.clear()
     await db.batch(
-        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
@@ -117,13 +112,12 @@ describe("graph mirror", () => {
         expect(await dids("interest")).toEqual(["did:plc:owner"])
         expect(await all("SELECT registered FROM interest")).toEqual([{ registered: 1 }])
         expect(await dids("graph_owners")).toEqual([])
-        expect(await reasons("did:plc:owner")).toEqual([])
         await inObj(s, async (obj) => {
             expect(await obj.dueMirror(10)).toEqual([])
         })
     })
 
-    it("a removed owner is mirrored with served-remove and its owner rows pruned", async () => {
+    it("a removed owner is mirrored and its owner rows pruned", async () => {
         const s = stub()
         await db.batch([
             db.prepare("INSERT INTO graph_owners (did) VALUES ('did:o')"),
@@ -138,9 +132,6 @@ describe("graph mirror", () => {
         })
         expect(await dids("graph_owners")).toEqual([])
         expect(await edgeCount("did:o")).toBe(0)
-        expect(await reasons("did:o")).toEqual(["served-remove"])
-        // The holder it followed reads its followers differently now.
-        expect(await reasons("did:h")).toEqual(["followers"])
     })
 
     it("a DID leaving interest has its mutual-hint rows pruned", async () => {
@@ -155,7 +146,6 @@ describe("graph mirror", () => {
         })
         expect(await dids("interest")).toEqual([])
         expect(await edgeCount("did:m")).toBe(0)
-        expect(await reasons("did:reg")).toEqual(["followers"])
     })
 
     it("a non-owner whose holder flag changes keeps its edges", async () => {
@@ -174,7 +164,6 @@ describe("graph mirror", () => {
         expect(await dids("graph_holders")).toEqual([])
         expect(await dids("interest")).toEqual(["did:x"])
         expect(await edgeCount("did:x")).toBe(1)
-        expect(await reasons("did:x")).toEqual(["holder-remove"])
     })
 
     it("a mirror retried after its batch committed still prunes the removed owner", async () => {
@@ -196,13 +185,11 @@ describe("graph mirror", () => {
             await mirrorGraph(deps(obj), 10)
             expect(await obj.dueMirror(10)).toEqual([])
         })
-        // One removal in the log, not two, and nothing left behind.
-        expect(await reasons("did:o")).toEqual(["served-remove"])
         expect(await dids("graph_owners")).toEqual([])
         expect(await dids("interest")).toEqual([])
     })
 
-    it("a holder whose leave dropped its holder_state is mirrored as holder-remove", async () => {
+    it("a holder whose leave dropped its holder_state is mirrored out", async () => {
         const s = stub()
         await db.batch([
             db.prepare("INSERT INTO interest (did, registered) VALUES ('did:gone', 0)"),
@@ -225,7 +212,6 @@ describe("graph mirror", () => {
         })
         expect(await dids("graph_holders")).toEqual([])
         expect(await dids("interest")).toEqual([])
-        expect(await reasons("did:gone")).toEqual(["holder-remove"])
     })
 
     it("reconcile repairs a missed add or remove", async () => {
@@ -252,29 +238,6 @@ describe("graph mirror", () => {
         expect(await dids("interest")).toEqual(["did:missed"])
         expect(await all("SELECT registered FROM interest")).toEqual([{ registered: 1 }])
         expect(await dids("graph_holders")).toEqual([])
-        expect(await reasons("did:stale")).toEqual(["holder-remove"])
-    })
-
-    it("change rows older than retention are pruned in bounded chunks", async () => {
-        const s = stub()
-        const old = Date.now() - 8 * 86_400_000
-        await db.batch([
-            ...[1, 2, 3, 4, 5].map((i) =>
-                db
-                    .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES (?, 'following', ?)")
-                    .bind(`did:old${i}`, old)
-            ),
-            db
-                .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:new', 'following', ?)")
-                .bind(Date.now()),
-        ])
-        await inObj(s, async (obj) => {
-            expect(await pruneGraphChanges(deps(obj), 2)).toBe(2)
-            expect(await pruneGraphChanges(deps(obj), 2)).toBe(2)
-            expect(await pruneGraphChanges(deps(obj), 2)).toBe(1)
-            expect(await pruneGraphChanges(deps(obj), 2)).toBe(0)
-        })
-        expect(await all<{ did: string }>("SELECT did FROM graph_changes")).toEqual([{ did: "did:new" }])
     })
 
     it("a failing mirror step does not stop the re-arm", async () => {
@@ -407,26 +370,26 @@ describe("graph mirror", () => {
 
     it("each graph step fails alone", async () => {
         const s = stub()
-        const old = Date.now() - 8 * 86_400_000
-        await db.batch([
-            db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:old', 'following', ?)").bind(old),
-            db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:new', 'following', ?)").bind(Date.now()),
-        ])
         await listed("did:plc:a")
+        const queries: string[] = []
         await inObj(s, async (obj) => {
             await obj.setRegistered("did:plc:a", true, 1)
             const writesFail = {
-                prepare: (q: string) => db.prepare(q),
+                prepare: (q: string) => {
+                    queries.push(q)
+                    return db.prepare(q)
+                },
                 batch: () => Promise.reject(new Error("batch down")),
             }
             obj.env = { ...obj.env, graph: writesFail as unknown as D1Database }
         })
         await alarm(s)
-        // The mirror's batch failed; the prune still ran.
-        expect(await all<{ did: string }>("SELECT did FROM graph_changes")).toEqual([{ did: "did:new" }])
+        // The mirror's batch failed; the reconcile's read still ran.
+        expect(await dids("interest")).toEqual([])
+        expect(queries.some((q) => q.includes("FROM graph_holders WHERE did = d.did"))).toBe(true)
     })
 
-    it("the alarm mirrors, prunes and reconciles", async () => {
+    it("the alarm mirrors and reconciles", async () => {
         const s = stub()
         await listed("did:plc:a")
         await inObj(s, (obj) => obj.setRegistered("did:plc:a", true, 1))

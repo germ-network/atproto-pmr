@@ -66,10 +66,6 @@ const mirror = (obj: MonitorIngest, limit = 50) =>
     )
 const graphOwners = async () =>
     (await all<{ did: string }>("SELECT did FROM graph_owners ORDER BY did")).map((r) => r.did)
-const reasons = async (did: string) =>
-    (await all<{ reason: string }>("SELECT reason FROM graph_changes WHERE did = ? ORDER BY seq", did)).map(
-        (r) => r.reason
-    )
 const markPaged = (obj: MonitorIngest, did: string) =>
     sql(obj, "INSERT INTO listings (did, paged) VALUES (?, 1) ON CONFLICT(did) DO UPDATE SET paged = 1", did)
 const flush = (obj: MonitorIngest) =>
@@ -102,7 +98,7 @@ describe("owner listing from getRepo", () => {
         expect(rows.every((r) => r.gen === 2)).toBe(true)
     })
 
-    it("an owner's first completed listing mirrors it with served-add", async () => {
+    it("an owner's first completed listing serves it", async () => {
         const s = registeredStub("l")
         await inObj(s, async (obj) => {
             await obj.register(O)
@@ -112,7 +108,6 @@ describe("owner listing from getRepo", () => {
             await step(obj)
             await mirror(obj)
             expect(await graphOwners()).toEqual([O])
-            expect(await reasons(O)).toContain("served-add")
         })
     })
 
@@ -162,7 +157,7 @@ describe("owner listing from getRepo", () => {
             await alarm(s)
             return seen
         })
-        expect(limits[0]).toBe(54)
+        expect(limits[0]).toBe(120)
     })
 
     it("a large verified repo drains across alarms and is served only after its sweep", async () => {
@@ -516,14 +511,13 @@ describe("paged owner listing", () => {
         expect(rows.every((r) => r.gen === 2)).toBe(true)
     })
 
-    it("a fallback listing's completion emits served-add", async () => {
+    it("a fallback listing's completion serves the owner", async () => {
         const s = registeredStub("l")
         await inObj(s, async (obj) => {
             await pagedOwner(obj, 3)
             await step(obj)
             await mirror(obj)
         })
-        expect(await reasons(O)).toContain("served-add")
         expect(await graphOwners()).toEqual([O])
     })
 

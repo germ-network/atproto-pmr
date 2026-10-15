@@ -37,8 +37,8 @@ describe("graph mirror — blocks", () => {
         expect(await store.isBlocked("did:m", "did:reg")).toBe(true)
         const leaves = { now: row("did:m", {}), mirrored: row("did:m", { member: true }) }
         // A pruning transition spends exactly the per-DID statements the alarm budgets for.
-        await expect(mirror(10, leaves)).rejects.toThrow(/budget/)
-        await mirror(11, leaves)
+        await expect(mirror(4, leaves)).rejects.toThrow(/budget/)
+        await mirror(5, leaves)
         expect(await blocksOf("did:m")).toEqual([])
         expect(await blocksOf("did:other")).toHaveLength(1)
         expect(await store.isBlocked("did:m", "did:reg")).toBe(false)
@@ -49,7 +49,7 @@ describe("graph mirror — blocks", () => {
         await run("INSERT INTO interest (did, registered) VALUES ('did:o', 1)")
         await putBlock("did:o", "1", "did:anyone")
         await putBlock("did:o", "2", "did:reg")
-        const budget = statementBudget(11)
+        const budget = statementBudget(5)
         await d1FollowEdgeWriter(db, budget).mirror([
             {
                 now: row("did:o", { member: true }),

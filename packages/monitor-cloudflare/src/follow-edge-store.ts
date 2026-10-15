@@ -58,8 +58,6 @@ export function statementBudget(limit: number): StatementBudget {
     }
 }
 
-const CHANGE = "INSERT INTO graph_changes (did, reason, at_ms) "
-
 function chunks<T>(items: readonly T[], size: number): T[][] {
     const out: T[][] = []
     for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
@@ -113,23 +111,12 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
 
     return {
         async putEdges(edges, gen) {
-            const now = Date.now()
             const statements: D1PreparedStatement[] = []
             // A put that re-points an existing follow leaves its old subject's
-            // followers changed too: note that subject before the upsert.
+            // followers changed too: read the old subjects before the upsert.
             const replaced: number[] = []
             for (const chunk of chunks(edges, D1_ROWS_PER_STATEMENT)) {
                 const binds = chunk.flatMap((e) => [e.follower, e.rkey])
-                const match = `(f.follower, f.rkey) IN (VALUES ${refList(chunk.length, 2)})`
-                statements.push(
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.subject, 'followers', ?1 FROM follows f " +
-                                `JOIN graph_holders h ON h.did = f.subject WHERE ${match}`
-                        )
-                        .bind(now, ...binds)
-                )
                 replaced.push(statements.length)
                 statements.push(
                     db
@@ -153,70 +140,23 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                         .bind(...chunk.flatMap((e) => [e.follower, e.rkey, e.subject, gen]))
                 )
             }
-            const followers = [...new Set(edges.map((e) => e.follower))]
             const subjects = [...new Set(edges.map((e) => e.subject))]
-            for (const chunk of chunks(followers, D1_ROWS_PER_STATEMENT)) {
-                statements.push(
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT did, 'following', ?1 FROM graph_owners " +
-                                `WHERE did IN (${placeholders(chunk.length, 2)})`
-                        )
-                        .bind(now, ...chunk)
-                )
-            }
-            for (const chunk of chunks(subjects, D1_ROWS_PER_STATEMENT)) {
-                statements.push(
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT did, 'followers', ?1 FROM graph_holders " +
-                                `WHERE did IN (${placeholders(chunk.length, 2)})`
-                        )
-                        .bind(now, ...chunk)
-                )
-            }
             const results = await send(statements)
             const old = replaced.flatMap((i) => subjectsOf(results[i]))
             return { subjects: [...new Set([...subjects, ...old])] }
         },
 
         async deleteEdges(refs: readonly EdgeRef[]): Promise<EdgeWriteResult> {
-            const now = Date.now()
-            const statements: D1PreparedStatement[] = []
-            const deletes: number[] = []
-            for (const chunk of chunks(refs, D1_ROWS_PER_STATEMENT)) {
-                const binds = chunk.flatMap((r) => [r.follower, r.rkey])
-                const match = `(f.follower, f.rkey) IN (VALUES ${refList(chunk.length, 2)})`
-                statements.push(
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.follower, 'following', ?1 FROM follows f " +
-                                `JOIN graph_owners o ON o.did = f.follower WHERE ${match}`
-                        )
-                        .bind(now, ...binds),
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.subject, 'followers', ?1 FROM follows f " +
-                                `JOIN graph_holders h ON h.did = f.subject WHERE ${match}`
-                        )
-                        .bind(now, ...binds)
-                )
-                deletes.push(statements.length)
-                statements.push(
-                    db
-                        .prepare(
-                            "DELETE FROM follows WHERE (follower, rkey) IN " +
-                                `(VALUES ${refList(chunk.length, 1)}) RETURNING subject`
-                        )
-                        .bind(...binds)
-                )
-            }
+            const statements = chunks(refs, D1_ROWS_PER_STATEMENT).map((chunk) =>
+                db
+                    .prepare(
+                        "DELETE FROM follows WHERE (follower, rkey) IN " +
+                            `(VALUES ${refList(chunk.length, 1)}) RETURNING subject`
+                    )
+                    .bind(...chunk.flatMap((r) => [r.follower, r.rkey]))
+            )
             const results = await send(statements)
-            return { subjects: [...new Set(deletes.flatMap((i) => subjectsOf(results[i])))] }
+            return { subjects: [...new Set(results.flatMap((r) => subjectsOf(r)))] }
         },
 
         async sweep(follower, gen) {
@@ -228,69 +168,16 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
         },
 
         async mirror(transitions: readonly GraphMirrorTransition[]): Promise<EdgeWriteResult> {
-            const now = Date.now()
             const statements: D1PreparedStatement[] = []
             const prunes: number[] = []
             for (const { now: s } of transitions) {
                 const owner = s.owner ? 1 : 0
                 const holder = s.holder ? 1 : 0
                 const member = s.member ? 1 : 0
-                // Each statement binds up to the highest index it uses, so some
-                // take a prefix; an unused index inside the prefix is harmless.
-                const didBind = [s.did, now, owner, holder, member] as const
                 const ownerNow = "EXISTS (SELECT 1 FROM graph_owners WHERE did = ?1)"
-                const holderNow = "EXISTS (SELECT 1 FROM graph_holders WHERE did = ?1)"
                 const memberNow = "EXISTS (SELECT 1 FROM interest WHERE did = ?1)"
-                const flagMoved = `(?3 <> ${ownerNow} OR ?4 <> ${holderNow})`
-                const pruning = `((${ownerNow} AND ?3 = 0) OR (${memberNow} AND ?5 = 0))`
-                statements.push(
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT ?1, CASE WHEN ?3 = 1 THEN 'served-add' ELSE 'served-remove' END, ?2 " +
-                                `WHERE ?3 <> ${ownerNow}`
-                        )
-                        .bind(...didBind.slice(0, 3)),
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT ?1, CASE WHEN ?4 = 1 THEN 'holder-add' ELSE 'holder-remove' END, ?2 " +
-                                `WHERE ?4 <> ${holderNow}`
-                        )
-                        .bind(...didBind.slice(0, 4)),
-                    // Whoever follows this DID reads it differently now, and
-                    // so does every holder it follows.
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.follower, 'following', ?2 FROM follows f " +
-                                `JOIN graph_owners o ON o.did = f.follower WHERE f.subject = ?1 AND ${flagMoved}`
-                        )
-                        .bind(...didBind.slice(0, 4)),
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.subject, 'followers', ?2 FROM follows f " +
-                                `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1 AND ${flagMoved}`
-                        )
-                        .bind(...didBind.slice(0, 4)),
-                    // A prune takes the DID's own edges away: holder subjects read their
-                    // followers differently, unless the fan-out above already said so.
-                    // A DID no longer served already has its served-remove row.
-                    db
-                        .prepare(
-                            CHANGE +
-                                "SELECT DISTINCT f.subject, 'followers', ?2 FROM follows f " +
-                                `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1 AND ${pruning} AND NOT ${flagMoved}`
-                        )
-                        .bind(...didBind),
-                    db
-                        .prepare(
-                            CHANGE +
-                                `SELECT ?1, 'following', ?2 WHERE ?3 = 1 AND ${ownerNow} AND ${pruning}`
-                        )
-                        .bind(...didBind)
-                )
+                const pruning = `((${ownerNow} AND ?2 = 0) OR (${memberNow} AND ?3 = 0))`
+                const didBind = [s.did, owner, member] as const
                 prunes.push(statements.length)
                 statements.push(
                     db
@@ -298,8 +185,7 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                             `DELETE FROM follows WHERE follower = ?1 AND ${pruning} RETURNING subject`
                         )
                         .bind(...didBind),
-                    // A DID's blocks go on the same transitions as its follows; they
-                    // change no projection, so no change rows follow from them.
+                    // A DID's blocks go on the same transitions as its follows.
                     db.prepare(`DELETE FROM blocks WHERE blocker = ?1 AND ${pruning}`).bind(...didBind),
                     owner === 1
                         ? db.prepare("INSERT OR IGNORE INTO graph_owners (did) VALUES (?1)").bind(s.did)
@@ -375,45 +261,10 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
             }
             return out
         },
-
-        async pruneChanges(beforeMs, limit) {
-            if (!budget.take(1)) throw new Error("D1 statement budget exceeded (1 needed)")
-            // The newest row stays so MAX(seq) never goes back.
-            const result = await db
-                .prepare(
-                    "DELETE FROM graph_changes WHERE seq IN (" +
-                        "SELECT seq FROM graph_changes WHERE seq <= " +
-                        "(SELECT MAX(seq) FROM graph_changes WHERE at_ms < ?1) AND seq < " +
-                        "(SELECT MAX(seq) FROM graph_changes) ORDER BY seq LIMIT ?2)"
-                )
-                .bind(beforeMs, limit)
-                .run()
-            return result.meta.changes
-        },
     }
 
     async function removeFollowerEdges(follower: string, gen?: number): Promise<EdgeWriteResult> {
-        const now = Date.now()
-        // The change rows number ?1 follower, ?2 now, ?3 the generation to sweep
-        // below (sweep only); the DELETE numbers its own binds.
-        const stale = gen === undefined ? "" : " AND gen < ?3"
-        const staleF = gen === undefined ? "" : " AND f.gen < ?3"
-        const binds = gen === undefined ? [follower, now] : [follower, now, gen]
         const results = await send([
-            db
-                .prepare(
-                    CHANGE +
-                        "SELECT did, 'following', ?2 FROM graph_owners WHERE did = ?1 " +
-                        `AND EXISTS (SELECT 1 FROM follows WHERE follower = ?1${stale})`
-                )
-                .bind(...binds),
-            db
-                .prepare(
-                    CHANGE +
-                        "SELECT DISTINCT f.subject, 'followers', ?2 FROM follows f " +
-                        `JOIN graph_holders h ON h.did = f.subject WHERE f.follower = ?1${staleF}`
-                )
-                .bind(...binds),
             db
                 .prepare(
                     gen === undefined
@@ -422,6 +273,6 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                 )
                 .bind(...(gen === undefined ? [follower] : [follower, gen])),
         ])
-        return { subjects: subjectsOf(results[2]) }
+        return { subjects: subjectsOf(results[0]) }
     }
 }

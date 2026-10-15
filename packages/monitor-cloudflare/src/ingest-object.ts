@@ -81,7 +81,6 @@ import {
     followGapExceeded,
     listEdgeRecords,
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
     relistStale,
@@ -179,7 +178,7 @@ const RECONCILE_INTERVAL_MS = 86_400_000
 /** How often the D1 graph mirror is checked against the single writer's state, both ways. */
 const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
 /** D1 statements the writer spends per mirrored DID. */
-const MIRROR_STATEMENTS_PER_DID = 11
+const MIRROR_STATEMENTS_PER_DID = 5
 const RECOUNT_DRAIN_BATCH = 1000
 const OWNER_RECONCILE_BATCH = 200
 /** `listRecords` pages all listings together take per alarm. */
@@ -2954,8 +2953,8 @@ export class MonitorIngest
     }
 
     /**
-     * The graph mirror, edge-log flush, re-count drain, change-log
-     * prune and the daily reconciles, sharing one D1 statement budget. Each runs
+     * The graph mirror, edge-log flush, re-count drain and the daily
+     * reconciles, sharing one D1 statement budget. Each runs
      * alone: a D1 outage costs neither the other steps nor the alarm's
      * re-arm.
      */
@@ -3001,10 +3000,6 @@ export class MonitorIngest
             [
                 "recount drain",
                 () => drainRecounts({ ...owners, queue: this, budget }, RECOUNT_DRAIN_BATCH),
-            ],
-            [
-                "graph change prune",
-                () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
             ],
             ["graph reconcile", () => this.reconcileGraph(deps)],
             [

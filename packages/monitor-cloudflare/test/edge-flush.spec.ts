@@ -18,6 +18,7 @@ import type { MonitorEnv } from "../src/env"
 import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
+import { setEnv } from "./listing-harness"
 
 const testEnv = env as unknown as MonitorEnv & {
     graph: D1Database
@@ -110,7 +111,7 @@ async function alarm(s: DurableObjectStub<MonitorIngest>) {
 
 beforeEach(async () => {
     await db.batch(
-        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
@@ -237,7 +238,7 @@ describe("edge_ops flush", () => {
         await inObj(s, async (obj) => {
             await obj.setRegistered("did:f", true, 1)
             for (let i = 0; i < 200; i++) await create(obj, "did:f", `r${i}`, "did:s")
-            const budget = statementBudget(30)
+            const budget = statementBudget(14)
             const done = await flush(obj, flushLimit(budget.remaining), budget)
             expect(done).toBe(125)
             expect(budget.remaining).toBeGreaterThanOrEqual(0)
@@ -252,10 +253,11 @@ describe("edge_ops flush", () => {
         await testEnv.pmrDirectory.put("did:f", "1")
         await inObj(s, async (obj) => {
             await obj.setRegistered("did:f", true, 1)
+            setEnv(obj, { GRAPH_STATEMENT_BUDGET: "120" })
             for (let i = 0; i < 3800; i++) await create(obj, "did:f", `r${i}`, `did:s${i % 50}`)
         })
         const left: number[] = []
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 8; i++) {
             await alarm(s)
             left.push(await inObj(s, async (obj) => opCount(obj)))
             if (left.at(-1) === 0) break

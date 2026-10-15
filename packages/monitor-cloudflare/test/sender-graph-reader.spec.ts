@@ -26,7 +26,7 @@ const facts = async (...recipients: string[]) => (await reader.forSender(SENDER,
 
 beforeEach(async () => {
     await db.batch(
-        ["blocks", "follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["blocks", "follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
