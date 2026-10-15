@@ -851,6 +851,8 @@ export async function handleSummaryRead(
             ? built.records
             : built.records.filter((r) => changedKeys.has(refKey(r))),
         removed: diff.removed,
+        more: false,
+        truncated: false,
     }
     return amortize(
         new Response(toResponseBody(encodeSummaryDelta(delta)), {

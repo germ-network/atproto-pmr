@@ -47,4 +47,5 @@ describe("graph projection store", () => {
         expect(await env.records.get(`graph:${did}`)).toBeNull()
         expect(await store.get(other)).toEqual(projection(other))
     })
+    it.todo("listDids pages every held projection's DID, and only graph: keys")
 })

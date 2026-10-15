@@ -31,5 +31,12 @@ export function kvGraphProjections(env: MonitorEnv): GraphProjectionWriter {
         async delete(did: string): Promise<void> {
             await env.records.delete(GRAPH_PREFIX + did)
         },
+
+        async listDids(
+            _cursor: string | null,
+            _limit: number
+        ): Promise<{ dids: string[]; cursor: string | null }> {
+            throw new Error("not implemented")
+        },
     }
 }

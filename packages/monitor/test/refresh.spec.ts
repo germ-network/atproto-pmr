@@ -227,6 +227,7 @@ function harness(opts: {
             },
             markChecked: async (did, at) => void checkedAt.set(did, at),
             markAttempted: async (did, at) => void attempted.set(did, at),
+            requestRefresh: async () => {},
             markGoneReversible: async (did) => void goneReversible.push(did),
             completeQuietly: async (did, rev, _at, verified) => {
                 revs.set(did, rev)

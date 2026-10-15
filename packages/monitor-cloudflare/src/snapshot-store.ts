@@ -1,6 +1,7 @@
 import {
     DECLARATION_COLLECTION_NSID,
     type RecordSnapshotStore,
+    type SummaryIndexReader,
 } from "@germ-network/atproto-pmr-core"
 import type {
     DigestMarker,
@@ -246,6 +247,22 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 rev: verifiedWith === null ? null : metadata.rev,
                 cid: verifiedWith === null ? null : (metadata.cid ?? null),
             }
+        },
+    }
+}
+
+/**
+ * The summary's index reads: each ref's `rec:` metadata and `chk:` entry in
+ * bulk reads of up to a hundred keys, never a CAR (a bulk read cannot return
+ * bytes, and the value is discarded). An entry stored without verified
+ * metadata reads as null, as does one with no `cid`.
+ */
+export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorIngest>(
+    _env: MonitorEnv<TIngest>
+): SummaryIndexReader {
+    return {
+        async entries() {
+            throw new Error("not implemented")
         },
     }
 }

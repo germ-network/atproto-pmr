@@ -52,6 +52,10 @@ import {
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
+    type GraphProjectorIndex,
+    type MirroredGraphStanding,
+    type PlcLogIndex,
+    type ProjectorCursor,
     type GraphMirrorRow,
     type GraphMirrorTransition,
     type MirrorReconcileCursor,
@@ -100,6 +104,9 @@ import {
     type DidDocument,
     type InterestPolicy,
     type MonitorRegistrationNotify,
+    type MonitorRecheckRequest,
+    type PlcLog,
+    type PlcLogEntry,
     type PlcCoverage,
     type RepoCollectionExpectation,
     type VerifiedCollection,
@@ -293,9 +300,12 @@ export class MonitorIngest
         ListingIndex,
         EdgeOpsIndex,
         GraphMirrorIndex,
+        GraphProjectorIndex,
+        PlcLogIndex,
         OwnerFollowedIndex,
         RecountQueueIndex,
-        MonitorRegistrationNotify
+        MonitorRegistrationNotify,
+        MonitorRecheckRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -1345,6 +1355,10 @@ export class MonitorIngest
             .map((r) => r.did)
     }
 
+    async requestRefresh(_did: string, _requestedAtMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
     async markChecked(did: string, checkedAtMs: number): Promise<void> {
         this.db.sql.exec(
             "INSERT INTO checks (did, checked_at) VALUES (?, ?) " +
@@ -1604,6 +1618,49 @@ export class MonitorIngest
                 .exec("SELECT 1 FROM interest WHERE did = ? AND registered = 1", did)
                 .toArray().length > 0
         )
+    }
+
+    // ---- PlcLogIndex ------------------------------------------------------
+
+    async intakePlcLogEntry(_did: string, _entry: PlcLogEntry): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async owePlcLog(_did: string, _owedAtMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async owedPlcLogs(_attemptedBeforeMs: number, _limit: number): Promise<string[]> {
+        throw new Error("not implemented")
+    }
+
+    async putPlcLog(_log: PlcLog): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async markPlcLogAttempted(_did: string, _attemptedAtMs: number): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    // ---- GraphProjectorIndex ----------------------------------------------
+
+    async projectorCursor(): Promise<ProjectorCursor | null> {
+        throw new Error("not implemented")
+    }
+
+    async setProjectorCursor(_cursor: ProjectorCursor): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async mirroredGraphStanding(_did: string): Promise<MirroredGraphStanding> {
+        throw new Error("not implemented")
+    }
+
+    async servedGraphsMirrored(
+        _cursor: string | null,
+        _limit: number
+    ): Promise<{ dids: string[]; cursor: string | null }> {
+        throw new Error("not implemented")
     }
 
     async isGraphOwner(did: string): Promise<boolean> {
