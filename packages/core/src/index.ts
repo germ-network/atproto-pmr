@@ -340,6 +340,12 @@ export {
     type MonitorOwnBlocksRequest,
 } from "./block-edges"
 export {
+    ownerGraph,
+    type MonitorOwnGraphRequest,
+    type OwnerGraph,
+    type OwnerGraphEdge,
+} from "./owner-graph"
+export {
     type GraphChangeLog,
     type GraphChangeReason,
     type GraphChangeRow,

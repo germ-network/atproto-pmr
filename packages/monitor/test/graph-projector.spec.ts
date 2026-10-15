@@ -74,6 +74,9 @@ function world(opts: { budget?: number } = {}) {
             }),
         },
         edges: {
+            ownEdges: async () => {
+                throw new Error("unused")
+            },
             following: async (did) => {
                 w.edgeReads.push(`following ${did}`)
                 return following.get(did) ?? []

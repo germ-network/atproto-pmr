@@ -15,29 +15,42 @@ import {
  * otherwise: `following(did)` its edges to subjects in `graph_holders`,
  * `followers(did)` the edges into it from followers in `graph_holders`. The
  * filters are in the query, so no caller can serve an edge outside the
- * declaration set or for a graph not served.
+ * declaration set or for a graph not served. `ownEdges(did)` answers both
+ * lists and the served bit from one `db.batch`, so they agree.
  */
 export function d1FollowEdgeStore(db: D1Database): FollowEdgeStore {
     const served = "EXISTS (SELECT 1 FROM graph_owners WHERE did = ?1)"
+    const followingQuery =
+        "SELECT f.follower, f.rkey, f.subject FROM follows f " +
+        "JOIN graph_holders h ON h.did = f.subject " +
+        `WHERE f.follower = ?1 AND ${served} ORDER BY f.rkey`
+    const followersQuery =
+        "SELECT f.follower, f.rkey, f.subject FROM follows f " +
+        "JOIN graph_holders h ON h.did = f.follower " +
+        `WHERE f.subject = ?1 AND ${served} ORDER BY f.follower, f.rkey`
     return {
+        async ownEdges(did: string) {
+            const [probe, following, followers] = await db.batch([
+                db.prepare("SELECT 1 AS served FROM graph_owners WHERE did = ?1").bind(did),
+                db.prepare(followingQuery).bind(did),
+                db.prepare(followersQuery).bind(did),
+            ])
+            if (probe!.results.length === 0) return null
+            return {
+                following: following!.results as unknown as FollowEdge[],
+                followers: followers!.results as unknown as FollowEdge[],
+            }
+        },
         async following(did: string): Promise<FollowEdge[]> {
             const { results } = await db
-                .prepare(
-                    "SELECT f.follower, f.rkey, f.subject FROM follows f " +
-                        "JOIN graph_holders h ON h.did = f.subject " +
-                        `WHERE f.follower = ?1 AND ${served} ORDER BY f.rkey`
-                )
+                .prepare(followingQuery)
                 .bind(did)
                 .all<FollowEdge>()
             return results
         },
         async followers(did: string): Promise<FollowEdge[]> {
             const { results } = await db
-                .prepare(
-                    "SELECT f.follower, f.rkey, f.subject FROM follows f " +
-                        "JOIN graph_holders h ON h.did = f.follower " +
-                        `WHERE f.subject = ?1 AND ${served} ORDER BY f.follower, f.rkey`
-                )
+                .prepare(followersQuery)
                 .bind(did)
                 .all<FollowEdge>()
             return results

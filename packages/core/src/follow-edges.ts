@@ -28,4 +28,9 @@ export interface FollowEdgeStore {
     following(did: string): Promise<FollowEdge[]>
     /** Edges with `subject === did`, followers restricted to declaration holders. */
     followers(did: string): Promise<FollowEdge[]>
+    /**
+     * Both edge lists of a served graph's owner, restricted to declaration
+     * holders, from one consistent read; null when the graph is not served.
+     */
+    ownEdges(did: string): Promise<{ following: FollowEdge[]; followers: FollowEdge[] } | null>
 }

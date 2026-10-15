@@ -117,6 +117,9 @@ import {
     type InterestPolicy,
     type MonitorRegistrationNotify,
     type MonitorOwnBlocksRequest,
+    type MonitorOwnGraphRequest,
+    type OwnerGraph,
+    ownerGraph,
     type MonitorRecheckRequest,
     type PlcLog,
     type PlcLogEntry,
@@ -331,7 +334,8 @@ export class MonitorIngest
         RecountQueueIndex,
         MonitorRegistrationNotify,
         MonitorRecheckRequest,
-        MonitorOwnBlocksRequest
+        MonitorOwnBlocksRequest,
+        MonitorOwnGraphRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -1482,6 +1486,15 @@ export class MonitorIngest
      */
     async ownBlocks(did: string): Promise<BlockEdge[] | null> {
         return d1BlockEdgeStore(this.env.graph!).ownBlocks(did)
+    }
+
+    /**
+     * `MonitorOwnGraphRequest`: the owner's graph from the follow-edge index,
+     * read from D1 outside the alarm's statement budget. A D1 failure throws.
+     */
+    async ownGraph(did: string): Promise<OwnerGraph | null> {
+        const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
+        return edges === null ? null : ownerGraph(did, edges.following, edges.followers)
     }
 
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
