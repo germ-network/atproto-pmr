@@ -13,6 +13,28 @@ export class MonitorIngestStub extends DurableObject {
         await this.record("unregister", did)
     }
 
+    /** Set what `ownBlocks(did)` answers: blocks, null (not served), or "throw". */
+    async setOwnBlocks(did: string, answer: unknown): Promise<void> {
+        await this.ctx.storage.put(`ownBlocks:${did}`, answer)
+    }
+
+    async ownBlocks(did: string): Promise<unknown> {
+        const answer = await this.ctx.storage.get(`ownBlocks:${did}`)
+        if (answer === "throw") throw new Error("monitor down")
+        return answer === undefined ? null : answer
+    }
+
+    /** Set what `ownGraph(did)` answers: a graph, null (not served), or "throw". */
+    async setOwnGraph(did: string, answer: unknown): Promise<void> {
+        await this.ctx.storage.put(`ownGraph:${did}`, answer)
+    }
+
+    async ownGraph(did: string): Promise<unknown> {
+        const answer = await this.ctx.storage.get(`ownGraph:${did}`)
+        if (answer === "throw") throw new Error("monitor down")
+        return answer === undefined ? null : answer
+    }
+
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
         await this.ctx.storage.put("refreshes", [
             ...(await this.refreshes()),

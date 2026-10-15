@@ -6,7 +6,9 @@
  * `InterestPolicy`; the subscription itself is filtered by collection only.
  */
 
+import { BLOCK_COLLECTION_NSID } from "./block-edges"
 import { DECLARATION_COLLECTION_NSID } from "./declaration"
+import { FOLLOW_COLLECTION_NSID } from "./follow-edges"
 
 export interface WatchedRecord {
     collection: string
@@ -80,6 +82,11 @@ export function parseMonitorCollections(raw: string): WatchedRecord[] {
         if (collection === DECLARATION_COLLECTION_NSID) {
             throw new Error(
                 `MONITOR_COLLECTIONS entry "${entry}" is the declaration, which MONITOR_COLLECTION watches`
+            )
+        }
+        if (collection === FOLLOW_COLLECTION_NSID || collection === BLOCK_COLLECTION_NSID) {
+            throw new Error(
+                `MONITOR_COLLECTIONS entry "${entry}" is an edge collection, which the follow index ingests itself`
             )
         }
         if (seen.has(entry)) {

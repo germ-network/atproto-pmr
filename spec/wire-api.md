@@ -1107,7 +1107,7 @@ likewise: it parses and verifies the CAR it takes from the monitor, rather than 
 path through the commit's tree), and does not take the declaration from the
 sender's PDS.
 
-### Device reads — records, graph, and summary
+### Device reads — records and summary
 
 A relay bound to a monitor answers its devices' reads of atproto state from
 the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
@@ -1118,12 +1118,13 @@ with the short keys below. A decoder MUST ignore keys it does not know.
 | method | path | auth | answers |
 |---|---|---|---|
 | `GET` | `/pmr/v1/records/{did}/{collection}/{rkey}` | none | one record's proof CAR |
-| `GET` | `/pmr/v1/graph/{did}` | none | a served DID's follow graph |
-| `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's graph and its contacts' records, as a delta |
+| `GET` | `/pmr/v1/did/{did}` | none | a DID document and its PLC log, [below](#did-documents) |
+| `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's contacts' records and own blocks, as a delta |
 
 Nothing here is evidence. Records are CAR ([above](#records-are-car-wherever-they-are-relayed)):
-a device verifies each against the DID's signing key itself, and treats the
-graph as a hint it checks against the follower's signed follow record.
+a device verifies each against the DID's signing key itself. No route serves
+a follow graph: the summary chooses its contacts from the owner's graph on the
+relay, and a device reads only the results.
 
 #### Records
 
@@ -1164,34 +1165,29 @@ held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#r
 The residual leak is that re-check: the PDS learns someone is interested in
 that DID.
 
-#### Graph
-
-`200` with `d` the DID, `o` its `following` and `n` its `followers`, each an
-array of edges `{d: the other party, k: the follow record's rkey, u: mutual}`,
-sorted by `d` then `k`. `404` when the relay holds no projection for the DID,
-`400` for a malformed path. Edges are restricted to DIDs that carry a Germ
-declaration. The `404`/`200` split reveals which DIDs the relay serves a graph
-for; that set is not secret.
-
 #### Summary
 
-An owner reads the records of everyone in their graph with one request. A
+An owner reads the records of themselves and their contacts with one
+request. Contacts are the declaration holders among the accounts they follow
+and their followers, mutuals first. A
 response is a delta against a state the client names by **token**:
 
 | key | field |
 |---|---|
 | `t` | `token`: name this on the next read |
 | `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` is empty |
-| `g` | `graph`: the owner's graph, absent (null) if unchanged |
+| `b` | `ownBlocks`: the owner's own block list, each `{d: blocked DID, k: rkey of the block record}`, sent whole when it changed and absent (null) when unchanged; a client that reads no `b` keeps the list it holds |
 | `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
 | `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
 | `m` | `more`: changes remain; read again at once naming this token |
-| `n` | `truncated`: the graph has more contacts than a summary covers |
+| `n` | `truncated`: the owner has more contacts than a summary covers |
 
 A read with no `since`, or one naming an unknown or dropped token, gets the
 whole summary as `full`. A relay keeps the last four states it served an
 owner, so a second device or a lost response never leaves a client wrong.
-`409` with `Retry-After` while the owner has no projection yet.
+`409` with `Retry-After` while the owner's graph is not yet served, and
+`503` with `Retry-After` when the relay cannot read their graph or blocks; neither changes the states the relay holds, so a retry names
+the same token.
 
 One response carries at most a page of records. When `m` is true the client
 reads again naming the response's token and continues from what that response
@@ -1204,6 +1200,20 @@ lowest priority first (the owner, then mutual follows, following, followers),
 by a cap that scales inversely with the number of watched collections; a
 contact pushed past the cap arrives in `x` though its records still exist, and
 costs full CARs when it returns.
+
+A client that has never held a `b` list (a build from before it, or a token
+the relay stored for one) MUST read without `since` when it first reads `b`, and
+drop its held tokens: a relay that stored a state for it counts the list as
+delivered, so naming that token would report the list as unchanged.
+
+The block list is the owner's own: it appears only here, not on any public
+route (no device reads another DID's block list, and serving them would cost),
+and is diffed independently of the records, so a change to blocks alone
+issues a new token. Each entry names the block record's
+rkey in the owner's repo, so a device can verify it against the signed record
+before relying on it; a block is a hint until then. These are
+the owner's `app.bsky.graph.block` records, unrelated to the relay's
+[blocked senders](#blocked-senders).
 
 A summary includes a record only if the relay holds it, ingest verified it and
 it passes the same trusted-current-key check as a record read, with the same

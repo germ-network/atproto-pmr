@@ -64,10 +64,10 @@ export {
     kvRecordSnapshots,
     kvSummaryIndexReader,
 } from "./snapshot-store"
-export { kvGraphProjections } from "./graph-projection-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
 export { d1FollowEdgeStore } from "./follow-edge-store"
+export { d1BlockEdgeStore } from "./block-edge-store"
 export { d1GraphChangeLog } from "./graph-change-log"
 export { d1InterestReader } from "./interest-reader"
 export type { MonitorEnv } from "./env"

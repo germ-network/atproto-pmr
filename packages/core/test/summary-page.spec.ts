@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest"
 import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
-import type { GraphReadResponse } from "../src/read-api"
+import type { OwnerGraph } from "../src/owner-graph"
 import type { ReadSigningKey } from "../src/read-signing-key"
 import { SNAPSHOT_MAX_AGE_MS } from "../src/snapshot-read"
 import {
@@ -28,16 +28,16 @@ const OWNER = "did:plc:owner"
 const NOW = 10_000_000_000
 const COLL = "app.example.thing"
 
-const edge = (did: string, rkey = "r", mutual = false) => ({ did, rkey, mutual })
+const edge = (did: string, mutual = false) => ({ did, mutual })
 const graphOf = (
-    following: GraphReadResponse["following"],
-    followers: GraphReadResponse["followers"] = []
-): GraphReadResponse => ({ did: OWNER, following, followers })
+    following: OwnerGraph["following"],
+    followers: OwnerGraph["followers"] = []
+): OwnerGraph => ({ did: OWNER, following, followers })
 
 describe("summaryContacts", () => {
     it("orders the owner, then mutuals, following and followers, each by DID", () => {
         const graph = graphOf(
-            [edge("did:plc:f2"), edge("did:plc:m2", "r", true), edge("did:plc:f1"), edge("did:plc:m1", "r", true)],
+            [edge("did:plc:f2"), edge("did:plc:m2", true), edge("did:plc:f1"), edge("did:plc:m1", true)],
             [edge("did:plc:g2"), edge("did:plc:g1")]
         )
         expect(summaryContacts(OWNER, graph, 100)).toEqual({
@@ -48,8 +48,8 @@ describe("summaryContacts", () => {
 
     it("a DID in several groups appears once, in its highest group", () => {
         const graph = graphOf(
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge("did:plc:b", "r2")],
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge(OWNER)]
+            [edge("did:plc:a"), edge("did:plc:b", true), edge("did:plc:b")],
+            [edge("did:plc:a"), edge("did:plc:b", true), edge(OWNER)]
         )
         expect(summaryContacts(OWNER, graph, 100).dids).toEqual([OWNER, "did:plc:b", "did:plc:a"])
     })
@@ -67,7 +67,7 @@ describe("summaryContacts", () => {
 
 function indexWorld(
     options: {
-        graph?: GraphReadResponse | null
+        graph?: OwnerGraph | null
         watched?: SummaryPageDeps["watched"]
         held?: (SummaryHeldEntry | null)[] | ((did: string, collection: string, rkey: string) => SummaryHeldEntry | null)
         keys?: (did: string) => ReadSigningKey | undefined
@@ -79,7 +79,8 @@ function indexWorld(
     const recordReads: string[] = []
     const watched = options.watched ?? [{ collection: COLL, rkey: "self" }]
     const deps: SummaryPageDeps = {
-        projections: { get: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        graph: { ownGraph: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        blocks: { ownBlocks: async () => [] },
         index: {
             entries: async (refs) => {
                 asked.push([...refs])
@@ -124,7 +125,7 @@ const held = (did: string, collection = COLL, rkey = "self", over: Partial<Summa
 })
 
 describe("buildSummaryIndex", () => {
-    it("is null when the owner has no projection", async () => {
+    it("is null when the owner's graph is not served", async () => {
         const w = indexWorld({ graph: null })
         expect(await buildSummaryIndex(OWNER, w.deps)).toBeNull()
         expect(w.asked).toEqual([])
@@ -225,8 +226,9 @@ const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey")
     cid,
     verifiedWith,
 })
-const indexOf = (records: ReturnType<typeof entryOf>[], graph = graphOf([]), more?: boolean): SummaryIndex => ({
-    graph,
+const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): SummaryIndex => ({
+    owner: OWNER,
+    ownBlocks: [],
     records,
     ...(more ? { more } : {}),
 })
@@ -278,7 +280,7 @@ describe("readSummaryPage", () => {
         const current = indexOf([entryOf("did:plc:a", "c1")])
         const w = pageWorld(current.records)
         const { page, delivered } = await readSummaryPage(null, current, w.deps, 10)
-        expect(page).toMatchObject({ full: true, removed: [], more: false, graph: current.graph })
+        expect(page).toMatchObject({ full: true, removed: [], more: false })
         expect(page.records.map((r) => r.did)).toEqual(["did:plc:a"])
         expect(delivered.records).toEqual(current.records)
     })
@@ -295,14 +297,13 @@ describe("readSummaryPage", () => {
     })
 
     it("pages changed records in (did, collection, rkey) order, the owner's first", async () => {
-        const graph = graphOf([])
         const records = [
             entryOf("did:plc:b", "c1", "z"),
             entryOf("did:plc:b", "c2", "a"),
             entryOf("did:plc:a", "c3"),
             entryOf(OWNER, "c4"),
         ]
-        const current = indexOf(records, graph)
+        const current = indexOf(records)
         const { page } = await readSummaryPage(null, current, pageWorld(records).deps, 10)
         expect(page.records.map((r) => `${r.did}/${r.rkey}`)).toEqual([
             `${OWNER}/self`,
@@ -322,17 +323,17 @@ describe("readSummaryPage", () => {
         expect(done.delivered.more).toBeUndefined()
     })
 
-    it("delivered is base minus removals plus the delivered records, with the current graph", async () => {
-        const oldGraph = graphOf([edge("did:plc:old")])
-        const newGraph = graphOf([edge("did:plc:new")])
-        const base = indexOf(
-            [entryOf("did:plc:keep", "k1"), entryOf("did:plc:change", "v1"), entryOf("did:plc:gone", "g1")],
-            oldGraph
-        )
-        const current = indexOf(
-            [entryOf("did:plc:added", "n1"), entryOf("did:plc:change", "v2"), entryOf("did:plc:keep", "k1")],
-            newGraph
-        )
+    it("delivered is base minus removals plus the delivered records", async () => {
+        const base = indexOf([
+            entryOf("did:plc:keep", "k1"),
+            entryOf("did:plc:change", "v1"),
+            entryOf("did:plc:gone", "g1"),
+        ])
+        const current = indexOf([
+            entryOf("did:plc:added", "n1"),
+            entryOf("did:plc:change", "v2"),
+            entryOf("did:plc:keep", "k1"),
+        ])
         const { delivered, page } = await readSummaryPage(base, current, pageWorld(current.records).deps, 10)
         expect(delivered).toEqual(current)
         expect(page.removed).toEqual([refOf("did:plc:gone")])
@@ -395,22 +396,9 @@ describe("readSummaryPage", () => {
         expect(delivered.records).toEqual([])
     })
 
-    it("the graph is carried on the first page it changed on, and null after", async () => {
-        const base = indexOf([], graphOf([]))
-        const current = indexOf([entryOf("did:plc:a", "c1"), entryOf("did:plc:b", "c2")], graphOf([edge("did:plc:a")]))
-        const w = pageWorld(current.records)
-        const first = await readSummaryPage(base, current, w.deps, 1)
-        expect(first.page.graph).toEqual(current.graph)
-        const second = await readSummaryPage(first.delivered, current, w.deps, 1)
-        expect(second.page.graph).toBeNull()
-        const unchanged = await readSummaryPage(current, current, w.deps, 1)
-        expect(unchanged.page).toMatchObject({ graph: null, records: [], removed: [], more: false })
-    })
-
     it("paging from each delivered index converges to current with more unset", async () => {
         const current = indexOf(
-            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`)),
-            graphOf([edge("did:plc:d1")])
+            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`))
         )
         const w = pageWorld(current.records)
         let held: SummaryIndex | null = null
@@ -433,7 +421,7 @@ describe("summary delta codec", () => {
     const delta: SummaryDelta = {
         token: "tok",
         full: false,
-        graph: null,
+        ownBlocks: null,
         records: [],
         removed: [],
         more: true,
@@ -451,7 +439,6 @@ describe("summary delta codec", () => {
             new Map<string, CoseValue>([
                 [SUMMARY_DELTA_KEYS.token, "t"],
                 [SUMMARY_DELTA_KEYS.full, false],
-                [SUMMARY_DELTA_KEYS.graph, null],
                 [SUMMARY_DELTA_KEYS.records, []],
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])

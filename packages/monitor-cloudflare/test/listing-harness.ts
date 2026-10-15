@@ -14,7 +14,7 @@ import {
     type ListingOutcome,
     type StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
-import type { VerifiedCollection } from "@germ-network/atproto-pmr-core"
+import type { VerifiedCollections } from "@germ-network/atproto-pmr-core"
 import type { MonitorEnv } from "../src/env"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -48,6 +48,15 @@ export const rowsOf = <T>(obj: MonitorIngest, query: string, ...binds: unknown[]
 export async function all<T>(query: string, ...binds: unknown[]): Promise<T[]> {
     return (await db.prepare(query).bind(...binds).all<T>()).results
 }
+export const blocks = () =>
+    all<{ blocker: string; rkey: string; subject: string; gen: number }>(
+        "SELECT blocker, rkey, subject, gen FROM blocks ORDER BY blocker, rkey"
+    )
+export const blocksOf = (blocker: string) =>
+    all<{ rkey: string; subject: string; gen: number }>(
+        "SELECT rkey, subject, gen FROM blocks WHERE blocker = ? ORDER BY rkey",
+        blocker
+    )
 export const follows = () =>
     all<{ follower: string; rkey: string; subject: string; gen: number }>(
         "SELECT follower, rkey, subject, gen FROM follows ORDER BY follower, rkey"
@@ -64,7 +73,7 @@ export const putEdge = (follower: string, rkey: string, subject: string, gen = 1
         .run()
 export const clearGraph = () =>
     db.batch(
-        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "blocks", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
@@ -147,9 +156,9 @@ export const recountQueue = (obj: MonitorIngest) =>
     rowsOf<{ did: string }>(obj, "SELECT did FROM recount_queue ORDER BY did").map((r) => r.did)
 
 export const create = (obj: MonitorIngest, follower: string, rkey: string, subject: string) =>
-    obj.logEdgeOp({ kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
 export const del = (obj: MonitorIngest, follower: string, rkey: string) =>
-    obj.logEdgeOp({ kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
 
 export const rkeyOf = (i: number) => `r${String(i).padStart(6, "0")}`
 export const entriesOf = (count: number, subjectOf = (i: number) => `did:plc:s${i}`) =>
@@ -159,19 +168,22 @@ export const entriesOf = (count: number, subjectOf = (i: number) => `did:plc:s${
 export interface Net {
     repoFetches: string[]
     resolves: string[]
-    pages: { did: string; cursor: string | null }[]
+    pages: { did: string; cursor: string | null; collection: "follow" | "block" }[]
 }
 
 /**
  * Stand in for the object's network seams. `repos` answers getRepo (the
- * verifier returns its records, or throws what the entry holds), `lists`
- * answers `listRecords` pages `pageSize` at a time in rkey order.
+ * verifier returns its follow records, or throws what the entry holds),
+ * `lists` answers `listRecords` follow pages `pageSize` at a time in rkey
+ * order; `blockRepos` and `blockLists` are the same for blocks.
  */
 export function stubNet(
     obj: MonitorIngest,
     options: {
         repos?: Record<string, FollowRecord[] | Error | (() => Promise<FollowRecord[]>)>
         lists?: Record<string, FollowRecord[] | Error>
+        blockRepos?: Record<string, FollowRecord[]>
+        blockLists?: Record<string, FollowRecord[] | Error>
         pageSize?: number
         pageDelayMs?: number
     }
@@ -192,19 +204,31 @@ export function stubNet(
     }
     o.verifyRepo = async (
         car: AsyncIterable<Uint8Array>,
-        expected: { did: string; maxRecords?: number }
-    ): Promise<VerifiedCollection> => {
+        expected: { did: string; maxRecords?: Record<string, number> }
+    ): Promise<VerifiedCollections> => {
         const answer = options.repos?.[expected.did] ?? []
         const found = answer instanceof Error ? answer : typeof answer === "function" ? await answer() : answer
         if (found instanceof Error) throw found
-        if (expected.maxRecords !== undefined && found.length > expected.maxRecords) {
-            const { RepoCollectionError } = await import("@germ-network/atproto-pmr-core")
-            throw new RepoCollectionError("record-cap-exceeded", "too many records")
+        const blocks = options.blockRepos?.[expected.did] ?? []
+        const { RepoCollectionError } = await import("@germ-network/atproto-pmr-core")
+        for (const [collection, list] of [
+            ["app.bsky.graph.follow", found],
+            ["app.bsky.graph.block", blocks],
+        ] as const) {
+            const cap = expected.maxRecords?.[collection]
+            if (cap !== undefined && list.length > cap) {
+                throw new RepoCollectionError("record-cap-exceeded", "too many records")
+            }
         }
         pending.delete(car)
+        const records = (list: FollowRecord[]) =>
+            list.map((f) => ({ rkey: f.rkey, cid: "bafy", record: { subject: f.subject } }))
         return {
             rev: "r",
-            records: found.map((f) => ({ rkey: f.rkey, cid: "bafy", record: { subject: f.subject } })),
+            records: new Map([
+                ["app.bsky.graph.follow", records(found)],
+                ["app.bsky.graph.block", records(blocks)],
+            ]),
         }
     }
     o.resolvePds = async (did: string) => {
@@ -215,10 +239,15 @@ export function stubNet(
             didDocument: { document: { id: did }, fetchedAtMs: Date.now() },
         }
     }
-    o.listFollows = async (_pds: string, did: string, cursor: string | null): Promise<FollowPage> => {
-        net.pages.push({ did, cursor })
+    o.listRecords = async (
+        _pds: string,
+        did: string,
+        collection: "follow" | "block",
+        cursor: string | null
+    ): Promise<FollowPage> => {
+        net.pages.push({ did, cursor, collection })
         if (options.pageDelayMs) await new Promise((r) => setTimeout(r, options.pageDelayMs))
-        const answer = options.lists?.[did] ?? []
+        const answer = (collection === "follow" ? options.lists : options.blockLists)?.[did] ?? []
         if (answer instanceof Error) throw answer
         const sorted = [...answer].sort((a, b) => (a.rkey < b.rkey ? -1 : 1))
         const rest = cursor === null ? sorted : sorted.filter((r) => r.rkey > cursor)

@@ -32,5 +32,7 @@
 export { PMRObject } from "./pmr-object"
 export { KVDirectory, pmrStore, kvBodyStore } from "./directory"
 export { monitorRecheck } from "./monitor-recheck"
+export { monitorOwnBlocks } from "./monitor-own-blocks"
+export { monitorOwnGraph } from "./monitor-own-graph"
 export { kvChallengeStore } from "./challenge-store"
 export type { PMREnv } from "./env"

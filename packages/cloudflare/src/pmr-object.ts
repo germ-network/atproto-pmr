@@ -62,9 +62,9 @@ const summaryKey = (token: string) => SUMMARY_PREFIX + token
 const KEY_SUMMARY_ORDER = "summaryOrder"
 
 /**
- * An index is stored as a header under `summaryKey` and its edges and
- * entries in parts under `summaryPartKey`, each part far below the 2 MB value
- * limit however large the owner's graph. A distinct prefix keeps a
+ * An index is stored as a header under `summaryKey` and the owner's
+ * blocks and the record entries in parts under `summaryPartKey`, each part far below the 2 MB value
+ * limit however many blocks or contacts the owner has. A distinct prefix keeps a
  * client-named token from addressing a part.
  */
 const SUMMARY_PART_PREFIX = "summaryPart:"
@@ -75,13 +75,13 @@ const SUMMARY_PART_CHARS = 1_000_000
 const STORAGE_BATCH = 128
 
 interface SummaryHeader {
-    graphDid: string
+    owner: string
     more?: boolean
     parts: number
 }
 
 interface SummaryPart {
-    field: "following" | "followers" | "records"
+    field: "ownBlocks" | "records"
     items: unknown[]
 }
 interface SummaryOrder {
@@ -441,7 +441,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 [
                     summaryKey(token),
                     {
-                        graphDid: index.graph.did,
+                        owner: index.owner,
                         ...(index.more ? { more: true } : {}),
                         parts: parts.length,
                     } satisfies SummaryHeader,
@@ -468,9 +468,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // A client names the token, so one too long to be a key is simply not held.
         if (new TextEncoder().encode(summaryKey(token)).length > MAX_KEY_BYTES) return null
         const header = await this.db.get<SummaryHeader>(summaryKey(token))
-        if (!header || typeof header.parts !== "number") return null
+        if (!header || typeof header.parts !== "number" || typeof header.owner !== "string") return null
         const index: SummaryIndex = {
-            graph: { did: header.graphDid, following: [], followers: [] },
+            owner: header.owner,
+            ownBlocks: [],
             records: [],
             ...(header.more ? { more: true } : {}),
         }
@@ -481,7 +482,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 const part = read.get(key)
                 if (!part) return null
                 if (part.field === "records") index.records.push(...(part.items as SummaryIndex["records"]))
-                else index.graph[part.field].push(...(part.items as SummaryIndex["graph"]["following"]))
+                else if (part.field === "ownBlocks") {
+                    index.ownBlocks.push(...(part.items as SummaryIndex["ownBlocks"]))
+                }
             }
         }
         return index
@@ -1053,8 +1056,7 @@ function summaryPartKeys(token: string, from: number, to: number): string[] {
 function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
     const parts: SummaryPart[] = []
     for (const [field, items] of [
-        ["following", index.graph.following],
-        ["followers", index.graph.followers],
+        ["ownBlocks", index.ownBlocks],
         ["records", index.records],
     ] as const) {
         let current: unknown[] = []

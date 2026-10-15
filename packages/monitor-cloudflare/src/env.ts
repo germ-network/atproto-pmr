@@ -70,8 +70,8 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /**
      * The follow-edge index (D1, schema in `migrations/`): written only by
-     * this object, read by the graph routes through `d1FollowEdgeStore`,
-     * `d1GraphChangeLog` and `d1InterestReader`. Required: the object fails
+     * this object, read through `d1FollowEdgeStore` and
+     * `d1InterestReader`. Required: the object fails
      * at startup without it, as it does for `pmrDirectory` under `registered`.
      */
     graph?: D1Database
@@ -80,8 +80,6 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     GRAPH_STATEMENT_BUDGET?: string
     /** DIDs mirrored to D1 per alarm, default 50. */
     GRAPH_MIRROR_BATCH?: string
-    /** DIDs the graph projector writes per alarm, default 200 (each a KV write). */
-    GRAPH_PROJECTOR_BATCH?: string
     /**
      * did:plc logs fetched from the directory per alarm, default 20, one after
      * another at up to five seconds each: keep the product well inside the
@@ -116,6 +114,13 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * also where a mutual listing stops.
      */
     MAX_FOLLOWS?: string
+
+    /**
+     * Block records the verifying getRepo walk holds before it refuses and the
+     * owner is listed by `listRecords` pages instead, default 20_000; also
+     * where a mutual listing stops reading blocks.
+     */
+    MAX_BLOCKS?: string
 
     /**
      * CAR bytes past which an owner is listed by `listRecords` pages across

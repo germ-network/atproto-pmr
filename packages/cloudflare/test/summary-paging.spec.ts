@@ -20,7 +20,8 @@ function freshStub(): DurableObjectStub<PMRObject> {
 }
 
 const small = (n: number, more = false): SummaryIndex => ({
-    graph: { did: "did:plc:me", following: [], followers: [] },
+    owner: "did:plc:me",
+    ownBlocks: [],
     records: [
         {
             did: "did:plc:a",
@@ -34,14 +35,11 @@ const small = (n: number, more = false): SummaryIndex => ({
 })
 
 /** About 1.7 KB of entries per hundred: well past one storage value at this size. */
-function large(records: number, edges: number): SummaryIndex {
+function large(records: number, blocks: number): SummaryIndex {
     const did = (prefix: string, i: number) => `did:plc:${prefix}${String(i).padStart(8, "0")}${"x".repeat(1000)}`
     return {
-        graph: {
-            did: "did:plc:me",
-            following: Array.from({ length: edges }, (_, i) => ({ did: did("f", i), rkey: `r${i}`, mutual: i % 2 === 0 })),
-            followers: Array.from({ length: edges }, (_, i) => ({ did: did("g", i), rkey: `r${i}`, mutual: false })),
-        },
+        owner: "did:plc:me",
+        ownBlocks: Array.from({ length: blocks }, (_, i) => ({ did: did("b", i), rkey: `r${i}` })),
         records: Array.from({ length: records }, (_, i) => ({
             did: did("c", i),
             collection: "app.example.thing",

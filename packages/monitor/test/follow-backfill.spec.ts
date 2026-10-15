@@ -18,12 +18,14 @@ import {
     type FollowBackfillDeps,
     type FollowPage,
     type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingOutcome,
     type QueuedListing,
 } from "../src/follow-backfill"
 import type { FollowEdge } from "@germ-network/atproto-pmr-core"
+import { BLOCK_COLLECTION_NSID, FOLLOW_COLLECTION_NSID } from "../src/follow-stream"
 import { FETCH_AS_OF_SKEW_MS } from "../src/storage"
 import type { EdgeWriteResult, StatementBudget } from "../src/storage"
 
@@ -35,6 +37,7 @@ const config: FollowBackfillConfig = {
     listRecordsInProgress: 100,
     statementReserve: 400,
     maxFollows: 20_000,
+    maxBlocks: 20_000,
     maxRepoBytes: 1_000_000,
     maxMstNodes: 1_000,
     pagesPerAlarm: 200,
@@ -51,7 +54,7 @@ interface Row extends QueuedListing {
 /** A ListingIndex that guards on gen as the real one does, handing out copies. */
 function fakeListings(clock: { now: number }) {
     const rows = new Map<string, Row>()
-    const staging = new Map<string, FollowRecord[]>()
+    const staging = new Map<string, StagedRow[]>()
     let gen = 0
     const calls = {
         begin: [] as {
@@ -67,7 +70,7 @@ function fakeListings(clock: { now: number }) {
             notBeforeMs: number
             cause: { timedOut: boolean; permanent: boolean }
         }[],
-        stage: [] as { did: string; rows: FollowRecord[]; cursor: string | null; done: boolean }[],
+        stage: [] as { did: string; rows: StagedRow[]; cursor: string | null; done: boolean }[],
         switched: [] as string[],
         dropped: [] as string[],
         completed: [] as { did: string; subjects: readonly string[] }[],
@@ -120,7 +123,16 @@ function fakeListings(clock: { now: number }) {
             r.attempts += 1
             r.notBeforeMs = notBeforeMs
             staging.set(did, [])
-            r.inProgress = { kind, gen, phase: "fetch", cursor: null, pds, beganAtMs: nowMs, pages: 0 }
+            r.inProgress = {
+                kind,
+                gen,
+                phase: "fetch",
+                collection: "follow",
+                cursor: null,
+                pds,
+                beganAtMs: nowMs,
+                pages: 0,
+            }
             return { gen, beganAtMs: nowMs }
         },
         async resumeListing(did, g, notBeforeMs) {
@@ -131,30 +143,47 @@ function fakeListings(clock: { now: number }) {
             r.notBeforeMs = notBeforeMs
             return true
         },
-        async stageRows(did, g, newRows, cursor, done) {
+        async stageRows(did, g, newRows, fetch, done) {
             const r = live(did, g)
             if (r === null) return false
-            calls.stage.push({ did, rows: [...newRows], cursor, done })
+            calls.stage.push({ did, rows: [...newRows], cursor: fetch.cursor, done })
             staging.get(did)!.push(...newRows)
             r.attempts = 0
             r.timeouts = 0
             r.notBeforeMs = 0
-            if (r.inProgress!.kind !== "owner-repo") r.inProgress!.pages += 1
-            r.inProgress!.cursor = cursor
+            if (r.inProgress!.kind !== "owner-repo") {
+                r.inProgress!.pages = r.inProgress!.collection === fetch.collection ? r.inProgress!.pages + 1 : 0
+            }
+            r.inProgress!.collection = fetch.collection
+            r.inProgress!.cursor = fetch.cursor
             if (done) r.inProgress!.phase = "drain"
             if (done) r.inProgress!.cursor = null
             return true
         },
         async stagedRows(did, after, limit) {
             return (staging.get(did) ?? [])
-                .filter((s) => after === null || s.rkey > after)
-                .sort((a, b) => (a.rkey < b.rkey ? -1 : 1))
+                .filter(
+                    (s) =>
+                        after === null ||
+                        s.collection > after.collection ||
+                        (s.collection === after.collection && s.rkey > after.rkey)
+                )
+                .sort((a, b) =>
+                    a.collection !== b.collection
+                        ? a.collection < b.collection
+                            ? -1
+                            : 1
+                        : a.rkey < b.rkey
+                          ? -1
+                          : 1
+                )
                 .slice(0, limit)
         },
         async saveDrainProgress(did, g, cursor, subjects) {
             const r = live(did, g)
             if (r === null) return false
-            r.inProgress!.cursor = cursor
+            r.inProgress!.collection = cursor.collection
+            r.inProgress!.cursor = cursor.rkey
             r.attempts = 0
             r.notBeforeMs = 0
             calls.recount.push(...subjects)
@@ -238,6 +267,7 @@ function fakeListings(clock: { now: number }) {
             staging.set(
                 did,
                 Array.from({ length: n }, (_, i) => ({
+                    collection: "follow" as const,
                     rkey: `${prefix}${String(i).padStart(6, "0")}`,
                     subject: `did:plc:s${i}`,
                 }))
@@ -284,16 +314,57 @@ interface Harness {
     clock: { now: number }
     puts: { follower: string; rkeys: string[]; gen: number }[]
     sweeps: { follower: string; gen: number }[]
+    blockPuts: { blocker: string; rkeys: string[]; gen: number }[]
+    blockSweeps: { blocker: string; gen: number }[]
     owners: Set<string>
     registered: Set<string>
     left: Set<string>
     verifyKeys: string[]
     resolved: string[]
     inflight: { max: number }
-    overrides: Partial<FollowBackfillDeps>
+    overrides: Overrides
 }
 
-function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000): Harness {
+/**
+ * Follow-only stand-ins for `verifyRepo` and `listRecords`: a `listFollows`
+ * page source and a `verifyRepo` answering one collection. Tests that carry
+ * blocks pass `verifyRepos` and `listRecords` instead.
+ */
+type Overrides = Omit<Partial<FollowBackfillDeps>, "verifyRepo" | "listRecords"> & {
+    listFollows?: (pds: string, did: string, cursor: string | null) => Promise<FollowPage>
+    verifyRepo?: (
+        car: AsyncIterable<Uint8Array>,
+        expected: { signingKey: string; maxRecords?: number }
+    ) => Promise<VerifiedCollection>
+    /** Replace the seams outright, for tests that carry blocks. */
+    verifyRepos?: FollowBackfillDeps["verifyRepo"]
+    listRecords?: FollowBackfillDeps["listRecords"]
+}
+
+/** The follow-only seams as the deps' own. */
+function seams(o: Overrides): Pick<FollowBackfillDeps, "verifyRepo" | "listRecords"> {
+    return {
+        async verifyRepo(car, expected) {
+            const v = await (o.verifyRepo ?? (async () => verified(["did:plc:a", "did:plc:b"])))(car, {
+                signingKey: expected.signingKey,
+                maxRecords: expected.maxRecords?.[FOLLOW_COLLECTION_NSID],
+            })
+            return {
+                rev: v.rev,
+                records: new Map([
+                    [FOLLOW_COLLECTION_NSID, v.records],
+                    [BLOCK_COLLECTION_NSID, []],
+                ]),
+            }
+        },
+        async listRecords(pds, did, collection, cursor) {
+            if (collection === "block") return { records: [], lastRkey: null }
+            return (o.listFollows ?? (async () => ({ records: [], lastRkey: null })))(pds, did, cursor)
+        },
+    }
+}
+
+function harness(overrides: Overrides = {}, budgetTotal = 1000): Harness {
     const clock = { now: NOW }
     const listings = fakeListings(clock)
     const budget = budgetOf(budgetTotal)
@@ -306,6 +377,9 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
     const resolved: string[] = []
     const inflight = { max: 0 }
     let active = 0
+    const blockPuts: Harness["blockPuts"] = []
+    const blockSweeps: Harness["blockSweeps"] = []
+    const { listFollows: _listFollows, verifyRepo: _verifyRepo, verifyRepos, listRecords, ...rest } = overrides
     const result = (subjects: string[]): EdgeWriteResult => ({ subjects })
     const deps: FollowBackfillDeps = {
         listings: listings.index,
@@ -336,9 +410,8 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
             active -= 1
             return fetched()
         },
-        async verifyRepo(_car, expected) {
-            verifyKeys.push(expected.signingKey)
-            return verified(["did:plc:a", "did:plc:b"])
+        verifyRepo: async () => {
+            throw new Error("replaced below")
         },
         async resolvePds(did) {
             resolved.push(did)
@@ -347,12 +420,32 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
                 didDocument: { document: { id: did }, fetchedAtMs: 0 },
             }
         },
-        async listFollows(): Promise<FollowPage> {
-            return { records: [], lastRkey: null }
+        listRecords: async () => {
+            throw new Error("replaced below")
+        },
+        blocks: {
+            async putBlocks(blocks, gen) {
+                if (!budget.take(Math.ceil(blocks.length / 25))) throw new Error("D1 statement budget exceeded")
+                blockPuts.push({ blocker: blocks[0]!.blocker, rkeys: blocks.map((b) => b.rkey), gen })
+            },
+            async deleteBlocks() {},
+            async sweepBlocks(blocker, gen) {
+                if (!budget.take(1)) throw new Error("D1 statement budget exceeded")
+                blockSweeps.push({ blocker, gen })
+            },
         },
         nowMs: () => clock.now,
-        ...overrides,
+        ...rest,
     }
+    const own = seams({
+        ...overrides,
+        verifyRepo: async (car, expected) => {
+            verifyKeys.push(expected.signingKey)
+            return (overrides.verifyRepo ?? (async () => verified(["did:plc:a", "did:plc:b"])))(car, expected)
+        },
+    })
+    deps.verifyRepo = verifyRepos ?? own.verifyRepo
+    deps.listRecords = listRecords ?? own.listRecords
     return {
         deps,
         listings,
@@ -360,6 +453,8 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
         clock,
         puts,
         sweeps,
+        blockPuts,
+        blockSweeps,
         owners,
         registered,
         left,
@@ -392,16 +487,16 @@ const pagesOf = (count: number) => {
 
 describe("follow listings", () => {
     it("one drain chunk's worst case plus the sweep fits the default reserve", () => {
-        expect(worstCaseDrainStatements(1, true)).toBe(8)
-        expect(worstCaseDrainStatements(25, false)).toBe(5)
-        expect(worstCaseDrainStatements(26, false)).toBe(9)
-        expect(worstCaseDrainStatements(0, true)).toBe(3)
-        expect(worstCaseDrainStatements(2_475, true)).toBe(400)
-        expect(worstCaseDrainStatements(2_476, true)).toBeGreaterThan(400)
+        expect(worstCaseDrainStatements(1, true)).toBe(10)
+        expect(worstCaseDrainStatements(25, false)).toBe(6)
+        expect(worstCaseDrainStatements(26, false)).toBe(10)
+        expect(worstCaseDrainStatements(0, true)).toBe(4)
+        expect(worstCaseDrainStatements(2_450, true)).toBe(398)
+        expect(worstCaseDrainStatements(2_451, true)).toBeGreaterThan(400)
     })
 
     it("drainChunkEdges is the largest chunk whose worst case fits", () => {
-        expect(drainChunkEdges(400)).toBe(2_475)
+        expect(drainChunkEdges(400)).toBe(2_450)
         for (let statements = 0; statements <= 450; statements++) {
             const edges = drainChunkEdges(statements)
             if (edges > 0) {
@@ -443,6 +538,7 @@ describe("follow listings", () => {
             kind: "owner-repo" as const,
             gen: 1,
             phase: "fetch" as const,
+            collection: "follow" as const,
             cursor: null,
             pds: null,
             beganAtMs: 1,
@@ -479,6 +575,7 @@ describe("follow listings", () => {
                     kind: "mutual",
                     gen: i + 1,
                     phase: "drain",
+                    collection: "follow",
                     cursor: null,
                     pds: "p",
                     beganAtMs: i,
@@ -488,14 +585,14 @@ describe("follow listings", () => {
             h.listings.stage(did, 100)
         }
         await run(h)
-        const first = h.puts.slice(0, 50)
-        expect(new Set(first.map((p) => p.follower)).size).toBe(50)
-        expect(first.every((p) => p.rkeys.length === 25)).toBe(true)
+        const first = h.puts.slice(0, 40)
+        expect(new Set(first.map((p) => p.follower)).size).toBe(40)
+        expect(first.every((p) => p.rkeys.length === 50)).toBe(true)
         expect(h.budget.spent()).toBeLessThanOrEqual(400)
     })
 
     it("a repo-level terminal answer, an unverifiable repo and an unresolvable PDS count as permanent failures", async () => {
-        const causes = async (override: Partial<FollowBackfillDeps>, owner = true) => {
+        const causes = async (override: Overrides, owner = true) => {
             const h = harness(override)
             if (owner) h.owners.add("did:plc:x")
             h.listings.queue("did:plc:x")
@@ -604,6 +701,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 1,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -642,6 +740,7 @@ describe("follow listings", () => {
                 kind: "owner-repo",
                 gen: 7,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: null,
                 beganAtMs: 1,
@@ -776,7 +875,8 @@ describe("follow listings", () => {
         expect(h.listings.calls.stage.map((s) => [s.cursor, s.done])).toEqual([
             ["a", false],
             ["b", false],
-            ["b", true],
+            [null, false],
+            [null, true],
         ])
     })
 
@@ -797,7 +897,7 @@ describe("follow listings", () => {
         expect(n).toBe(2)
         await run(h, { maxFollows: 300, pagesPerAlarm: 3 })
         expect(n).toBe(3)
-        expect(h.listings.calls.stage.map((s) => s.done)).toEqual([false, false, true])
+        expect(h.listings.calls.stage.map((s) => s.done)).toEqual([false, false, false, true])
         expect(h.puts.flatMap((p) => p.rkeys)).toEqual(["k001"])
         expect(h.listings.calls.completed).toHaveLength(1)
     })
@@ -816,7 +916,7 @@ describe("follow listings", () => {
             h.listings.queue("did:plc:m", { paged: owner })
             expect(await run(h)).toEqual(["listed"])
             expect(seen).toEqual([null, "a"])
-            expect(h.listings.calls.stage.map((s) => s.done)).toEqual([false, true])
+            expect(h.listings.calls.stage.map((s) => s.done)).toEqual([false, false, true])
         }
     })
 
@@ -851,6 +951,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 5,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -873,6 +974,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 5,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -926,6 +1028,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 5,
                 phase: "fetch",
+                collection: "follow",
                 cursor: "a",
                 pds: "p",
                 beganAtMs: 1,
@@ -953,7 +1056,9 @@ describe("follow listings", () => {
         h.registered.add("did:plc:yes")
         h.listings.queue("did:plc:m")
         await run(h)
-        expect(h.listings.calls.stage[0]!.rows).toEqual([{ rkey: "a", subject: "did:plc:yes" }])
+        expect(h.listings.calls.stage[0]!.rows).toEqual([
+            { collection: "follow", rkey: "a", subject: "did:plc:yes" },
+        ])
     })
 
     it("a failed step bumps attempts and a committed step resets them", async () => {
@@ -991,7 +1096,10 @@ describe("follow listings", () => {
         stale.listings.queue("did:plc:x")
         stale.deps.verifyRepo = async () => {
             await stale.listings.index.beginListing("did:plc:x", "owner-repo", NOW, null, 0)
-            return verified(["did:plc:a"])
+            return {
+                rev: "r",
+                records: new Map([[FOLLOW_COLLECTION_NSID, verified(["did:plc:a"]).records]]),
+            }
         }
         expect(await run(stale)).toEqual(["superseded"])
         expect(stale.puts).toEqual([])
@@ -1003,6 +1111,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 100,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -1039,6 +1148,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 1,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -1057,6 +1167,7 @@ describe("follow listings", () => {
                 kind: "mutual",
                 gen: 1,
                 phase: "drain",
+                collection: "follow",
                 cursor: null,
                 pds: "p",
                 beganAtMs: 1,
@@ -1197,5 +1308,195 @@ describe("a listing's fetched document", () => {
         h.listings.queue("did:plc:m")
         expect(await run(h)).toEqual(["listed", "listed"])
         expect(s.writes).toEqual([])
+    })
+})
+
+describe("listings — blocks", () => {
+    const recordsOf = (rows: { rkey: string; subject: string }[]) =>
+        rows.map((r) => ({ rkey: r.rkey, cid: "bafy", record: { subject: r.subject } }))
+
+    /** A repo with these follows and blocks, recording the expectation it was verified under. */
+    function repoOf(follows: { rkey: string; subject: string }[], blocks: { rkey: string; subject: string }[]) {
+        const seen: RepoCollectionsExpectationLike[] = []
+        const verifyRepos: FollowBackfillDeps["verifyRepo"] = async (_car, expected) => {
+            seen.push(expected)
+            return {
+                rev: "r",
+                records: new Map([
+                    [FOLLOW_COLLECTION_NSID, recordsOf(follows)],
+                    [BLOCK_COLLECTION_NSID, recordsOf(blocks)],
+                ]),
+            }
+        }
+        return { seen, verifyRepos }
+    }
+    type RepoCollectionsExpectationLike = Parameters<FollowBackfillDeps["verifyRepo"]>[1]
+
+    /** `listRecords` answering one page per collection, then the end. */
+    function pagesFor(byCollection: Record<string, { rkey: string; subject: string }[]>) {
+        const asked: [string, string | null][] = []
+        const listRecords: FollowBackfillDeps["listRecords"] = async (_pds, _did, collection, cursor) => {
+            asked.push([collection, cursor])
+            const rows = (byCollection[collection] ?? []).filter((r) => cursor === null || r.rkey > cursor)
+            return { records: rows, lastRkey: rows.length === 0 ? null : rows[rows.length - 1]!.rkey }
+        }
+        return { asked, listRecords }
+    }
+
+    it("an owner listing verifies follows and blocks from one repo, each under its own cap, and writes both", async () => {
+        const repo = repoOf(
+            [{ rkey: "f1", subject: "did:plc:a" }],
+            [
+                { rkey: "b1", subject: "did:plc:x" },
+                { rkey: "b2", subject: "did:plc:y" },
+            ]
+        )
+        const h = harness({ verifyRepos: repo.verifyRepos })
+        h.owners.add("did:plc:o")
+        h.listings.queue("did:plc:o")
+        expect(await run(h, { maxFollows: 7, maxBlocks: 9 })).toEqual(["listed"])
+        expect(repo.seen).toHaveLength(1)
+        expect(repo.seen[0]!.collections).toEqual([FOLLOW_COLLECTION_NSID, BLOCK_COLLECTION_NSID])
+        expect(repo.seen[0]!.maxRecords).toEqual({
+            [FOLLOW_COLLECTION_NSID]: 7,
+            [BLOCK_COLLECTION_NSID]: 9,
+        })
+        expect(h.puts.flatMap((p) => p.rkeys)).toEqual(["f1"])
+        expect(h.blockPuts.flatMap((p) => p.rkeys)).toEqual(["b1", "b2"])
+        expect(h.blockPuts[0]!.gen).toBe(h.puts[0]!.gen)
+    })
+
+    it("a completed listing sweeps both collections at its generation", async () => {
+        const h = harness({ verifyRepos: repoOf([], []).verifyRepos })
+        h.owners.add("did:plc:o")
+        h.listings.queue("did:plc:o")
+        await run(h)
+        expect(h.sweeps).toHaveLength(1)
+        expect(h.blockSweeps).toEqual([{ blocker: "did:plc:o", gen: h.sweeps[0]!.gen }])
+    })
+
+    it("a paged owner lists follows then blocks, keeping every record", async () => {
+        const net = pagesFor({
+            follow: [{ rkey: "f1", subject: "did:plc:a" }],
+            block: [{ rkey: "b1", subject: "did:plc:x" }],
+        })
+        const h = harness({ listRecords: net.listRecords })
+        h.owners.add("did:plc:o")
+        h.listings.queue("did:plc:o", { paged: true })
+        expect(await run(h)).toEqual(["listed"])
+        expect(net.asked).toEqual([
+            ["follow", null],
+            ["follow", "f1"],
+            ["block", null],
+            ["block", "b1"],
+        ])
+        expect(h.puts.flatMap((p) => p.rkeys)).toEqual(["f1"])
+        expect(h.blockPuts.flatMap((p) => p.rkeys)).toEqual(["b1"])
+    })
+
+    it("a mutual listing keeps only blocks whose subject is registered", async () => {
+        const net = pagesFor({
+            block: [
+                { rkey: "b1", subject: "did:plc:yes" },
+                { rkey: "b2", subject: "did:plc:no" },
+            ],
+        })
+        const h = harness({ listRecords: net.listRecords })
+        h.registered.add("did:plc:yes")
+        h.listings.queue("did:plc:m")
+        expect(await run(h)).toEqual(["listed"])
+        expect(h.blockPuts.flatMap((p) => p.rkeys)).toEqual(["b1"])
+    })
+
+    it("a follow and a block sharing an rkey stage, drain and sweep independently", async () => {
+        const repo = repoOf(
+            [{ rkey: "same", subject: "did:plc:a" }],
+            [{ rkey: "same", subject: "did:plc:x" }]
+        )
+        const h = harness({ verifyRepos: repo.verifyRepos })
+        h.owners.add("did:plc:o")
+        h.listings.queue("did:plc:o")
+        expect(await run(h)).toEqual(["listed"])
+        expect(h.listings.calls.stage[0]!.rows.map((r) => [r.collection, r.rkey]).sort()).toEqual([
+            ["block", "same"],
+            ["follow", "same"],
+        ])
+        expect(h.puts.flatMap((p) => p.rkeys)).toEqual(["same"])
+        expect(h.blockPuts.flatMap((p) => p.rkeys)).toEqual(["same"])
+    })
+
+    it("only follow subjects are queued for re-count; block subjects are not", async () => {
+        const repo = repoOf(
+            [{ rkey: "f1", subject: "did:plc:a" }],
+            [{ rkey: "b1", subject: "did:plc:x" }]
+        )
+        const h = harness({ verifyRepos: repo.verifyRepos })
+        h.owners.add("did:plc:o")
+        h.listings.queue("did:plc:o")
+        await run(h)
+        expect(h.listings.calls.recount).toEqual(["did:plc:a"])
+    })
+
+    it("a drain of mixed follows and blocks stays within its worst case, split anywhere", async () => {
+        for (const [follows, blocks] of [
+            [24, 1],
+            [1, 24],
+            [25, 25],
+            [26, 1],
+            [100, 7],
+        ] as const) {
+            const f = Array.from({ length: follows }, (_, i) => ({ rkey: `f${String(i).padStart(3, "0")}`, subject: "did:plc:a" }))
+            const b = Array.from({ length: blocks }, (_, i) => ({ rkey: `b${String(i).padStart(3, "0")}`, subject: "did:plc:x" }))
+            const h = harness({ verifyRepos: repoOf(f, b).verifyRepos })
+            h.owners.add("did:plc:o")
+            h.listings.queue("did:plc:o")
+            expect(await run(h)).toEqual(["listed"])
+            expect(h.budget.spent()).toBeLessThanOrEqual(worstCaseDrainStatements(follows + blocks, true))
+        }
+    })
+
+    it("a mutual fetch caps blocks at maxBlocks pages, counting from the switch", async () => {
+        let followPages = 0
+        const blockPages: (string | null)[] = []
+        const h = harness({
+            listRecords: async (_pds, _did, collection, cursor) => {
+                const n = collection === "follow" ? ++followPages : blockPages.push(cursor)
+                return {
+                    records: [{ rkey: `k${String(n).padStart(3, "0")}`, subject: "did:plc:r" }],
+                    lastRkey: `k${String(n).padStart(3, "0")}`,
+                }
+            },
+        })
+        h.registered.add("did:plc:r")
+        h.listings.queue("did:plc:m")
+        expect(await run(h, { maxFollows: 200, maxBlocks: 300 })).toEqual(["listed"])
+        expect(followPages).toBe(2)
+        expect(blockPages).toHaveLength(3)
+        expect(h.listings.calls.stage.at(-1)!.done).toBe(true)
+    })
+
+    it("a fetch resumes in the block collection at its stored cursor", async () => {
+        const asked: [string, string | null][] = []
+        const h = harness({
+            listRecords: async (_pds, _did, collection, cursor) => {
+                asked.push([collection, cursor])
+                return { records: [], lastRkey: null }
+            },
+        })
+        h.listings.queue("did:plc:m", {
+            inProgress: {
+                kind: "mutual",
+                gen: 1,
+                phase: "fetch",
+                collection: "block",
+                cursor: "b1",
+                pds: "https://pds.example",
+                beganAtMs: 1,
+                pages: 0,
+            },
+        })
+        h.listings.stage("did:plc:m", 0)
+        await run(h)
+        expect(asked).toEqual([["block", "b1"]])
     })
 })

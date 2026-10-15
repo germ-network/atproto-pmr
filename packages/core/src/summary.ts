@@ -1,20 +1,16 @@
 /**
- * The owner's summary: their graph plus the full proof CAR of every watched
- * record of every DID in it, so a device holds what it needs without
- * querying record by record. A read names the summary state the client
- * already holds by its token, and gets only what changed since; an unknown
- * token gets the whole summary. The indices behind recent tokens are private
+ * The owner's summary: their own block list, plus the full proof CAR of
+ * every watched record of the owner and their contacts, so a device holds
+ * what it needs without querying record by record. A read names the
+ * summary state the client already holds by its token, and gets only what
+ * changed since; an unknown token gets the whole summary. The indices behind recent tokens are private
  * state on the owner's registration.
  */
 
 import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
-import {
-    encodeGraphReadResponse,
-    graphFromCose,
-    graphToCose,
-    type GraphProjectionStore,
-} from "./device-read.js"
-import type { GraphReadResponse } from "./read-api.js"
+import type { BlockEdgeStore } from "./block-edges.js"
+import type { MonitorOwnGraphRequest, OwnerGraph } from "./owner-graph.js"
+import { OWN_BLOCK_KEYS, type OwnBlock } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
@@ -37,9 +33,14 @@ export interface SummaryIndexEntry extends SummaryRecordRef {
     verifiedWith: string
 }
 
-/** Enough of a summary to diff against: the graph and each record's state. */
+/** Enough of a summary to diff against: the owner, their blocks and each record's state. */
 export interface SummaryIndex {
-    graph: GraphReadResponse
+    owner: string
+    /**
+     * The owner's own `app.bsky.graph.block` records, by rkey (not the
+     * relay's blocked senders).
+     */
+    ownBlocks: OwnBlock[]
     records: SummaryIndexEntry[]
     /** Delivered by a page that left more: a client holding it is mid-sync. */
     more?: boolean
@@ -59,8 +60,11 @@ export interface SummaryDelta {
      * holds, since nothing can name what it held that is now gone.
      */
     full: boolean
-    /** Null when the graph is unchanged since the named state. */
-    graph: GraphReadResponse | null
+    /**
+     * The owner's whole block list, null when it is unchanged since the named
+     * state. A list is sent whole, since a removal names no block by itself.
+     */
+    ownBlocks: OwnBlock[] | null
     /** Records added, or whose CID or verifying key changed. */
     records: SummaryRecord[]
     /** Records in the named state no longer in the summary, including any no longer verified. */
@@ -113,7 +117,17 @@ export interface SummaryIndexReader {
 }
 
 export interface SummaryPageDeps {
-    projections: GraphProjectionStore
+    /**
+     * The owner's graph, from which the summary chooses its contacts. Throws
+     * when it cannot be read, and returns null when the owner's graph is not
+     * served; neither is ever an empty graph.
+     */
+    graph: MonitorOwnGraphRequest
+    /**
+     * The owner's own blocks. Throws when they cannot be read, and returns
+     * null when the owner's graph is not served; neither is ever an empty list.
+     */
+    blocks: Pick<BlockEdgeStore, "ownBlocks">
     index: SummaryIndexReader
     /** Read once per delivered record, for its CAR. */
     records: RecordSnapshotStore
@@ -129,13 +143,24 @@ export interface SummaryPageDeps {
 }
 
 /**
+ * The owner's graph or blocks could not be read, so no summary can be built
+ * without choosing contacts from an empty graph or losing the blocks.
+ */
+export class SummaryOwnerReadError extends Error {
+    constructor(cause: unknown) {
+        super("the owner's graph or blocks could not be read", { cause })
+        this.name = "SummaryOwnerReadError"
+    }
+}
+
+/**
  * The DIDs a summary covers, the owner first, then mutuals, following and
  * followers, each by DID; at most `maxContacts` (`SUMMARY_MAX_RECORDS` over
  * the watched count). `truncated` when any were left out.
  */
 export function summaryContacts(
     owner: string,
-    graph: GraphReadResponse,
+    graph: OwnerGraph,
     maxContacts: number
 ): { dids: string[]; truncated: boolean } {
     const mutuals = graph.following.filter((e) => e.mutual).map((e) => e.did)
@@ -154,17 +179,26 @@ export function summaryContacts(
 }
 
 /**
- * The summary's index as held now: the owner's projection and the entry of
- * every watched record of each covered contact that is held, verified at
- * ingest and servable under rotation. Reads no CAR. Null when the owner has
- * no projection yet.
+ * The summary's index as held now: the entry of every watched record of the
+ * owner and each covered contact that is held, verified at ingest and
+ * servable under rotation. Reads no CAR. Null when the owner's graph is not
+ * served. Throws `SummaryOwnerReadError` when the graph or the blocks cannot
+ * be read.
  */
 export async function buildSummaryIndex(
     did: string,
     deps: SummaryPageDeps
 ): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
-    const graph = await deps.projections.get(did)
-    if (!graph) return null
+    let graph, blocks
+    try {
+        ;[graph, blocks] = await Promise.all([deps.graph.ownGraph(did), deps.blocks.ownBlocks(did)])
+    } catch (error) {
+        throw new SummaryOwnerReadError(error)
+    }
+    if (graph === null || blocks === null) return null
+    const ownBlocks = blocks
+        .map((b) => ({ did: b.subject, rkey: b.rkey }))
+        .sort((a, b) => compareStrings(a.rkey, b.rkey) || compareStrings(a.did, b.did))
     const maxContacts = Math.floor(SUMMARY_MAX_RECORDS / Math.max(1, deps.watched.length))
     const { dids, truncated } = summaryContacts(did, graph, maxContacts)
     const refs = dids.flatMap((d) =>
@@ -192,11 +226,11 @@ export async function buildSummaryIndex(
     }
     for (const lapse of lapsed) deps.onLapse(lapse)
     records.sort(compareRefs)
-    return { index: { graph, records }, truncated }
+    return { index: { owner: did, ownBlocks, records }, truncated }
 }
 
 /**
- * One page from `base` toward `current`: the graph if it changed, at most
+ * One page from `base` toward `current`: at most
  * `limit` changed records with their CARs, and every removal. Each
  * delivered record takes the entry of its own CAR read, so served bytes
  * match the index; one gone or no longer servable by then is reported
@@ -214,7 +248,7 @@ export async function readSummaryPage(
     page: Omit<SummaryDelta, "token" | "truncated">
 }> {
     const diff = diffSummaryIndex(base, current)
-    const owner = current.graph.did
+    const owner = current.owner
     const ordered = [...diff.changed].sort(
         (a, b) =>
             Number(b.did === owner) - Number(a.did === owner) || compareRefs(a, b)
@@ -243,7 +277,8 @@ export async function readSummaryPage(
     for (const gone of removed) kept.delete(refKey(gone))
     for (const { car: _car, ...entry } of records) kept.set(refKey(entry), entry)
     const delivered: SummaryIndex = {
-        graph: current.graph,
+        owner: current.owner,
+        ownBlocks: current.ownBlocks,
         records: [...kept.values()].sort(compareRefs),
         ...(more ? { more: true } : {}),
     }
@@ -251,7 +286,7 @@ export async function readSummaryPage(
         delivered,
         page: {
             full: diff.full,
-            graph: diff.graphChanged ? current.graph : null,
+            ownBlocks: diff.blocksChanged ? current.ownBlocks : null,
             records,
             removed,
             more,
@@ -319,21 +354,22 @@ export function diffSummaryIndex(
     current: SummaryIndex
 ): {
     full: boolean
-    graphChanged: boolean
+    blocksChanged: boolean
     changed: SummaryIndexEntry[]
     removed: SummaryRecordRef[]
 } {
     if (!base) {
-        return { full: true, graphChanged: true, changed: current.records, removed: [] }
+        return { full: true, blocksChanged: true, changed: current.records, removed: [] }
     }
     const before = new Map(base.records.map((e) => [refKey(e), e]))
     const after = new Set(current.records.map(refKey))
     return {
         full: false,
-        graphChanged: !equalBytes(
-            encodeGraphReadResponse(base.graph),
-            encodeGraphReadResponse(current.graph)
-        ),
+        blocksChanged:
+            base.ownBlocks.length !== current.ownBlocks.length ||
+            base.ownBlocks.some(
+                (b, i) => b.did !== current.ownBlocks[i]!.did || b.rkey !== current.ownBlocks[i]!.rkey
+            ),
         changed: current.records.filter((e) => {
             const prior = before.get(refKey(e))
             return !prior || prior.cid !== e.cid || prior.verifiedWith !== e.verifiedWith
@@ -342,10 +378,6 @@ export function diffSummaryIndex(
             .filter((e) => !after.has(refKey(e)))
             .map(({ did, collection, rkey }) => ({ did, collection, rkey })),
     }
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-    return a.length === b.length && a.every((byte, i) => byte === b[i])
 }
 
 /**
@@ -358,7 +390,7 @@ type WireKeys<T> = { readonly [K in FieldsOf<T>]: string }
 export const SUMMARY_DELTA_KEYS = {
     token: "t",
     full: "f",
-    graph: "g",
+    ownBlocks: "b",
     records: "r",
     removed: "x",
     more: "m",
@@ -386,7 +418,18 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
         new Map<string, CoseValue>([
             [SUMMARY_DELTA_KEYS.token, delta.token],
             [SUMMARY_DELTA_KEYS.full, delta.full],
-            [SUMMARY_DELTA_KEYS.graph, delta.graph === null ? null : graphToCose(delta.graph)],
+            [
+                SUMMARY_DELTA_KEYS.ownBlocks,
+                delta.ownBlocks === null
+                    ? null
+                    : delta.ownBlocks.map(
+                          (b) =>
+                              new Map<string, CoseValue>([
+                                  [OWN_BLOCK_KEYS.did, b.did],
+                                  [OWN_BLOCK_KEYS.rkey, b.rkey],
+                              ])
+                      ),
+            ],
             [
                 SUMMARY_DELTA_KEYS.records,
                 delta.records.map((r) => {
@@ -428,12 +471,22 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
     })
     const full = map.get(D.full)
     if (typeof full !== "boolean") throw new Error("summary: missing or malformed full")
-    const graph = map.get(D.graph)
-    if (graph !== null && !(graph instanceof Map)) throw new Error("summary: malformed graph")
+    const blocks = map.get(D.ownBlocks)
+    if (blocks !== undefined && blocks !== null) {
+        if (!Array.isArray(blocks) || !blocks.every((i) => i instanceof Map)) {
+            throw new Error("summary: malformed own blocks")
+        }
+    }
     return {
         token: str(map, D.token),
         full,
-        graph: graph === null ? null : graphFromCose(graph),
+        ownBlocks:
+            blocks === undefined || blocks === null
+                ? null
+                : (blocks as Map<number | string, CoseValue>[]).map((m) => ({
+                      did: str(m, OWN_BLOCK_KEYS.did),
+                      rkey: str(m, OWN_BLOCK_KEYS.rkey),
+                  })),
         records: items(D.records).map((m) => {
             const car = m.get(R.car)
             if (!(car instanceof Uint8Array)) throw new Error("summary: missing or malformed car")

@@ -15,6 +15,7 @@ import {
     type StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "../src/env"
+import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
 
@@ -55,9 +56,9 @@ const putEdge = (follower: string, rkey: string, subject: string) =>
         .run()
 
 const create = (obj: MonitorIngest, follower: string, rkey: string, subject: string) =>
-    obj.logEdgeOp({ kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
 const del = (obj: MonitorIngest, follower: string, rkey: string) =>
-    obj.logEdgeOp({ kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
 
 const opCount = (obj: MonitorIngest) => rowsOf<{ n: number }>(obj, "SELECT COUNT(*) AS n FROM edge_ops")[0]!.n
 const queued = (obj: MonitorIngest) =>
@@ -80,6 +81,7 @@ const seedFollowee = (obj: MonitorIngest, did: string, count: number) =>
 const flushDeps = (obj: MonitorIngest, budget: StatementBudget) => ({
     ops: obj,
     edges: d1FollowEdgeWriter(db, budget),
+    blocks: d1BlockEdgeWriter(db, budget),
     budget,
     interest: obj,
 })

@@ -1,12 +1,12 @@
 /**
- * Reads every record of one collection out of a whole-repo CAR
+ * Reads every record of the requested collections out of a whole-repo CAR
  * (`com.atproto.sync.getRepo`), proved under the repo's signing key: a
  * commit signed by the DID document's `#atproto` key, an MST walk over the
  * collection's whole key range, and hash-checked blocks for everything the
  * walk reads.
  *
  * The CAR is consumed as a stream and only what the walk can need is kept —
- * the commit, MST nodes, and record blocks that may belong to the collection
+ * the commit, MST nodes, and record blocks that may belong to a requested collection
  * — so a large repo of mostly unrelated records does not have to fit in
  * memory. Dropping a block the walk never reads does not weaken the proof:
  * the tree commits to every record by CID.
@@ -97,11 +97,61 @@ export interface VerifiedCollection {
     records: CollectionRecord[]
 }
 
+/**
+ * `RepoCollectionExpectation` for several collections read in one pass of
+ * the CAR. `maxRecords` caps each collection's held record blocks on its
+ * own; `maxBytes` and `maxNodes` cap the pass as a whole.
+ */
+export interface RepoCollectionsExpectation extends Omit<RepoCollectionExpectation, "collection" | "maxRecords"> {
+    /** Distinct NSIDs; at least one. */
+    collections: readonly string[]
+    /** Per collection; a collection absent here is unbounded. */
+    maxRecords?: Readonly<Record<string, number>>
+}
+
+export interface VerifiedCollections {
+    /** The signed commit's `rev`. */
+    rev: string
+    /** Every requested collection, empty when the repo has none of its records. */
+    records: ReadonlyMap<string, CollectionRecord[]>
+}
+
 export const DEFAULT_MAX_REPO_BYTES = 64 * 1024 * 1024
 export const DEFAULT_MAX_MST_NODES = 200_000
 
 const MAX_HEADER_BYTES = 64 * 1024
 const MAX_BLOCK_BYTES = 2 * 1024 * 1024
+
+/**
+ * `verifyRepoCollection` over several collections, consuming the CAR once:
+ * one getRepo serves every collection a listing needs. Each collection's key
+ * range is walked on its own. Throws `RepoCollectionError`;
+ * `record-cap-exceeded` names no collection, since a caller falls back to
+ * pages for all of them. Rejects with `RangeError` for an empty or
+ * duplicated `collections`. A record block with no `$type` may belong to any
+ * collection, so it is charged against every collection's cap.
+ */
+export async function verifyRepoCollections(
+    car: AsyncIterable<Uint8Array>,
+    expected: RepoCollectionsExpectation
+): Promise<VerifiedCollections> {
+    if (
+        expected.collections.length === 0 ||
+        new Set(expected.collections).size !== expected.collections.length
+    ) {
+        throw new RangeError("collections must be a non-empty list of distinct NSIDs")
+    }
+    try {
+        const kept = await readKeptBlocks(car, expected)
+        expected.onRetained?.(kept.retained)
+        return walkCollections(kept, expected)
+    } catch (error) {
+        if (error instanceof RepoProofError) {
+            throw new RepoCollectionError(error.code, error.message)
+        }
+        throw error
+    }
+}
 
 /**
  * Throws `RepoCollectionError`. An empty collection is not an error: it
@@ -111,16 +161,13 @@ export async function verifyRepoCollection(
     car: AsyncIterable<Uint8Array>,
     expected: RepoCollectionExpectation
 ): Promise<VerifiedCollection> {
-    try {
-        const kept = await readKeptBlocks(car, expected)
-        expected.onRetained?.(kept.retained)
-        return walkCollection(kept, expected)
-    } catch (error) {
-        if (error instanceof RepoProofError) {
-            throw new RepoCollectionError(error.code, error.message)
-        }
-        throw error
-    }
+    const { collection, maxRecords, ...rest } = expected
+    const result = await verifyRepoCollections(car, {
+        ...rest,
+        collections: [collection],
+        ...(maxRecords === undefined ? {} : { maxRecords: { [collection]: maxRecords } }),
+    })
+    return { rev: result.rev, records: result.records.get(collection) ?? [] }
 }
 
 interface KeptBlocks {
@@ -132,12 +179,12 @@ interface KeptBlocks {
 /**
  * Reads the CAR section by section, keeping (as copies, so no input chunk is
  * pinned) only the root commit, MST nodes, and blocks that could be a record
- * of the collection. Kept blocks are hash-checked; the rest are never read
+ * of a requested collection. Kept blocks are hash-checked; the rest are never read
  * again, since the signed tree reaches every record by CID.
  */
 async function readKeptBlocks(
     car: AsyncIterable<Uint8Array>,
-    expected: RepoCollectionExpectation
+    expected: RepoCollectionsExpectation
 ): Promise<KeptBlocks> {
     let pending = new Uint8Array(0)
     const incoming: Uint8Array[] = []
@@ -149,6 +196,9 @@ async function readKeptBlocks(
     let root: Uint8Array | null = null
     let nodes = 0
     let records = 0
+    const recordsByCollection = new Map<string, number>()
+    const requested = new Set(expected.collections)
+    const maxRecords = new Map(Object.entries(expected.maxRecords ?? {}))
     let retainedBytes = 0
     const blocks = new Map<string, Uint8Array>()
 
@@ -186,7 +236,7 @@ async function readKeptBlocks(
                 )
             }
             const data = section.subarray(CID_LENGTH)
-            const kind = classify(data, cid, root, expected.collection)
+            const { kind, type } = classify(data, cid, root, requested)
             if (kind === "drop") continue
             if (!bytesEqual(sha256(data), cid.subarray(4))) {
                 throw new RepoProofError(
@@ -202,11 +252,18 @@ async function readKeptBlocks(
             }
             const key = cidToString(cid)
             if (blocks.has(key)) continue
-            if (kind === "record" && ++records > (expected.maxRecords ?? Infinity)) {
-                throw new RepoCollectionError(
-                    "record-cap-exceeded",
-                    "too many records"
-                )
+            if (kind === "record") {
+                records++
+                for (const collection of type === undefined ? requested : [type]) {
+                    const count = (recordsByCollection.get(collection) ?? 0) + 1
+                    recordsByCollection.set(collection, count)
+                    if (count > (maxRecords.get(collection) ?? Infinity)) {
+                        throw new RepoCollectionError(
+                            "record-cap-exceeded",
+                            "too many records"
+                        )
+                    }
+                }
             }
             retainedBytes += data.length
             blocks.set(key, data.slice())
@@ -285,31 +342,31 @@ function parseHeaderRoot(header: Uint8Array): Uint8Array {
 
 type BlockKind = "commit" | "node" | "record" | "drop"
 
+/** `type` is a record block's `$type` when it has one, else undefined. */
 function classify(
     data: Uint8Array,
     cid: Uint8Array,
     root: Uint8Array,
-    collection: string
-): BlockKind {
-    if (bytesEqual(cid, root)) return "commit"
+    collections: ReadonlySet<string>
+): { kind: BlockKind; type?: string } {
+    if (bytesEqual(cid, root)) return { kind: "commit" }
     let value: unknown
     try {
         value = decodeCbor(data)
     } catch {
-        return "drop"
+        return { kind: "drop" }
     }
-    if (!isRecord(value)) return "drop"
-    if (Array.isArray(value.e) && "l" in value) return "node"
+    if (!isRecord(value)) return { kind: "drop" }
+    if (Array.isArray(value.e) && "l" in value) return { kind: "node" }
     const type = value.$type
-    return type === undefined || typeof type !== "string" || type === collection
-        ? "record"
-        : "drop"
+    if (typeof type !== "string") return { kind: "record" }
+    return collections.has(type) ? { kind: "record", type } : { kind: "drop" }
 }
 
-function walkCollection(
+function walkCollections(
     kept: KeptBlocks,
-    expected: RepoCollectionExpectation
-): VerifiedCollection {
+    expected: RepoCollectionsExpectation
+): VerifiedCollections {
     const commitBytes = kept.blocks.get(kept.root)
     if (!commitBytes) {
         throw new RepoProofError("commit-malformed", "root block missing")
@@ -319,13 +376,25 @@ function walkCollection(
         throw new RepoProofError("did-mismatch", "commit is for a different DID")
     }
     verifyCommitSignature(commit, expected.signingKey)
+    const records = new Map<string, CollectionRecord[]>()
+    const decoded = new Map<string, unknown>()
+    for (const collection of expected.collections) {
+        records.set(collection, walkCollection(kept, commit, collection, decoded))
+    }
+    return { rev: commit.rev, records }
+}
 
+function walkCollection(
+    kept: KeptBlocks,
+    commit: Commit,
+    collection: string,
+    decoded: Map<string, unknown>
+): CollectionRecord[] {
     const encoder = new TextEncoder()
-    const prefix = encoder.encode(`${expected.collection}/`)
-    const upper = encoder.encode(`${expected.collection}0`)
+    const prefix = encoder.encode(`${collection}/`)
+    const upper = encoder.encode(`${collection}0`)
     const records: CollectionRecord[] = []
     const walked = new Set<string>()
-    const decoded = new Map<string, unknown>()
     const decoder = new TextDecoder()
 
     // Key order inside a node is not checked by `decodeNode`, but the range
@@ -374,7 +443,6 @@ function walkCollection(
     const readRecord = (key: Uint8Array, link: CidLink): CollectionRecord => {
         const cid = cidToString(link.bytes)
         const rkey = decoder.decode(key.subarray(prefix.length))
-        if (decoded.has(cid)) return { rkey, cid, record: decoded.get(cid) }
         const block = kept.blocks.get(cid)
         if (!block) {
             throw new RepoCollectionError(
@@ -382,16 +450,27 @@ function walkCollection(
                 `record block for ${rkey} missing, or not of the collection`
             )
         }
-        let record: unknown
-        try {
-            record = decodeCbor(block)
-        } catch {
-            throw new RepoProofError("mst-malformed", "undecodable record")
+        let record = decoded.get(cid)
+        if (record === undefined) {
+            try {
+                record = decodeCbor(block)
+            } catch {
+                throw new RepoProofError("mst-malformed", "undecodable record")
+            }
+            decoded.set(cid, record)
         }
-        decoded.set(cid, record)
+        // The block is kept for whichever requested collection it names; under
+        // this collection's key it must name this one.
+        const type = isRecord(record) ? record.$type : undefined
+        if (typeof type === "string" && type !== collection) {
+            throw new RepoCollectionError(
+                "block-missing",
+                `record block for ${rkey} missing, or not of the collection`
+            )
+        }
         return { rkey, cid, record }
     }
 
     visit(commit.data, 0)
-    return { rev: commit.rev, records }
+    return records
 }
