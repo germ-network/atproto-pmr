@@ -162,7 +162,7 @@ describe("owner listing from getRepo", () => {
             await alarm(s)
             return seen
         })
-        expect(limits[0]).toBe(60)
+        expect(limits[0]).toBe(54)
     })
 
     it("a large verified repo drains across alarms and is served only after its sweep", async () => {

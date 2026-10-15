@@ -326,8 +326,9 @@ interface Harness {
 }
 
 /**
- * Follow-only stand-ins for the two seams that now carry blocks too: a
- * `listFollows` page source and a `verifyRepo` answering one collection.
+ * Follow-only stand-ins for `verifyRepo` and `listRecords`: a `listFollows`
+ * page source and a `verifyRepo` answering one collection. Tests that carry
+ * blocks pass `verifyRepos` and `listRecords` instead.
  */
 type Overrides = Omit<Partial<FollowBackfillDeps>, "verifyRepo" | "listRecords"> & {
     listFollows?: (pds: string, did: string, cursor: string | null) => Promise<FollowPage>
@@ -1452,5 +1453,50 @@ describe("listings — blocks", () => {
             expect(await run(h)).toEqual(["listed"])
             expect(h.budget.spent()).toBeLessThanOrEqual(worstCaseDrainStatements(follows + blocks, true))
         }
+    })
+
+    it("a mutual fetch caps blocks at maxBlocks pages, counting from the switch", async () => {
+        let followPages = 0
+        const blockPages: (string | null)[] = []
+        const h = harness({
+            listRecords: async (_pds, _did, collection, cursor) => {
+                const n = collection === "follow" ? ++followPages : blockPages.push(cursor)
+                return {
+                    records: [{ rkey: `k${String(n).padStart(3, "0")}`, subject: "did:plc:r" }],
+                    lastRkey: `k${String(n).padStart(3, "0")}`,
+                }
+            },
+        })
+        h.registered.add("did:plc:r")
+        h.listings.queue("did:plc:m")
+        expect(await run(h, { maxFollows: 200, maxBlocks: 300 })).toEqual(["listed"])
+        expect(followPages).toBe(2)
+        expect(blockPages).toHaveLength(3)
+        expect(h.listings.calls.stage.at(-1)!.done).toBe(true)
+    })
+
+    it("a fetch resumes in the block collection at its stored cursor", async () => {
+        const asked: [string, string | null][] = []
+        const h = harness({
+            listRecords: async (_pds, _did, collection, cursor) => {
+                asked.push([collection, cursor])
+                return { records: [], lastRkey: null }
+            },
+        })
+        h.listings.queue("did:plc:m", {
+            inProgress: {
+                kind: "mutual",
+                gen: 1,
+                phase: "fetch",
+                collection: "block",
+                cursor: "b1",
+                pds: "https://pds.example",
+                beganAtMs: 1,
+                pages: 0,
+            },
+        })
+        h.listings.stage("did:plc:m", 0)
+        await run(h)
+        expect(asked).toEqual([["block", "b1"]])
     })
 })

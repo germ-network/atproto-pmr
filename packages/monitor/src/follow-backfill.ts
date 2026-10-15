@@ -956,8 +956,10 @@ export async function drainListing(
                 if (left < SWEEP_STATEMENTS) {
                     return committed ? "in-progress" : "over-budget"
                 }
-                const swept = await deps.edges.sweep(did, gen)
+                // Blocks first: the follow sweep's subjects then reach
+                // `completeListing` with no write in between that could lose them.
                 await deps.blocks.sweepBlocks(did, gen)
+                const swept = await deps.edges.sweep(did, gen)
                 const done = await deps.listings.completeListing(did, gen, {
                     beganAtMs: progress.beganAtMs,
                     nowMs: deps.nowMs(),

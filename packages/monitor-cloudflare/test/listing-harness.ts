@@ -52,6 +52,11 @@ export const blocks = () =>
     all<{ blocker: string; rkey: string; subject: string; gen: number }>(
         "SELECT blocker, rkey, subject, gen FROM blocks ORDER BY blocker, rkey"
     )
+export const blocksOf = (blocker: string) =>
+    all<{ rkey: string; subject: string; gen: number }>(
+        "SELECT rkey, subject, gen FROM blocks WHERE blocker = ? ORDER BY rkey",
+        blocker
+    )
 export const follows = () =>
     all<{ follower: string; rkey: string; subject: string; gen: number }>(
         "SELECT follower, rkey, subject, gen FROM follows ORDER BY follower, rkey"

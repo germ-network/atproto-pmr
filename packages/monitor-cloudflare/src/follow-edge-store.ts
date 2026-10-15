@@ -300,6 +300,9 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                             `DELETE FROM follows WHERE follower = ?1 AND ${pruning} RETURNING subject`
                         )
                         .bind(...didBind),
+                    // A DID's blocks go on the same transitions as its follows; they
+                    // change no projection, so no change rows follow from them.
+                    db.prepare(`DELETE FROM blocks WHERE blocker = ?1 AND ${pruning}`).bind(...didBind),
                     owner === 1
                         ? db.prepare("INSERT OR IGNORE INTO graph_owners (did) VALUES (?1)").bind(s.did)
                         : db.prepare("DELETE FROM graph_owners WHERE did = ?1").bind(s.did),
