@@ -60,6 +60,16 @@ export interface GraphReadResponse {
     followers: GraphEdge[]
 }
 
+/**
+ * One of the owner's own blocks, carried only by the owner's summary. `rkey`
+ * locates the block record in the owner's repo, so the device can verify it.
+ */
+export interface OwnBlock {
+    /** The blocked DID. */
+    did: string
+    rkey: string
+}
+
 type FieldsOf<T> = T extends unknown ? keyof T : never
 type WireKeys<T> = { readonly [K in FieldsOf<T>]: string }
 
@@ -78,6 +88,11 @@ export const GRAPH_READ_KEYS = {
     following: "o",
     followers: "n",
 } as const satisfies WireKeys<GraphReadResponse>
+
+export const OWN_BLOCK_KEYS = {
+    did: "d",
+    rkey: "k",
+} as const satisfies WireKeys<OwnBlock>
 
 export const GRAPH_EDGE_KEYS = {
     did: "d",

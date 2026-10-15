@@ -26,6 +26,7 @@
  */
 
 import type {
+    BlockEdge,
     DidDocument,
     FollowEdge,
     InterestPolicy,
@@ -758,6 +759,27 @@ export interface EdgeRef {
  */
 export interface EdgeWriteResult {
     subjects: string[]
+}
+
+/** One block, identified the way the stream identifies it. */
+export interface BlockRef {
+    blocker: string
+    rkey: string
+}
+
+/**
+ * The single writer's seam onto the block index. Blocks write no
+ * `graph_changes` rows and move no follower count: nothing is projected
+ * from them. Pruning on a DID's mirror transitions is `FollowEdgeWriter.mirror`'s,
+ * in the same batch as its follows.
+ */
+export interface BlockEdgeWriter {
+    /** Put blocks at listing generation `gen`; idempotent on `(blocker, rkey)`. */
+    putBlocks(blocks: readonly BlockEdge[], gen: number): Promise<void>
+    /** Delete by `(blocker, rkey)`; an absent block is a no-op. */
+    deleteBlocks(refs: readonly BlockRef[]): Promise<void>
+    /** Delete `blocker`'s blocks older than generation `gen`. */
+    sweepBlocks(blocker: string, gen: number): Promise<void>
 }
 
 /** One DID's standing in the edge index's mirrored tables. */

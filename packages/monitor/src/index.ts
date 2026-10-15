@@ -69,6 +69,8 @@ export {
     type SecondarySnapshotStore,
     type SecondaryWriteAnswer,
     D1_ROWS_PER_STATEMENT,
+    type BlockEdgeWriter,
+    type BlockRef,
     type EdgeRef,
     type EdgeWriteResult,
     type FollowEdgeWriter,
@@ -91,9 +93,11 @@ export {
 
 // The follow/profile stream.
 export {
+    BLOCK_COLLECTION_NSID,
     EDGE_OPS_TABLE,
     FOLLOW_COLLECTION_NSID,
     routeFollowEvent,
+    type EdgeCollection,
     type EdgeOp,
     type FollowRoute,
     type FollowRouteDeps,

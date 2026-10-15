@@ -10,7 +10,12 @@ import type { MonitorEvent } from "./jetstream"
 import { intakeSecondary } from "./secondary"
 import type { Cursor, InterestIndex, SecondaryIntakeIndex } from "./storage"
 
-export const FOLLOW_COLLECTION_NSID = "app.bsky.graph.follow"
+import { BLOCK_COLLECTION_NSID, FOLLOW_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
+
+export { BLOCK_COLLECTION_NSID, FOLLOW_COLLECTION_NSID }
+
+/** Which edge collection a logged op or staged listing row belongs to. */
+export type EdgeCollection = "follow" | "block"
 
 /**
  * The single writer's log of live follow changes, flushed to the edge index
