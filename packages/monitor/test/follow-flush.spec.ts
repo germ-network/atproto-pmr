@@ -18,6 +18,7 @@ import type { FollowEdge } from "@germ-network/atproto-pmr-core"
 
 const create = (seq: number, follower: string, rkey: string, subject = "did:s"): EdgeOp => ({
     seq,
+    collection: "follow",
     kind: "create",
     follower,
     rkey,
@@ -27,6 +28,7 @@ const create = (seq: number, follower: string, rkey: string, subject = "did:s"):
 })
 const del = (seq: number, follower: string, rkey: string): EdgeOp => ({
     seq,
+    collection: "follow",
     kind: "delete",
     follower,
     rkey,

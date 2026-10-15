@@ -147,9 +147,9 @@ export const recountQueue = (obj: MonitorIngest) =>
     rowsOf<{ did: string }>(obj, "SELECT did FROM recount_queue ORDER BY did").map((r) => r.did)
 
 export const create = (obj: MonitorIngest, follower: string, rkey: string, subject: string) =>
-    obj.logEdgeOp({ kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
 export const del = (obj: MonitorIngest, follower: string, rkey: string) =>
-    obj.logEdgeOp({ kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
 
 export const rkeyOf = (i: number) => `r${String(i).padStart(6, "0")}`
 export const entriesOf = (count: number, subjectOf = (i: number) => `did:plc:s${i}`) =>

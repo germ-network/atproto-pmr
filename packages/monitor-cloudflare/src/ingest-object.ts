@@ -35,6 +35,7 @@ import {
     type InterestIndex,
     type InterestTransition,
     type FollowStreamIndex,
+    type EdgeCollection,
     type NewEdgeOp,
     type OwedRecord,
     type PendingRecordFetch,
@@ -446,7 +447,8 @@ export class MonitorIngest
                     rkey TEXT NOT NULL,
                     subject TEXT,
                     rev TEXT NOT NULL,
-                    cursor TEXT NOT NULL
+                    cursor TEXT NOT NULL,
+                    collection TEXT NOT NULL DEFAULT 'follow'
                 );
                 CREATE TABLE IF NOT EXISTS listing_requeue (
                     did TEXT PRIMARY KEY,
@@ -510,6 +512,13 @@ export class MonitorIngest
                     .toArray().length === 0
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('edge_ops') WHERE name = 'collection'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE edge_ops ADD COLUMN collection TEXT NOT NULL DEFAULT 'follow'")
             }
             for (const column of [
                 "attempts",
@@ -2212,14 +2221,15 @@ export class MonitorIngest
     async logEdgeOp(op: NewEdgeOp, cursor: Cursor): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
-                "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor) " +
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor, collection) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 op.kind,
                 op.follower,
                 op.rkey,
                 op.kind === "create" ? op.subject : null,
                 op.rev,
-                op.cursor
+                op.cursor,
+                op.collection
             )
             this.raiseFollowCursor(cursor)
         })
@@ -2749,8 +2759,9 @@ export class MonitorIngest
                 subject: string | null
                 rev: string
                 cursor: string
+                collection: EdgeCollection
             }>(
-                "SELECT seq, kind, follower, rkey, subject, rev, cursor FROM edge_ops " +
+                "SELECT seq, kind, follower, rkey, subject, rev, cursor, collection FROM edge_ops " +
                     "ORDER BY seq LIMIT ?",
                 limit
             )
@@ -2759,6 +2770,7 @@ export class MonitorIngest
                 r.kind === "create"
                     ? {
                           seq: r.seq,
+                          collection: r.collection,
                           kind: "create" as const,
                           follower: r.follower,
                           rkey: r.rkey,
@@ -2768,6 +2780,7 @@ export class MonitorIngest
                       }
                     : {
                           seq: r.seq,
+                          collection: r.collection,
                           kind: "delete" as const,
                           follower: r.follower,
                           rkey: r.rkey,

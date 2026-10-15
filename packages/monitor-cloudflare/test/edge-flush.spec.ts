@@ -55,9 +55,9 @@ const putEdge = (follower: string, rkey: string, subject: string) =>
         .run()
 
 const create = (obj: MonitorIngest, follower: string, rkey: string, subject: string) =>
-    obj.logEdgeOp({ kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "create", follower, rkey, subject, rev: "r", cursor: "1" }, "1")
 const del = (obj: MonitorIngest, follower: string, rkey: string) =>
-    obj.logEdgeOp({ kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
+    obj.logEdgeOp({ collection: "follow", kind: "delete", follower, rkey, rev: "r", cursor: "1" }, "1")
 
 const opCount = (obj: MonitorIngest) => rowsOf<{ n: number }>(obj, "SELECT COUNT(*) AS n FROM edge_ops")[0]!.n
 const queued = (obj: MonitorIngest) =>
