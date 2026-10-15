@@ -93,5 +93,28 @@ export const POLICY_NOT_ENABLED = "policy-not-enabled"
  * honouring a policy that admits strangers.
  */
 export function admissionOf(verdict: CanMessageVerdict | null): Admission {
-    throw new Error("not implemented")
+    if (verdict === null) return { verdict: "unknown", why: [RECIPIENT_NOT_HELD] }
+    switch (verdict.verdict) {
+        case "no":
+            return verdict.why.includes("blocked")
+                ? { verdict: "blocked" }
+                : { verdict: "no", why: verdict.why }
+        case "unknown":
+            return { verdict: "unknown", why: verdict.why }
+        case "yes":
+            return admitsThroughBoundedPolicy(verdict.via)
+                ? { verdict: "yes" }
+                : { verdict: "unknown", why: [POLICY_NOT_ENABLED] }
+    }
+}
+
+/**
+ * The relay admits only through policies it knows bound what an admitted
+ * sender can cost: `bsky-follows`, which admits people the recipient follows.
+ * A yes admitted only by a policy that admits strangers (`open`), or by one
+ * the relay does not know, is held back as unknown until the relay bounds
+ * admitted senders — mailbox depth and push wakes — as the recovery pool does.
+ */
+export function admitsThroughBoundedPolicy(via: readonly string[]): boolean {
+    return via.some((policy) => policy === "bsky-follows")
 }

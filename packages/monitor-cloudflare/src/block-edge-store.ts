@@ -13,7 +13,7 @@ import {
  * served owner or its subject is registered, so rows left from before a
  * subject deregistered read as not blocked.
  */
-export function d1BlockEdgeStore(db: D1Database): BlockEdgeStore {
+export function d1BlockEdgeStore(db: Pick<D1Database, "prepare" | "batch">): BlockEdgeStore {
     return {
         async ownBlocks(did: string): Promise<BlockEdge[] | null> {
             const [served, rows] = await db.batch<BlockEdge & { served: number }>([

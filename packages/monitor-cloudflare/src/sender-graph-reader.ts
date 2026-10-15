@@ -11,7 +11,7 @@ import type { PairFact, RecipientGraphFacts, SenderGraphReader } from "@germ-net
  * hint like every kept edge and is read as held. Blocks are read
  * through the block index's `blockersOf`, so its keep rule decides.
  */
-export function d1SenderGraphReader(db: D1Database): SenderGraphReader {
+export function d1SenderGraphReader(db: Pick<D1Database, "prepare" | "batch">): SenderGraphReader {
     const blocks = d1BlockEdgeStore(db)
     return {
         async forSender(sender, recipients) {
