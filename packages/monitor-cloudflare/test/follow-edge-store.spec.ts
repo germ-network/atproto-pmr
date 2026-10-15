@@ -11,7 +11,6 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "../src/env"
 import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
-import { d1GraphChangeLog } from "../src/graph-change-log"
 import { d1InterestReader } from "../src/interest-reader"
 import { MonitorIngest } from "../src/ingest-object"
 import { runInDurableObject } from "cloudflare:test"
@@ -56,11 +55,10 @@ const edge = (follower: string, rkey: string, subject: string) => ({ follower, r
 
 beforeEach(async () => {
     await db.batch(
-        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )
-    await db.exec("DELETE FROM sqlite_sequence WHERE name = 'graph_changes'")
 })
 
 describe("follow-edge index writer and reads", () => {
@@ -321,50 +319,6 @@ describe("follow-edge index writer and reads", () => {
     })
 })
 
-describe("graph change log", () => {
-    it("readSince pages by seq and returns maxSeq from the same batch", async () => {
-        await db.batch(
-            [1, 2, 3, 4, 5].map((n) =>
-                db
-                    .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES (?, 'following', ?)")
-                    .bind(`did:${n}`, n)
-            )
-        )
-        const log = d1GraphChangeLog(db)
-        const first = await log.readSince(0, 2)
-        expect(first.rows.map((r) => [r.seq, r.did, r.reason, r.atMs])).toEqual([
-            [1, "did:1", "following", 1],
-            [2, "did:2", "following", 2],
-        ])
-        expect(first.maxSeq).toBe(5)
-        const rest = await log.readSince(2, 10)
-        expect(rest.rows.map((r) => r.seq)).toEqual([3, 4, 5])
-        expect((await log.readSince(5, 10)).rows).toEqual([])
-    })
-
-    it("maxSeq does not go backwards after the prune empties the log", async () => {
-        await db.batch(
-            [1, 2, 3].map((n) =>
-                db
-                    .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES (?, 'following', ?)")
-                    .bind(`did:${n}`, n)
-            )
-        )
-        const log = d1GraphChangeLog(db)
-        expect((await log.readSince(0, 10)).maxSeq).toBe(3)
-        // The writer's prune never deletes the newest row, so MAX(seq) stays
-        // right too; a raw emptying shows the high-water mark is what counts.
-        expect(await writer().pruneChanges(100, 10)).toBe(2)
-        expect((await log.readSince(0, 10)).maxSeq).toBe(3)
-        await db.exec("DELETE FROM graph_changes")
-        expect(await log.readSince(0, 10)).toEqual({ rows: [], maxSeq: 3 })
-        await db
-            .prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:n', 'following', 9)")
-            .run()
-        expect((await log.readSince(0, 10)).rows.map((r) => r.seq)).toEqual([4])
-    })
-})
-
 describe("interest reader", () => {
     it("InterestReader serves, isRegistered and servedGraphs read the mirrored tables", async () => {
         await mirror(
@@ -381,13 +335,5 @@ describe("interest reader", () => {
         expect(await reader.isRegistered("did:nobody")).toBe(false)
         expect(await reader.servedGraphs(null, 1)).toEqual({ dids: ["did:a"], cursor: "did:a" })
         expect(await reader.servedGraphs("did:a", 1)).toEqual({ dids: ["did:c"], cursor: null })
-    })
-})
-
-describe("sqlite_sequence", () => {
-    it("is readable, so maxSeq needs no fallback", async () => {
-        await db.prepare("INSERT INTO graph_changes (did, reason, at_ms) VALUES ('did:q', 'following', 1)").run()
-        const [r] = await all<{ seq: number }>("SELECT seq FROM sqlite_sequence WHERE name = 'graph_changes'")
-        expect(r!.seq).toBeGreaterThan(0)
     })
 })

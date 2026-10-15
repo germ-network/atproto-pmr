@@ -81,7 +81,6 @@ import {
     followGapExceeded,
     listEdgeRecords,
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
     relistStale,
@@ -2954,8 +2953,8 @@ export class MonitorIngest
     }
 
     /**
-     * The graph mirror, edge-log flush, re-count drain, change-log
-     * prune and the daily reconciles, sharing one D1 statement budget. Each runs
+     * The graph mirror, edge-log flush, re-count drain and the daily
+     * reconciles, sharing one D1 statement budget. Each runs
      * alone: a D1 outage costs neither the other steps nor the alarm's
      * re-arm.
      */
@@ -3001,10 +3000,6 @@ export class MonitorIngest
             [
                 "recount drain",
                 () => drainRecounts({ ...owners, queue: this, budget }, RECOUNT_DRAIN_BATCH),
-            ],
-            [
-                "graph change prune",
-                () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
             ],
             ["graph reconcile", () => this.reconcileGraph(deps)],
             [

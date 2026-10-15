@@ -731,8 +731,7 @@ export interface SecondarySnapshotStore {
 
 /**
  * Rows per bound-value D1 `INSERT`: 25 rows of `follows` (4 columns) is
- * exactly D1's 100 bound parameters. Change rows that follow from rows
- * already in D1 are never bound this way (see `FollowEdgeWriter`).
+ * exactly D1's 100 bound parameters.
  */
 export const D1_ROWS_PER_STATEMENT = 25
 
@@ -849,9 +848,4 @@ export interface FollowEdgeWriter {
     mirroredOf(dids: readonly string[]): Promise<Map<string, GraphMirrorRow>>
     /** The followers of each subject, for the `owner_followers` re-count. */
     followersOf(subjects: readonly string[]): Promise<Map<string, string[]>>
-    /**
-     * Delete up to `limit` `graph_changes` rows written before `beforeMs`,
-     * oldest first; returns how many, so the caller can resume next alarm.
-     */
-    pruneChanges(beforeMs: number, limit: number): Promise<number>
 }

@@ -261,21 +261,6 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
             }
             return out
         },
-
-        async pruneChanges(beforeMs, limit) {
-            if (!budget.take(1)) throw new Error("D1 statement budget exceeded (1 needed)")
-            // The newest row stays so MAX(seq) never goes back.
-            const result = await db
-                .prepare(
-                    "DELETE FROM graph_changes WHERE seq IN (" +
-                        "SELECT seq FROM graph_changes WHERE seq <= " +
-                        "(SELECT MAX(seq) FROM graph_changes WHERE at_ms < ?1) AND seq < " +
-                        "(SELECT MAX(seq) FROM graph_changes) ORDER BY seq LIMIT ?2)"
-                )
-                .bind(beforeMs, limit)
-                .run()
-            return result.meta.changes
-        },
     }
 
     async function removeFollowerEdges(follower: string, gen?: number): Promise<EdgeWriteResult> {

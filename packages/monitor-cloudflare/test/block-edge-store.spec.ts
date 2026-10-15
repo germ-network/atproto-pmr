@@ -26,7 +26,7 @@ const interest = (did: string, registered: number) =>
 
 beforeEach(async () => {
     await db.batch(
-        ["blocks", "follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["blocks", "follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )

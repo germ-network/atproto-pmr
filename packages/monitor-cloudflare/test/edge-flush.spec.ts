@@ -111,7 +111,7 @@ async function alarm(s: DurableObjectStub<MonitorIngest>) {
 
 beforeEach(async () => {
     await db.batch(
-        ["follows", "graph_owners", "graph_holders", "interest", "graph_changes"].map((t) =>
+        ["follows", "graph_owners", "graph_holders", "interest"].map((t) =>
             db.prepare(`DELETE FROM ${t}`)
         )
     )

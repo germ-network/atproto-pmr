@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it } from "vitest"
 import { flushStatements, worstCaseDrainStatements, type GraphMirrorTransition } from "@germ-network/atproto-pmr-monitor"
 import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
-import { alarm, clearGraph, db, inObj, registeredStub, setEnv } from "./listing-harness"
+import * as exported from "../src/index"
+import { alarm, all, clearGraph, db, inObj, registeredStub, setEnv } from "./listing-harness"
 
 beforeEach(clearGraph)
 
@@ -105,6 +106,14 @@ describe("no graph change log", () => {
         ).toBe(worstCaseDrainStatements(25, true))
     })
 
-    it.todo("the migrated schema has no graph_changes table")
-    it.todo("monitor-cloudflare exports no d1GraphChangeLog")
+    it("the migrated schema has no graph_changes table", async () => {
+        const tables = await all<{ name: string }>(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'graph_changes%'"
+        )
+        expect(tables).toEqual([])
+    })
+
+    it("monitor-cloudflare exports no d1GraphChangeLog", () => {
+        expect(exported).not.toHaveProperty("d1GraphChangeLog")
+    })
 })
