@@ -4,6 +4,7 @@ import {
     type DidDocument,
     type DidDocumentCache,
     type PlcCoverage,
+    type PlcLog,
     type PlcLogStore,
     type ReadSigningKeys,
 } from "@germ-network/atproto-pmr-core"
@@ -141,13 +142,50 @@ const KV_BULK_READ_MAX = 100
  * reads as none.
  */
 export function kvPlcLogs<TIngest extends MonitorIngest = MonitorIngest>(
-    _env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>
 ): PlcLogStore {
     return {
-        async get() {
-            throw new Error("not implemented")
+        async get(did) {
+            const text = await env.records.get(PLC_LOG_PREFIX + did)
+            return text === null ? null : parsePlcLog(did, text)
         },
     }
+}
+
+/** `plclog:<did>` = {@link PlcLog} JSON, written only by the ingest object. */
+export const PLC_LOG_PREFIX = "plclog:"
+
+/** No expirationTtl: a log stays until the DID leaves the kept set. */
+export function kvPlcLogWriter<TIngest extends MonitorIngest = MonitorIngest>(
+    env: MonitorEnv<TIngest>
+): { put(log: PlcLog): Promise<void>; delete(did: string): Promise<void> } {
+    return {
+        put: (log) => env.records.put(PLC_LOG_PREFIX + log.did, JSON.stringify(log)),
+        delete: (did) => env.records.delete(PLC_LOG_PREFIX + did),
+    }
+}
+
+function parsePlcLog(did: string, text: string): PlcLog | null {
+    let value: unknown
+    try {
+        value = JSON.parse(text)
+    } catch {
+        return null
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null
+    const { did: stored, entries, asOfMs } = value as Record<string, unknown>
+    if (stored !== did || !Array.isArray(entries) || entries.length === 0) return null
+    if (typeof asOfMs !== "number" || !Number.isFinite(asOfMs)) return null
+    for (const entry of entries) {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return null
+        const e = entry as Record<string, unknown>
+        if (typeof e.cid !== "string" || typeof e.createdAtMs !== "number") return null
+        if (typeof e.nullified !== "boolean") return null
+        if (typeof e.operation !== "object" || e.operation === null || Array.isArray(e.operation)) {
+            return null
+        }
+    }
+    return value as PlcLog
 }
 
 /** No expirationTtl: the reader enforces age from `fetchedAtMs`. */

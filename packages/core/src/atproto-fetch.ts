@@ -160,6 +160,8 @@ export async function guardedFetchJSON(
          *  irreversible. Omitted, or a terminal name absent here, defaults
          *  `permanent` to `true`. */
         permanentErrorNames?: readonly string[]
+        /** Body cap in bytes; the default suits a DID document. */
+        maxBytes?: number
     } = {}
 ): Promise<unknown> {
     let parsed: URL
@@ -228,7 +230,7 @@ export async function guardedFetchJSON(
             }
             throw new Error(`endpoint answered ${response.status}`)
         }
-        const text = await readCapped(response, MAX_RESPONSE_BYTES)
+        const text = await readCapped(response, options.maxBytes ?? MAX_RESPONSE_BYTES)
         return JSON.parse(text) as unknown
     } finally {
         clearTimeout(timer)
@@ -634,6 +636,20 @@ export async function fetchDidDocument(
         throw new Error("DID document does not match the requested DID")
     }
     return doc as Record<string, unknown>
+}
+
+/** Enough for a DID's whole audit log: an operation is capped at 7500 bytes of DAG-CBOR, a few KB as JSON. */
+const MAX_AUDIT_LOG_BYTES = 4 * 1024 * 1024
+
+/**
+ * The body of the PLC directory's `/<did>/log/audit`: every operation of a
+ * did:plc DID including nullified ones, for the caller to parse and verify.
+ */
+export function fetchPlcAuditLog(did: string, fetchImpl: typeof fetch): Promise<unknown> {
+    if (!did.startsWith("did:plc:")) throw new Error(`not a did:plc DID: ${did}`)
+    return guardedFetchJSON(`https://plc.directory/${encodeURIComponent(did)}/log/audit`, fetchImpl, {
+        maxBytes: MAX_AUDIT_LOG_BYTES,
+    })
 }
 
 export async function resolvePDSEndpoint(

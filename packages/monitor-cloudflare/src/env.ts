@@ -82,6 +82,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     GRAPH_MIRROR_BATCH?: string
     /** DIDs the graph projector writes per alarm, default 200 (each a KV write). */
     GRAPH_PROJECTOR_BATCH?: string
+    /**
+     * did:plc logs fetched from the directory per alarm, default 20, one after
+     * another at up to five seconds each: keep the product well inside the
+     * watchdog interval. After a coverage restart under `everyone` every held
+     * log is owed again, tens of thousands of fetches at this rate; keep it
+     * within plc.directory's limits.
+     */
+    PLC_LOG_DRAIN_BATCH?: string
     /** `graph_changes` rows pruned per alarm, default 1000. */
     GRAPH_PRUNE_BATCH?: string
     /** DIDs checked per page of the daily mirror reconcile, default 25. */

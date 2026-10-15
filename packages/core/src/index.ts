@@ -229,6 +229,7 @@ export {
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
+    fetchPlcAuditLog,
     pdsResolutionFromDocument,
     extractSigningKey,
     fetchRecordProofCar,
