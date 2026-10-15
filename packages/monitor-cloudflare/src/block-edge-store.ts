@@ -5,6 +5,12 @@ import {
     type StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
 
+/** What a read needs of D1: a database, or a session a replica may serve. */
+export type D1Reader = Pick<D1Database, "prepare" | "batch">
+
+// Compile-time check that a `withSession()` session can stand in for the database.
+export const sessionIsReader = (session: D1DatabaseSession): D1Reader => session
+
 /**
  * The block index's reads, over the D1 `graph` database. `ownBlocks` returns
  * a DID's blocks only while its graph is served (in `graph_owners`), null
@@ -13,7 +19,7 @@ import {
  * served owner or its subject is registered, so rows left from before a
  * subject deregistered read as not blocked.
  */
-export function d1BlockEdgeStore(db: Pick<D1Database, "prepare" | "batch">): BlockEdgeStore {
+export function d1BlockEdgeStore(db: D1Reader): BlockEdgeStore {
     return {
         async ownBlocks(did: string): Promise<BlockEdge[] | null> {
             const [served, rows] = await db.batch<BlockEdge & { served: number }>([

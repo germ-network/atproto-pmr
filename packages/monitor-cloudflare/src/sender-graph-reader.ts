@@ -1,17 +1,17 @@
-import { d1BlockEdgeStore } from "./block-edge-store"
+import { d1BlockEdgeStore, type D1Reader } from "./block-edge-store"
 import type { PairFact, RecipientGraphFacts, SenderGraphReader } from "@germ-network/atproto-pmr-core"
 
 /**
  * The graph facts for one sender against many recipients over the D1
- * `graph` database, in a fixed number of queries whatever the recipient
- * count: follows and blocks naming the sender, and which recipients' graphs
+ * `graph` database or a session over it, in a fixed number of queries
+ * whatever the recipient count: follows and blocks naming the sender, and which recipients' graphs
  * are served. Only a served graph's edges are complete; a non-owner's kept
  * edges arrive with its next listing, so for a recipient not served a
  * missing row proves nothing and the fact is `unknown`. A follow row is a
  * hint like every kept edge and is read as held. Blocks are read
  * through the block index's `blockersOf`, so its keep rule decides.
  */
-export function d1SenderGraphReader(db: Pick<D1Database, "prepare" | "batch">): SenderGraphReader {
+export function d1SenderGraphReader(db: D1Reader): SenderGraphReader {
     const blocks = d1BlockEdgeStore(db)
     return {
         async forSender(sender, recipients) {
