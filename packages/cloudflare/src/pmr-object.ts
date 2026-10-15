@@ -1091,12 +1091,37 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.delete(bskyBlockKey(key))
     }
 
-    async syncBskyBlocks(_blocked: ReadonlySet<string>): Promise<void> {
-        throw new Error("not implemented")
+    async syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void> {
+        const held = new Set<string>()
+        const mirrored = new Set<string>()
+        for (const [prefix, family] of [
+            [POOL_PREFIX, "pool"],
+            [ADMITTED_PREFIX, "adm"],
+            [BSKY_BLOCK_PREFIX, "bsky"],
+            [MAILBOX_PREFIX, "mbox"],
+        ] as const) {
+            const keys = await this.db.list({ prefix })
+            for (const k of keys.keys()) {
+                const sender = k.slice(prefix.length)
+                // Grant mailboxes name no sender.
+                if (family === "mbox" && !isPairMailboxKey(sender)) continue
+                held.add(sender)
+                if (family === "bsky") mirrored.add(sender)
+            }
+        }
+        for (const sender of held) {
+            const key = sender as PairMailboxKey
+            if (blocked.has(sender)) {
+                await this.block(key, 0, "bsky")
+            } else if (mirrored.has(sender)) {
+                await this.unblock(key)
+            }
+        }
     }
 
     async listBskyBlocked(): Promise<string[]> {
-        throw new Error("not implemented")
+        const entries = await this.db.list({ prefix: BSKY_BLOCK_PREFIX })
+        return [...entries.keys()].map((k) => k.slice(BSKY_BLOCK_PREFIX.length))
     }
 
     /** The block markers' own keys — the DIDs. No second table to drift. */

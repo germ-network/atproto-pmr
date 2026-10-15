@@ -364,7 +364,10 @@ export async function handleRegistrationDelete(
 
 // MARK: - Blocks
 
-/** `GET /pmr/v1/blocks` — list blocked sender DIDs. */
+/**
+ * `GET /pmr/v1/blocks` — every blocked sender in `b`, and in `bs` those whose
+ * block mirrors a Bsky block, which a Bsky unblock lifts and a device cannot.
+ */
 export async function handleBlocksList(
     request: Request,
     deps: OwnerDeps
@@ -372,7 +375,8 @@ export async function handleBlocksList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
     const dids = await a.auth.store.listBlocked()
-    return amortize(cbor([["b", dids]]), a.auth.did, deps)
+    const bsky = await a.auth.store.listBskyBlocked()
+    return amortize(cbor([["b", dids], ["bs", bsky]]), a.auth.did, deps)
 }
 
 /**
@@ -397,7 +401,7 @@ export async function handleBlockSet(
         return new Response("Not a DID", { status: 400 })
     }
     if (blocked) {
-        await a.auth.store.block(senderDID, deps.nowSeconds)
+        await a.auth.store.block(senderDID, deps.nowSeconds, "device")
     } else {
         await a.auth.store.unblock(senderDID)
     }
