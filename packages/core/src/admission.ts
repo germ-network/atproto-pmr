@@ -50,7 +50,8 @@ export const ADMISSION_DEADLINE_MS = 1_000
 
 /**
  * `source`'s verdict, or unknown[`ADMISSION_UNAVAILABLE`] when it throws or
- * misses `deadlineMs`. Never throws, and clears its timer once settled.
+ * misses `deadlineMs`. Never throws, and clears its timer once settled. A
+ * missed read is abandoned, not cancelled.
  */
 export async function admissionOrUnavailable(
     source: AdmissionSource,
@@ -58,7 +59,24 @@ export async function admissionOrUnavailable(
     recipient: string,
     deadlineMs: number = ADMISSION_DEADLINE_MS
 ): Promise<Admission> {
-    throw new Error("not implemented")
+    const unavailable: Admission = {
+        verdict: "unknown",
+        why: [ADMISSION_UNAVAILABLE],
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<Admission>((resolve) => {
+        timer = setTimeout(() => resolve(unavailable), deadlineMs)
+    })
+    try {
+        return await Promise.race([
+            source.admission(sender, recipient).catch(() => unavailable),
+            deadline,
+        ])
+    } catch {
+        return unavailable
+    } finally {
+        clearTimeout(timer)
+    }
 }
 
 /** Unknown reason when the relay holds no declaration snapshot for the recipient. */

@@ -1,4 +1,4 @@
-import type { AdmissionSource } from "./admission.js"
+import { admissionOrUnavailable, type AdmissionSource } from "./admission.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
@@ -8,6 +8,7 @@ import {
     BodyStore,
     Directory,
     Locator,
+    MessageRef,
     PairMailboxKey,
     PMRStore,
 } from "./storage.js"
@@ -186,6 +187,50 @@ export async function handlePairPut(
             nowSeconds + config.limits.messageExpirySeconds
         )
 
+    if (deps.admission) {
+        const admission = await admissionOrUnavailable(
+            deps.admission,
+            senderKey,
+            recipientDID
+        )
+        const received = await store.receive(
+            mailboxKey,
+            ref,
+            envelope.payload.nonce,
+            nowSeconds,
+            admission
+        )
+        if (received.outcome === "refused") {
+            return new Response(null, {
+                status: 429,
+                headers: {
+                    "Retry-After": String(
+                        Math.max(0, received.retryAfter - nowSeconds)
+                    ),
+                },
+            })
+        }
+        if (received.outcome === "queued" && received.persistBody) {
+            deps.defer(
+                deliverQueued(
+                    store,
+                    mailboxKey,
+                    ref,
+                    envelope.payload.payload,
+                    storeBody,
+                    received.moved?.map((moved) => ({
+                        ref: moved,
+                        // Stored when the entry was pooled.
+                        body: () => deps.bodies.getBody(moved.messageId),
+                    }))
+                )
+            )
+        } else if (received.outcome === "pooled" && received.persistBody) {
+            deps.defer(storeBody())
+        }
+        return new Response(null, { status: 202 })
+    }
+
     if (await store.hasMailbox(mailboxKey)) {
         const result = await store.append(
             mailboxKey,
@@ -205,38 +250,11 @@ export async function handlePairPut(
         }
         if (result.outcome === "appended" && result.persistBody) {
             // `persistBody` is false when the append was absorbed by the
-            // synthetic mailbox. Checking it — rather than storing
-            // unconditionally — is what keeps "no bytes for a blocked
-            // sender" true even though this code cannot tell blocked from
-            // real. `duplicate` never re-stores; the body already landed.
+            // synthetic mailbox; checking it is what keeps "no bytes for a
+            // blocked sender" true although this code cannot tell blocked
+            // from real.
             deps.defer(
-                (async () => {
-                    await storeBody()
-                    // Best effort, and sequenced after the body write: a
-                    // failed push costs the recipient a reconnect-drain,
-                    // never a message, since the entry stays queued either
-                    // way. Swallowing the error here (not on storeBody)
-                    // keeps that asymmetry — the body MUST land even if the
-                    // live push doesn't.
-                    try {
-                        await store.deliverLive?.(
-                            mailboxKey,
-                            ref,
-                            envelope.payload.payload
-                        )
-                    } catch {}
-                    // Same asymmetry as deliverLive: a failed push costs
-                    // nothing beyond itself, so its error is swallowed
-                    // separately rather than let it prevent deliverLive
-                    // from running or vice versa.
-                    try {
-                        await store.deliverPush?.(
-                            mailboxKey,
-                            ref,
-                            envelope.payload.payload
-                        )
-                    } catch {}
-                })()
+                deliverQueued(store, mailboxKey, ref, envelope.payload.payload, storeBody)
             )
         }
         return new Response(null, { status: 202 })
@@ -263,4 +281,38 @@ function declarationUnverifiable(): Response {
         status: 409,
         headers: { "Retry-After": String(DECLARATION_RETRY_AFTER_SECONDS) },
     })
+}
+
+/**
+ * Store the body, then deliver a queued message live and by push. `moved`
+ * (pooled entries a yes moved into the mailbox) goes live first, in order,
+ * so the device sees the mailbox in queue order; the one push covers them all.
+ *
+ * Best effort and sequenced after the body write: a failed delivery costs the
+ * recipient a reconnect-drain, never a message, since the entry stays queued
+ * either way. The body MUST land even if a delivery doesn't, and each
+ * delivery's failure is swallowed separately so one cannot prevent another.
+ * A duplicate never reaches this: its body already landed.
+ */
+async function deliverQueued(
+    store: PMRStore,
+    key: PairMailboxKey,
+    ref: MessageRef,
+    message: Uint8Array,
+    storeBody: () => Promise<void>,
+    moved: Array<{ ref: MessageRef; body: () => Promise<Uint8Array | null> }> = []
+): Promise<void> {
+    await storeBody()
+    for (const entry of moved) {
+        try {
+            const body = await entry.body()
+            if (body) await store.deliverLive?.(key, entry.ref, body)
+        } catch {}
+    }
+    try {
+        await store.deliverLive?.(key, ref, message)
+    } catch {}
+    try {
+        await store.deliverPush?.(key, ref, message)
+    } catch {}
 }
