@@ -1296,10 +1296,12 @@ response is a delta against a state the client names by **token**:
 | key | field |
 |---|---|
 | `t` | `token`: name this on the next read |
-| `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` is empty |
+| `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` and `y` are empty |
 | `b` | `ownBlocks`: the owner's own block list, each `{d: blocked DID, k: rkey of the block record}`, sent whole when it changed and absent (null) when unchanged; a client that reads no `b` keeps the list it holds |
 | `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
 | `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
+| `c` | `verdicts`: the owner's can-message verdict for each contact whose verdict is new or changed, each `{d: contact DID, v: verdict}` with `v` encoded as in the [can-message verdict](#can-message-verdict); the owner is the sender and the contact the recipient |
+| `y` | `droppedVerdicts`: DIDs that had a verdict in the named state and have none now |
 | `m` | `more`: changes remain; read again at once naming this token |
 | `n` | `truncated`: the owner has more contacts than a summary covers |
 
@@ -1307,7 +1309,7 @@ A read with no `since`, or one naming an unknown or dropped token, gets the
 whole summary as `full`. A relay keeps the last four states it served an
 owner, so a second device or a lost response never leaves a client wrong.
 `409` with `Retry-After` while the owner's graph is not yet served, and
-`503` with `Retry-After` when the relay cannot read their graph or blocks; neither changes the states the relay holds, so a retry names
+`503` with `Retry-After` when the relay cannot read their graph, blocks or contacts' graph facts; neither changes the states the relay holds, so a retry names
 the same token.
 
 One response carries at most a page of records. When `m` is true the client
@@ -1326,6 +1328,19 @@ A client that has never held a `b` list (a build from before it, or a token
 the relay stored for one) MUST read without `since` when it first reads `b`, and
 drop its held tokens: a relay that stored a state for it counts the list as
 delivered, so naming that token would report the list as unchanged.
+
+A client that has never held a `c` list (a build from before it, or a token
+the relay stored for one) MUST read without `since` when it first reads `c`, and
+drop its held tokens, for the same reason.
+
+A verdict covers a contact only while the contact is covered and the relay
+holds a servable declaration for it; a contact with none has no verdict, and that is not a `no`: a client
+treats a DID in `y`, or one never listed in `c`, as unanswered. A declaration
+the relay stored before it kept policies reads `unknown [declaration-unavailable]`
+here until the account's next repo commit rewrites it. Verdicts are small, so
+every verdict changed since the named state arrives in that response, whatever
+`m` says about records; a later page carries only verdicts that changed after
+it. A change to verdicts alone issues a new token.
 
 The block list is the owner's own: it appears only here, not on any public
 route (no device reads another DID's block list, and serving them would cost),
