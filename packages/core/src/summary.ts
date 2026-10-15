@@ -16,7 +16,7 @@ import {
 } from "./device-read.js"
 import type { GraphReadResponse } from "./read-api.js"
 import { readRecordFromCar } from "./repo-proof.js"
-import { servableUnderRotation, type ReadSigningKeys } from "./read-signing-key.js"
+import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import type { WatchedRecord } from "./watched.js"
@@ -203,15 +203,94 @@ export async function buildSummaryIndex(
  * which is what the page's token must name.
  */
 export async function readSummaryPage(
-    _base: SummaryIndex | null,
-    _current: SummaryIndex,
-    _deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
-    _limit: number
+    base: SummaryIndex | null,
+    current: SummaryIndex,
+    deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
+    limit: number
 ): Promise<{
     delivered: SummaryIndex
     page: Omit<SummaryDelta, "token" | "truncated">
 }> {
-    throw new Error("not implemented")
+    const diff = diffSummaryIndex(base, current)
+    const owner = current.graph.did
+    const ordered = [...diff.changed].sort(
+        (a, b) =>
+            Number(b.did === owner) - Number(a.did === owner) || compareRefs(a, b)
+    )
+    const batch = ordered.slice(0, Math.max(1, limit))
+    const more = ordered.length > batch.length
+
+    const keys =
+        batch.length === 0
+            ? new Map<string, ReadSigningKey>()
+            : await deps.signingKeys.keysFor([...new Set(batch.map((e) => e.did))])
+    const reads = await Promise.all(
+        batch.map((entry) =>
+            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" })
+        )
+    )
+    const records = reads.filter((r): r is SummaryRecord => r !== null)
+    const dropped = batch
+        .filter((_, i) => reads[i] === null)
+        .map(({ did, collection, rkey }) => ({ did, collection, rkey }))
+    const kept = new Map(
+        (diff.full ? [] : base!.records).map((e) => [refKey(e), e] as const)
+    )
+    // A drop is a removal only for a record the client holds.
+    const removed = [...diff.removed, ...dropped.filter((r) => kept.has(refKey(r)))]
+    for (const gone of removed) kept.delete(refKey(gone))
+    for (const { car: _car, ...entry } of records) kept.set(refKey(entry), entry)
+    const delivered: SummaryIndex = {
+        graph: current.graph,
+        records: [...kept.values()].sort(compareRefs),
+        ...(more ? { more: true } : {}),
+    }
+    return {
+        delivered,
+        page: {
+            full: diff.full,
+            graph: diff.graphChanged ? current.graph : null,
+            records,
+            removed,
+            more,
+        },
+    }
+}
+
+/**
+ * The record as its own store read holds it: its entry is taken from that
+ * read, so the CAR served matches the index stored under the token. Null when
+ * nothing verified is held, it fails to parse, or it is no longer servable
+ * under the DID's current key. The parse only runs for an entry stored
+ * without its verified `rev` and `cid`.
+ */
+async function readSummaryRecord(
+    ref: SummaryRecordRef,
+    store: RecordSnapshotStore,
+    key: ReadSigningKey
+): Promise<SummaryRecord | null> {
+    const snapshot = await store.get(ref.did, ref.collection, ref.rkey)
+    if (!snapshot || snapshot.verifiedWith === null) return null
+    if (!servableUnderRotation(snapshot.verifiedWith, key)) return null
+    let cid = snapshot.rev !== null ? snapshot.cid : null
+    if (cid === null) {
+        let parsed
+        try {
+            parsed = readRecordFromCar(snapshot.car, ref.collection, ref.rkey)
+        } catch {
+            return null
+        }
+        if (!parsed || parsed.did !== ref.did) return null
+        cid = parsed.cid
+    }
+    return {
+        did: ref.did,
+        collection: ref.collection,
+        rkey: ref.rkey,
+        cid,
+        verifiedWith: snapshot.verifiedWith,
+        car: snapshot.car,
+    }
 }
 
 export interface SummaryDeps {
@@ -240,7 +319,7 @@ export async function buildSummary(
         ...new Set([did, ...graph.following.map((e) => e.did), ...graph.followers.map((e) => e.did)]),
     ]
     const held = await Promise.all(
-        dids.flatMap((d) => deps.watched.map((w) => readSummaryRecord(d, w, deps.records)))
+        dids.flatMap((d) => deps.watched.map((w) => readWatchedRecord(d, w, deps.records)))
     )
     const records = held
         .filter((r): r is SummaryRecord => r !== null)
@@ -259,7 +338,7 @@ export async function buildSummary(
     }
 }
 
-async function readSummaryRecord(
+async function readWatchedRecord(
     did: string,
     watched: WatchedRecord,
     store: RecordSnapshotStore
@@ -386,6 +465,8 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
                 }),
             ],
             [SUMMARY_DELTA_KEYS.removed, delta.removed.map(ref)],
+            [SUMMARY_DELTA_KEYS.more, delta.more],
+            [SUMMARY_DELTA_KEYS.truncated, delta.truncated],
         ])
     )
 }
