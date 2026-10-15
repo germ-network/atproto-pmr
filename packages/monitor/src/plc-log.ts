@@ -3,7 +3,12 @@
  * serve one a device verifies itself. The export stream extends a log; the
  * directory's audit log starts or repairs one.
  */
-import type { PlcLog, PlcLogEntry } from "@germ-network/atproto-pmr-core"
+import {
+    parsePlcAuditLog,
+    verifyPlcLog,
+    type PlcLog,
+    type PlcLogEntry,
+} from "@germ-network/atproto-pmr-core"
 
 export interface PlcLogIndex {
     /**
@@ -37,6 +42,21 @@ export const PLC_LOG_RETRY_MS = 60 * 60 * 1000
  * (`verifyPlcLog`) with `asOfMs` at the fetch; any other outcome is a
  * failed attempt. Returns how many were stored.
  */
-export async function drainPlcLogs(_deps: DrainPlcLogsDeps, _limit: number): Promise<number> {
-    throw new Error("not implemented")
+export async function drainPlcLogs(deps: DrainPlcLogsDeps, limit: number): Promise<number> {
+    const owed = await deps.index.owedPlcLogs(deps.nowMs() - PLC_LOG_RETRY_MS, limit)
+    let stored = 0
+    for (const did of owed) {
+        const fetchedAtMs = deps.nowMs()
+        try {
+            const entries = parsePlcAuditLog(did, await deps.fetchAuditLog(did))
+            if (entries === null) throw new Error("not an audit log for the DID")
+            verifyPlcLog(did, entries)
+            await deps.index.putPlcLog({ did, entries, asOfMs: fetchedAtMs })
+            stored += 1
+        } catch (error) {
+            console.warn(`plc log: fetch for ${did} failed`, error)
+            await deps.index.markPlcLogAttempted(did, fetchedAtMs)
+        }
+    }
+    return stored
 }
