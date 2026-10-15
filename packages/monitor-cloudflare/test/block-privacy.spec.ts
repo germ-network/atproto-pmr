@@ -1,4 +1,4 @@
-/** Blocks feed no follow graph: no change rows, and the owner's graph is the same with or without them. */
+/** Blocks feed no follow graph: the owner's graph is the same with or without them. */
 import { beforeEach, describe, expect, it } from "vitest"
 import { decodeEvent, flushEdgeOps, routeFollowEvent } from "@germ-network/atproto-pmr-monitor"
 import { d1BlockEdgeWriter } from "../src/block-edge-store"
@@ -63,12 +63,11 @@ async function blockActivity(obj: MonitorIngest, listing = true): Promise<void> 
 }
 
 describe("blocks reach no follow graph", () => {
-    it("block ops by socket, listing and mirror prune write no graph_changes rows", async () => {
+    it("block ops by socket, listing and mirror prune keep only the blocks listed", async () => {
         const s = registeredStub("bp")
         await inObj(s, blockActivity)
         const blocks = await all<{ blocker: string; rkey: string }>("SELECT blocker, rkey FROM blocks ORDER BY rkey")
         expect(blocks.map((b) => [b.blocker, b.rkey])).toEqual([[O, "listed"]])
-        expect(await all("SELECT * FROM graph_changes")).toEqual([])
     })
 
     it("block ops by socket, listing and mirror prune leave ownGraph(owner) unchanged", async () => {

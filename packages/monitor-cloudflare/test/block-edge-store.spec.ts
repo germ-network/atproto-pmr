@@ -81,16 +81,6 @@ describe("d1BlockEdgeWriter", () => {
             ["did:b", "old"],
         ])
     })
-
-    it("writes no graph_changes rows", async () => {
-        await serve("did:a")
-        await writer().putBlocks([block("did:a", "1", "did:x")], 1)
-        await writer().putBlocks([block("did:a", "1", "did:y")], 2)
-        await writer().sweepBlocks("did:a", 3)
-        await writer().putBlocks([block("did:a", "1", "did:y")], 3)
-        await writer().deleteBlocks([{ blocker: "did:a", rkey: "1" }])
-        expect(await all("SELECT * FROM graph_changes")).toEqual([])
-    })
 })
 
 describe("d1BlockEdgeStore", () => {

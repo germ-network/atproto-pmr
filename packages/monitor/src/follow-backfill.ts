@@ -244,7 +244,7 @@ export interface ListingIndex {
      * - stamp `listed_at`. For an owner kind, stamp `owner_listed_at` only if
      *   the DID owns a graph in this same step; that stamp is what makes the
      *   graph served (its mirror standing's `owner` needs both ownership and
-     *   the stamp, so the next mirror writes `served-add`). A mutual
+     *   the stamp, so the next mirror adds it to `graph_owners`). A mutual
      *   completion clears it;
      * - on an owner's first completion (no `owner_listed_at` before) by a
      *   registered DID, queue `registration` re-lists for the staged follow
@@ -434,9 +434,9 @@ export type ListingOutcome =
     /** Its progress was restarted or cleared while the step ran; nothing published. */
     | "superseded"
 
-const PUT_STATEMENTS_PER_CHUNK = 4
-const PUT_FIXED_STATEMENTS = 2
-const SWEEP_STATEMENTS = 4
+const PUT_STATEMENTS_PER_CHUNK = 2
+const PUT_FIXED_STATEMENTS = 1
+const SWEEP_STATEMENTS = 2
 const PAGE_SIZE = 100
 
 /**

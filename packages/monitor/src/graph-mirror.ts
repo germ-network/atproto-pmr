@@ -2,7 +2,7 @@
  * The edge index's copy of the single writer's standing per DID: whose graph
  * is served (`graph_owners`), who holds a declaration (`graph_holders`), and
  * who is in interest (`interest`). Read routes consult the copy, never the
- * single writer, so it is pushed from the alarm, with change rows.
+ * single writer, so it is pushed from the alarm.
  */
 import type { ListingIndex } from "./follow-backfill"
 import type { FollowEdgeWriter, GraphMirrorRow, GraphMirrorTransition } from "./storage"

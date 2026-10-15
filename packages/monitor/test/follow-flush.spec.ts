@@ -93,20 +93,20 @@ describe("coalesceEdgeOps — blocks", () => {
 })
 
 describe("statement costs", () => {
-    it("flushStatements is 5 per 25 creates and 3 per 25 deletes, rounded up", () => {
+    it("flushStatements is 2 per 25 creates and 1 per 25 deletes, rounded up", () => {
         expect(flushStatements(0, 0, 0, 0)).toBe(0)
-        expect(flushStatements(1, 0, 0, 0)).toBe(5)
-        expect(flushStatements(25, 0, 0, 0)).toBe(5)
-        expect(flushStatements(26, 0, 0, 0)).toBe(10)
-        expect(flushStatements(0, 1, 0, 0)).toBe(3)
-        expect(flushStatements(0, 26, 0, 0)).toBe(6)
-        expect(flushStatements(26, 26, 0, 0)).toBe(16)
+        expect(flushStatements(1, 0, 0, 0)).toBe(2)
+        expect(flushStatements(25, 0, 0, 0)).toBe(2)
+        expect(flushStatements(26, 0, 0, 0)).toBe(4)
+        expect(flushStatements(0, 1, 0, 0)).toBe(1)
+        expect(flushStatements(0, 26, 0, 0)).toBe(2)
+        expect(flushStatements(26, 26, 0, 0)).toBe(6)
     })
 
     it("flushStatements counts one per 25 block creates and one per 25 block deletes", () => {
         expect(flushStatements(0, 0, 1, 0)).toBe(1)
         expect(flushStatements(0, 0, 26, 25)).toBe(3)
-        expect(flushStatements(26, 1, 26, 26)).toBe(10 + 3 + 2 + 2)
+        expect(flushStatements(26, 1, 26, 26)).toBe(4 + 1 + 2 + 2)
     })
 
     it("recountStatements is one per 50 subjects, rounded up", () => {
@@ -118,8 +118,8 @@ describe("statement costs", () => {
 
     it("flushLimit sizes a read whose worst case fits, whatever the follow and block split", () => {
         expect(flushLimit(0)).toBe(0)
-        expect(flushLimit(9)).toBe(0)
-        for (const remaining of [10, 13, 100, 1000]) {
+        expect(flushLimit(4)).toBe(0)
+        for (const remaining of [5, 8, 100, 1000]) {
             const n = flushLimit(remaining)
             expect(n).toBeGreaterThan(0)
             for (let c = 0; c <= n; c++) {
@@ -131,8 +131,8 @@ describe("statement costs", () => {
             }
             expect(flushStatements(n - 3, 1, 1, 1)).toBeLessThanOrEqual(remaining)
         }
-        expect(flushLimit(10)).toBe(25)
-        expect(flushStatements(22, 1, 1, 1)).toBe(10)
+        expect(flushLimit(5)).toBe(25)
+        expect(flushStatements(22, 1, 1, 1)).toBe(5)
     })
 })
 

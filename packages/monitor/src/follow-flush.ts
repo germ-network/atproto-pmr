@@ -103,13 +103,13 @@ export function coalesceEdgeOps(ops: readonly EdgeOp[]): CoalescedOps {
     return { creates, deletes, blockCreates, blockDeletes, throughSeq }
 }
 
-const CREATE_STATEMENTS_PER_CHUNK = 5
-const DELETE_STATEMENTS_PER_CHUNK = 3
+const CREATE_STATEMENTS_PER_CHUNK = 2
+const DELETE_STATEMENTS_PER_CHUNK = 1
 const BLOCK_STATEMENTS_PER_CHUNK = 1
 const RECOUNT_SUBJECTS_PER_STATEMENT = 50
 
 /**
- * Worst-case D1 statements to flush: 5 per 25 follow creates, 3 per 25
+ * Worst-case D1 statements to flush: 2 per 25 follow creates, 1 per 25
  * follow deletes, and 1 per 25 block creates or deletes.
  */
 export function flushStatements(

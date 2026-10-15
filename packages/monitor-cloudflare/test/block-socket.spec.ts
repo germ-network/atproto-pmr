@@ -172,7 +172,7 @@ describe("follow socket — blocks", () => {
             for (let i = 0; i < 40; i++) {
                 await route(obj, commit("did:owner", FOLLOW, "create", `g${i}`, `did:t${i}`))
             }
-            const budget = statementBudget(10)
+            const budget = statementBudget(5)
             expect(flushLimit(budget.remaining)).toBe(25)
             expect(await flush(obj, flushLimit(budget.remaining), budget)).toBe(25)
             expect(budget.remaining).toBeGreaterThanOrEqual(0)

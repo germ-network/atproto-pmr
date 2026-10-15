@@ -179,7 +179,7 @@ const RECONCILE_INTERVAL_MS = 86_400_000
 /** How often the D1 graph mirror is checked against the single writer's state, both ways. */
 const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
 /** D1 statements the writer spends per mirrored DID. */
-const MIRROR_STATEMENTS_PER_DID = 11
+const MIRROR_STATEMENTS_PER_DID = 5
 const RECOUNT_DRAIN_BATCH = 1000
 const OWNER_RECONCILE_BATCH = 200
 /** `listRecords` pages all listings together take per alarm. */
