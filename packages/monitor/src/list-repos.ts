@@ -5,7 +5,7 @@
  * currently carrying the collection, paginated. An enumeration hint only:
  * nothing here enters the snapshot, and every DID it names still goes
  * through the ordinary tier-2 fetch-and-verify before anything is stored
- * (`docs/monitor-ingest.md`, "Reconciliation").
+ * (`spec/key-transparency.md`, "Keeping the snapshot current").
  */
 
 import { guardedFetchJSON } from "@germ-network/atproto-pmr-core"

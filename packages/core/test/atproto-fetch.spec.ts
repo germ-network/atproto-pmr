@@ -10,9 +10,12 @@
  * platform incompatibility; these tests pin the refusal that "error" used
  * to provide automatically.
  */
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
+import { BodyTooLargeError } from "../src/util"
 import {
+    FetchTimeoutError,
     guardedFetchBytes,
+    guardedFetchStream,
     guardedFetchJSON,
     RecordNotFoundError,
     resolvePDSEndpoint,
@@ -382,5 +385,152 @@ describe("RecordNotFoundError.reason", () => {
         })
         await expect(rejection).rejects.toBeInstanceOf(RecordNotFoundError)
         await expect(rejection).rejects.toMatchObject({ reason: null })
+    })
+})
+
+describe("guardedFetchStream", () => {
+    const options = { timeoutMs: 1_000, maxBytes: 1_000 }
+
+    /** A body that yields `chunks`, then waits until `signal` aborts it. */
+    function hangingBody(chunks: Uint8Array[], signal: AbortSignal | null | undefined) {
+        let sent = 0
+        return new ReadableStream<Uint8Array>({
+            pull(controller) {
+                if (sent < chunks.length) {
+                    controller.enqueue(chunks[sent++]!)
+                    return
+                }
+                return new Promise<void>((_resolve, reject) => {
+                    signal?.addEventListener("abort", () =>
+                        reject(new DOMException("aborted", "AbortError"))
+                    )
+                })
+            },
+        })
+    }
+
+    async function collect(stream: AsyncIterable<Uint8Array>): Promise<number[]> {
+        const sizes: number[] = []
+        for await (const chunk of stream) sizes.push(chunk.length)
+        return sizes
+    }
+
+    it("refuses a non-https endpoint and a redirect", async () => {
+        const never = (async () => {
+            throw new Error("fetched")
+        }) as typeof fetch
+        await expect(
+            guardedFetchStream("http://pds.example.com/x", never, options)
+        ).rejects.toThrow(/non-https/)
+        const redirect = (async () =>
+            cloudflareStyleRedirect("https://evil.example/steal")) as typeof fetch
+        await expect(guardedFetchStream(URL_, redirect, options)).rejects.toThrow(
+            /redirect/
+        )
+        let seen: string | undefined
+        const spy = (async (_input, init) => {
+            seen = init?.redirect
+            return new Response(new Uint8Array(1))
+        }) as typeof fetch
+        await guardedFetchStream(URL_, spy, options)
+        expect(seen).toBe("manual")
+    })
+
+    it("yields the body in chunks without buffering it whole", async () => {
+        const chunks = [new Uint8Array(100), new Uint8Array(200), new Uint8Array(50)]
+        let pulled = 0
+        const fetchImpl = (async () =>
+            new Response(
+                new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        const next = chunks[pulled++]
+                        if (next === undefined) controller.close()
+                        else controller.enqueue(next)
+                    },
+                })
+            )) as typeof fetch
+        const stream = await guardedFetchStream(URL_, fetchImpl, options)
+        const iterator = stream[Symbol.asyncIterator]()
+        const first = await iterator.next()
+        expect(first.value?.length).toBe(100)
+        expect(pulled).toBeLessThan(chunks.length)
+        const rest = [first.value!.length]
+        for (let r = await iterator.next(); !r.done; r = await iterator.next()) {
+            rest.push(r.value.length)
+        }
+        expect(rest).toEqual([100, 200, 50])
+    })
+
+    it("a body past maxBytes ends the stream with BodyTooLargeError", async () => {
+        const fetchImpl = (async () =>
+            new Response(
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(new Uint8Array(600))
+                        controller.enqueue(new Uint8Array(600))
+                        controller.close()
+                    },
+                })
+            )) as typeof fetch
+        const stream = await guardedFetchStream(URL_, fetchImpl, options)
+        await expect(collect(stream)).rejects.toBeInstanceOf(BodyTooLargeError)
+    })
+
+    it("a body still arriving after timeoutMs is aborted with FetchTimeoutError", async () => {
+        const midBody = (async (_input, init) =>
+            new Response(
+                hangingBody([new Uint8Array(10)], init?.signal)
+            )) as typeof fetch
+        const stream = await guardedFetchStream(URL_, midBody, {
+            ...options,
+            timeoutMs: 20,
+        })
+        await expect(collect(stream)).rejects.toBeInstanceOf(FetchTimeoutError)
+
+        const noHeaders = (async (_input, init) =>
+            new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener("abort", () =>
+                    reject(new DOMException("aborted", "AbortError"))
+                )
+            })) as typeof fetch
+        await expect(
+            guardedFetchStream(URL_, noHeaders, { ...options, timeoutMs: 20 })
+        ).rejects.toBeInstanceOf(FetchTimeoutError)
+    })
+
+    it("a consumer that stops early cancels the body and clears the timer", async () => {
+        const cancelled = vi.fn()
+        const fetchImpl = (async () =>
+            new Response(
+                new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        controller.enqueue(new Uint8Array(10))
+                    },
+                    cancel: cancelled,
+                })
+            )) as typeof fetch
+        const clear = vi.spyOn(globalThis, "clearTimeout")
+        const stream = await guardedFetchStream(URL_, fetchImpl, options)
+        for await (const _chunk of stream) break
+        expect(cancelled).toHaveBeenCalledTimes(1)
+        expect(clear).toHaveBeenCalled()
+        clear.mockRestore()
+    })
+
+    it("a terminal XRPC error carries its error name as reason", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "RepoTakendown" }), {
+                status: 400,
+            })) as typeof fetch
+        await expect(
+            guardedFetchStream(URL_, fetchImpl, {
+                ...options,
+                terminalErrorNames: ["RepoTakendown"],
+                permanentErrorNames: [],
+            })
+        ).rejects.toMatchObject({ reason: "RepoTakendown", permanent: false })
+        await expect(
+            guardedFetchStream(URL_, fetchImpl, options)
+        ).rejects.toThrow(/answered 400/)
     })
 })

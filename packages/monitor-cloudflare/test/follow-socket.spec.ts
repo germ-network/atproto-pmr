@@ -335,6 +335,7 @@ describe("follow/profile routing", () => {
         const owner = uniqDid()
         await inObj(stub, async (obj) => {
             await obj.setRegistered(owner, true, 1)
+            obj.ctx.storage.sql.exec("DELETE FROM listing_requeue")
             expect(await route(obj, identity(owner, 10))).toBe("dropped")
         })
         expect(await ops(stub)).toEqual([])
@@ -359,6 +360,7 @@ describe("follow/profile routing", () => {
         const owner = uniqDid()
         await inObj(stub, async (obj) => {
             await obj.setRegistered(owner, true, 1)
+            obj.ctx.storage.sql.exec("DELETE FROM listing_requeue")
             expect(await route(obj, account(owner, 10, false))).toBe("dropped")
             expect(obj.ctx.storage.sql.exec("SELECT did FROM listing_requeue").toArray()).toEqual([])
             expect(await route(obj, account(owner, 11, true))).toBe("relist")

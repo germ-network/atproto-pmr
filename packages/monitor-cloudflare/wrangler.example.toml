@@ -73,7 +73,7 @@ DIGEST_FALSE_POSITIVE_RATE = "0.01"
 # Records never expire; digest windows do.
 WINDOW_RETENTION_SECONDS = "604800"
 
-# Tier 3's baseline build (docs/monitor-ingest.md, "Reconciliation"): how a
+# Tier 3's baseline build (spec/key-transparency.md, "Keeping the snapshot current"): how a
 # DID published before this monitor's connection opened, and never
 # touched since, still gets discovered. The live tail alone cannot see it.
 BACKFILL_RELAY_URL = "https://relay1.us-west.bsky.network"
@@ -84,6 +84,22 @@ BACKFILL_BATCH = "100"
 # checked against the sender's PDS on puts naming it; these keep that rare.
 REFRESH_BATCH = "64"
 REFRESH_STALE_AFTER_MS = "3600000"
+
+# The follow-edge index: getRepo listings fetched per alarm (one at a time), the D1
+# statements they may take per alarm out of GRAPH_STATEMENT_BUDGET, the record
+# count and repo size past which an owner is listed by listRecords pages
+# instead of one verified getRepo, and the getRepo bound. Raise
+# FOLLOW_MAX_REPO_BYTES only on a measured heap: the verifying walk shares the
+# isolate's 128 MB with the sockets. A follow stream down longer than
+# Jetstream's replay window re-lists everyone; any listing older than the
+# re-list interval runs again.
+FOLLOW_BACKFILL_REPOS = "4"
+FOLLOW_LISTING_STATEMENT_RESERVE = "400"
+MAX_FOLLOWS = "20000"
+FOLLOW_MAX_REPO_BYTES = "33554432"
+FOLLOW_FETCH_TIMEOUT_MS = "30000"
+JETSTREAM_LOOKBACK_MS = "129600000"
+FOLLOW_RELIST_AFTER_MS = "604800000"
 
 # The relay's directory of registered DIDs (bare <did> keys), read only: the
 # daily reconcile lists it to repair a missed register or unregister. Required

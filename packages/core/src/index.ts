@@ -223,6 +223,8 @@ export {
     fetchLatestRev,
     guardedFetchBytes,
     guardedFetchJSON,
+    guardedFetchStream,
+    FetchTimeoutError,
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
@@ -298,6 +300,7 @@ export {
     DEFAULT_MAX_MST_NODES,
     type CollectionRecord,
     type RepoCollectionErrorCode,
+    type RetainedBlocks,
     type RepoCollectionExpectation,
     type VerifiedCollection,
 } from "./repo-collection"

@@ -101,7 +101,30 @@ export {
     type NewEdgeOp,
 } from "./follow-stream"
 
-// The follow-edge index: the live flush and the mirrored standing.
+// The follow-edge index: listings, the live flush, and the mirrored standing.
+export {
+    drainChunkEdges,
+    drainListing,
+    fetchListingPages,
+    followGapExceeded,
+    followRecordsOf,
+    listOwner,
+    relistStale,
+    runListings,
+    worstCaseDrainStatements,
+    type FetchedRepo,
+    type FollowBackfillConfig,
+    type FollowBackfillDeps,
+    type FollowPage,
+    type FollowRecord,
+    type ListingIndex,
+    type ListingKind,
+    type ListingOutcome,
+    type ListingProgress,
+    type ListingQueueReason,
+    type QueuedListing,
+    type StartedListing,
+} from "./follow-backfill"
 export {
     coalesceEdgeOps,
     drainRecounts,
@@ -128,6 +151,7 @@ export {
     type GraphMirrorIndex,
     type MirrorReconcileCursor,
 } from "./graph-mirror"
+export { listFollowRecords, type ListFollowRecordsOptions } from "./list-records"
 
 // The change digest.
 export {
@@ -170,6 +194,8 @@ export {
 export {
     fetchRecordCar,
     fetchHeadRev,
+    fetchRepoCar,
+    type FetchRepoOptions,
     type FetchHeadRevOptions,
     type HeadRev,
     type FetchRecordOptions,

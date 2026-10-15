@@ -4,6 +4,7 @@
  * who is in interest (`interest`). Read routes consult the copy, never the
  * single writer, so it is pushed from the alarm, with change rows.
  */
+import type { ListingIndex } from "./follow-backfill"
 import type { FollowEdgeWriter, GraphMirrorRow, GraphMirrorTransition } from "./storage"
 
 /** How long `graph_changes` rows are kept; a consumer further behind rebuilds. */
@@ -41,6 +42,8 @@ export interface GraphMirrorIndex {
 export interface GraphMirrorDeps {
     index: GraphMirrorIndex
     edges: FollowEdgeWriter
+    /** Queues a mutual listing for a DID that stops being served but stays in interest. */
+    listings?: Pick<ListingIndex, "queueListing">
     nowMs(): number
 }
 
@@ -48,7 +51,9 @@ export interface GraphMirrorDeps {
  * Mirror up to `limit` changed DIDs in one writer batch, then record them as
  * mirrored. A DID whose graph stops being served, or that leaves interest,
  * has its edges pruned in that batch; the pruned edges' subjects are queued
- * for re-count when the rows are recorded. Returns how many were mirrored.
+ * for re-count when the rows are recorded, and a DID that stops being served
+ * but stays in interest gets a mutual listing queued. Returns how many were
+ * mirrored.
  */
 export async function mirrorGraph(deps: GraphMirrorDeps, limit: number): Promise<number> {
     const transitions = await deps.index.dueMirror(limit)
@@ -58,6 +63,14 @@ export async function mirrorGraph(deps: GraphMirrorDeps, limit: number): Promise
         transitions.map((t) => t.now),
         pruned.subjects
     )
+    if (deps.listings !== undefined) {
+        const now = deps.nowMs()
+        for (const t of transitions) {
+            if (t.mirrored?.owner === true && !t.now.owner && t.now.member) {
+                await deps.listings.queueListing(t.now.did, now, "ownership")
+            }
+        }
+    }
     return transitions.length
 }
 

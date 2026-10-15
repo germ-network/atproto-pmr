@@ -385,4 +385,82 @@ describe("verifyRepoCollection", () => {
             )
         ).resolves.toBeDefined()
     })
+
+    it("refuses past maxRecords while reading, before the walk", async () => {
+        const repo = buildRepoCar({ did: DID, records: mixedRecords(20, 5) })
+        let walked = false
+        let pulled = 0
+        const total = Math.ceil(repo.car.length / 512)
+        async function* counted(): AsyncGenerator<Uint8Array> {
+            for await (const chunk of chunked(repo.car, 512)) {
+                pulled++
+                yield chunk
+            }
+        }
+        const error = await rejection(
+            verifyRepoCollection(
+                counted(),
+                expectation(repo, {
+                    maxRecords: 19,
+                    onRetained: () => {
+                        walked = true
+                    },
+                })
+            )
+        )
+        expect(error.code).toBe("record-cap-exceeded")
+        expect(walked).toBe(false)
+        expect(pulled).toBeLessThan(total)
+
+        await expect(
+            verifyRepoCollection(
+                chunked(repo.car, 512),
+                expectation(repo, { maxRecords: 20 })
+            )
+        ).resolves.toMatchObject({ records: expect.any(Array) })
+    })
+
+    it("onRetained reports exactly the sum of the kept block sizes, commit included", async () => {
+        const repo = buildRepoCar({ did: DID, records: mixedRecords(30, 40) })
+        const records = new Set(Object.values(repo.recordCids))
+        const followCids = new Set(
+            Object.entries(repo.recordCids)
+                .filter(([key]) => key.startsWith(`${FOLLOW}/`))
+                .map(([, cid]) => cid)
+        )
+        let expectedBytes = 0
+        let expectedNodes = 0
+        for (const block of repo.blocks) {
+            const cid = cidString(block.cid)
+            if (cidString(repo.commitBlock.cid) === cid) {
+                expectedBytes += block.data.length
+            } else if (followCids.has(cid)) {
+                expectedBytes += block.data.length
+            } else if (!records.has(cid)) {
+                expectedBytes += block.data.length
+                expectedNodes++
+            }
+        }
+        const reports: unknown[] = []
+        await verifyRepoCollection(
+            chunked(repo.car, 512),
+            expectation(repo, { onRetained: (r) => reports.push(r) })
+        )
+        expect(reports).toEqual([
+            { bytes: expectedBytes, nodes: expectedNodes, records: 30 },
+        ])
+        expect(expectedBytes).toBeLessThan(repo.car.length)
+
+        const wrongKey: unknown[] = []
+        await rejection(
+            verifyRepoCollection(
+                chunked(repo.car, 512),
+                expectation(repo, {
+                    signingKey: makeKey().multikey,
+                    onRetained: (r) => wrongKey.push(r),
+                })
+            )
+        )
+        expect(wrongKey).toHaveLength(1)
+    })
 })
