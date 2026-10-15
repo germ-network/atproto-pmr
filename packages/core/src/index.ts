@@ -229,6 +229,7 @@ export {
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
+    fetchPlcAuditLog,
     pdsResolutionFromDocument,
     extractSigningKey,
     fetchRecordProofCar,
@@ -379,6 +380,7 @@ export {
 export {
     appendPlcLogEntry,
     parsePlcAuditLog,
+    PlcLogError,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,
@@ -388,6 +390,7 @@ export {
     DID_DOC_READ_KEYS,
     encodeDidDocReadResponse,
     handleDidDocRead,
+    PLC_COVERAGE_KEYS,
     PLC_LOG_ENTRY_KEYS,
     type DidDocReadDeps,
     type DidDocReadMiss,

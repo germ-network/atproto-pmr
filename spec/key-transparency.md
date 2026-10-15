@@ -420,6 +420,8 @@ rendered document and a fetched one of the same state are the same write. (That
 a fetch started after the directory accepted an operation sees it is an
 inference about the directory, not specified text.)
 
+**The operation log.** For a watched `did:plc` DID the monitor also keeps the DID's signed operation log, which a device verifies itself ([wire API](wire-api.md#did-documents)). A stream operation that chains onto the held log and is signed by a rotation key of its predecessor extends it; one that does not (a recovery that forks, a missing operation), or a DID with no log, owes a fetch of the directory's audit log, as does every held log when the stream's unbroken run restarts. A fetched log is stored only if it verifies, and its rendered document confirms the stored document as of the fetch. The log is published as `plclog:<did>` and removed with the DID.
+
 **Publishing.** Each alarm carries what changed to `doc:<did>` in the records
 store: the document, when the monitor last confirmed it current, and whether
 it came from `did:plc` or `did:web`. A document the monitor cannot vouch for —

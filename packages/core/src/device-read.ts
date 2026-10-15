@@ -174,7 +174,7 @@ function isDeclaration(collection: string, rkey: string): boolean {
 }
 
 // A DID names store keys, so anything that could escape a key segment is refused.
-const DID_SYNTAX = /^did:[a-z]+:[A-Za-z0-9._:%-]+$/
+export const DID_SYNTAX = /^did:[a-z]+:[A-Za-z0-9._:%-]+$/
 
 function parseRecordPath(
     pathname: string

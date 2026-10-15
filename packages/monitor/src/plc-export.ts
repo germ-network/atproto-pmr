@@ -25,7 +25,12 @@
  * operations arrives as a later operation ("Key Rotation & Account Recovery").
  */
 
-import { renderPlcDocument, type DidDocument } from "@germ-network/atproto-pmr-core"
+import {
+    renderPlcDocument,
+    type DidDocument,
+    type PlcLogEntry,
+} from "@germ-network/atproto-pmr-core"
+import type { PlcLogIndex } from "./plc-log"
 import type {
     DidDocumentSink,
     KeyUpdateIndex,
@@ -62,6 +67,13 @@ export interface PlcExportEvent {
     createdAtMs: number | null
     update: SigningKeyUpdate
     change: PlcDocumentChange
+    /**
+     * The operation as a log entry, for the DID's retained log. Null when the
+     * frame lacks its CID, operation or timestamp; the log is then re-fetched.
+     * The stream does not say whether the directory has nullified it, so it
+     * is never nullified here.
+     */
+    entry: PlcLogEntry | null
 }
 
 /**
@@ -91,7 +103,15 @@ export function decodePlcExportFrame(raw: string): PlcExportEvent | null {
         createdAtMs,
         update: updateOf(frame, createdAtMs),
         change: changeOf(did, frame.operation, createdAtMs),
+        entry: entryOf(frame, createdAtMs),
     }
+}
+
+function entryOf(frame: Record<string, unknown>, createdAtMs: number | null): PlcLogEntry | null {
+    const { cid, operation } = frame
+    if (typeof cid !== "string" || createdAtMs === null) return null
+    if (typeof operation !== "object" || operation === null || Array.isArray(operation)) return null
+    return { cid, operation: operation as Record<string, unknown>, createdAtMs, nullified: false }
 }
 
 const DID_KEY_PREFIX = "did:key:"
@@ -160,12 +180,14 @@ export type PlcIntakeDecision = "ignored" | "owed"
  * other DID, only the cursor advances. A DID confirmed permanently deleted is
  * not watched, owes neither, and still has its stored document followed (a
  * relay trusts any stored did:plc document confirmed inside the coverage run).
- * Without `didDocuments` the stored documents are left alone.
+ * Without `didDocuments` the stored documents are left alone. A watched
+ * DID's operation also goes to its retained log (`plcLogs`).
  */
 export async function intakePlcEvent(
     index: MonitorIndex & KeyUpdateIndex,
     event: PlcExportEvent,
-    didDocuments?: DidDocumentSink
+    didDocuments?: DidDocumentSink,
+    plcLogs?: PlcLogIndex
 ): Promise<PlcIntakeDecision> {
     const createdAt = event.createdAtMs ?? undefined
     const watched = await index.isWatched(event.did)
@@ -187,6 +209,10 @@ export async function intakePlcEvent(
     if (!watched) {
         await index.advancePlcCursor(event.seq, createdAt)
         return "ignored"
+    }
+    if (plcLogs !== undefined) {
+        if (event.entry !== null) await plcLogs.intakePlcLogEntry(event.did, event.entry)
+        else await plcLogs.owePlcLog(event.did, Date.now())
     }
     const rev = await index.revOf(event.did)
     if (rev !== null) await index.owe(event.did, rev)

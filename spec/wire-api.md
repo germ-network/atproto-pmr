@@ -1209,6 +1209,58 @@ A summary includes a record only if the relay holds it, ingest verified it and
 it passes the same trusted-current-key check as a record read, with the same
 exemption for `did:web`. A record that stops passing is reported in `x`.
 
+#### DID documents
+
+`GET /pmr/v1/did/{did}` (no authentication) answers from state the relay holds,
+never from the directory or a `did:web` host, so a device normally resolves a
+contact's keys without telling either which DID it asked about. `200` whether or
+not anything is found, `400` for a malformed path, `no-store`, the same for
+every caller.
+
+| code | meaning |
+|---|---|
+| `not-watched` | the relay does not serve that DID, or it is neither `did:plc` nor `did:web` |
+| `not-held` | nothing is held for it |
+
+A `did:plc` DID returns its **signed operation log**, which the device verifies
+itself: `f`=true, `m`="plc", `d` the DID, `l` the entries oldest first, `a`
+the time the log was last known whole (ms), `v` the monitor's PLC stream
+coverage or null. Each entry is `{c: the operation's CID, o: the operation as
+JSON text, t: when the directory accepted it (ms), n: nullified}`. The
+operation is exactly the object the controller signed plus `sig`; a device
+encodes it as DAG-CBOR and does not depend on key order.
+
+A device verifies a log as the [did:plc specification](https://web.plc.directory/spec/v0.1/did-plc)
+(v0.3.0) describes in "Audit Logs": the genesis operation hashes to the DID
+(a legacy `create` genesis is hashed and verified in its own format); every
+entry's CID is the SHA-256 CID of its operation as served; each live operation's
+`prev` is the CID of the live operation before it, and its signature verifies
+under one of that operation's `rotationKeys` (low-S, canonical base64url, over
+the DAG-CBOR of the operation without `sig`); a `plc_tombstone` ends the log. The
+document the last live operation renders is the DID's document. The did:plc
+specification does not say how a legacy `create` converts to a regular operation;
+a verifier treats its `recoveryKey` and `signingKey` as its rotation keys and
+renders `handle` as `at://<handle>`, `service` as the `atproto_pds` service, and
+`signingKey` as the `#atproto` key. A verified log reproduces the document
+the directory serves for both a legacy-genesis and a current-format DID.
+
+What the signatures do not cover is **asserted by the relay and the directory**:
+which entries are `nullified` and `t` (the directory's judgement of recovery
+windows and key priority, which a device trusts as it trusts the log's
+completeness), the log's completeness, and `a` and `v`. A log can be truncated,
+but not forged. `a` bounds freshness: when `a` is not before
+`v.continuousSinceMs`, the stream has covered the log continuously since `a`
+and an operation accepted later, up to `v.coveredThroughMs`, would have
+extended it; otherwise (or with `v` null) the log is only known whole as of
+`a`. Times are the relay's and the monitor's clocks, which a device compares to
+its own. A relay refreshes a log after any gap in its stream, so a device
+SHOULD refetch one whose `a` is older than it can accept.
+
+A `did:web` DID returns `{f: true, m: "web", d, o: the document as JSON text, t:
+when the monitor last confirmed it (ms)}`. There is no log to verify: it is a
+**hint** the device may confirm with the host over HTTPS. A client that trusts it
+accepts the relay's word for the document.
+
 ### Monitoring — a separate component, not a relay surface
 
 A **key monitor** reports changes to the record in which a DID publishes a

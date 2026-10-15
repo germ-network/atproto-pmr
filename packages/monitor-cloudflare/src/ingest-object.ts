@@ -6,6 +6,8 @@ import {
     fetchRecordCar,
     decodePlcExportFrame,
     drainKeyUpdates,
+    drainPlcLogs,
+    FETCH_AS_OF_SKEW_MS,
     intake,
     intakePlcEvent,
     routeFollowEvent,
@@ -98,10 +100,13 @@ import { d1GraphChangeLog } from "./graph-change-log"
 import { kvGraphProjections } from "./graph-projection-store"
 import {
     DEFAULT_MAX_MST_NODES,
+    appendPlcLogEntry,
     fetchDidDocument,
+    fetchPlcAuditLog,
     pdsResolutionFromDocument,
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
+    verifyPlcLog,
     verifyRecordProofOutcome,
     verifyRepoCollection,
     type DidDocument,
@@ -118,6 +123,7 @@ import {
 import {
     canonicalDidDocumentJson,
     kvDidDocumentWriter,
+    kvPlcLogWriter,
     PLC_COVERAGE_KEY,
 } from "./did-document-store"
 import { interestPolicy as policyFromEnv, monitorCollections, type MonitorEnv } from "./env"
@@ -145,6 +151,7 @@ const CONNECT_TIMEOUT_MS = 5_000
 
 /** KV puts one alarm may spend on stored DID documents. */
 const DID_DOCUMENT_PUBLISH_BATCH = 64
+const PLC_LOG_PUBLISH_BATCH = 64
 
 type PublishRow = {
     did: string
@@ -483,6 +490,15 @@ export class MonitorIngest
                     checked_at INTEGER NOT NULL,
                     attempted_at INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS plc_logs (
+                    did TEXT PRIMARY KEY,
+                    log TEXT,
+                    as_of INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    published_version INTEGER,
+                    owed_at INTEGER,
+                    attempted_at INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE TABLE IF NOT EXISTS refresh_requests (
                     did TEXT PRIMARY KEY,
                     requested_at INTEGER NOT NULL
@@ -520,6 +536,21 @@ export class MonitorIngest
             this.seedHolderState()
             this.seedInterest()
             this.seedListings()
+            this.seedPlcLogs()
+        })
+    }
+
+    /** Once: every kept did:plc DID already in interest is owed its first log fetch. */
+    private seedPlcLogs(): void {
+        if (this.metaOf("plc_logs_seeded") !== undefined) return
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO plc_logs (did, owed_at) " +
+                    "SELECT did, ? FROM interest WHERE member = 1 AND did LIKE 'did:plc:%' " +
+                    "AND did NOT IN (SELECT did FROM deleted)",
+                Date.now()
+            )
+            this.setMeta("plc_logs_seeded", "1")
         })
     }
 
@@ -653,6 +684,13 @@ export class MonitorIngest
     private raisePlcCursor(seq: number, createdAtMs?: number): void {
         this.plcSeq = Math.max(this.plcSeq ?? seq, seq)
         if (createdAtMs === undefined) return
+        if (this.plcContinuousSinceMs === null) {
+            // A new unbroken run: operations in the gap before it may be missing from every held log.
+            this.db.sql.exec(
+                "UPDATE plc_logs SET owed_at = ? WHERE log IS NOT NULL AND owed_at IS NULL",
+                Date.now()
+            )
+        }
         this.plcContinuousSinceMs ??= createdAtMs
         this.plcHighCreatedAtMs = Math.max(this.plcHighCreatedAtMs ?? createdAtMs, createdAtMs)
     }
@@ -1221,6 +1259,7 @@ export class MonitorIngest
                     did,
                     observedAtMs
                 )
+                this.dropPlcLogSync(did)
             }
             this.setGoneState(did, permanent)
             // Only the declaration goes: other collections' snapshots outlive it.
@@ -1669,24 +1708,158 @@ export class MonitorIngest
 
     // ---- PlcLogIndex ------------------------------------------------------
 
-    async intakePlcLogEntry(_did: string, _entry: PlcLogEntry): Promise<void> {
-        throw new Error("not implemented")
+    /** Whether `did`'s log is kept: a watched did:plc DID. */
+    private async keepsPlcLog(did: string): Promise<boolean> {
+        return did.startsWith("did:plc:") && (await this.isWatched(did))
     }
 
-    async owePlcLog(_did: string, _owedAtMs: number): Promise<void> {
-        throw new Error("not implemented")
+    private plcLogRow(
+        did: string
+    ): { log: string | null; as_of: number; owed_at: number | null } | undefined {
+        return this.db.sql
+            .exec<{ log: string | null; as_of: number; owed_at: number | null }>(
+                "SELECT log, as_of, owed_at FROM plc_logs WHERE did = ?",
+                did
+            )
+            .toArray()[0]
     }
 
-    async owedPlcLogs(_attemptedBeforeMs: number, _limit: number): Promise<string[]> {
-        throw new Error("not implemented")
+    async intakePlcLogEntry(did: string, entry: PlcLogEntry): Promise<void> {
+        if (!(await this.keepsPlcLog(did))) return
+        const row = this.plcLogRow(did)
+        if (row?.log) {
+            const held = JSON.parse(row.log) as PlcLog
+            // A replayed operation is already in the log.
+            if (held.entries.some((e) => e.cid === entry.cid)) return
+            const next = appendPlcLogEntry(held, entry)
+            if (next !== null) {
+                this.db.sql.exec(
+                    "UPDATE plc_logs SET log = ?, as_of = ?, version = version + 1 WHERE did = ?",
+                    JSON.stringify(next),
+                    next.asOfMs,
+                    did
+                )
+                return
+            }
+        }
+        await this.owePlcLog(did, Date.now())
     }
 
-    async putPlcLog(_log: PlcLog): Promise<void> {
-        throw new Error("not implemented")
+    async owePlcLog(did: string, owedAtMs: number): Promise<void> {
+        if (!(await this.keepsPlcLog(did))) return
+        this.db.sql.exec(
+            "INSERT INTO plc_logs (did, owed_at) VALUES (?1, ?2) " +
+                "ON CONFLICT(did) DO UPDATE SET owed_at = MAX(COALESCE(owed_at, 0), ?2)",
+            did,
+            owedAtMs
+        )
     }
 
-    async markPlcLogAttempted(_did: string, _attemptedAtMs: number): Promise<void> {
-        throw new Error("not implemented")
+    async owedPlcLogs(attemptedBeforeMs: number, limit: number): Promise<string[]> {
+        return this.db.sql
+            .exec<{ did: string }>(
+                "SELECT did FROM plc_logs WHERE owed_at IS NOT NULL AND attempted_at < ? " +
+                    "ORDER BY owed_at LIMIT ?",
+                attemptedBeforeMs,
+                limit
+            )
+            .toArray()
+            .map((r) => r.did)
+    }
+
+    async putPlcLog(log: PlcLog): Promise<void> {
+        if (!(await this.keepsPlcLog(log.did))) {
+            // No longer kept (or never): forget the debt rather than fetch it again.
+            this.dropPlcLogSync(log.did)
+            return
+        }
+        // The same verification a device runs; it also renders the document.
+        const document = verifyPlcLog(log.did, log.entries)
+        const row = this.plcLogRow(log.did)
+        if (row?.log && row.as_of > log.asOfMs) {
+            // The stream extended the held log after this fetch began, and the
+            // fetched one may lack that operation: keep the held log and fetch again.
+            const held = JSON.parse(row.log) as PlcLog
+            const last = held.entries[held.entries.length - 1]!.cid
+            if (!log.entries.some((e) => e.cid === last)) {
+                await this.owePlcLog(log.did, row.as_of)
+                return
+            }
+        }
+        // A debt that arrived after this fetch began is still owed.
+        const settled = row?.owed_at == null || row.owed_at <= log.asOfMs
+        this.db.sql.exec(
+            "INSERT INTO plc_logs (did, log, as_of, owed_at) VALUES (?1, ?2, ?3, NULL) " +
+                "ON CONFLICT(did) DO UPDATE SET log = ?2, as_of = ?3, version = version + 1, " +
+                "owed_at = CASE WHEN ?4 THEN NULL ELSE owed_at END, attempted_at = 0",
+            log.did,
+            JSON.stringify(log),
+            log.asOfMs,
+            settled ? 1 : 0
+        )
+        await this.recordDidDocument(log.did, document, log.asOfMs - FETCH_AS_OF_SKEW_MS)
+    }
+
+    async markPlcLogAttempted(did: string, attemptedAtMs: number): Promise<void> {
+        this.db.sql.exec("UPDATE plc_logs SET attempted_at = ? WHERE did = ?", attemptedAtMs, did)
+    }
+
+    /** A DID that left: unpublish its log and forget any debt. */
+    private dropPlcLogSync(did: string): void {
+        this.db.sql.exec("DELETE FROM plc_logs WHERE did = ? AND published_version IS NULL", did)
+        this.db.sql.exec(
+            "UPDATE plc_logs SET log = NULL, owed_at = NULL, version = version + 1 WHERE did = ?",
+            did
+        )
+    }
+
+    /**
+     * Publish up to `limit` logs as `plclog:<did>`: any whose version differs
+     * from the published one. A DID that left has its entry removed, and its
+     * row once that is done.
+     */
+    async publishPlcLogs(limit: number): Promise<{ published: number; remaining: number }> {
+        const writer = kvPlcLogWriter(this.env)
+        const due = this.db.sql
+            .exec<{ did: string; log: string | null; version: number }>(
+                "SELECT did, log, version FROM plc_logs " +
+                    "WHERE (published_version IS NULL OR published_version != version) " +
+                    "AND (log IS NOT NULL OR published_version IS NOT NULL) ORDER BY as_of LIMIT ?",
+                limit
+            )
+            .toArray()
+        let published = 0
+        for (const row of due) {
+            try {
+                if (row.log === null) await writer.delete(row.did)
+                else await writer.put(JSON.parse(row.log) as PlcLog)
+            } catch (err) {
+                console.warn(`monitor: plc log publish failed for ${row.did}`, err)
+                continue
+            }
+            const marked = this.db.sql.exec(
+                "UPDATE plc_logs SET published_version = ? WHERE did = ?",
+                row.version,
+                row.did
+            ).rowsWritten
+            if (marked === 0 && row.log !== null) {
+                // The DID left while its log was being written: nothing else will remove it.
+                await writer.delete(row.did).catch(() => {})
+            }
+            this.db.sql.exec(
+                "DELETE FROM plc_logs WHERE did = ? AND log IS NULL AND owed_at IS NULL AND version = ?",
+                row.did,
+                row.version
+            )
+            published += 1
+        }
+        const remaining = this.db.sql
+            .exec<{ n: number }>(
+                "SELECT COUNT(*) AS n FROM plc_logs WHERE (published_version IS NULL OR published_version != version) " +
+                    "AND (log IS NOT NULL OR published_version IS NOT NULL)"
+            )
+            .one().n
+        return { published, remaining }
     }
 
     // ---- GraphProjectorIndex ----------------------------------------------
@@ -1805,6 +1978,14 @@ export class MonitorIngest
                     did
                 )
             }
+            if (did.startsWith("did:plc:") && !deleted) {
+                this.db.sql.exec(
+                    "INSERT INTO plc_logs (did, owed_at) VALUES (?, ?) " +
+                        "ON CONFLICT(did) DO UPDATE SET owed_at = COALESCE(owed_at, excluded.owed_at)",
+                    did,
+                    Date.now()
+                )
+            }
             for (const r of records) {
                 this.db.sql.exec(
                     "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) " +
@@ -1825,6 +2006,7 @@ export class MonitorIngest
             for (const table of ["records", "rec_pending", "checks", "refresh_requests"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
+            this.dropPlcLogSync(did)
             if (this.interestPolicy() === "registered") {
                 for (const table of ["pending", "revs", "holder_state", "deleted", "key_updates"]) {
                     this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
@@ -3433,7 +3615,7 @@ export class MonitorIngest
         const next = this.plcChain.then(async () => {
             const event = decodePlcExportFrame(raw)
             if (event === null) return
-            if ((await intakePlcEvent(this, event, this)) === "owed") this.kickDrain()
+            if ((await intakePlcEvent(this, event, this, this)) === "owed") this.kickDrain()
         })
         this.plcChain = next.catch((err) => {
             console.error("monitor: plc frame failed", err)
@@ -3619,6 +3801,24 @@ export class MonitorIngest
                 this.persistPlcCursor()
             } catch (err) {
                 console.error("monitor: plc cursor persist failed", err)
+            }
+            // Before the documents are published, so a document a fetched log
+            // confirms goes out in the same alarm.
+            try {
+                await drainPlcLogs(
+                    {
+                        index: this,
+                        fetchAuditLog: (did) => fetchPlcAuditLog(did, fetch),
+                        nowMs: () => Date.now(),
+                    },
+                    this.envInt(this.env.PLC_LOG_DRAIN_BATCH, 20)
+                )
+                const published = await this.publishPlcLogs(PLC_LOG_PUBLISH_BATCH)
+                if (published.published > 0 || published.remaining > 0) {
+                    console.log("monitor: plc logs", published)
+                }
+            } catch (err) {
+                console.error("monitor: plc log drain failed", err)
             }
             // Ahead of the sweep, which throws when its relay is down: stored
             // documents and the coverage marker must not wait behind it.

@@ -92,10 +92,11 @@ PDSes.
 | The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
 | Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
 | A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](key-transparency.md#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
+| A `did:plc` **operation log** per watched DID, for a device to verify | **built** — the stream extends a held log (each appended operation's signature is checked), a gap or a fork owes a fetch of the directory's audit log, a fetched log is verified before it is kept and published as `plclog:<did>`, and a stored log confirms the document it renders ([wire API](wire-api.md#did-documents)) |
 | PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](key-transparency.md#the-signing-key-cache), [stored documents](key-transparency.md#the-stored-did-document)) |
 | Pushing **counterpart** record changes to devices | **not yet built** |
 | A device-facing read API, and so the 24-hour rule for device reads | **built** — public record and graph reads and the owner's summary ([wire API](wire-api.md#device-reads--records-graph-and-summary)); routes are mounted by the deploying Worker |
-| `did:web` document proxying | **not yet built** |
+| `did:web` document proxying | **built, as a hint** — the device reads the monitor's stored document from `/pmr/v1/did/{did}`, which it cannot verify and may confirm with the host |
 | The user setting that routes PLC queries through the PMR | **not yet built** |
 
 ## Sizing the follow-edge index

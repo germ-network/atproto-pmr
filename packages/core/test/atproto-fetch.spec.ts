@@ -13,6 +13,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { BodyTooLargeError } from "../src/util"
 import {
+    fetchPlcAuditLog,
     FetchTimeoutError,
     guardedFetchBytes,
     guardedFetchStream,
@@ -38,6 +39,27 @@ function cloudflareStyleRedirect(location: string): Response {
 function opaqueRedirect(): Response {
     return { status: 0, type: "opaqueredirect", ok: false } as unknown as Response
 }
+
+describe("fetchPlcAuditLog", () => {
+    it("asks the directory for the DID's audit log, with a cap above a DID document's", async () => {
+        const urls: string[] = []
+        const big = JSON.stringify(
+            Array.from({ length: 200 }, (_, i) => ({ i, pad: "x".repeat(900) }))
+        )
+        expect(big.length).toBeGreaterThan(64 * 1024)
+        const fetchImpl = (async (url: string) => {
+            urls.push(url)
+            return new Response(big, { status: 200 })
+        }) as unknown as typeof fetch
+        const body = (await fetchPlcAuditLog("did:plc:abcdefghijklmnopqrstuvwx", fetchImpl)) as unknown[]
+        expect(urls).toEqual(["https://plc.directory/did%3Aplc%3Aabcdefghijklmnopqrstuvwx/log/audit"])
+        expect(body).toHaveLength(200)
+    })
+
+    it("refuses a DID that is not did:plc", () => {
+        expect(() => fetchPlcAuditLog("did:web:example.com", fetch)).toThrow(/did:plc/)
+    })
+})
 
 describe("guardedFetchJSON", () => {
     it("refuses a Cloudflare-style redirect (real 3xx status, Location header)", async () => {

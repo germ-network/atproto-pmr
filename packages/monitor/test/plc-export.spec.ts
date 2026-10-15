@@ -3,6 +3,7 @@
  * DID documents: decode, intake in the read loop, and the drain that reaches
  * the key cache.
  */
+import type { PlcLogIndex } from "../src/plc-log"
 import { describe, expect, it } from "vitest"
 import { renderPlcDocument, type DidDocument } from "@germ-network/atproto-pmr-core"
 import {
@@ -170,6 +171,7 @@ describe("intakePlcEvent", () => {
         createdAtMs: 5,
         update,
         change: { kind: "refetch" },
+        entry: null,
     })
 
     it("unwatched DID → ignored, only the cursor advances, nothing owed", async () => {
@@ -450,6 +452,7 @@ describe("intakePlcEvent: the stored document", () => {
         did: DID_,
         createdAtMs,
         update: { kind: "delete" },
+        entry: null,
         change,
     })
     const document: DidDocument = { id: DID_ }
@@ -544,5 +547,73 @@ describe("intakePlcEvent: the stored document", () => {
         const f = fakes()
         expect(await intakePlcEvent(f.index, event(RENDER))).toBe("owed")
         expect(f.log).toEqual(["owe", "key"])
+    })
+})
+
+describe("PLC log entries from the stream", () => {
+    const frame = (over: Record<string, unknown> = {}) =>
+        JSON.stringify({
+            type: "sequenced_op",
+            seq: 7,
+            did: "did:plc:abc",
+            cid: "bafyreicid",
+            createdAt: "2026-10-13T00:00:00.071Z",
+            operation: { type: "plc_operation", prev: "bafyreiprev", sig: "SIG", rotationKeys: [] },
+            ...over,
+        })
+
+    it("a frame yields its entry: cid, the operation with its sig, createdAt, never nullified", () => {
+        expect(decodePlcExportFrame(frame())?.entry).toEqual({
+            cid: "bafyreicid",
+            operation: { type: "plc_operation", prev: "bafyreiprev", sig: "SIG", rotationKeys: [] },
+            createdAtMs: Date.parse("2026-10-13T00:00:00.071Z"),
+            nullified: false,
+        })
+    })
+
+    it("a frame without a cid, an object operation or a usable createdAt yields no entry", () => {
+        for (const over of [
+            { cid: undefined },
+            { operation: "op" },
+            { operation: [] },
+            { createdAt: undefined },
+            { createdAt: "yesterday" },
+        ]) {
+            expect(decodePlcExportFrame(frame(over))?.entry, JSON.stringify(over)).toBeNull()
+        }
+    })
+
+    function intake(watched: boolean) {
+        const calls: string[] = []
+        const index = {
+            isWatched: async () => watched,
+            isDeleted: async () => false,
+            advancePlcCursor: async () => {},
+            revOf: async () => null,
+            owe: async () => {},
+            oweKeyUpdate: async () => {},
+        } as unknown as MonitorIndex & KeyUpdateIndex
+        const plcLogs = {
+            intakePlcLogEntry: async (did: string, entry: { cid: string }) => {
+                calls.push(`entry ${did} ${entry.cid}`)
+            },
+            owePlcLog: async (did: string) => {
+                calls.push(`owe ${did}`)
+            },
+        } as unknown as PlcLogIndex
+        return { index, plcLogs, calls }
+    }
+
+    it("a watched DID's entry goes to its retained log; one with no entry owes a fetch", async () => {
+        const w = intake(true)
+        await intakePlcEvent(w.index, decodePlcExportFrame(frame())!, undefined, w.plcLogs)
+        await intakePlcEvent(w.index, decodePlcExportFrame(frame({ cid: undefined }))!, undefined, w.plcLogs)
+        expect(w.calls).toEqual(["entry did:plc:abc bafyreicid", "owe did:plc:abc"])
+    })
+
+    it("a DID that is not watched gives its log nothing", async () => {
+        const w = intake(false)
+        await intakePlcEvent(w.index, decodePlcExportFrame(frame())!, undefined, w.plcLogs)
+        expect(w.calls).toEqual([])
     })
 })
