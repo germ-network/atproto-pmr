@@ -12,6 +12,7 @@ describe("stored summary baseline", () => {
         const stub = testEnv.pmrs.get(testEnv.pmrs.idFromName("no-graph-baseline"))
         const index: SummaryIndex = {
             owner: "did:plc:me",
+            verdicts: [],
             ownBlocks: [{ did: "did:plc:x", rkey: "3k1" }],
             records: [
                 { did: "did:plc:a", collection: "app.example.thing", rkey: "self", cid: "bafy", verifiedWith: "zKey" },

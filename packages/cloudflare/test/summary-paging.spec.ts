@@ -21,6 +21,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
 
 const small = (n: number, more = false): SummaryIndex => ({
     owner: "did:plc:me",
+    verdicts: [],
     ownBlocks: [],
     records: [
         {
@@ -39,6 +40,7 @@ function large(records: number, blocks: number): SummaryIndex {
     const did = (prefix: string, i: number) => `did:plc:${prefix}${String(i).padStart(8, "0")}${"x".repeat(1000)}`
     return {
         owner: "did:plc:me",
+        verdicts: [],
         ownBlocks: Array.from({ length: blocks }, (_, i) => ({ did: did("b", i), rkey: `r${i}` })),
         records: Array.from({ length: records }, (_, i) => ({
             did: did("c", i),

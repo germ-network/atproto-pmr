@@ -69,7 +69,7 @@ const KEY_SUMMARY_ORDER = "summaryOrder"
 
 /**
  * An index is stored as a header under `summaryKey` and the owner's
- * blocks and the record entries in parts under `summaryPartKey`, each part far below the 2 MB value
+ * blocks, the record entries and the verdicts in parts under `summaryPartKey`, each part far below the 2 MB value
  * limit however many blocks or contacts the owner has. A distinct prefix keeps a
  * client-named token from addressing a part.
  */
@@ -87,7 +87,7 @@ interface SummaryHeader {
 }
 
 interface SummaryPart {
-    field: "ownBlocks" | "records"
+    field: "ownBlocks" | "records" | "verdicts"
     items: unknown[]
 }
 interface SummaryOrder {
@@ -496,6 +496,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             owner: header.owner,
             ownBlocks: [],
             records: [],
+            verdicts: [],
             ...(header.more ? { more: true } : {}),
         }
         const keys = summaryPartKeys(token, 0, header.parts)
@@ -507,6 +508,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 if (part.field === "records") index.records.push(...(part.items as SummaryIndex["records"]))
                 else if (part.field === "ownBlocks") {
                     index.ownBlocks.push(...(part.items as SummaryIndex["ownBlocks"]))
+                } else if (part.field === "verdicts") {
+                    index.verdicts.push(...(part.items as SummaryIndex["verdicts"]))
                 }
             }
         }
@@ -1231,6 +1234,7 @@ function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
     for (const [field, items] of [
         ["ownBlocks", index.ownBlocks],
         ["records", index.records],
+        ["verdicts", index.verdicts],
     ] as const) {
         let current: unknown[] = []
         let chars = 0

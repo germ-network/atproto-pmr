@@ -81,6 +81,7 @@ function indexWorld(
     const deps: SummaryPageDeps = {
         graph: { ownGraph: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
         blocks: { ownBlocks: async () => [] },
+        senderGraph: { forSender: async () => new Map() },
         index: {
             entries: async (refs) => {
                 asked.push([...refs])
@@ -230,6 +231,7 @@ const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): Summary
     owner: OWNER,
     ownBlocks: [],
     records,
+    verdicts: [],
     ...(more ? { more } : {}),
 })
 
@@ -424,6 +426,8 @@ describe("summary delta codec", () => {
         ownBlocks: null,
         records: [],
         removed: [],
+        verdicts: [],
+        droppedVerdicts: [],
         more: true,
         truncated: true,
     }

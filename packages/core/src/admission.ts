@@ -1,4 +1,6 @@
-import type { CanMessageVerdict } from "./can-message.js"
+import { admitsThroughBoundedPolicy, POLICY_NOT_ENABLED, type CanMessageVerdict } from "./can-message.js"
+
+export { admitsThroughBoundedPolicy, POLICY_NOT_ENABLED }
 
 /**
  * Receive-time admission: whether a hosted recipient accepts a pair put from
@@ -82,15 +84,11 @@ export async function admissionOrUnavailable(
 
 /** Unknown reason when the relay holds no declaration snapshot for the recipient. */
 export const RECIPIENT_NOT_HELD = "recipient-not-held"
-/** Unknown reason for a yes that only a policy this relay does not yet honour admits. */
-export const POLICY_NOT_ENABLED = "policy-not-enabled"
-
 /**
  * The relay's reading of a can-message verdict, with the put's signed sender
  * as sender and the hosted owner as recipient. A no that names `blocked`
- * becomes `blocked`; a yes admitted only by `open` is held back as unknown,
- * since a relay must bound what an admitted stranger can cost before
- * honouring a policy that admits strangers.
+ * becomes `blocked`; a yes admitted only by `open` is held back as unknown
+ * (`admitsThroughBoundedPolicy`), which `evaluateCanMessage` already applies.
  */
 export function admissionOf(verdict: CanMessageVerdict | null): Admission {
     if (verdict === null) return { verdict: "unknown", why: [RECIPIENT_NOT_HELD] }
@@ -106,15 +104,4 @@ export function admissionOf(verdict: CanMessageVerdict | null): Admission {
                 ? { verdict: "yes" }
                 : { verdict: "unknown", why: [POLICY_NOT_ENABLED] }
     }
-}
-
-/**
- * The relay admits only through policies it knows bound what an admitted
- * sender can cost: `bsky-follows`, which admits people the recipient follows.
- * A yes admitted only by a policy that admits strangers (`open`), or by one
- * the relay does not know, is held back as unknown until the relay bounds
- * admitted senders — mailbox depth and push wakes — as the recovery pool does.
- */
-export function admitsThroughBoundedPolicy(via: readonly string[]): boolean {
-    return via.some((policy) => policy === "bsky-follows")
 }

@@ -15,6 +15,15 @@ import { readRecordFromCar } from "./repo-proof.js"
 import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
+import {
+    canMessageFromCose,
+    canMessageToCose,
+    computeCanMessageMany,
+    encodeCanMessageVerdict,
+    type SenderGraphReader,
+} from "./can-message.js"
+import { indexPolicySource, SUMMARY_VERDICT_KEYS, type SummaryVerdict } from "./summary-verdicts.js"
+import type { StoredPolicies } from "./policy.js"
 import type { WatchedRecord } from "./watched.js"
 
 export interface SummaryRecordRef {
@@ -42,6 +51,12 @@ export interface SummaryIndex {
      */
     ownBlocks: OwnBlock[]
     records: SummaryIndexEntry[]
+    /**
+     * The owner's can-message verdict for each covered contact the relay
+     * holds a servable declaration for, by DID. A baseline stored before
+     * verdicts existed has none and reads as empty.
+     */
+    verdicts: SummaryVerdict[]
     /** Delivered by a page that left more: a client holding it is mid-sync. */
     more?: boolean
 }
@@ -69,6 +84,13 @@ export interface SummaryDelta {
     records: SummaryRecord[]
     /** Records in the named state no longer in the summary, including any no longer verified. */
     removed: SummaryRecordRef[]
+    /**
+     * Verdicts new or different since the named state, all in the first page
+     * of a sync. A contact with no verdict is not a refusal.
+     */
+    verdicts: SummaryVerdict[]
+    /** DIDs that had a verdict in the named state and have none now. */
+    droppedVerdicts: string[]
     /**
      * More changes remain than one response carries: read again at once,
      * naming this response's token. A `full` response that sets it is the
@@ -106,6 +128,12 @@ export const SUMMARY_PAGE_RECORDS = 300
 /** A held, ingest-verified record's index entry, read without its CAR. */
 export interface SummaryHeldEntry extends SummaryIndexEntry {
     freshAtMs: number
+    /**
+     * A declaration's stored policies; absent on other records and on a
+     * declaration stored before they were kept. Dropped before an entry
+     * joins a {@link SummaryIndex}.
+     */
+    policies?: StoredPolicies
 }
 
 export interface SummaryIndexReader {
@@ -129,6 +157,11 @@ export interface SummaryPageDeps {
      */
     blocks: Pick<BlockEdgeStore, "ownBlocks">
     index: SummaryIndexReader
+    /**
+     * The owner's contacts' block and follow facts, for the owner as sender.
+     * Throws when they cannot be read.
+     */
+    senderGraph: SenderGraphReader
     /** Read once per delivered record, for its CAR. */
     records: RecordSnapshotStore
     signingKeys: ReadSigningKeys
@@ -143,12 +176,13 @@ export interface SummaryPageDeps {
 }
 
 /**
- * The owner's graph or blocks could not be read, so no summary can be built
- * without choosing contacts from an empty graph or losing the blocks.
+ * The owner's graph, their blocks or their contacts' graph facts could not
+ * be read, so no summary can be built without choosing contacts from an empty
+ * graph, losing the blocks or reporting verdicts from missing facts.
  */
 export class SummaryOwnerReadError extends Error {
     constructor(cause: unknown) {
-        super("the owner's graph or blocks could not be read", { cause })
+        super("the owner's graph, blocks or contacts' graph facts could not be read", { cause })
         this.name = "SummaryOwnerReadError"
     }
 }
@@ -181,9 +215,10 @@ export function summaryContacts(
 /**
  * The summary's index as held now: the entry of every watched record of the
  * owner and each covered contact that is held, verified at ingest and
- * servable under rotation. Reads no CAR. Null when the owner's graph is not
- * served. Throws `SummaryOwnerReadError` when the graph or the blocks cannot
- * be read.
+ * servable under rotation, and the owner's verdict for each covered contact
+ * with a servable declaration. Reads no CAR. Null when the owner's graph is not
+ * served. Throws `SummaryOwnerReadError` when the graph, the blocks or the
+ * contacts' graph facts cannot be read.
  */
 export async function buildSummaryIndex(
     did: string,
@@ -210,6 +245,7 @@ export async function buildSummaryIndex(
     const now = deps.nowMs()
     const lapsed = new Set<string>()
     const records: SummaryIndexEntry[] = []
+    const servable: SummaryHeldEntry[] = []
     for (const entry of held) {
         if (entry === null) continue
         const key = keys.get(entry.did) ?? { kind: "unknown" as const }
@@ -221,17 +257,32 @@ export async function buildSummaryIndex(
         ) {
             lapsed.add(entry.did)
         }
-        const { freshAtMs: _freshAtMs, ...indexed } = entry
+        servable.push(entry)
+        const { freshAtMs: _freshAtMs, policies: _policies, ...indexed } = entry
         records.push(indexed)
     }
     for (const lapse of lapsed) deps.onLapse(lapse)
     records.sort(compareRefs)
-    return { index: { owner: did, ownBlocks, records }, truncated }
+    let verdicts: SummaryVerdict[]
+    try {
+        const computed = await computeCanMessageMany(
+            did,
+            dids.filter((d) => d !== did),
+            { policies: indexPolicySource(servable), graph: deps.senderGraph }
+        )
+        verdicts = [...computed]
+            .map(([contact, verdict]) => ({ did: contact, verdict }))
+            .sort((a, b) => compareStrings(a.did, b.did))
+    } catch (error) {
+        throw new SummaryOwnerReadError(error)
+    }
+    return { index: { owner: did, ownBlocks, records, verdicts }, truncated }
 }
 
 /**
  * One page from `base` toward `current`: at most
- * `limit` changed records with their CARs, and every removal. Each
+ * `limit` changed records with their CARs, and every removal and changed
+ * verdict (small, so none waits for a later page). Each
  * delivered record takes the entry of its own CAR read, so served bytes
  * match the index; one gone or no longer servable by then is reported
  * removed. Changed records go in `(did, collection, rkey)` order, the
@@ -280,6 +331,7 @@ export async function readSummaryPage(
         owner: current.owner,
         ownBlocks: current.ownBlocks,
         records: [...kept.values()].sort(compareRefs),
+        verdicts: current.verdicts,
         ...(more ? { more: true } : {}),
     }
     return {
@@ -289,6 +341,8 @@ export async function readSummaryPage(
             ownBlocks: diff.blocksChanged ? current.ownBlocks : null,
             records,
             removed,
+            verdicts: diff.verdicts,
+            droppedVerdicts: diff.droppedVerdicts,
             more,
         },
     }
@@ -357,10 +411,23 @@ export function diffSummaryIndex(
     blocksChanged: boolean
     changed: SummaryIndexEntry[]
     removed: SummaryRecordRef[]
+    verdicts: SummaryVerdict[]
+    droppedVerdicts: string[]
 } {
     if (!base) {
-        return { full: true, blocksChanged: true, changed: current.records, removed: [] }
+        return {
+            full: true,
+            blocksChanged: true,
+            changed: current.records,
+            removed: [],
+            verdicts: current.verdicts,
+            droppedVerdicts: [],
+        }
     }
+    const heldVerdicts = new Map(
+        (base.verdicts ?? []).map((v) => [v.did, encodeCanMessageVerdict(v.verdict)] as const)
+    )
+    const currentVerdicts = new Set(current.verdicts.map((v) => v.did))
     const before = new Map(base.records.map((e) => [refKey(e), e]))
     const after = new Set(current.records.map(refKey))
     return {
@@ -377,7 +444,16 @@ export function diffSummaryIndex(
         removed: base.records
             .filter((e) => !after.has(refKey(e)))
             .map(({ did, collection, rkey }) => ({ did, collection, rkey })),
+        verdicts: current.verdicts.filter((v) => {
+            const prior = heldVerdicts.get(v.did)
+            return prior === undefined || !bytesEqual(prior, encodeCanMessageVerdict(v.verdict))
+        }),
+        droppedVerdicts: [...heldVerdicts.keys()].filter((d) => !currentVerdicts.has(d)).sort(compareStrings),
     }
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, i) => byte === b[i])
 }
 
 /**
@@ -393,6 +469,8 @@ export const SUMMARY_DELTA_KEYS = {
     ownBlocks: "b",
     records: "r",
     removed: "x",
+    verdicts: "c",
+    droppedVerdicts: "y",
     more: "m",
     truncated: "n",
 } as const satisfies WireKeys<SummaryDelta>
@@ -441,6 +519,17 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
                 }),
             ],
             [SUMMARY_DELTA_KEYS.removed, delta.removed.map(ref)],
+            [
+                SUMMARY_DELTA_KEYS.verdicts,
+                delta.verdicts.map(
+                    (v) =>
+                        new Map<string, CoseValue>([
+                            [SUMMARY_VERDICT_KEYS.did, v.did],
+                            [SUMMARY_VERDICT_KEYS.verdict, canMessageToCose(v.verdict)],
+                        ])
+                ),
+            ],
+            [SUMMARY_DELTA_KEYS.droppedVerdicts, delta.droppedVerdicts],
             [SUMMARY_DELTA_KEYS.more, delta.more],
             [SUMMARY_DELTA_KEYS.truncated, delta.truncated],
         ])
@@ -464,6 +553,16 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
         }
         return list as Map<number | string, CoseValue>[]
     }
+    const optionalItems = (key: string): Map<number | string, CoseValue>[] =>
+        map.get(key) === undefined ? [] : items(key)
+    const droppedRaw = map.get(D.droppedVerdicts)
+    if (
+        droppedRaw !== undefined &&
+        !(Array.isArray(droppedRaw) && droppedRaw.every((d) => typeof d === "string"))
+    ) {
+        throw new Error("summary: malformed dropped verdicts")
+    }
+    const dropped = (droppedRaw ?? []) as string[]
     const refOf = (m: Map<number | string, CoseValue>): SummaryRecordRef => ({
         did: str(m, R.did),
         collection: str(m, R.collection),
@@ -498,6 +597,12 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
             }
         }),
         removed: items(D.removed).map(refOf),
+        verdicts: optionalItems(D.verdicts).map((m) => {
+            const verdict = m.get(SUMMARY_VERDICT_KEYS.verdict)
+            if (!(verdict instanceof Map)) throw new Error("summary: missing or malformed verdict")
+            return { did: str(m, SUMMARY_VERDICT_KEYS.did), verdict: canMessageFromCose(verdict) }
+        }),
+        droppedVerdicts: dropped,
         more: map.get(D.more) === true,
         truncated: map.get(D.truncated) === true,
     }

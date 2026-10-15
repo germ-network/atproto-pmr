@@ -40,7 +40,8 @@ Two consequences for the read surface:
   blocks. It is public, for a recipient whose declaration the PMR holds
   ([wire API](wire-api.md#can-message-verdict)), and reports a fact it cannot
   establish as unknown rather than guessing. **Built.** In the owner's summary,
-  for each of the owner's contacts: **not yet built.**
+  for each of the owner's contacts, as the owner messaging that contact
+  (changed verdicts only, with the contacts that lost one). **Built.**
 - **The user's own blocks.** The owner's block list, in the owner's
   authenticated summary, sent whole when it changes. **Built.**
 - **Profiles.** Each contact's profile record, beside their declaration, in

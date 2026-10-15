@@ -5,17 +5,9 @@
  * response, lost state or second device leaves a client wrong.
  */
 import { describe, expect, it } from "vitest"
-import { ed25519 } from "@noble/curves/ed25519.js"
-import { encodeBinding } from "../src/challenge"
 import { encodeCose, type CoseValue } from "../src/cose/cbor"
-import { encodeOkpEd25519Key } from "../src/cose/key"
-import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
-import { signRequest } from "../src/http-sig/sign"
-import { handleSummaryRead, type OwnerDeps } from "../src/owner/endpoints"
-import type { OwnerGraph } from "../src/owner-graph"
+import { handleSummaryRead } from "../src/owner/endpoints"
 import { readRecordFromCar } from "../src/repo-proof"
-import type { RecordSnapshotStore } from "../src/snapshot-read"
-import type { ChallengeStore, Directory, Locator, PMRStore, RegistrationFields } from "../src/storage"
 import {
     decodeSummaryDelta,
     diffSummaryIndex,
@@ -25,10 +17,19 @@ import {
     SUMMARY_RECORD_KEYS,
     SUMMARY_TOKENS_KEPT,
     type SummaryDelta,
-    type SummaryPageDeps,
     type SummaryIndex,
 } from "../src/summary"
-import { buildRepoCar, makeKey } from "./fixtures/repo-car"
+import {
+    COLLECTION,
+    dids,
+    OTHER_OWNER,
+    owner,
+    OWNER,
+    PEER,
+    read,
+    summaryWorld,
+    URL_BASE,
+} from "./fixtures/summary-world"
 
 describe("diffSummaryIndex", () => {
     const entry = (did: string, cid = "c1", verifiedWith = "k1") => ({
@@ -42,6 +43,7 @@ describe("diffSummaryIndex", () => {
         owner: "did:plc:me",
         ownBlocks: [],
         records,
+        verdicts: [],
     })
 
     it("with no base, everything changed and full is set", () => {
@@ -51,6 +53,8 @@ describe("diffSummaryIndex", () => {
             blocksChanged: true,
             changed: current.records,
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
         })
     })
 
@@ -62,6 +66,8 @@ describe("diffSummaryIndex", () => {
             blocksChanged: false,
             changed: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
         })
     })
 
@@ -97,195 +103,6 @@ describe("diffSummaryIndex", () => {
 })
 
 describe("summary read", () => {
-    const COLLECTION = "app.example.thing"
-    const WATCHED = [{ collection: COLLECTION, rkey: "self" }]
-    const OWNER = "did:plc:alice0000000000000000"
-    const OTHER_OWNER = "did:plc:bob00000000000000000000"
-    const PEER = "did:plc:peer0000000000000000000"
-    const URL_BASE = "https://relay.example/pmr/v1/summary"
-    const T0 = 1_760_000_000
-
-    function summaryWorld() {
-        const registrations = new Map<string, RegistrationFields>()
-        const challenges = (() => {
-            const rows = new Map<string, string>()
-            return {
-                async mint(c: string, boundTo: string) {
-                    rows.set(c, boundTo)
-                },
-                async consume(c: string) {
-                    const v = rows.get(c)
-                    if (v === undefined) return null
-                    rows.delete(c)
-                    return v
-                },
-            } as ChallengeStore
-        })()
-        const directory = {
-            async resolve(did: string): Promise<Locator | null> {
-                return registrations.has(did) ? `loc:${did}` : null
-            },
-            async create(did: string, registration: RegistrationFields): Promise<Locator> {
-                if (!registrations.has(did)) registrations.set(did, registration)
-                return `loc:${did}`
-            },
-        } as unknown as Directory
-
-        // The served-state store, as the PMRStore contract describes it.
-        const served = new Map<string, { token: string; index: SummaryIndex }[]>()
-        const puts: { locator: string; token: string }[] = []
-        const store = (locator: Locator): PMRStore =>
-            ({
-                load: async () => registrations.get(locator.slice(4)) ?? null,
-                async putSummaryIndex(token: string, index: SummaryIndex, _servedAtMs: number, replaces?: string) {
-                    puts.push({ locator, token })
-                    const list = (served.get(locator) ?? []).filter(
-                        (e) => e.token !== token && e.token !== replaces
-                    )
-                    list.push({ token, index })
-                    served.set(locator, list.slice(-SUMMARY_TOKENS_KEPT))
-                },
-                async getSummaryIndex(token: string) {
-                    return served.get(locator)?.find((e) => e.token === token)?.index ?? null
-                },
-            }) as unknown as PMRStore
-
-        // What the monitor holds: a record per DID at a version; absent unless set.
-        const versions = new Map<string, number>()
-        const key = makeKey()
-        const ownGraphs = new Map<string, OwnerGraph>()
-        const blocks = new Map<string, { blocker: string; rkey: string; subject: string }[]>()
-        const blocksFail = new Set<string>()
-        const graphFail = new Set<string>()
-        const notServed = new Set<string>()
-        const reads: string[] = []
-        const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
-        const repoOf = (did: string, collection: string, rkey: string) => {
-            const version = versions.get(did)
-            if (version === undefined) return null
-            const cacheKey = `${did}|${collection}/${rkey}@${version}`
-            if (!repos.has(cacheKey)) {
-                repos.set(
-                    cacheKey,
-                    buildRepoCar({
-                        did,
-                        key,
-                        records: { [`${collection}/${rkey}`]: { $type: collection, did, version } },
-                    })
-                )
-            }
-            return repos.get(cacheKey)!
-        }
-        const unreadable = new Set<string>()
-        const records: RecordSnapshotStore = {
-            async get(did, collection, rkey) {
-                reads.push(`${did}|${collection}/${rkey}`)
-                if (unreadable.has(did)) return null
-                const repo = repoOf(did, collection, rkey)
-                if (!repo) return null
-                return {
-                    car: repo.car,
-                    freshAtMs: 0,
-                    verifiedWith: key.multikey,
-                    rev: "3kaaaaaaaaaaa",
-                    cid: repo.recordCids[`${collection}/${rkey}`]!,
-                }
-            },
-        }
-        const index: SummaryPageDeps["index"] = {
-            async entries(refs) {
-                return refs.map((r) => {
-                    const repo = repoOf(r.did, r.collection, r.rkey)
-                    return repo === null
-                        ? null
-                        : {
-                              ...r,
-                              cid: repo.recordCids[`${r.collection}/${r.rkey}`]!,
-                              verifiedWith: key.multikey,
-                              freshAtMs: T0 * 1000,
-                          }
-                })
-            },
-        }
-        const edge = (did: string): OwnerGraph["following"][number] => ({ did, mutual: false })
-        ownGraphs.set(OWNER, { did: OWNER, following: [edge(PEER)], followers: [] })
-        ownGraphs.set(OTHER_OWNER, { did: OTHER_OWNER, following: [], followers: [] })
-        versions.set(OWNER, 1)
-        versions.set(OTHER_OWNER, 1)
-        versions.set(PEER, 1)
-
-        let n = 0
-        const deps: OwnerDeps & SummaryPageDeps & { randomBytes: (n: number) => Uint8Array; pageRecords?: number } = {
-            challenges,
-            directory,
-            resolveLocator: (did) => directory.resolve(did),
-            store,
-            nowSeconds: T0,
-            discardWindowSeconds: 3600,
-            graph: {
-                ownGraph: async (did) => {
-                    if (graphFail.has(did)) throw new Error("d1 down")
-                    return ownGraphs.get(did) ?? null
-                },
-            },
-            blocks: {
-                ownBlocks: async (did) => {
-                    if (blocksFail.has(did)) throw new Error("d1 down")
-                    return blocks.get(did) ?? (notServed.has(did) ? null : [])
-                },
-            },
-            records,
-            index,
-            signingKeys: {
-                keysFor: async (dids) =>
-                    new Map(dids.map((d) => [d, { kind: "trusted", key: key.multikey } as const])),
-            },
-            onLapse: () => {},
-            watched: WATCHED,
-            randomBytes: (len) => {
-                n += 1
-                const bytes = new Uint8Array(len)
-                new DataView(bytes.buffer).setUint32(0, n)
-                return bytes
-            },
-            nowMs: () => T0 * 1000 + n,
-        }
-        return {
-            deps,
-            registrations,
-            directory,
-            challenges,
-            versions,
-            ownGraphs,
-            blocks,
-            blocksFail,
-            graphFail,
-            notServed,
-            served,
-            puts,
-            reads,
-            unreadable,
-        }
-    }
-
-    async function owner(w: ReturnType<typeof summaryWorld>, did: string) {
-        const secretKey = ed25519.utils.randomSecretKey()
-        await w.directory.create(did, {
-            did,
-            anchorKey: encodeOkpEd25519Key({ x: ed25519.getPublicKey(secretKey) }),
-            lastActive: T0,
-        })
-        return async (since?: string): Promise<Response> => {
-            const c = `chal-${Math.random().toString(36).slice(2)}`
-            await w.challenges.mint(c, encodeBinding({ realm: "anchor", subject: did }), T0 + 600)
-            const url = since === undefined ? URL_BASE : `${URL_BASE}?since=${encodeURIComponent(since)}`
-            const parts = signRequest({ method: "GET", url, nonce: c, keyid: "t", secretKey })
-            return handleSummaryRead(new Request(url, { method: "GET", headers: parts.headers }), w.deps)
-        }
-    }
-    const read = async (res: Response) => decodeSummaryDelta(new Uint8Array(await res.arrayBuffer()))
-    const dids = (d: { records: { did: string }[] }) => d.records.map((r) => r.did).sort()
-
     it("an unauthenticated read is 401", async () => {
         const w = summaryWorld()
         const res = await handleSummaryRead(new Request(URL_BASE), w.deps)
@@ -340,6 +157,8 @@ describe("summary read", () => {
             ownBlocks: null,
             records: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
             more: false,
             truncated: false,
         })
@@ -703,6 +522,8 @@ describe("summary codec", () => {
             },
         ],
         removed: [{ did: "did:plc:b", collection: "app.example.thing", rkey: "self" }],
+        verdicts: [],
+        droppedVerdicts: [],
     }
 
     it("a delta round-trips through encode and decode", () => {
@@ -750,6 +571,8 @@ describe("summary codec", () => {
             SUMMARY_DELTA_KEYS.more,
             SUMMARY_DELTA_KEYS.truncated,
             SUMMARY_DELTA_KEYS.ownBlocks,
+            SUMMARY_DELTA_KEYS.verdicts,
+            SUMMARY_DELTA_KEYS.droppedVerdicts,
         ]
         for (const key of Object.values(SUMMARY_DELTA_KEYS)) {
             if (optional.includes(key)) continue

@@ -27,6 +27,7 @@ function depsFor(
     const deps: SummaryPageDeps = {
         graph: { ownGraph },
         blocks: { ownBlocks },
+        senderGraph: { forSender: async () => new Map() },
         index: {
             entries: async (refs) => {
                 asked.push([...new Set(refs.map((r) => r.did))])
