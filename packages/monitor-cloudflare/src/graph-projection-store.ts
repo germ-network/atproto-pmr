@@ -33,10 +33,18 @@ export function kvGraphProjections(env: MonitorEnv): GraphProjectionWriter {
         },
 
         async listDids(
-            _cursor: string | null,
-            _limit: number
+            cursor: string | null,
+            limit: number
         ): Promise<{ dids: string[]; cursor: string | null }> {
-            throw new Error("not implemented")
+            const page = await env.records.list({
+                prefix: GRAPH_PREFIX,
+                limit,
+                ...(cursor === null ? {} : { cursor }),
+            })
+            return {
+                dids: page.keys.map((k) => k.name.slice(GRAPH_PREFIX.length)),
+                cursor: page.list_complete ? null : page.cursor,
+            }
         },
     }
 }
