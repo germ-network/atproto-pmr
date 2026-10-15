@@ -87,8 +87,9 @@ A key monitor:
   uninterrupted connection — a monitor MUST resume from its cursor (or
   replay) across any gap. This workload difference is why the monitor
   and a relay separate cleanly even when one operator runs both.
-- holds a **stateful snapshot** of its coverage:
-  `did → (rev, record CAR, observedAt)`.
+- holds a **stateful snapshot** of its coverage,
+  `did → (rev, record CAR, observedAt)`, and a coverage watermark that dates
+  all of it ([freshness](#freshness-comes-from-coverage-not-polling)).
 - declares its **coverage**: the population of records it observes,
   typically everything visible on the firehose it consumes. Coverage is a
   published fact about the monitor, not a per-client setting.
@@ -213,19 +214,48 @@ device looks at. That privacy is the whole of the trust: records stay CAR, a
 device verifies each against the DID document itself, and it never takes the
 relay's word for content or a key.
 
+### Freshness comes from coverage, not polling
+
+A monitor is sized for every declaration holder on the network, not for a
+population small enough to poll. Its cost grows with the number of changes,
+never with the number of holders, so it MUST NOT establish freshness by
+re-reading holders' PDSes on a schedule.
+
+- **The coverage watermark.** A monitor keeps one instant, its watermark: every
+  commit to the declaration collection, and every identity and account event,
+  that the firehose sequenced before it has been applied. A held snapshot is
+  current as of the watermark, not as of its own fetch. A snapshot's
+  **freshness** is the later of the watermark and that DID's last direct fetch.
+- **Per-DID fetches are event-driven.** A monitor reads a holder's PDS when an
+  event names the DID, when it first learns of the DID, and during a resync.
+  Key rotations arrive as identity events and, for `did:plc`, through the PLC
+  export stream.
+- **Gaps.** Resuming from a cursor inside the stream's replay window keeps
+  coverage continuous. When a monitor cannot resume (its cursor fell out of the
+  window, or the stream reset), its watermark stops at the last instant it
+  covered. It then **resyncs**, checking each held DID's repo head against the
+  `rev` it holds, and raises each DID's freshness as the check reaches it. A
+  resync costs one head read per holder, paid per gap, not per day.
+- **What polling defended against.** Polling a PDS caught events that a relay
+  or stream dropped. That defence belongs to plurality instead: several
+  independent monitors on independent streams, and the device's own-DID push
+  ([the two comparisons](#the-two-comparisons-and-their-different-weights)).
+
 ### Reads and the 24-hour rule
 
-A **relay** that relies on a held snapshot for a pair put checks it against the
-DID's PDS once it is 24 hours unconfirmed, comparing the record's CID only. If
-the PDS cannot be read, the older snapshot stands; if the record changed or is
-gone, the put is refused until the monitor catches up
-([trust-model P5](trust-model.md#p5--sender-verification)). A monitor in that
-role therefore re-confirms held snapshots on a schedule, so the check is the
-exception.
+A **relay** relies on a held snapshot for a pair put while the snapshot's
+freshness is within 24 hours. Past that, the monitor has fallen behind, and
+the relay checks the DID's PDS, comparing the record's CID only. If the PDS
+cannot be read, the older snapshot stands. If the record changed or is gone,
+the put is refused until the monitor catches up
+([trust-model P5](trust-model.md#p5--sender-verification)). With continuous
+coverage this never fires; it bounds a monitor whose stream has broken for a
+day and whose resync has not yet reached that DID.
 
 A **device read** does not wait: a lapsed declaration is served as held, and
-the monitor is asked to re-check it afterwards. The re-check tells the PDS that
-someone is interested in the DID, though not who or when.
+the monitor is asked to move that DID forward in its resync. The read that
+follows tells the PDS that someone is interested in the DID, though not who
+or when.
 
 ### Which DID directory a device queries
 

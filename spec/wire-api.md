@@ -1160,9 +1160,9 @@ continuous coverage, which leaves `did:plc` snapshots `unverifiable` until
 they are confirmed again. A declaration that fails this check requests no
 re-check.
 
-The response never waits on the PDS. A declaration past 24 hours is served as
-held and queued for the monitor to re-check ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
-The residual leak is that re-check: the PDS learns someone is interested in
+The response never waits on the PDS. A declaration whose freshness is past 24 hours is served as
+held and moved forward in the monitor's resync ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
+The residual leak is that read: the PDS learns someone is interested in
 that DID.
 
 #### Summary

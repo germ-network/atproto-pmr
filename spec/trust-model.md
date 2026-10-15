@@ -143,12 +143,14 @@ It does not take the
 declaration from the sender's PDS on a put, for two reasons: an inline fetch
 tells the sender's PDS when the sender sends, and a read from the party
 whose claim is being checked is not independent of it. The cost is
-freshness: the relay's view is the monitor's view, bounded by the monitor's
-periodic re-confirmation of every held snapshot. A rotation or revocation
-the monitor has not yet observed is accepted until it is.
+freshness: the relay's view is the monitor's view, current as of the
+monitor's firehose coverage
+([key-transparency](key-transparency.md#freshness-comes-from-coverage-not-polling)).
+A rotation or revocation the monitor has not yet observed is accepted until it is.
 
-**One bounded exception.** A held snapshot the monitor has not confirmed for
-24 hours means the monitor has fallen behind. The relay then reads the
+**One bounded exception.** A held snapshot whose freshness (the monitor's
+coverage watermark, or that DID's last direct fetch if later) is more than
+24 hours old means the monitor has fallen behind. The relay then reads the
 sender's PDS to check whether the declaration record is still the same
 — it compares the record CID and nothing else, and never takes the PDS's
 bytes as the declaration. Unchanged, the snapshot stands. Changed or gone,
