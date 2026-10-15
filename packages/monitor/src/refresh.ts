@@ -15,7 +15,8 @@ import {
 } from "@germ-network/atproto-pmr-core"
 import {
     pushNewlySeenKey,
-    recordFetchedDocument,
+    recordWatchedDocument,
+    withdrawFetchedDocument,
     settle,
     settleDeletion,
     type IngestDeps,
@@ -228,7 +229,7 @@ async function refreshDeclaration(
             repoGone: repoLevel(err),
         }
     }
-    await recordFetchedDocument(ingest, did, fetched.didDocument)
+    const recorded = await recordWatchedDocument(ingest, did, fetched.didDocument)
     const verified = await ingest.verify(did, fetched)
     if (verified.kind === "unverifiable") {
         // Not evidence of anything: the stored record stands and the DID is
@@ -240,7 +241,14 @@ async function refreshDeclaration(
     if (verified.kind === "verified-absent") {
         // A 200 with an exclusion proof: the repo is alive and the record is
         // gone. Reversible, because the account may publish it again.
-        return { outcome: await disposeGone(deps, did, false, false, nowMs), repoGone: false }
+        const outcome = await disposeGone(deps, did, false, false, nowMs)
+        // A document stored for a DID this left unwatched would be trusted
+        // with nothing following it. Unguarded on purpose: a failed check is
+        // not "unwatched", and the caller marks the DID attempted.
+        if (recorded && !(await ingest.index.isWatched(did))) {
+            await withdrawFetchedDocument(ingest, did, fetched.didDocument)
+        }
+        return { outcome, repoGone: false }
     }
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 

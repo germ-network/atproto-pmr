@@ -11,10 +11,10 @@ import {
     routeFollowEvent,
     listReposByCollection,
     plcCursorAfterClose,
-    FETCH_AS_OF_SKEW_MS,
     FOLLOW_COLLECTION_NSID,
     fetchHeadRev,
     pushDeclarationChange,
+    recordWatchedDocument,
     refreshDue,
     sealDueWindows,
     settleDue,
@@ -2700,6 +2700,7 @@ export class MonitorIngest
             listings: this,
             interest: this,
             index: this,
+            didDocuments: this,
             edges,
             budget,
             fetchRepo: (did) => this.fetchRepo(did),
@@ -2941,14 +2942,15 @@ export class MonitorIngest
      * the document it was resolved through, for the refresh. Defaults to a
      * real read that also keeps that document; a subclass overrides it
      * alongside `fetchRecord` when the deployment resolves DIDs differently,
-     * and must hand its own document to `recordDidDocument` to keep that.
+     * and must hand its own document to `recordWatchedDocument` to keep that.
      * The key must be in the form `fetchRecord` returns, since refresh
      * compares the two as strings; a `null` key counts as a mismatch.
      */
     protected fetchHeadRev(did: string): Promise<HeadRev> {
         return fetchHeadRev(did, {
-            onDidDocument: ({ document, fetchedAtMs }) =>
-                this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
+            onDidDocument: async (fetched) => {
+                await recordWatchedDocument({ index: this, didDocuments: this }, did, fetched)
+            },
         })
     }
 

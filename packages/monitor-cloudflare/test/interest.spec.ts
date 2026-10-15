@@ -1557,7 +1557,45 @@ describe("documents and key updates follow interest", () => {
         expect(await rows(stub, "SELECT did, kind FROM key_updates")).toEqual([{ did: followee, kind: "delete" }])
         expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
     })
-    it.todo(
-        "a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)"
-    )
+    it("a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)", async () => {
+        const stub = everyoneStub()
+        const did = uniqDid()
+        const original = globalThis.fetch
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            const url = String(input)
+            if (url.startsWith("https://plc.directory/")) {
+                return Promise.resolve(
+                    Response.json({
+                        id: did,
+                        service: [
+                            {
+                                id: "#atproto_pds",
+                                type: "AtprotoPersonalDataServer",
+                                serviceEndpoint: "https://pds.invalid",
+                            },
+                        ],
+                    })
+                )
+            }
+            if (url.includes("sync.getLatestCommit")) {
+                return Promise.resolve(Response.json({ cid: "bafy", rev: "3m5" }))
+            }
+            return Promise.resolve(new Response(null, { status: 404 }))
+        }) as typeof fetch
+        try {
+            await inObj(stub, async (obj) => {
+                await obj.complete(did, "3m1", 1_000, VERIFIED)
+                await obj.completeDeletion(did, 2_000, false)
+                expect(await obj.holderStateOf(did)).toBe("gone-reversible")
+                expect(await obj.isWatched(did)).toBe(false)
+                const head = await (
+                    obj as unknown as { fetchHeadRev(did: string): Promise<{ rev: string }> }
+                ).fetchHeadRev(did)
+                expect(head.rev).toBe("3m5")
+            })
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(await rows(stub, `SELECT did FROM did_documents WHERE did = '${did}'`)).toEqual([])
+    })
 })

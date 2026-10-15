@@ -34,7 +34,7 @@ import {
     type VerifiedCollection,
 } from "@germ-network/atproto-pmr-core"
 import { FOLLOW_COLLECTION_NSID } from "./follow-stream"
-import type { FetchedDidDocument } from "./ingest"
+import { recordWatchedDocument, type FetchedDidDocument } from "./ingest"
 import {
     D1_ROWS_PER_STATEMENT,
     type DidDocumentSink,
@@ -707,6 +707,7 @@ export async function listOwner(
     let unverifiable = false
     try {
         const fetched = await deps.fetchRepo(did)
+        await recordWatchedDocument(deps, did, fetched.didDocument)
         if (fetched.signingKey === null) {
             unverifiable = true
             throw new Error("the DID document has no #atproto key")
@@ -792,7 +793,9 @@ export async function fetchListingPages(
         pagesUsed = 1
         listing.attempts += 1
         try {
-            pds = (await deps.resolvePds(did)).pds
+            const resolved = await deps.resolvePds(did)
+            pds = resolved.pds
+            await recordWatchedDocument(deps, did, resolved.didDocument)
         } catch (error) {
             const outcome = await deferStep(deps, config, listing, held?.gen ?? null, {
                 timedOut: false,

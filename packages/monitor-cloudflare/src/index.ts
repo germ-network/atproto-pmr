@@ -36,7 +36,7 @@
  * `kvPlcCoverage(env)` into `storedSigningKeyResolver`, with
  * `cachedSigningKeyResolver` as its fallback. Wiring that into the relay's
  * `resolveSigningKey` is the deployment's step. A subclass that overrides
- * `fetchHeadRev` must hand its document to `recordDidDocument` to keep the
+ * `fetchHeadRev` must hand its document to `recordWatchedDocument` to keep the
  * stored copy current, and a `fetchRecord` not built on `fetchRecordCar`
  * must return the document it resolved as `didDocument`.
  *

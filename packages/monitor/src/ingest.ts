@@ -421,48 +421,55 @@ export async function pushNewlySeenKey(
 /**
  * Keeps the DID document a fetch resolved through, ordered by when that
  * fetch started. A failing sink never costs the caller its fetch: the
- * stored copy is refreshed again by the next one.
+ * stored copy is refreshed again by the next one. Resolves to whether the
+ * sink took the document.
  */
 export async function recordFetchedDocument(
     deps: Pick<IngestDeps, "didDocuments">,
     did: string,
     fetched: FetchedDidDocument | undefined
-): Promise<void> {
-    if (fetched === undefined || deps.didDocuments === undefined) return
+): Promise<boolean> {
+    if (fetched === undefined || deps.didDocuments === undefined) return false
     try {
         await deps.didDocuments.recordDidDocument(
             did,
             fetched.document,
             fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
         )
-    } catch {}
+        return true
+    } catch {
+        return false
+    }
 }
 
 /**
- * `recordFetchedDocument`, for a fetch whose own outcome cannot change
- * whether the DID is watched: a document is kept only for a DID the export
- * stream keeps current, so none is stored that nothing will follow. The gate
- * sits here, at the fetch, and not in the sink, which the stream also feeds
- * for permanently deleted DIDs. Never throws: a failed `isWatched` counts as
- * not watched. Resolves to whether a document was recorded, so a caller
- * withdraws only what it stored.
+ * `recordFetchedDocument` for a DID that is watched: a document is kept only
+ * where the export stream keeps it current, so none is stored that nothing
+ * will follow. The gate sits at the fetch, not in the sink, which the stream
+ * also feeds for permanently deleted DIDs. Never throws: a failed `isWatched`
+ * counts as not watched. Resolves to whether the sink took the document, so
+ * a caller whose outcome can leave the DID unwatched withdraws only what it
+ * stored.
  */
 export async function recordWatchedDocument(
     deps: { index: Pick<MonitorIndex, "isWatched">; didDocuments?: DidDocumentSink },
     did: string,
     fetched: FetchedDidDocument | undefined
 ): Promise<boolean> {
-    void deps
-    void did
-    void fetched
-    throw new Error("not implemented")
+    if (fetched === undefined || deps.didDocuments === undefined) return false
+    try {
+        if (!(await deps.index.isWatched(did))) return false
+    } catch {
+        return false
+    }
+    return recordFetchedDocument(deps, did, fetched)
 }
 
 /**
  * Withdraws trust in the stored document `fetched` just wrote, ordered with
  * that write, for a DID no one will keep current.
  */
-async function withdrawFetchedDocument(
+export async function withdrawFetchedDocument(
     deps: Pick<IngestDeps, "didDocuments">,
     did: string,
     fetched: FetchedDidDocument | undefined

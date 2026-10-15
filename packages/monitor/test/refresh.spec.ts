@@ -510,10 +510,88 @@ describe("refresh keeps the stored DID document", () => {
 
     // A document stored for a DID that stays unwatched would be trusted for a
     // day with nothing following it.
-    it.todo("a re-fetch that leaves the DID unwatched withdraws the document it stored")
+    it("a re-fetch that leaves the DID unwatched withdraws the document it stored", async () => {
+        const document = { id: DID }
+        const recordDidDocument = vi.fn(async () => {})
+        const markDidDocumentStale = vi.fn(async () => {})
+        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document, fetchedAtMs: 50_000 } }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => gone,
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale }
+        // Holds until the verified-absent disposal ends it, as in the object.
+        let ended = false
+        const completeDeletion = h.deps.ingest.index.completeDeletion
+        h.deps.ingest.index.completeDeletion = async (...args) => {
+            ended = true
+            return completeDeletion(...args)
+        }
+        h.deps.ingest.index.isWatched = async () => !ended
+        await run(h)
+        expect(recordDidDocument).toHaveBeenCalledExactlyOnceWith(DID, document, 50_000 - FETCH_AS_OF_SKEW_MS)
+        expect(markDidDocumentStale).toHaveBeenCalledExactlyOnceWith(DID, 50_000 - FETCH_AS_OF_SKEW_MS)
+    })
+
     // No row, no version bump and no KV delete on each head move of a DID
     // that was never watched.
-    it.todo("a re-fetch for a DID that was not watched records nothing and withdraws nothing")
+    it("a re-fetch for a DID that was not watched records nothing and withdraws nothing", async () => {
+        const recordDidDocument = vi.fn(async () => {})
+        const markDidDocumentStale = vi.fn(async () => {})
+        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => gone,
+            gone: [DID],
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale }
+        h.deps.ingest.index.isWatched = async () => false
+        await run(h)
+        expect(recordDidDocument).not.toHaveBeenCalled()
+        expect(markDidDocumentStale).not.toHaveBeenCalled()
+    })
+
+    it("a failing sink leaves nothing to withdraw", async () => {
+        const markDidDocumentStale = vi.fn(async () => {})
+        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => gone,
+        })
+        h.deps.ingest.didDocuments = {
+            recordDidDocument: async () => {
+                throw new Error("store down")
+            },
+            markDidDocumentStale,
+        }
+        await run(h)
+        expect(markDidDocumentStale).not.toHaveBeenCalled()
+    })
+
+    it("a failing isWatched after the outcome is not taken for unwatched", async () => {
+        const markDidDocumentStale = vi.fn(async () => {})
+        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => gone,
+        })
+        h.deps.ingest.didDocuments = { recordDidDocument: async () => {}, markDidDocumentStale }
+        let calls = 0
+        h.deps.ingest.index.isWatched = async () => {
+            if (++calls > 1) throw new Error("index down")
+            return true
+        }
+        await run(h)
+        expect(markDidDocumentStale).not.toHaveBeenCalled()
+    })
 })
 
 describe("refresh re-verifies", () => {
