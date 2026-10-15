@@ -149,20 +149,24 @@ export async function intake(
 ): Promise<IntakeDecision> {
     if (event.kind !== "commit") {
         // Identity/account/sync ignore the collection filter and arrive for
-        // every DID. Only those already in the snapshot matter — and for
-        // them this is not merely informational: a DID-document rotation
-        // changes what the record verifies against, so the record must be
-        // read again even though it did not change. `owe` rather than
-        // `intake` because the dedupe check would suppress exactly this.
+        // every DID. For one already in the snapshot this is not merely
+        // informational: a DID-document rotation changes what the record
+        // verifies against, so the record must be read again even though it
+        // did not change. `owe` rather than `intake` because the dedupe
+        // check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
-        if (known === null) return "ignored"
         // A DID confirmed deleted has no live record to re-verify against
         // — re-owing here would only rediscover the same deletion and
         // re-push it, once per identity/account/sync event, forever.
-        if (await deps.index.isDeleted(event.did)) return "ignored"
-        await deps.index.owe(event.did, known)
-        await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
-        return "reverify"
+        const reverify = known !== null && !(await deps.index.isDeleted(event.did))
+        if (reverify) await deps.index.owe(event.did, known)
+        // The relay's cached key is dropped for every DID whose document the
+        // monitor keeps, declaration or not. After the owe, so a holder that
+        // reverifies is watched.
+        if (await deps.index.isWatched(event.did)) {
+            await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
+        }
+        return reverify ? "reverify" : "ignored"
     }
 
     const commit: CommitEvent = event
@@ -432,6 +436,26 @@ export async function recordFetchedDocument(
             fetched.fetchedAtMs - FETCH_AS_OF_SKEW_MS
         )
     } catch {}
+}
+
+/**
+ * `recordFetchedDocument`, for a fetch whose own outcome cannot change
+ * whether the DID is watched: a document is kept only for a DID the export
+ * stream keeps current, so none is stored that nothing will follow. The gate
+ * sits here, at the fetch, and not in the sink, which the stream also feeds
+ * for permanently deleted DIDs. Never throws: a failed `isWatched` counts as
+ * not watched. Resolves to whether a document was recorded, so a caller
+ * withdraws only what it stored.
+ */
+export async function recordWatchedDocument(
+    deps: { index: Pick<MonitorIndex, "isWatched">; didDocuments?: DidDocumentSink },
+    did: string,
+    fetched: FetchedDidDocument | undefined
+): Promise<boolean> {
+    void deps
+    void did
+    void fetched
+    throw new Error("not implemented")
 }
 
 /**

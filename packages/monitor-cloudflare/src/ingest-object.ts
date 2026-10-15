@@ -61,6 +61,7 @@ import {
     type QueuedRecount,
     type RecountQueueIndex,
     type FetchedRepo,
+    type ResolvedPds,
     type FollowPage,
     type FollowRecord,
     type ListingIndex,
@@ -2698,6 +2699,7 @@ export class MonitorIngest
         return {
             listings: this,
             interest: this,
+            index: this,
             edges,
             budget,
             fetchRepo: (did) => this.fetchRepo(did),
@@ -2917,8 +2919,13 @@ export class MonitorIngest
      * The DID's PDS from a freshly fetched document, once per `listRecords`
      * listing (mutual or paged owner). Protected so a test can stand in.
      */
-    protected async resolvePds(did: string): Promise<string> {
-        return pdsResolutionFromDocument(await fetchDidDocument(did, fetch)).endpoint
+    protected async resolvePds(did: string): Promise<ResolvedPds> {
+        const fetchedAtMs = Date.now()
+        const document = await fetchDidDocument(did, fetch)
+        return {
+            pds: pdsResolutionFromDocument(document).endpoint,
+            didDocument: { document: document as unknown as DidDocument, fetchedAtMs },
+        }
     }
 
     /**

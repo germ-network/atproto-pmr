@@ -1020,3 +1020,7 @@ describe("stale steps and kind changes", () => {
         })
     })
 })
+
+describe("listing documents", () => {
+    it.todo("a listing's fetched document is recorded")
+})

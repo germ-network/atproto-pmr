@@ -507,6 +507,13 @@ describe("refresh keeps the stored DID document", () => {
         }
         expect((await run(h)).outcomes["advanced-quiet"]).toBe(1)
     })
+
+    // A document stored for a DID that stays unwatched would be trusted for a
+    // day with nothing following it.
+    it.todo("a re-fetch that leaves the DID unwatched withdraws the document it stored")
+    // No row, no version bump and no KV delete on each head move of a DID
+    // that was never watched.
+    it.todo("a re-fetch for a DID that was not watched records nothing and withdraws nothing")
 })
 
 describe("refresh re-verifies", () => {

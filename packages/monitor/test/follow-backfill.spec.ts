@@ -313,6 +313,7 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
             inInterest: async (d) => !left.has(d),
             isRegistered: async (d) => registered.has(d),
         },
+        index: { isWatched: async (d) => !left.has(d) },
         edges: {
             async putEdges(edges: readonly FollowEdge[], gen: number) {
                 const cost = 4 * Math.ceil(edges.length / 25) + 1
@@ -340,7 +341,10 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
         },
         async resolvePds(did) {
             resolved.push(did)
-            return "https://pds.example"
+            return {
+                pds: "https://pds.example",
+                didDocument: { document: { id: did }, fetchedAtMs: 0 },
+            }
         },
         async listFollows(): Promise<FollowPage> {
             return { records: [], lastRkey: null }
@@ -1109,4 +1113,11 @@ describe("follow stream gap", () => {
         expect(followGapExceeded(NOW - LOOKBACK - 1, NOW, LOOKBACK)).toBe(true)
         expect(followGapExceeded(NOW - 1_000, NOW, LOOKBACK)).toBe(false)
     })
+})
+
+describe("a listing's fetched document", () => {
+    it.todo("a getRepo listing records the document it resolved through, verified or not")
+    it.todo("a listRecords listing records the document its PDS was resolved from")
+    it.todo("a listing of a DID that is not watched records no document")
+    it.todo("a failing isWatched records no document and does not fail the listing")
 })

@@ -210,7 +210,10 @@ export function stubNet(
     o.resolvePds = async (did: string) => {
         net.resolves.push(did)
         if (options.pageDelayMs) await new Promise((r) => setTimeout(r, options.pageDelayMs))
-        return "https://pds.invalid"
+        return {
+            pds: "https://pds.invalid",
+            didDocument: { document: { id: did }, fetchedAtMs: Date.now() },
+        }
     }
     o.listFollows = async (_pds: string, did: string, cursor: string | null): Promise<FollowPage> => {
         net.pages.push({ did, cursor })

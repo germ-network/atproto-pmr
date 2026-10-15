@@ -1732,6 +1732,11 @@ describe("wiring stored DID documents into the monitor", () => {
         expect(failed).toContain("publish 64")
         expect(failed).toContain("seal")
     })
+
+    it.todo("the default fetchHeadRev records no document for a DID that is not watched")
+    // The gate is at the fetch, not in recordDidDocument, which the stream
+    // also feeds for deleted DIDs.
+    it.todo("a deleted DID's document still follows the PLC stream, though a fetch for it records none")
 })
 
 describe("the PLC export cursor", () => {

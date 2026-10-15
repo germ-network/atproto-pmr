@@ -1535,3 +1535,29 @@ describe("declaration intake by policy", () => {
         }
     })
 })
+
+describe("documents and key updates follow interest", () => {
+    // did:web keeps this independent of whether the PLC stream is configured,
+    // which makes the wrapper drop did:plc hints.
+    it("an identity event for a non-holder did:web followee owes a key update", async () => {
+        const stub = registeredStub()
+        const followee = `did:web:followee${crypto.randomUUID().slice(0, 8)}.example`
+        const stranger = `did:web:stranger${crypto.randomUUID().slice(0, 8)}.example`
+        await inObj(stub, async (obj) => {
+            await obj.setOwnerFollowers(followee, 1, 1)
+            for (const did of [followee, stranger]) {
+                await onFrame(
+                    obj,
+                    JSON.stringify({
+                        payload: { $type: "com.atproto.sync.subscribeRepos#identity", did, time_us: 1_000_000 },
+                    })
+                )
+            }
+        })
+        expect(await rows(stub, "SELECT did, kind FROM key_updates")).toEqual([{ did: followee, kind: "delete" }])
+        expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+    })
+    it.todo(
+        "a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)"
+    )
+})
