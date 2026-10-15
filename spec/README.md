@@ -142,8 +142,8 @@ fingerprint an attacker can test a relay against. See
 | [`wire-api.md`](wire-api.md) | the **normative wire surface** — request authentication, key material, the endpoint inventory, the pair-put payload and its verification algorithm, error semantics, the closure exception |
 | [`storage-consistency.md`](storage-consistency.md) | the **storage consistency contract** an implementation must satisfy, stated backend-neutrally, plus the operation inventory the relay's logic runs against |
 | [`trust-model.md`](trust-model.md) | the **security properties** an implementation must preserve, what a relay necessarily learns, and what a malicious one can do |
-| [`key-transparency.md`](key-transparency.md) | the **key monitor** — key transparency for atproto messaging: the CT-shaped trust structure, the monitor's surfaces (own-DID push, domain deltas, the change digest, the community-view fetch), and the append-only-ledger enhancement |
-| [`proxy-cache.md`](proxy-cache.md) | the **intended** model of a PMR as a verified cache of the records and DID documents of the DIDs it serves — marked, element by element, built or not yet built |
+| [`key-transparency.md`](key-transparency.md) | the **key monitor** — key transparency for atproto messaging: the CT-shaped trust structure, the monitor's surfaces (own-DID push, domain deltas, the change digest, the community-view fetch), serving held declarations and DID documents to devices (the 24-hour rule), and the append-only-ledger enhancement |
+| [`messaging-appview.md`](messaging-appview.md) | the PMR as a **messaging appview**: what it computes for its users (whether they can message a DID, their own blocks, contacts' profiles), the posture of its public reads, its follow and block indexes and their sizing — marked, element by element, built or not yet built |
 
 ## Dependencies on a non-atproto record format
 

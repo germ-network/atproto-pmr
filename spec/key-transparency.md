@@ -580,6 +580,83 @@ is neither skew nor an alarm — it means the DID document moved between the
 two observations, which the PLC log settles, not these two records
 (and which nothing settles at all for `did:web`).
 
+## Serving held snapshots and documents to devices
+
+A relay can answer its devices' reads of declarations and DID documents from
+the key monitor's stores, instead of the device querying the PDS or the
+directory. These reads are the relay's; the monitor's own surfaces above are
+unchanged.
+
+A cache of this kind is only worth keeping if a device can use it without trusting it.
+It therefore stays a **cache of signed things**: records are CAR, verified
+against the DID document, and DID documents are checked against PLC. This is
+the same posture the rest of the specification takes toward a monitor —
+[as untrusted as any relay](#the-record-fetch), for the
+authenticity reasons in
+[trust-model P2](trust-model.md#p2--relayed-repo-records-are-car) — and it is why [the hint](trust-model.md#p8--the-relays-verdict-is-a-hint) is
+a freshness cue and never evidence.
+
+### Trusted for privacy, not for content
+
+Routing a device's reads through its PMR is a privacy measure: the PDS and a
+`did:web` host do not learn which DIDs a device is looking at, or when. That
+is the whole of the trust. A device still verifies every CAR against the DID
+document itself, and never takes the PMR's word for a record's content or for
+a key. A PMR that served a wrong record would be caught by that verification,
+the same as any other source.
+
+### Reads and the 24-hour rule
+
+A snapshot the monitor has not been able to confirm for 24 hours is checked
+against the DID's PDS for change, comparing the record's CID only, before a
+**relay** relies on it for a pair put: if the PDS cannot be read the older
+snapshot stands, and if the record changed or is gone the put is refused until
+the monitor catches up (the rule in
+[trust-model P5](trust-model.md#p5--sender-verification)).
+
+A **device read** does not wait for that check. A lapsed declaration is served
+as held, and the read asks the monitor to re-check it afterwards: a re-check
+request only moves a DID that is already due toward the front of the monitor's
+refresh queue, never makes one due, and takes at most a quarter of a batch, so
+anonymous reads cannot pin failing sources at its head. The check against the
+PDS is the monitor's, off the response path. The pair-put rule is unchanged.
+
+This carries the P5 caveat with it, in a smaller form. The re-check makes the
+monitor read that DID's PDS, so the PDS learns that someone is interested in
+it, though not who or when, and a burst of reads costs one request. The
+privacy benefit of the proxy does not extend to a record whose snapshot has to
+be re-confirmed this way. A summary index also notes a held declaration past
+24 hours, as an operational alarm that the monitor has fallen behind, and never
+requests a re-check, so one owner's sync does not fan out to their contacts'
+PDSes.
+
+### Which DID directory a device queries
+
+- **`did:plc`** — a device may query the PLC directory directly by default.
+  A user setting routes PLC queries through the PMR instead.
+- **`did:web`** — a device does not query a `did:web` host directly, because
+  a direct read reaches the identity's own host. The PMR proxies `did:web`
+  documents.
+
+### What is built, and what is not
+
+| element | status |
+|---|---|
+| A monitor's record snapshot, kept current by Jetstream and backfilled by direct query of the PDS | **built** — [key transparency](#keeping-the-snapshot-current) (under the `everyone` policy, every DID that carries the declaration collection, not only the DIDs one PMR serves; under `registered`, only the DIDs on the allow list below) |
+| The monitor's periodic re-confirmation of held snapshots | **built** |
+| The monitor's **re-check queue**: a device read of a declaration past the 24-hour rule asks the monitor to refresh that DID | **built** — a request only moves a DID that is already due toward the front (at most a quarter of a batch), never makes one due, and expires after a day |
+| A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path and exposed to devices by the [device read API](wire-api.md#device-reads--records-and-summary) |
+| The `sd` + `dc` hint on delivered messages | **built** |
+| The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
+| Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
+| A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
+| A `did:plc` **operation log** per watched DID, for a device to verify | **built** — the stream extends a held log (each appended operation's signature is checked), a gap or a fork owes a fetch of the directory's audit log, a fetched log is verified before it is kept and published as `plclog:<did>`, and a stored log confirms the document it renders ([wire API](wire-api.md#did-documents)) |
+| PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](#the-signing-key-cache), [stored documents](#the-stored-did-document)) |
+| Pushing **counterpart** record changes to devices | **not yet built** |
+| `did:web` document proxying | **built, as a hint** — the device reads the monitor's stored document from `/pmr/v1/did/{did}`, which it cannot verify and may confirm with the host |
+| The user setting that routes PLC queries through the PMR | **not yet built** |
+| A device-facing record and DID-document read, and so the 24-hour rule for device reads | **built** — the public record read ([wire API](wire-api.md#device-reads--records-and-summary)) and `/pmr/v1/did/{did}` ([wire API](wire-api.md#did-documents)); routes are mounted by the deploying Worker |
+
 ## The two comparisons, and their different weights
 
 - **Own-DID**: the device knows its own key, so it holds ground truth. One

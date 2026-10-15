@@ -33,63 +33,34 @@ Two consequences follow for the read surface:
   don't consume them, and keeping them projected for publication costs the
   host writes.
 
-## Reads and the 24-hour rule
+## What the appview computes
 
-A snapshot the cache has not been able to confirm for 24 hours is checked
-against the DID's PDS for change, comparing the record's CID only, before a
-**relay** relies on it for a pair put: if the PDS cannot be read the older
-snapshot stands, and if the record changed or is gone the put is refused until
-the cache catches up (the rule in
-[trust-model P5](trust-model.md#p5--sender-verification)).
+- **Whether the user can message a DID.** A verdict per sender and recipient,
+  computed from the recipient's declared policy, their follows and their
+  blocks: public, for any pair, and in the owner's summary for each of the
+  owner's contacts. **Not yet built.**
+- **The user's own blocks.** The owner's block list, in the owner's
+  authenticated summary, sent whole when it changes. **Built.**
+- **Profiles.** Each contact's profile record, beside their declaration, in
+  the summary and from the public record read. **Built.**
 
-A **device read** does not wait for that check. A lapsed declaration is served
-as held, and the read asks the monitor to re-check it afterwards: a re-check
-request only moves a DID that is already due toward the front of the monitor's
-refresh queue, never makes one due, and takes at most a quarter of a batch, so
-anonymous reads cannot pin failing sources at its head. The check against the
-PDS is the monitor's, off the response path. The pair-put rule is unchanged.
-
-This carries the P5 caveat with it, in a smaller form. The re-check makes the
-monitor read that DID's PDS, so the PDS learns that someone is interested in
-it, though not who or when, and a burst of reads costs one request. The
-privacy benefit of the proxy does not extend to a record whose snapshot has to
-be re-confirmed this way. A summary index also notes a held declaration past
-24 hours, as an operational alarm that the monitor has fallen behind, and never
-requests a re-check, so one owner's sync does not fan out to their contacts'
-PDSes.
-
-## Which DID directory a device queries
-
-- **`did:plc`** — a device may query the PLC directory directly by default.
-  A user setting routes PLC queries through the PMR instead.
-- **`did:web`** — a device does not query a `did:web` host directly, because
-  a direct read reaches the identity's own host. The PMR proxies `did:web`
-  documents.
+The inputs it keeps are the follow-edge index, the block index and the
+monitor's interest policy below. None of them is served raw. Declaration
+snapshots and DID documents belong to the key monitor
+([serving them to devices](key-transparency.md#serving-held-snapshots-and-documents-to-devices)).
 
 ## What is built, and what is not
 
 | element | status |
 |---|---|
-| A monitor's record snapshot, kept current by Jetstream and backfilled by direct query of the PDS | **built** — [key transparency](key-transparency.md#keeping-the-snapshot-current) (under the `everyone` policy, every DID that carries the declaration collection, not only the DIDs one PMR serves; under `registered`, only the DIDs on the allow list below) |
-| The monitor's periodic re-confirmation of held snapshots | **built** |
 | The monitor's **interest policy**: an allow list of DIDs it keeps records for, `registered` (the default: registered users and, once follow edges are written, the DIDs they follow) or `everyone` (every declaration holder), set by `INTEREST_POLICY` | **built** — `registered` needs a `pmrDirectory` binding, and only `everyone` runs the relay backfill and takes in declaration commits for DIDs it does not already follow. DIDs join and leave the list with an epoch check, so nothing is stored for a DID that left while a fetch was in flight; under `registered` the declaration socket ignores commits outside it |
 | The monitor's **profile snapshot**: the records named in `MONITOR_COLLECTIONS` (for example `app.bsky.actor.profile/self`; none when unset), verified and kept quietly beside the declaration for every DID in the allow list | **built** — no digest-window entry and no push. A holder's profile is head-checked hourly with its declaration; a DID that holds no declaration (a followee) is checked every 24 hours (`REFRESH_NONHOLDER_STALE_AFTER_MS`), with live profile events from the follow/profile stream keeping it current in between |
 | The monitor's **follow-edge index**: who each graph owner follows, in D1, with the follower counts the interest policy needs | **built** — an owner is a registered user under `registered`, a declaration holder under `everyone`. Live follow events keep it current; an owner listing (one verified `getRepo`, or `listRecords` pages for a repo past the walk's caps) writes it in full. A graph is served only after its owner listing completes; until then the [summary](wire-api.md#summary) answers "not served yet". The graph is read only by the relay, over the ingest binding, to choose a summary's contacts: no route, KV key or job publishes it. Each summary poll costs two RPCs to the ingest object (the graph and the owner's blocks), each one D1 batch |
 | The monitor's **block index**: `app.bsky.graph.block` records, in D1, not projected or served publicly | **built** — every block of a served graph's owner, and a non-owner in interest's blocks of registered DIDs. Live block events ride the follow socket; listings read blocks with the follows, from the same verified `getRepo` (each collection under its own cap) or by `listRecords` pages. A DID's block rows are pruned with its follows when it leaves interest or its graph stops being served. Block lists have no public projection and no public route, since no device reads another DID's and serving them would cost: an owner reads only their own, through the authenticated [summary](wire-api.md#summary), which the relay fills from the monitor over its ingest binding; other DIDs' blocks only answer whether one DID blocks another |
-| The monitor's **re-check queue**: a device read of a declaration past the 24-hour rule asks the monitor to refresh that DID | **built** — a request only moves a DID that is already due toward the front (at most a quarter of a batch), never makes one due, and expires after a day |
 | **Mutual hints**: for each non-owner in interest, its follows of registered users, from `listRecords` | **built** — under `registered`, a followee's follows of a registered user are the hint that the followee follows them back |
 | **Mixed provenance** of edges | **built** — rows from a verified `getRepo` listing are proven under the owner's signing key; paged-owner, mutual-hint and live rows are not. Every edge is a hint, not proof |
-| A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path and exposed to devices by the [device read API](wire-api.md#device-reads--records-and-summary) |
-| The `sd` + `dc` hint on delivered messages | **built** |
-| The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
-| Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
-| A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](key-transparency.md#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
-| A `did:plc` **operation log** per watched DID, for a device to verify | **built** — the stream extends a held log (each appended operation's signature is checked), a gap or a fork owes a fetch of the directory's audit log, a fetched log is verified before it is kept and published as `plclog:<did>`, and a stored log confirms the document it renders ([wire API](wire-api.md#did-documents)) |
-| PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](key-transparency.md#the-signing-key-cache), [stored documents](key-transparency.md#the-stored-did-document)) |
-| Pushing **counterpart** record changes to devices | **not yet built** |
-| A device-facing read API, and so the 24-hour rule for device reads | **built** — the public record read and the owner's summary ([wire API](wire-api.md#device-reads--records-and-summary)); routes are mounted by the deploying Worker |
-| `did:web` document proxying | **built, as a hint** — the device reads the monitor's stored document from `/pmr/v1/did/{did}`, which it cannot verify and may confirm with the host |
-| The user setting that routes PLC queries through the PMR | **not yet built** |
+| The owner's summary: their own blocks, and each contact's declaration and profile | **built** — owner-authenticated ([wire API](wire-api.md#device-reads--records-and-summary)); routes are mounted by the deploying Worker |
+| The public "can A message B" verdict, and per-contact verdicts in the summary | **not yet built** |
 
 ## Sizing the follow-edge index
 

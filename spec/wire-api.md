@@ -1110,7 +1110,7 @@ sender's PDS.
 ### Device reads — records and summary
 
 A relay bound to a monitor answers its devices' reads of atproto state from
-the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
+the monitor's verified cache ([`key-transparency.md`](key-transparency.md#serving-held-snapshots-and-documents-to-devices)), so a
 device normally reaches its contacts' records without reaching their PDSes.
 Three routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
 with the short keys below. A decoder MUST ignore keys it does not know.
@@ -1161,7 +1161,7 @@ they are confirmed again. A declaration that fails this check requests no
 re-check.
 
 The response never waits on the PDS. A declaration past 24 hours is served as
-held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#reads-and-the-24-hour-rule)).
+held and queued for the monitor to re-check ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
 The residual leak is that re-check: the PDS learns someone is interested in
 that DID.
 
