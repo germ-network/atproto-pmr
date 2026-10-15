@@ -32,7 +32,7 @@ export async function ownerWorld(stub: Partial<PMRStore>, overrides: Partial<Own
     const directory = {
         resolve: async (did: string): Promise<Locator | null> => (did === OWNER ? "loc" : null),
     } as never
-    const store = { load: async () => registration, ...stub } as unknown as PMRStore
+    const store = { ...stub, load: async () => registration } as unknown as PMRStore
     const deps: OwnerDeps = {
         challenges,
         directory,

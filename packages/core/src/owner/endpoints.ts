@@ -1,4 +1,5 @@
 import type { BlockEdgeStore } from "../block-edges.js"
+import { syncOwnerBlocks } from "../block-sync.js"
 import { redeemChallenge } from "../challenge.js"
 import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
@@ -423,6 +424,7 @@ export async function handlePoolList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
+    await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
     const senders = await a.auth.store.poolSenders()
     return amortize(
         cbor([
@@ -742,6 +744,11 @@ export async function handleMessagesList(
     if (!a.ok) return a.response
 
     const cursor = new URL(request.url).searchParams.get("cursor")
+    // Once per catch-up, before anything is delivered; later pages read what
+    // the first page left.
+    if (cursor === null || cursor === "") {
+        await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
+    }
     const page = await a.auth.store.openMailboxes(cursor, deps.catchUpPageMailboxes)
 
     const ms: CoseValue[] = []

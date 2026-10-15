@@ -39,6 +39,7 @@ import {
 } from "@germ-network/atproto-pmr-core"
 import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
+import { monitorOwnBlocks } from "./monitor-own-blocks"
 import { webPushSender } from "./push-sender"
 
 /**
@@ -374,7 +375,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // whole backlog to be computed before the socket even opens.
         this.ctx.waitUntil(
             drainBacklog(
-                { store: this, bodies: kvBodyStore(this.env) },
+                {
+                    store: this,
+                    bodies: kvBodyStore(this.env),
+                    blocks: monitorOwnBlocks(this.env),
+                },
                 capabilities,
                 (frame) => server.send(frame)
             )

@@ -5,9 +5,16 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import type { Admission, MessageRef, Nonce } from "@germ-network/atproto-pmr-core"
+import {
+    decodeFrame,
+    type Admission,
+    type DecodedFrame,
+    type MessageRef,
+    type Nonce,
+} from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
+import type { MonitorIngestStub } from "./worker"
 import { inPMR } from "./helpers"
 
 const testEnv = env as unknown as PMREnv
@@ -153,6 +160,62 @@ describe("PMRObject Bsky block mirror", () => {
 })
 
 describe("PMRObject catch-up wiring", () => {
-    it.todo("the events socket drain mirrors the owner's blocks from MONITOR_INGEST before delivering")
-    it.todo("a missing or failing monitor still drains, on last-known blocks")
+    let owners = 0
+    const ingest = () => {
+        const ns = testEnv.MONITOR_INGEST!
+        return ns.get(ns.idFromName(testEnv.MONITOR_INGEST_NAME!)) as unknown as DurableObjectStub<MonitorIngestStub>
+    }
+
+    /** A registered owner whose relay holds an admitted mailbox for B. */
+    async function ownerWithQueue() {
+        owners += 1
+        const owner = `did:plc:mirror-owner-${owners}`
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.update({ did: owner })
+            await put(pmr, B, `m-${owners}`, YES)
+        })
+        await testEnv.messages.put(`m-${owners}`, new Uint8Array([1]))
+        return { owner, stub, messageId: `m-${owners}` }
+    }
+
+    async function drain(stub: DurableObjectStub<PMRObject>) {
+        const response = await stub.fetch("https://relay.example/pmr/v1/events", {
+            headers: { Upgrade: "websocket" },
+        })
+        const ws = response.webSocket!
+        ws.binaryType = "arraybuffer"
+        ws.accept()
+        const frames: DecodedFrame[] = []
+        await new Promise<void>((resolve, reject) => {
+            ws.addEventListener("message", (event) => {
+                const frame = decodeFrame(new Uint8Array(event.data as ArrayBuffer))
+                frames.push(frame)
+                if (frame.type === "caughtUp") resolve()
+            })
+            ws.addEventListener("error", reject)
+        })
+        ws.close()
+        return frames
+    }
+
+    it("the events socket drain mirrors the owner's blocks from MONITOR_INGEST before delivering", async () => {
+        const { owner, stub } = await ownerWithQueue()
+        await ingest().setOwnBlocks(owner, [{ blocker: owner, rkey: "3k1", subject: B }])
+        const frames = await drain(stub)
+        expect(frames.filter((f) => f.type === "delivery")).toEqual([])
+        await inPMR(stub, async (pmr) => {
+            expect(await pmr.listBskyBlocked()).toEqual([B])
+        })
+    })
+
+    it("a missing or failing monitor still drains, on last-known blocks", async () => {
+        const { owner, stub } = await ownerWithQueue()
+        await ingest().setOwnBlocks(owner, "throw")
+        const frames = await drain(stub)
+        expect(frames.filter((f) => f.type === "delivery")).toHaveLength(1)
+        await inPMR(stub, async (pmr) => {
+            expect(await pmr.listBskyBlocked()).toEqual([])
+        })
+    })
 })
