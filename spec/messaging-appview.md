@@ -67,12 +67,25 @@ they MUST NOT be kept current by re-listing repos on a schedule.
   verdict built on them is a hint the device can check against the signed
   records.
 
-## Known gap
+## Inbound blocks at registration
 
-A newly registered user's existing inbound blocks are kept only for blockers
-the index already lists, and it keeps a non-owner's blocks of registered DIDs
-only. So a block that an in-interest DID made before the user registered, when
-that DID is not one of the user's followees, is not caught: no re-list will
-come. The user's followees' blocks are caught, because registration queues
-their listings. Closing the gap needs a lookup at registration of who blocks
-the user, or keeping every in-interest DID's blocks. **Open.**
+The block index keeps a non-owner's blocks of registered DIDs only, and nothing
+re-lists on a timer. So when a user registers, the blocks of them made earlier
+by DIDs the index already lists would never arrive. The user's followees are
+covered, because registration queues their listings. Everyone else is covered
+by a **backlink lookup**:
+
+- At registration the appview asks a backlink index for the
+  `app.bsky.graph.block` records whose `subject` is the user. That index is
+  any service that indexes atproto records by the DIDs they reference.
+- For each blocker in interest, the appview reads that block record from the
+  blocker's repo and verifies it before keeping it. The backlink index is
+  untrusted: it can only point at a record. A record it fails to return is
+  missed until the blocker's next block event or listing.
+- Blockers outside interest are not kept, because no verdict the appview
+  serves depends on them.
+- The lookup tells the backlink index that someone is interested in the user's
+  blockers when they register, but not who.
+
+**Not yet built.** Until then, a block made before registration by an
+in-interest DID that is not one of the user's followees is not caught.
