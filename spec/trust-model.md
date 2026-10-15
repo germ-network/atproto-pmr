@@ -128,8 +128,7 @@ lagging or gapped stream; the KV propagation delay (about a minute) and the
 stale-if-error window add to either bound. A `did:web` entry follows its TTL,
 shortened by the monitor's identity-event hint. One race remains: a fetch that
 read the old document just before an operation landed can be written after the
-stream's update and keep the old key for up to one TTL. See
-[`key-transparency.md` §The signing-key cache](key-transparency.md#the-signing-key-cache).
+stream's update and keep the old key for up to one TTL.
 A relay may instead read the DID document the monitor stores for the sender,
 which orders its writes so that race does not arise within the clock-skew
 margin it allows for, and trusts it by case: a
@@ -139,8 +138,7 @@ lag, plus one alarm interval, plus the propagation delay of about a minute,
 never more than ten minutes' lag plus that delay);
 a `did:web` document, or a `did:plc` document without that coverage, for ten
 minutes, after which the relay asks the directory as above, with the same
-stale-if-error behaviour. See
-[`key-transparency.md` §The stored DID document](key-transparency.md#the-stored-did-document).
+stale-if-error behaviour.
 It does not take the
 declaration from the sender's PDS on a put, for two reasons: an inline fetch
 tells the sender's PDS when the sender sends, and a read from the party

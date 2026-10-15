@@ -127,527 +127,113 @@ so one singular path names the one resource for every verb that touches it.
 
 ### Registration and the own-DID push
 
-A registration binds a DID to a push destination; the monitor pushes when
-that DID's own record changes — a rev advancing or regressing, a key
-rotation observed via an identity event even when `rev` did not move, and
-a **repo-level** terminal state confirmed at the source (the repo gone,
-taken down, suspended, or deactivated — never inferred from a bare
-unreachability). This is deliberately narrower than "the record deleted":
-per `com.atproto.sync.getRecord`'s own lexicon, deleting a single record
-still answers with an inclusion-exclusion proof over the *repo*, which
-flows through the ordinary rev-advance path above, not this one — a
-repo-level state is what has no such proof to serve instead. Not every
-one of these is permanent, either: a takedown or suspension may lift, and
-the monitor keeps that DID open to the next identity/account event
-noticing a reversal rather than treating it as settled forever. Even so,
-this is not a lesser case: it is arguably the single most alarming kind
-of change this component could observe, one step further than a rev
-regression or a key rotation. On a confirmed repo-level state the monitor
-also stops serving the stale record — continuing to answer
-`GET /records/{did}` with proof of a record whose repo no longer serves
-it would misrepresent the community view, not merely leave it stale.
-This is the security primitive of the component: the device holds ground
-truth for its own key, so a single honest monitor detects a malicious
-publication of it — or its disappearance.
+A registration binds a DID to a push destination. The monitor pushes when
+that DID's own record changes: a `rev` that advances or regresses, a key
+rotation seen through an identity event even when `rev` did not move, or a
+**repo-level** terminal state confirmed at the source (gone, taken down,
+suspended or deactivated, never inferred from unreachability). On a confirmed
+repo-level state the monitor stops serving the stale record. The device holds
+ground truth for its own key, so a single honest monitor detects a malicious
+publication of it, or its disappearance.
 
-**Registration authenticates to the declared anchor key** (the same
-`anchor` realm a relay registration uses), not to any atproto-side
-credential. The reason is that atproto account authentication is mediated
-by the party this component exists to check. Binding the push channel to
-the device-held key means a PDS cannot rebind or deregister the
-notification before swapping keys: the swap notifies the push destination
-bound to the old key. Registration is publish-then-register — a record must
-exist to authenticate against.
-
-**This property only holds if a mutation of an EXISTING registration is
-verified against the key stored at create time, never the currently-declared
-one.** `POST` with no existing registration verifies against the DID's
-current declaration (there is nothing else to check against). `POST` with
-an existing registration, and `DELETE`, both verify against the *stored*
-key, unconditionally — and the stored key is never rewritten by a `POST`,
-only the subscription fields are. A legitimate key rotation is therefore
-**`DELETE`, signed with the old stored key, followed by re-`POST`**, which
-verifies against the now-current declaration — never an in-place rebind of
-the key itself. A device that loses its old key before completing this
-(e.g. a reinstall) cannot rebind or deregister; that is bounded and
-self-healing, since the stranded subscription eventually answers 404/410 at
-the push service and the registration is dropped, ready for the device to
-re-register fresh under its current key.
-
-Body (provisional CBOR, single-letter keys — the same vocabulary the PMR's
-owner endpoints use): `{ pse: string, psk: bstr(32), psi: uint(0..255) }` —
-the subscription endpoint, its 32-byte content key, and the device-assigned
-`keyId`. Required, unlike the PMR's own registration: a monitor registration
-with no destination has no meaning. A monitor registration's subscription
-is its own, never shared with a co-located relay's — `keyId` is
-device-global across every deliverer a device holds.
-
-Push delivery is [Web Push](wire-api.md#push-delivery--web-push-optional),
-with both custody properties intact: the monitor holds a subscription,
-never a push token, and the payload is sealed under a device-provisioned
-symmetric content key the push service cannot read. A **browser** client
-can register with a monitor using the literal Push API — its subscription
-comes from its browser's own push service, with no additional
-infrastructure anywhere in the path. **The push is content-free** — exactly
-`{t:"d"}`, per [the sealed payload](wire-api.md#the-sealed-payload), never
-the changed DID or the observed `rev`: bundling "here's what changed" would
-let a compromised deliverer assert a declaration directly to the device,
-bypassing the fetch-and-compare-across-monitors step this system exists to
-force. There is only one DID a registration's push could mean, so the
-device already knows which record to re-fetch and verify; it must never
-trust the push content itself.
-
-Deregistration revokes the delegation and forgets the subscription. Nothing
-a monitor holds is issued to third parties, so dropping one leaves no peer
-holding anything that stops working.
+- **Registration authenticates to the declared anchor key** (the `anchor`
+  realm), never to an atproto credential, because atproto account
+  authentication is mediated by the party this component checks. It is
+  publish-then-register: a record must exist to authenticate against.
+- **A mutation of an existing registration MUST verify against the key stored
+  at create time**, never the currently declared one. `POST` with no existing
+  registration verifies against the current declaration. `POST` on an existing
+  one, and `DELETE`, verify against the stored key, which a `POST` never
+  rewrites. A key rotation is `DELETE` signed with the old key, then a fresh
+  `POST`.
+- **Body** (provisional CBOR): `{ pse: string, psk: bstr(32), psi: uint(0..255) }`,
+  the subscription endpoint, its 32-byte content key and the device-assigned
+  `keyId`. All are required. The subscription is the monitor's own, never
+  shared with a co-located relay.
+- **Delivery** is [Web Push](wire-api.md#push-delivery--web-push-optional),
+  sealed under the device-provisioned content key. **The push is
+  content-free**, exactly `{t:"d"}` ([the sealed payload](wire-api.md#the-sealed-payload)),
+  never the changed DID or `rev`, so a compromised deliverer cannot assert a
+  declaration to the device. The device re-fetches and verifies.
 
 ### The change digest
 
-`GET /digest?cursor=…` — unauthenticated, **identical bytes for every
-caller** at the same cursor, and cacheable. This surface serves the
-population the other two cannot serve without cost: DIDs the device cares
-about that carry no public signal. The monitor publishes what changed and
-learns nothing about who cares; the device tests its private set locally
-and fetches only the hits.
+`GET /digest?cursor=…`: unauthenticated, **identical bytes for every caller**
+at the same cursor, and cacheable. It serves the DIDs a device cares about
+that carry no public signal: the monitor publishes what changed and learns
+nothing about who cares, and the device tests its private set locally. It is
+a change notice over a baseline the client already holds, with no genesis to
+sync; a new client starts its cursor at the current window.
 
-The digest is a **change notice over a baseline the client already holds**,
-not a source of truth, so there is no genesis to sync. A new client's
-baseline is the records it verifies directly at first contact; it starts
-its cursor at the current window and looks only forward.
-
-#### Windows
-
-A monitor divides time into **fixed windows** and publishes, for each, a
-filter over the DIDs whose records changed in it — every change in its
-coverage, not only those of registered DIDs. Restricting the population to
-known-interesting DIDs would make the filter a function of who registered,
-and would miss the private contacts this surface exists for.
-
-**A window is identified by its start instant**, in epoch milliseconds,
-which MUST be a multiple of the width. Not an index: `floor(t / width)` is
-ambiguous the moment a monitor retunes its width — index `5` covers
-minutes 50–60 at a ten-minute width and 25–30 at a five-minute one — so
-every identifier would name two different intervals. A client computes the
-window it wants from a timestamp and reads the width from any window it
-already holds.
-
-**Membership is by observation time**: a DID appears in the window in which
-*this monitor confirmed* the change, not the window in which the change was
-published. A monitor's authoritative fetch may lag arbitrarily — a
-counterpart's PDS may be unreachable for hours — and a sealed filter cannot
-be amended, so indexing by publication time would drop a change into a
-window already served and make it permanently invisible. Two consequences a
-client MUST respect:
-
-- **Window numbers are monitor-local.** Two honest monitors that confirmed
-  the same change at different moments place it in different windows.
-  Digest windows MUST NOT be compared across monitors; the `rev`
-  comparison is the only cross-monitor test
-  ([`trust-model.md`](trust-model.md#why-more-than-one-monitor-is-load-bearing)).
-- **A monitor's downtime is indistinguishable from quiet**, and correctly
-  so: nothing was observed, so nothing is reported, and the backlog appears
-  in whichever window finally confirms it.
-
-**Only closed windows are published.** The current window is still
-accumulating; serving it would return different bytes to two callers a
-second apart, forfeiting both cacheability and the identical-bytes property
-this surface's privacy rests on. The cost is a latency floor: a change is
-invisible to the digest for up to one window width. A client that needs
-tighter latency uses the own-DID push, which has none.
-
-#### The filter
-
-The filter is a **Bloom filter**, and its guarantee is one-sided in the
-direction that matters: a DID that changed MUST NEVER test negative. A
-false negative is a key change the device never learns about — precisely
-the withholding this component exists to detect. A false positive costs one
-fetch of a record that turns out unchanged.
-
-**A window MUST carry the parameters it was sealed under** — the filter
-length in bits, the hash count, and the window width. This is the load-
-bearing interoperability requirement, and it is what makes everything else
-about the filter an operator's choice rather than a specification's: a
-monitor may retune its sizing or its target false-positive rate at any
-time, and windows sealed under earlier values stay readable. **This
-specification therefore fixes no false-positive rate and no filter size.**
-Length in bits is carried explicitly because it is not recoverable from the
-byte length: a filter is padded to a byte boundary, and reading the padding
-as filter bits answers negative for DIDs that are present.
-
-A monitor SHOULD floor the filter size well above what the textbook sizing
-gives for very small populations. The asymptotic formula is a poor guide
-where windows hold a handful of members, which is the common case for a
-single collection: at one member it yields ten bits and seven hashes,
-saturating the filter and pushing the error rate roughly eightfold above
-its target, where a 64-bit floor costs eight bytes and removes the problem.
-
-Implementations MUST agree exactly on bit indexing — the hash input
-encoding, the derivation of positions from it, and the bit order within
-the filter — because a client that indexes differently reads a different
-filter and silently misses changes. That failure is invisible from both
-sides. The reference implementation's derivation and its test vectors are
-in `packages/monitor`; a second implementation MUST reproduce those
-vectors.
-
-#### The response
-
-A page, not a bare list of windows, because three facts have to travel with
-them and none is derivable from the windows alone:
-
-| field | meaning |
-|---|---|
-| `windows` | the sealed windows in `[cursor, sealedThrough]`, oldest first |
-| `oldest` | the earliest window still retained |
-| `sealedThrough` | the newest published window |
-| `nextCursor` | where to resume |
-
-**A client whose cursor precedes `oldest` has lost coverage** and MUST fall
-back to re-verifying its interest set directly — the cost it would pay with
-no digest at all. This is why the floor is published rather than implied:
-without it, "past retention" and "nothing changed in any window" are the
-same empty answer, and the failure is silent in exactly the case where
-coverage was lost. A monitor MUST NOT serve windows below `oldest`, since
-doing so would present a partial view as a complete one.
-
-**A monitor MAY return fewer windows than the range holds**, and a client
-knows it is caught up when `nextCursor` exceeds `sealedThrough` — not from
-a separate truncation flag, which would be a second source of the same
-truth and free to disagree with the first. A monitor SHOULD bound a page by
-the **size of the filters it carries** rather than by a window count: a
-count is fixed against a change rate that is not, so it goes stale as a
-population grows, where a byte budget self-adjusts.
-
-A window with no changes is a real answer and MUST be served as an empty
-filter rather than omitted, so that "nothing changed here" and "not
-published yet" stay distinguishable. A monitor need not store such windows;
-`sealedThrough` is what licenses synthesising them on read, since it
-asserts that everything at or below it has been sealed.
-
-**A request carrying no cursor is a bootstrap, not an error.** A client
-with no baseline has nothing to diff — it verifies records directly at
-first contact — so a monitor SHOULD answer with an empty page whose
-`nextCursor` names the current window, telling the client where to begin.
-
-#### Caching
-
-Cacheability is a correctness property here, not only an efficiency one: a
-page held past its validity reports coverage the monitor never gave, and on
-this surface stale coverage reads as "nothing changed".
-
-The distinction is whether a page reaches the tip:
-
-- A page whose `nextCursor` is **at or below `sealedThrough`** is fully
-  determined — every window in it is sealed and the range cannot grow — and
-  MAY be cached indefinitely.
-- A page that runs to the tip **gains windows as they seal**, and MUST NOT
-  be cached beyond one window width.
-
-This is also why the truncation signal is `nextCursor` against
-`sealedThrough` rather than a flag: the same comparison that tells a client
-whether to keep paging tells a cache whether the answer can be kept.
-
-### The signing-key cache
-
-A relay caches each sender's `#atproto` signing key for a bounded time (see
-[trust-model §P5](trust-model.md#p5--sender-verification)). A monitor that is
-configured with the PLC directory's export stream can keep that cache current
-for `did:plc` senders, so a re-key is acted on when the directory sequences
-it rather than when the cache entry expires. This is an optimization of
-freshness only; the TTL remains the bound, and nothing here is required of a
-conforming monitor.
-
-The monitor reads the directory's export WebSocket (did:plc, "Export
-Streaming WebSocket") from a stored `seq` cursor, or from the tip when it has
-none or the directory closes the stream with `OutdatedCursor` or
-`FutureCursor`. A gap therefore costs at most one TTL of staleness; no replay
-or purge is needed. The cursor is kept per directory host, since `seq` is
-assigned by each directory.
-
-The monitor acts only on DIDs it holds or has owed. For one of those, a
-current-format `plc_operation` writes the `verificationMethods.atproto` key
-(or records that there is none) to the cache, stamped with the `createdAt` the
-directory assigned the operation (never later than the
-time of the write, so a replayed operation does not look fresh). A legacy
-`create`, a tombstone, an operation of unknown type, an unreadable `createdAt`
-or a malformed key value deletes the entry, so the next resolve reads the directory. When the monitor already holds the DID's snapshot, the same
-operation also owes a re-fetch of it, which is how a re-key under an
-unchanged record is noticed. Writes to the cache happen outside the
-stream's read loop and are retried until applied.
-
-For a DID the stream does not cover — `did:web`, or any DID when no stream is
-configured — an identity, account or sync event for a held DID deletes its
-cached key as a hint. With the stream configured, `did:plc` DIDs are left to
-the stream: a PDS emits its identity event after the directory's operation,
-and the delete would discard the key just written.
-
-### The stored DID document
-
-A monitor keeps a DID document for each DID it watches — the DIDs it holds a
-snapshot for or is owed a fetch for, and any confirmed permanently deleted — and
-publishes it where a relay reads it, so that a relay can take
-the sender's signing key from the monitor instead of asking the directory.
-It is kept current by two things: the monitor's own fetches, and, for
-`did:plc` when the export stream is configured, the stream itself.
-
-- **From fetches.** Every DID-document fetch the monitor already makes — the
-  record fetch that settles a wake, the head read that refreshes a snapshot —
-  also stores the document it resolved. That is the only source for `did:web`,
-  and the backstop for `did:plc`.
-- **From the stream.** For a watched DID, a current-format `plc_operation` is
-  rendered into the document the directory serves for it and stored when the
-  directory sequences it. What cannot be rendered — a legacy `create`, an
-  operation of an unknown type, an operation of a shape no live document has
-  been checked against, an unreadable `createdAt` — withdraws trust in the
-  stored document instead, and the next fetch restores it. A tombstone stores
-  that the identity is gone. A DID the monitor does not watch moves only the
-  cursor; no operation, log or rotation key is kept for it.
-
-Writes are ordered by when the directory held the state they describe: a
-stream operation by its `createdAt`, a fetch by the time it started less five
-seconds (for clock skew). A write older than what is stored is dropped, so a
-fetch that read the document before an operation was accepted can never
-overwrite it, and a replayed operation can never overwrite a later fetch.
-Two documents are equal when their JSON is equal with keys sorted, so a
-rendered document and a fetched one of the same state are the same write. (That
-a fetch started after the directory accepted an operation sees it is an
-inference about the directory, not specified text.)
-
-**The operation log.** For a watched `did:plc` DID the monitor also keeps the DID's signed operation log, which a device verifies itself ([wire API](wire-api.md#did-documents)). A stream operation that chains onto the held log and is signed by a rotation key of its predecessor extends it; one that does not (a recovery that forks, a missing operation), or a DID with no log, owes a fetch of the directory's audit log, as does every held log when the stream's unbroken run restarts. A fetched log is stored only if it verifies, and its rendered document confirms the stored document as of the fetch. The log is published as `plclog:<did>` and removed with the DID.
-
-**Publishing.** Each alarm carries what changed to `doc:<did>` in the records
-store: the document, when the monitor last confirmed it current, and whether
-it came from `did:plc` or `did:web`. A document the monitor cannot vouch for —
-a tombstone, or one whose latest operation it could not render — is published
-as the absence of `doc:<did>`, so a reader asks the directory. An unchanged
-document is re-confirmed at most twice a day, and once more when a new coverage
-run begins.
-
-**Coverage.** The export stream cannot say a document is *current*, only that
-no operation was missed: `plc:coverage` records the stream's URL, when its
-current unbroken run began, and the `createdAt` through which every operation
-accepted since that run began has reached the published documents. A run
-begins with the first frame after a start without a usable cursor — first
-configuration, a tip start after `OutdatedCursor` or `FutureCursor`, a changed
-URL — and a restart that resumes from the stored cursor continues the same run,
-because the stream replays the gap. A frame the monitor fails to take in keeps
-the cursor but ends the run, and the next frame with a readable `createdAt`
-begins a new one. The marker advances only after a publish pass leaves no
-unpublished change, and is written only once the run is stored with the cursor,
-so an eviction cannot lose a run the marker claims. When a run ends the old
-marker stays in the records store, so what it covered stays trusted until it
-is ten minutes old, which is the bound it was published under.
-
-**How a relay trusts it.** A stored `did:plc` document is trusted for 24 hours
-from when it was confirmed only if that confirmation falls inside the marker's
-current run and the marker's `coveredThroughMs` is no more than ten minutes
-old. Any other stored document — `did:web`, or `did:plc` without such coverage
-— is trusted for ten minutes, the same as a direct fetch, and past its window
-the relay falls back to its signing-key cache and then the directory. A missing or unreadable marker is no coverage.
-The staleness bound of the covered case is the stream's lag plus one alarm
-interval plus the records store's propagation delay (about a minute), and
-never more than the ten-minute coverage lag plus that delay.
-
-A DID confirmed permanently deleted owes no re-fetch and no key update, but its
-stored document still follows the stream, because a relay would otherwise trust
-a superseded key for the rest of the 24 hours. A fetch that leaves its DID
-unwatched (a DID never held whose record came back verified absent, or one
-confirmed permanently deleted) has the document that fetch stored withdrawn at once (published as
-absent) rather than left to age; a DID that is still held or owed keeps it.
-
-**Cost.** Per alarm, at most 64 `doc:` writes and one `plc:coverage` write.
-Per day, per watched DID: about two `doc:` writes plus one for each change to
-its document (and one more for each new coverage run), plus one `plc:coverage`
-write per alarm for the whole monitor — 720 a day at a two-minute alarm. For a
-monitor watching 1,754 DIDs that is about 4,200 writes a day plus changes,
-which needs a paid plan. The export stream is a second outbound socket beside
-the one to Jetstream. The cost scales with the watched set, not with the
-network, so size it from the DIDs the monitor is configured to watch.
-
-### Keeping the snapshot current
-
-A relay that admits pair puts from a monitor's CAR (see
-[trust-model §P5](trust-model.md#p5--sender-verification)) serves a held snapshot as is
-until it is 24 hours unconfirmed, after which it checks the sender's PDS
-directly to see whether the record changed. A monitor serving that role
-therefore re-confirms every DID it holds on a schedule rather than only when
-a wake signal arrives, so that check is the exception.
-
-For each held DID that has not been confirmed for a configured interval, the
-monitor reads the repo's current head `rev` from the DID's own PDS
-(re-resolving the DID document each time, so a PDS migration is seen, and
-keeping that document as the DID's
-[stored document](#the-stored-did-document), at no extra subrequest) and
-compares it with the `rev` it holds:
-
-- **Unchanged** — the snapshot is confirmed current as of now, unless nothing
-  was ever verified for the declaration (a snapshot stored before ingest
-  verified) or it verified under a key other than the one the document now
-  carries. Those take the fetch below even at an unchanged head; a re-verify at
-  an unchanged `rev`, record CID and key is stored quietly, so an upgrade does not
-  put every legacy DID in the digest window.
-- **Advanced, declaration record unchanged** — a repo `rev` moves on any
-  commit, so this is the common case. The monitor verifies the fetched CAR
-  (see below), then stores the new CAR and signed `rev` quietly: no
-  digest-window entry and no own-DID push, because nothing a client holds
-  became stale. It compares record CIDs to decide this.
-- **Advanced, declaration record changed** (or the DID document re-keyed) —
-  the ordinary path: stored, entered in the digest window, pushed.
-- **Regressed** — raised as a regression (once per interval), nothing stored.
-- **Gone at the source** (a repo-level terminal answer, or a signed view
-  holding no record) — the deletion path.
-- **Unreachable** — never recorded as confirmed; retried once per refresh
-  interval.
-- **Unverifiable** — the fetched CAR does not verify under the key of the
-  document fetched with it. The held snapshot is kept and not re-confirmed, and
-  the DID is retried once per refresh interval, so a head still signed by an
-  old key costs two document resolutions, one head read and one record fetch an
-  hour at the default interval.
-
-**Verification at ingest.** Every fetched CAR is checked against the
-`#atproto` key of the DID document fetched with it (commit signature, block
-hashes and the path through the tree) before anything is stored or disposed
-of. A result is *verified* (stored with its signed `rev`, CID and the key it
-verified under), *verified absent* (a signed view holding no record: the
-reversible deletion path, subject to the regression check) or *unverifiable*
-(kept entry, not stored). A fetch that carried no key is unverifiable. A
-malformed CAR is unverifiable, not a transient failure. A DID never held that
-comes back unverifiable stays owed for one interval rather than being dropped,
-and, on the event-driven fetch (not the refresh pass), an unverifiable result
-under a key that differs from the one the held snapshot verified under pushes a
-change once per newly seen key, so the device learns of the rotation and
-verifies for itself.
-
-A confirmation is recorded as a separate `chk:<did>` entry carrying the `rev`
-it confirmed and the time; it is honoured only when that `rev` equals the
-held record's, so a confirmation of an older CAR never makes a newer one look
-fresh, and the CAR is not rewritten. A snapshot's freshness is the later of
-its fetch time and a matching confirmation.
-
-**Capacity.** The worst-case staleness of a quiet sender's snapshot is one
-full cycle: population × alarm interval ÷ per-alarm batch, plus outage slack.
-With the defaults (batch 64 per 2-minute alarm) a cycle takes about an hour
-at 1,754 DIDs and grows linearly with the population; it reaches the relay's
-24-hour bound near 46,000 DIDs (fewer with outage slack), past which relays begin reading the sender's
-PDS directly for the lapsed ones. Each refreshed DID costs
-two subrequests for the head `rev` (DID document, then commit) plus its KV
-reads and writes, and a DID whose head advanced costs several more (a record
-fetch, and a second one if the change takes the ordinary path; so does a DID
-with no verified record indexed or a changed key, which on the first cycle
-after an upgrade is every held DID). The batch
-must therefore also fit the platform's per-invocation subrequest limit: even
-an all-confirmed batch of 64 exceeds the free plan's limit of 50, where the
-batch should be lowered.
+- **Windows.** Time is divided into fixed windows, each with a filter over
+  every DID whose record changed in it, across the monitor's whole coverage. A
+  window is identified by its **start instant** in epoch milliseconds, a
+  multiple of its width, not by an index. **Membership is by observation
+  time**, so window numbers are monitor-local and MUST NOT be compared across
+  monitors. **Only closed windows are published.**
+- **Filter.** A Bloom filter: a DID that changed MUST NEVER test negative.
+  Each window MUST carry the parameters it was sealed under (length in bits,
+  hash count, width), so this specification fixes no size or false-positive
+  rate. Implementations MUST agree exactly on bit indexing; the reference
+  derivation and its test vectors are in `packages/monitor`, and a second
+  implementation MUST reproduce them.
+- **Response.** A page of `windows` (sealed, in `[cursor, sealedThrough]`,
+  oldest first), `oldest` (earliest retained), `sealedThrough` (newest
+  published) and `nextCursor`. A client whose cursor precedes `oldest` has
+  lost coverage and MUST re-verify its interest set directly; a monitor MUST
+  NOT serve windows below `oldest`. A monitor MAY return fewer windows than the
+  range holds, and a client is caught up when `nextCursor` exceeds
+  `sealedThrough`. An empty window MUST be served as an empty filter, not
+  omitted. A request with no cursor SHOULD get an empty page whose
+  `nextCursor` names the current window.
+- **Caching.** A page whose `nextCursor` is at or below `sealedThrough` MAY be
+  cached indefinitely. One that runs to the tip MUST NOT be cached beyond one
+  window width.
 
 ### The record fetch
 
-`GET /records/{did}` — unauthenticated. Returns the monitor's held record
-for the DID **as CAR**, with the `rev`, `observedAt`, `source`, and
-`signingKey` it holds. Never JSON: the response must be verifiable, because
-a monitor is as untrusted as any relay
-([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)).
-
-`source` (the PDS the record was fetched from) is provenance, and `signingKey`
-is the key the CAR verified under at ingest (absent only for a snapshot stored
-before ingest verified). A monitor's check does not replace the client's: a
-client still verifies what it is served (Q-PMR-24).
-They are what makes the comparison below meaningful: a monitor's own
-fetch already discards nothing here, so a client comparing two monitors'
-records can tell a legitimate key rotation apart from a stale or dishonest
-observation, which `rev` and content alone cannot do.
-
-This is the community view: what this monitor holds as the current record
-for that DID. A client uses it to cross-check against its own fetch,
-against other monitors, and against what its relay resolved, applying the
-comparison rules in
-[`trust-model.md`](trust-model.md#why-more-than-one-monitor-is-load-bearing):
-**compare under a common authority, or not at all** — check `signingKey`
-first, and only once it agrees does a `rev`/content comparison mean what
-it looks like it means. Differing `rev` under a shared authority is skew;
-a `rev` that moved backwards is the alarm; same `rev` with different
-content is the strongest signal available from these two fields alone,
-but escalates to a client's own decode-and-verify rather than standing as
-proof on its own — a CAR's block ordering is not guaranteed deterministic,
-so two honest fetches can differ byte-for-byte. A differing `signingKey`
-is neither skew nor an alarm — it means the DID document moved between the
-two observations, which the PLC log settles, not these two records
-(and which nothing settles at all for `did:web`).
+`GET /records/{did}`, unauthenticated, returns the monitor's held record for
+the DID **as CAR**, never JSON, with the `rev`, `observedAt`, `source` (the
+PDS it came from) and `signingKey` (the key it verified under at ingest) it
+holds. A monitor is as untrusted as any relay
+([trust-model §P2](trust-model.md#p2--relayed-repo-records-are-car)), and its
+check does not replace the client's (Q-PMR-24). This is the community view. A
+client comparing it against its own fetch, other monitors and its relay MUST
+**compare under a common authority, or not at all**
+([trust-model](trust-model.md#why-more-than-one-monitor-is-load-bearing)): check
+`signingKey` first, then `rev` and content. Differing `rev` under a shared
+authority is skew, a `rev` that moved backwards is the alarm, and a differing
+`signingKey` means the DID document moved between the two observations.
 
 ## Serving held snapshots and documents to devices
 
 A relay can answer its devices' reads of declarations and DID documents from
-the key monitor's stores, instead of the device querying the PDS or the
-directory. These reads are the relay's; the monitor's own surfaces above are
-unchanged.
-
-A cache of this kind is only worth keeping if a device can use it without trusting it.
-It therefore stays a **cache of signed things**: records are CAR, verified
-against the DID document, and DID documents are checked against PLC. This is
-the same posture the rest of the specification takes toward a monitor —
-[as untrusted as any relay](#the-record-fetch), for the
-authenticity reasons in
-[trust-model P2](trust-model.md#p2--relayed-repo-records-are-car) — and it is why [the hint](trust-model.md#p8--the-relays-verdict-is-a-hint) is
-a freshness cue and never evidence.
-
-### Trusted for privacy, not for content
-
-Routing a device's reads through its PMR is a privacy measure: the PDS and a
-`did:web` host do not learn which DIDs a device is looking at, or when. That
-is the whole of the trust. A device still verifies every CAR against the DID
-document itself, and never takes the PMR's word for a record's content or for
-a key. A PMR that served a wrong record would be caught by that verification,
-the same as any other source.
+the monitor's stores, so the PDS and a `did:web` host do not learn which DIDs a
+device looks at. That privacy is the whole of the trust: records stay CAR, a
+device verifies each against the DID document itself, and it never takes the
+relay's word for content or a key.
 
 ### Reads and the 24-hour rule
 
-A snapshot the monitor has not been able to confirm for 24 hours is checked
-against the DID's PDS for change, comparing the record's CID only, before a
-**relay** relies on it for a pair put: if the PDS cannot be read the older
-snapshot stands, and if the record changed or is gone the put is refused until
-the monitor catches up (the rule in
-[trust-model P5](trust-model.md#p5--sender-verification)).
+A **relay** that relies on a held snapshot for a pair put checks it against the
+DID's PDS once it is 24 hours unconfirmed, comparing the record's CID only. If
+the PDS cannot be read, the older snapshot stands; if the record changed or is
+gone, the put is refused until the monitor catches up
+([trust-model P5](trust-model.md#p5--sender-verification)). A monitor in that
+role therefore re-confirms held snapshots on a schedule, so the check is the
+exception.
 
-A **device read** does not wait for that check. A lapsed declaration is served
-as held, and the read asks the monitor to re-check it afterwards: a re-check
-request only moves a DID that is already due toward the front of the monitor's
-refresh queue, never makes one due, and takes at most a quarter of a batch, so
-anonymous reads cannot pin failing sources at its head. The check against the
-PDS is the monitor's, off the response path. The pair-put rule is unchanged.
-
-This carries the P5 caveat with it, in a smaller form. The re-check makes the
-monitor read that DID's PDS, so the PDS learns that someone is interested in
-it, though not who or when, and a burst of reads costs one request. The
-privacy benefit of the proxy does not extend to a record whose snapshot has to
-be re-confirmed this way. A summary index also notes a held declaration past
-24 hours, as an operational alarm that the monitor has fallen behind, and never
-requests a re-check, so one owner's sync does not fan out to their contacts'
-PDSes.
+A **device read** does not wait: a lapsed declaration is served as held, and
+the monitor is asked to re-check it afterwards. The re-check tells the PDS that
+someone is interested in the DID, though not who or when.
 
 ### Which DID directory a device queries
 
-- **`did:plc`** — a device may query the PLC directory directly by default.
-  A user setting routes PLC queries through the PMR instead.
-- **`did:web`** — a device does not query a `did:web` host directly, because
-  a direct read reaches the identity's own host. The PMR proxies `did:web`
-  documents.
-
-### What is built, and what is not
-
-| element | status |
-|---|---|
-| A monitor's record snapshot, kept current by Jetstream and backfilled by direct query of the PDS | **built** — [key transparency](#keeping-the-snapshot-current) (under the `everyone` policy, every DID that carries the declaration collection, not only the DIDs one PMR serves; under `registered`, only the DIDs on the allow list below) |
-| The monitor's periodic re-confirmation of held snapshots | **built** |
-| The monitor's **re-check queue**: a device read of a declaration past the 24-hour rule asks the monitor to refresh that DID | **built** — a request only moves a DID that is already due toward the front (at most a quarter of a batch), never makes one due, and expires after a day |
-| A verified read of one record from a snapshot, generic over collection and rkey, with the 24-hour rule | **built** — used on the pair-put path and exposed to devices by the [device read API](wire-api.md#device-reads--records-and-summary) |
-| The `sd` + `dc` hint on delivered messages | **built** |
-| The monitor's community-view fetch (`GET /records/{did}`) | **specified; store built** — `kvSnapshotStore` holds the record, the route itself is the deploying Worker's |
-| Pushing the **owner's own** declaration change to its device | **built** — the monitor's own-DID web push, not the events socket |
-| A cache of DID documents | **built** — a monitor stores and publishes a document for each DID it watches ([key transparency](#the-stored-did-document)); a relay reading it is a deployment step, and the `#atproto` signing key it caches meanwhile is re-fetched after ten minutes |
-| A `did:plc` **operation log** per watched DID, for a device to verify | **built** — the stream extends a held log (each appended operation's signature is checked), a gap or a fork owes a fetch of the directory's audit log, a fetched log is verified before it is kept and published as `plclog:<did>`, and a stored log confirms the document it renders ([wire API](wire-api.md#did-documents)) |
-| PLC export stream ingest | **built** — one stream, opt-in by `PLC_EXPORT_STREAM_URL`, feeds both the signing-key cache and the stored documents ([signing-key cache](#the-signing-key-cache), [stored documents](#the-stored-did-document)) |
-| Pushing **counterpart** record changes to devices | **not yet built** |
-| `did:web` document proxying | **built, as a hint** — the device reads the monitor's stored document from `/pmr/v1/did/{did}`, which it cannot verify and may confirm with the host |
-| The user setting that routes PLC queries through the PMR | **not yet built** |
-| A device-facing record and DID-document read, and so the 24-hour rule for device reads | **built** — the public record read ([wire API](wire-api.md#device-reads--records-and-summary)) and `/pmr/v1/did/{did}` ([wire API](wire-api.md#did-documents)); routes are mounted by the deploying Worker |
+- **`did:plc`**: a device may query the PLC directory directly by default; a
+  user setting routes PLC queries through the PMR instead.
+- **`did:web`**: a device does not query the host directly, since that reaches
+  the identity's own host. The PMR proxies `did:web` documents, as a hint the
+  device may confirm with the host.
 
 ## The two comparisons, and their different weights
 
