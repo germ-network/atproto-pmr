@@ -1,3 +1,4 @@
+import type { BlockEdgeStore } from "../block-edges.js"
 import { redeemChallenge } from "../challenge.js"
 import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
@@ -57,6 +58,11 @@ export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
+    /**
+     * The owner's Bsky blocks, mirrored (`syncOwnerBlocks`) before the
+     * message catch-up's first page and the pool listing.
+     */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
     /**
      * Supplied to amortize the mint: every authenticated response carries a
      * fresh challenge, so a client pays the mint round trip only on its

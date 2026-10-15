@@ -33,6 +33,8 @@ export type {
     PMRStore,
     PoolAppendResult,
     PoolSender,
+    ReceiveResult,
+    BlockSource,
     RegistrationFields,
     ResolvedAddress,
     VerificationHint,
@@ -155,6 +157,20 @@ export {
     type MessagesConfig,
     type OwnerDeps,
 } from "./owner/endpoints.js"
+
+// Receive-time admission and the Bsky block mirror.
+export {
+    ADMISSION_DEADLINE_MS,
+    ADMISSION_UNAVAILABLE,
+    admissionOf,
+    admissionOrUnavailable,
+    POLICY_NOT_ENABLED,
+    RECIPIENT_NOT_HELD,
+    type Admission,
+    type AdmissionSource,
+    type PoolVerdict,
+} from "./admission"
+export { syncOwnerBlocks } from "./block-sync"
 
 // The pair-put endpoint.
 export {

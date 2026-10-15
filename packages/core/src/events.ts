@@ -1,6 +1,7 @@
 import { decodeCoseSequence, encodeCose, type CoseValue } from "./cose/cbor.js"
 import type { GrantLifecycle } from "./config.js"
 import { asMailboxKey } from "./mailbox-key.js"
+import type { BlockEdgeStore } from "./block-edges.js"
 import type { BodyStore, MessageRef, PMRStore } from "./storage.js"
 
 /**
@@ -197,6 +198,8 @@ export function decodeAckFrame(bytes: Uint8Array): AckPayload {
 export interface EventsDeps {
     store: PMRStore
     bodies: BodyStore
+    /** The owner's Bsky blocks, mirrored before a drain delivers anything (`syncOwnerBlocks`). */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
 }
 
 /** Implementation-defined, like every other limit in this package. */

@@ -12,6 +12,9 @@ import {
     parseGrantLifecycle,
     reconcileWatchState,
     type AppendResult,
+    type Admission,
+    type ReceiveResult,
+    type PairMailboxKey,
     type EffectiveCapabilities,
     type GrantLifecycle,
     type GrantSummary,
@@ -693,6 +696,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return (await this.db.get(syntheticKey(key))) !== undefined
     }
 
+    async receive(
+        _key: PairMailboxKey,
+        _ref: MessageRef,
+        _nonce: Nonce,
+        _nowSeconds: number,
+        _admission: Admission
+    ): Promise<ReceiveResult> {
+        throw new Error("not implemented")
+    }
+
     /**
      * Reconnect-drain's primitive. `startAfter` gives cursor semantics for
      * free from the underlying storage — `nextCursor` is just the last raw
@@ -954,6 +967,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async unblock(key: MailboxKey): Promise<void> {
         await this.db.delete(syntheticKey(key))
+    }
+
+    async syncBskyBlocks(_blocked: ReadonlySet<string>): Promise<void> {
+        throw new Error("not implemented")
+    }
+
+    async listBskyBlocked(): Promise<string[]> {
+        throw new Error("not implemented")
     }
 
     /** The block markers' own keys — the DIDs. No second table to drift. */

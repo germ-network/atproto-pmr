@@ -1,3 +1,4 @@
+import type { AdmissionSource } from "./admission.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
@@ -32,6 +33,12 @@ export interface PairPutDeps {
      * route through its own fetch.
      */
     resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
+    /**
+     * Whether the recipient accepts this sender, read once per put that
+     * reaches a registered store and before anything is stored. Omitted, the
+     * relay adjudicates nothing: unprovisioned senders pool without a verdict.
+     */
+    admission?: AdmissionSource
     /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.
