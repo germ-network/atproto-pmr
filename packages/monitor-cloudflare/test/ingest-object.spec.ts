@@ -1619,11 +1619,13 @@ describe("wiring stored DID documents into the monitor", () => {
         })
     })
 
-    it("the default fetchHeadRev records the document it resolved through", async () => {
-        const stub = freshStub()
-        const did = "did:plc:s10head"
+    /** `fetchHeadRev` with the directory and PDS stubbed, after `setup` ran in the object. */
+    async function headCheck(
+        stub: DurableObjectStub<MonitorIngest>,
+        did: string,
+        setup: (obj: MonitorIngest) => Promise<void>
+    ) {
         const original = globalThis.fetch
-        const before = Date.now()
         globalThis.fetch = ((input: RequestInfo | URL) => {
             const url = String(input)
             if (url.startsWith("https://plc.directory/")) {
@@ -1646,22 +1648,62 @@ describe("wiring stored DID documents into the monitor", () => {
             return Promise.resolve(new Response(null, { status: 404 }))
         }) as typeof fetch
         try {
-            const rev = await inMonitorObj(stub, (obj) =>
-                (
+            return await inMonitorObj(stub, async (obj) => {
+                await setup(obj)
+                return (
                     obj as unknown as {
                         fetchHeadRev(did: string): Promise<{ rev: string; signingKey: string | null }>
                     }
                 ).fetchHeadRev(did)
-            )
-            expect(rev).toEqual({ rev: "3m5", signingKey: null })
+            })
         } finally {
             globalThis.fetch = original
         }
+    }
+
+    it("the default fetchHeadRev records the document it resolved through", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s10head"
+        const before = Date.now()
+        const rev = await headCheck(stub, did, (obj) => obj.complete(did, "3m1", 1_000, STUB_VERIFIED))
+        expect(rev).toEqual({ rev: "3m5", signingKey: null })
         const row = await rowOf(stub, did)
         expect(row?.document).toContain(`"id":"${did}"`)
         const after = Date.now()
         expect(row?.as_of).toBeGreaterThanOrEqual(before - FETCH_AS_OF_SKEW_MS)
         expect(row?.as_of).toBeLessThanOrEqual(after - FETCH_AS_OF_SKEW_MS)
+    })
+
+    it("the default fetchHeadRev records no document for a DID that is not watched", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s11unwatched"
+        const rev = await headCheck(stub, did, async () => {})
+        expect(rev).toEqual({ rev: "3m5", signingKey: null })
+        expect(await rowOf(stub, did)).toBeNull()
+    })
+
+    // The gate is at the fetch, not in recordDidDocument, which the stream
+    // also feeds for deleted DIDs.
+    it("a deleted DID's document still follows the PLC stream, though a fetch for it records none", async () => {
+        const stub = freshStub()
+        const did = "did:plc:s11deleted"
+        await headCheck(stub, did, async (obj) => {
+            await obj.complete(did, "3m1", 1_000, STUB_VERIFIED)
+            await obj.completeDeletion(did, 2_000, true)
+        })
+        expect(await rowOf(stub, did)).toBeNull()
+        const document: DidDocument = { id: did, alsoKnownAs: ["at://rotated.example"] }
+        await inMonitorObj(stub, async (obj) => {
+            const event: PlcExportEvent = {
+                seq: 5,
+                did,
+                createdAtMs: 9_000,
+                update: { kind: "put", key: "zK", asOfMs: 9_000 },
+                change: { kind: "render", document },
+            }
+            expect(await intakePlcEvent(obj, event, obj)).toBe("ignored")
+        })
+        expect(await rowOf(stub, did)).toMatchObject({ document: canonicalDidDocumentJson(document), as_of: 9_000 })
     })
 
     async function alarmWith(publish: () => Promise<unknown>) {

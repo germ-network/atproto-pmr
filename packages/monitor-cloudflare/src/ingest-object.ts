@@ -11,10 +11,10 @@ import {
     routeFollowEvent,
     listReposByCollection,
     plcCursorAfterClose,
-    FETCH_AS_OF_SKEW_MS,
     FOLLOW_COLLECTION_NSID,
     fetchHeadRev,
     pushDeclarationChange,
+    recordWatchedDocument,
     refreshDue,
     sealDueWindows,
     settleDue,
@@ -61,6 +61,7 @@ import {
     type QueuedRecount,
     type RecountQueueIndex,
     type FetchedRepo,
+    type ResolvedPds,
     type FollowPage,
     type FollowRecord,
     type ListingIndex,
@@ -2698,6 +2699,8 @@ export class MonitorIngest
         return {
             listings: this,
             interest: this,
+            index: this,
+            didDocuments: this,
             edges,
             budget,
             fetchRepo: (did) => this.fetchRepo(did),
@@ -2917,8 +2920,13 @@ export class MonitorIngest
      * The DID's PDS from a freshly fetched document, once per `listRecords`
      * listing (mutual or paged owner). Protected so a test can stand in.
      */
-    protected async resolvePds(did: string): Promise<string> {
-        return pdsResolutionFromDocument(await fetchDidDocument(did, fetch)).endpoint
+    protected async resolvePds(did: string): Promise<ResolvedPds> {
+        const fetchedAtMs = Date.now()
+        const document = await fetchDidDocument(did, fetch)
+        return {
+            pds: pdsResolutionFromDocument(document).endpoint,
+            didDocument: { document: document as unknown as DidDocument, fetchedAtMs },
+        }
     }
 
     /**
@@ -2934,14 +2942,15 @@ export class MonitorIngest
      * the document it was resolved through, for the refresh. Defaults to a
      * real read that also keeps that document; a subclass overrides it
      * alongside `fetchRecord` when the deployment resolves DIDs differently,
-     * and must hand its own document to `recordDidDocument` to keep that.
+     * and must hand its own document to `recordWatchedDocument` to keep that.
      * The key must be in the form `fetchRecord` returns, since refresh
      * compares the two as strings; a `null` key counts as a mismatch.
      */
     protected fetchHeadRev(did: string): Promise<HeadRev> {
         return fetchHeadRev(did, {
-            onDidDocument: ({ document, fetchedAtMs }) =>
-                this.recordDidDocument(did, document, fetchedAtMs - FETCH_AS_OF_SKEW_MS),
+            onDidDocument: async (fetched) => {
+                await recordWatchedDocument({ index: this, didDocuments: this }, did, fetched)
+            },
         })
     }
 

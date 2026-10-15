@@ -34,11 +34,13 @@ import {
     type VerifiedCollection,
 } from "@germ-network/atproto-pmr-core"
 import { FOLLOW_COLLECTION_NSID } from "./follow-stream"
-import type { FetchedDidDocument } from "./ingest"
+import { recordWatchedDocument, type FetchedDidDocument } from "./ingest"
 import {
     D1_ROWS_PER_STATEMENT,
+    type DidDocumentSink,
     type FollowEdgeWriter,
     type InterestIndex,
+    type MonitorIndex,
     type StatementBudget,
 } from "./storage"
 
@@ -296,6 +298,12 @@ export interface FetchedRepo {
     didDocument: FetchedDidDocument
 }
 
+/** A DID's PDS, with the document it was read from. */
+export interface ResolvedPds {
+    pds: string
+    didDocument: FetchedDidDocument
+}
+
 /** One follow record from a `listRecords` page. */
 export interface FollowRecord {
     rkey: string
@@ -316,6 +324,10 @@ export interface FollowPage {
 export interface FollowBackfillDeps {
     listings: ListingIndex
     interest: Pick<InterestIndex, "isGraphOwner" | "inInterest" | "isRegistered">
+    /** Decides whether a listing's fetched document is kept (`recordWatchedDocument`). */
+    index: Pick<MonitorIndex, "isWatched">
+    /** Where a listing's fetched document goes; unset, none is kept. */
+    didDocuments?: DidDocumentSink
     edges: FollowEdgeWriter
     /** The alarm's shared budget; listings take at most `statementReserve` of it. */
     budget: StatementBudget
@@ -326,7 +338,7 @@ export interface FollowBackfillDeps {
         expected: RepoCollectionExpectation
     ): Promise<VerifiedCollection>
     /** The DID's PDS from a fresh document; called once per `listRecords` listing. */
-    resolvePds(did: string): Promise<string>
+    resolvePds(did: string): Promise<ResolvedPds>
     /** One `listRecords` page of `did`'s follows at `pds`, ascending, after rkey `cursor`. */
     listFollows(pds: string, did: string, cursor: string | null): Promise<FollowPage>
     nowMs(): number
@@ -695,6 +707,7 @@ export async function listOwner(
     let unverifiable = false
     try {
         const fetched = await deps.fetchRepo(did)
+        await recordWatchedDocument(deps, did, fetched.didDocument)
         if (fetched.signingKey === null) {
             unverifiable = true
             throw new Error("the DID document has no #atproto key")
@@ -780,7 +793,9 @@ export async function fetchListingPages(
         pagesUsed = 1
         listing.attempts += 1
         try {
-            pds = await deps.resolvePds(did)
+            const resolved = await deps.resolvePds(did)
+            pds = resolved.pds
+            await recordWatchedDocument(deps, did, resolved.didDocument)
         } catch (error) {
             const outcome = await deferStep(deps, config, listing, held?.gen ?? null, {
                 timedOut: false,

@@ -831,6 +831,28 @@ describe("identity events and the signing-key cache", () => {
         expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
         expect(owed).toEqual([])
     })
+
+    // The relay's cached key must be dropped for every DID whose document the
+    // monitor keeps, not only for the ones holding a declaration.
+    it("an identity event for a watched DID with no declaration owes a key update, returns ignored and leaves pending unchanged", async () => {
+        const { owed, keyUpdates } = withKeyUpdates()
+        const h = harness({ keyUpdates })
+        const entry = { rev: "3m1", attempts: 2, notBeforeMs: 5, quiet: false }
+        h.pending.set(DID, entry)
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
+        expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
+        expect(h.pending.get(DID)).toEqual(entry)
+    })
+
+    // A holder outside interest under `everyone` is watched only once it is owed.
+    it("a holder watched only through its reverify owe still owes a key update", async () => {
+        const { owed, keyUpdates } = withKeyUpdates()
+        const h = harness({ keyUpdates })
+        h.revs.set(DID, "3m1")
+        h.deps.index.isWatched = async (did) => h.pending.has(did) && !h.deleted.has(did)
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("reverify")
+        expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
+    })
 })
 
 describe("settle verifies at ingest", () => {

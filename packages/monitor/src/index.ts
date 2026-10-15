@@ -113,6 +113,7 @@ export {
     runListings,
     worstCaseDrainStatements,
     type FetchedRepo,
+    type ResolvedPds,
     type FollowBackfillConfig,
     type FollowBackfillDeps,
     type FollowPage,
@@ -204,6 +205,7 @@ export {
 // Ingest orchestration.
 export {
     intake,
+    recordWatchedDocument,
     settle,
     settleDeletion,
     settleDue,

@@ -1020,3 +1020,40 @@ describe("stale steps and kind changes", () => {
         })
     })
 })
+
+describe("listing documents", () => {
+    const docRow = (obj: MonitorIngest, did: string) =>
+        rowsOf<{ document: string; as_of: number }>(
+            obj,
+            "SELECT document, as_of FROM did_documents WHERE did = ?",
+            did
+        )[0]
+
+    it("a listing's fetched document is recorded", async () => {
+        const s = registeredStub("l")
+        await inObj(s, async (obj) => {
+            await obj.register(O)
+            stubNet(obj, {
+                repos: { [O]: new RepoCollectionError("byte-cap-exceeded", "big") },
+                lists: { [O]: entriesOf(2) },
+            })
+            expect(await step(obj)).toEqual(["switched-to-paged"])
+            const fromRepo = docRow(obj, O)
+            expect(fromRepo?.document).toContain(`"id":"${O}"`)
+            expect(fromRepo?.as_of).toBeLessThan(0)
+            expect(await step(obj)).toEqual(["listed"])
+            expect(docRow(obj, O)!.as_of).toBeGreaterThan(Date.now() - 60_000)
+        })
+    })
+
+    it("a listing of a DID that is not watched stores no document", async () => {
+        const s = registeredStub("l")
+        await inObj(s, async (obj) => {
+            await obj.register(O)
+            stubNet(obj, { repos: { [O]: entriesOf(2) } })
+            obj.isWatched = async () => false
+            expect(await step(obj)).toEqual(["listed"])
+            expect(docRow(obj, O)).toBeUndefined()
+        })
+    })
+})

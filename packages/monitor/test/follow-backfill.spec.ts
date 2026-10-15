@@ -24,6 +24,7 @@ import {
     type QueuedListing,
 } from "../src/follow-backfill"
 import type { FollowEdge } from "@germ-network/atproto-pmr-core"
+import { FETCH_AS_OF_SKEW_MS } from "../src/storage"
 import type { EdgeWriteResult, StatementBudget } from "../src/storage"
 
 const NOW = 1_000_000
@@ -313,6 +314,7 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
             inInterest: async (d) => !left.has(d),
             isRegistered: async (d) => registered.has(d),
         },
+        index: { isWatched: async (d) => !left.has(d) },
         edges: {
             async putEdges(edges: readonly FollowEdge[], gen: number) {
                 const cost = 4 * Math.ceil(edges.length / 25) + 1
@@ -340,7 +342,10 @@ function harness(overrides: Partial<FollowBackfillDeps> = {}, budgetTotal = 1000
         },
         async resolvePds(did) {
             resolved.push(did)
-            return "https://pds.example"
+            return {
+                pds: "https://pds.example",
+                didDocument: { document: { id: did }, fetchedAtMs: 0 },
+            }
         },
         async listFollows(): Promise<FollowPage> {
             return { records: [], lastRkey: null }
@@ -1108,5 +1113,89 @@ describe("follow stream gap", () => {
         expect(followGapExceeded(NOW - LOOKBACK, NOW, LOOKBACK)).toBe(false)
         expect(followGapExceeded(NOW - LOOKBACK - 1, NOW, LOOKBACK)).toBe(true)
         expect(followGapExceeded(NOW - 1_000, NOW, LOOKBACK)).toBe(false)
+    })
+})
+
+describe("a listing's fetched document", () => {
+    function sink() {
+        const writes: Array<{ did: string; document: unknown; asOfMs: number }> = []
+        return {
+            writes,
+            didDocuments: {
+                async recordDidDocument(did: string, document: unknown, asOfMs: number) {
+                    writes.push({ did, document, asOfMs })
+                },
+                async markDidDocumentStale() {},
+            },
+        }
+    }
+
+    it("a getRepo listing records the document it resolved through, verified or not", async () => {
+        const doc = { id: "did:plc:x" } as never
+        for (const verifyRepo of [
+            async () => verified(["did:plc:a"]),
+            async (): Promise<never> => {
+                throw new Error("bad signature")
+            },
+        ]) {
+            const s = sink()
+            const h = harness({
+                didDocuments: s.didDocuments,
+                verifyRepo,
+                fetchRepo: async () => ({ ...fetched(), didDocument: { document: doc, fetchedAtMs: 7_000 } }),
+            })
+            h.owners.add("did:plc:x")
+            h.listings.queue("did:plc:x")
+            await run(h)
+            expect(s.writes).toEqual([{ did: "did:plc:x", document: doc, asOfMs: 7_000 - FETCH_AS_OF_SKEW_MS }])
+        }
+    })
+
+    it("a listRecords listing records the document its PDS was resolved from", async () => {
+        const s = sink()
+        const doc = { id: "did:plc:m" }
+        const h = harness({
+            didDocuments: s.didDocuments,
+            listFollows: pagesOf(1).listFollows,
+            resolvePds: async () => ({
+                pds: "https://pds.example",
+                didDocument: { document: doc, fetchedAtMs: 8_000 },
+            }),
+        })
+        h.listings.queue("did:plc:m")
+        expect(await run(h)).toEqual(["listed"])
+        expect(s.writes).toEqual([{ did: "did:plc:m", document: doc, asOfMs: 8_000 - FETCH_AS_OF_SKEW_MS }])
+    })
+
+    it("a listing of a DID that is not watched records no document", async () => {
+        const s = sink()
+        const h = harness({
+            didDocuments: s.didDocuments,
+            index: { isWatched: async () => false },
+            listFollows: pagesOf(1).listFollows,
+        })
+        h.owners.add("did:plc:x")
+        h.listings.queue("did:plc:x")
+        h.listings.queue("did:plc:m")
+        expect(await run(h)).toEqual(["listed", "listed"])
+        expect(s.writes).toEqual([])
+    })
+
+    it("a failing isWatched records no document and does not fail the listing", async () => {
+        const s = sink()
+        const h = harness({
+            didDocuments: s.didDocuments,
+            index: {
+                isWatched: async () => {
+                    throw new Error("index down")
+                },
+            },
+            listFollows: pagesOf(1).listFollows,
+        })
+        h.owners.add("did:plc:x")
+        h.listings.queue("did:plc:x")
+        h.listings.queue("did:plc:m")
+        expect(await run(h)).toEqual(["listed", "listed"])
+        expect(s.writes).toEqual([])
     })
 })

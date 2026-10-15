@@ -1535,3 +1535,67 @@ describe("declaration intake by policy", () => {
         }
     })
 })
+
+describe("documents and key updates follow interest", () => {
+    // did:web keeps this independent of whether the PLC stream is configured,
+    // which makes the wrapper drop did:plc hints.
+    it("an identity event for a non-holder did:web followee owes a key update", async () => {
+        const stub = registeredStub()
+        const followee = `did:web:followee${crypto.randomUUID().slice(0, 8)}.example`
+        const stranger = `did:web:stranger${crypto.randomUUID().slice(0, 8)}.example`
+        await inObj(stub, async (obj) => {
+            await obj.setOwnerFollowers(followee, 1, 1)
+            for (const did of [followee, stranger]) {
+                await onFrame(
+                    obj,
+                    JSON.stringify({
+                        payload: { $type: "com.atproto.sync.subscribeRepos#identity", did, time_us: 1_000_000 },
+                    })
+                )
+            }
+        })
+        expect(await rows(stub, "SELECT did, kind FROM key_updates")).toEqual([{ did: followee, kind: "delete" }])
+        expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+    })
+    it("a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)", async () => {
+        const stub = everyoneStub()
+        const did = uniqDid()
+        const original = globalThis.fetch
+        globalThis.fetch = ((input: RequestInfo | URL) => {
+            const url = String(input)
+            if (url.startsWith("https://plc.directory/")) {
+                return Promise.resolve(
+                    Response.json({
+                        id: did,
+                        service: [
+                            {
+                                id: "#atproto_pds",
+                                type: "AtprotoPersonalDataServer",
+                                serviceEndpoint: "https://pds.invalid",
+                            },
+                        ],
+                    })
+                )
+            }
+            if (url.includes("sync.getLatestCommit")) {
+                return Promise.resolve(Response.json({ cid: "bafy", rev: "3m5" }))
+            }
+            return Promise.resolve(new Response(null, { status: 404 }))
+        }) as typeof fetch
+        try {
+            await inObj(stub, async (obj) => {
+                await obj.complete(did, "3m1", 1_000, VERIFIED)
+                await obj.completeDeletion(did, 2_000, false)
+                expect(await obj.holderStateOf(did)).toBe("gone-reversible")
+                expect(await obj.isWatched(did)).toBe(false)
+                const head = await (
+                    obj as unknown as { fetchHeadRev(did: string): Promise<{ rev: string }> }
+                ).fetchHeadRev(did)
+                expect(head.rev).toBe("3m5")
+            })
+        } finally {
+            globalThis.fetch = original
+        }
+        expect(await rows(stub, `SELECT did FROM did_documents WHERE did = '${did}'`)).toEqual([])
+    })
+})
