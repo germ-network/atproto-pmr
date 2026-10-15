@@ -121,4 +121,6 @@ An owner past `FOLLOW_MAX_REPO_BYTES` (32 MiB), `MAX_FOLLOWS` follow records (20
 
 **Blocks, per summary read.** Each owner summary read costs the singleton ingest object one D1 read of that owner's blocks (a batch of two statements) over the cross-Worker binding, outside the alarm's statement budget, so polling devices add read load in proportion to their poll rate. A failed read answers the summary `503` rather than an empty list.
 
+**Deploy contract for blocks.** Apply migration `0002_blocks.sql` before deploying; the follow socket's URL gains the block collection once; `MAX_BLOCKS` is optional. The relay's summary needs `blocks: monitorOwnBlocks(env)` and so a bound `MONITOR_INGEST` and `MONITOR_INGEST_NAME`: without them every summary read answers `503`, where a relay without the monitor served the summary before. Relay state stored by this version holds a block-list part that an older relay cannot read, so a rollback fails summary reads until those states age out.
+
 **Known gap.** A newly registered user's existing inbound blocks from in-interest DIDs that are not their followees reach the index only at each blocker's next stale re-list (`FOLLOW_RELIST_AFTER_MS`); their followees' blocks are caught by the followee listings registration already queues.

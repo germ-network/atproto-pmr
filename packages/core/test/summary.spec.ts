@@ -490,6 +490,37 @@ describe("summary read", () => {
             expect(second.token).not.toBe(first.token)
             expect(second).toMatchObject({ full: false, graph: null, records: [], removed: [] })
             expect(second.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const third = await read(await get(second.token))
+            expect(third.ownBlocks).toBeNull()
+            expect(third.token).toBe(second.token)
+        })
+
+        it("sorts the list by rkey, so an unordered source does not resend it on every poll", async () => {
+            const w = summaryWorld()
+            w.blocks.set(OWNER, [
+                { blocker: OWNER, rkey: "3k2", subject: "did:plc:y" },
+                { blocker: OWNER, rkey: "3k1", subject: "did:plc:x" },
+            ])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks!.map((b) => b.rkey)).toEqual(["3k1", "3k2"])
+            w.blocks.set(OWNER, [...w.blocks.get(OWNER)!].reverse())
+            expect((await read(await get(first.token))).ownBlocks).toBeNull()
+        })
+
+        it("a paged sync delivers the list on its first page and a later change on the next", async () => {
+            const w = summaryWorld()
+            w.deps.pageRecords = 1
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first).toMatchObject({ full: true, more: true })
+            expect(first.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const second = await read(await get(first.token))
+            expect(second.ownBlocks).toBeNull()
+            w.blocks.set(OWNER, [])
+            const third = await read(await get(second.token))
+            expect(third.ownBlocks).toEqual([])
         })
 
         it("answers 503 with Retry-After when the blocks cannot be read, keeping the held states", async () => {

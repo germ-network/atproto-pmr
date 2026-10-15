@@ -97,7 +97,7 @@ describe("summary read — own blocks", () => {
         })
     })
 
-    it("a change to blocks alone issues a new token", async () => {
+    it("a change to blocks alone diffs as blocksChanged", async () => {
         const did = freshDID()
         await ingest().setOwnBlocks(did, [])
         const first = (await buildSummaryIndex(did, summaryDeps(did)))!
@@ -107,7 +107,7 @@ describe("summary read — own blocks", () => {
         expect(diff).toMatchObject({ blocksChanged: true, graphChanged: false, changed: [], removed: [] })
     })
 
-    it("answers 503 when the owner's blocks cannot be read, keeping the held baseline", async () => {
+    it("a failed blocks read over the RPC rejects with SummaryOwnBlocksError and touches no baseline", async () => {
         const did = freshDID()
         await ingest().setOwnBlocks(did, "throw")
         await inPMR(freshPMR(), async (pmr) => {
@@ -117,7 +117,7 @@ describe("summary read — own blocks", () => {
         })
     })
 
-    it("answers 409 when the owner's graph is not served, keeping the held baseline", async () => {
+    it("an unserved graph builds no index and touches no baseline", async () => {
         const did = freshDID()
         await ingest().setOwnBlocks(did, null)
         await inPMR(freshPMR(), async (pmr) => {

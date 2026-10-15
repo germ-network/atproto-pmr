@@ -1209,6 +1209,11 @@ by a cap that scales inversely with the number of watched collections; a
 contact pushed past the cap arrives in `x` though its records still exist, and
 costs full CARs when it returns.
 
+A client that has never held a `b` list (a build from before it, or a token
+the relay stored for one) MUST read without `since` when it first reads `b`, and
+drop its held tokens: a relay that stored a state for it counts the list as
+delivered, so naming that token would report the list as unchanged.
+
 The block list is private to the owner: it appears only here, never in the
 graph or on any public route, and is diffed independently of the graph, so a
 change to blocks alone issues a new token. Each entry names the block record's

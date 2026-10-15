@@ -41,7 +41,11 @@ export interface SummaryIndexEntry extends SummaryRecordRef {
 /** Enough of a summary to diff against: the graph, the owner's blocks and each record's state. */
 export interface SummaryIndex {
     graph: GraphReadResponse
-    /** The owner's own blocks, by rkey; they never appear in the graph or on a public route. */
+    /**
+     * The owner's own `app.bsky.graph.block` records, by rkey (not the
+     * relay's blocked senders); they never appear in the graph or on a public
+     * route.
+     */
     ownBlocks: OwnBlock[]
     records: SummaryIndexEntry[]
     /** Delivered by a page that left more: a client holding it is mid-sync. */
