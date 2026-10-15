@@ -874,7 +874,6 @@ export async function handleSummaryRead(
     const unchanged =
         base !== null &&
         !page.full &&
-        page.graph === null &&
         page.ownBlocks === null &&
         page.records.length === 0 &&
         page.removed.length === 0 &&

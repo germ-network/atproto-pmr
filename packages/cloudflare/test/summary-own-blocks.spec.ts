@@ -51,7 +51,7 @@ describe("monitorOwnBlocks", () => {
 })
 
 const baseline = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
-    graph: { did: "did:plc:me", following: [], followers: [] },
+    owner: "did:plc:me",
     ownBlocks,
     records: [],
 })
@@ -104,7 +104,7 @@ describe("summary read — own blocks", () => {
         await ingest().setOwnBlocks(did, [{ blocker: did, rkey: "3k1", subject: "did:plc:x" }])
         const second = (await buildSummaryIndex(did, summaryDeps(did)))!
         const diff = diffSummaryIndex(first.index, second.index)
-        expect(diff).toMatchObject({ blocksChanged: true, graphChanged: false, changed: [], removed: [] })
+        expect(diff).toMatchObject({ blocksChanged: true, changed: [], removed: [] })
     })
 
     it("a failed blocks read over the RPC rejects with SummaryOwnBlocksError and touches no baseline", async () => {

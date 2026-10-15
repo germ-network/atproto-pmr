@@ -226,8 +226,8 @@ const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey")
     cid,
     verifiedWith,
 })
-const indexOf = (records: ReturnType<typeof entryOf>[], graph = graphOf([]), more?: boolean): SummaryIndex => ({
-    graph,
+const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): SummaryIndex => ({
+    owner: OWNER,
     ownBlocks: [],
     records,
     ...(more ? { more } : {}),
@@ -280,7 +280,7 @@ describe("readSummaryPage", () => {
         const current = indexOf([entryOf("did:plc:a", "c1")])
         const w = pageWorld(current.records)
         const { page, delivered } = await readSummaryPage(null, current, w.deps, 10)
-        expect(page).toMatchObject({ full: true, removed: [], more: false, graph: current.graph })
+        expect(page).toMatchObject({ full: true, removed: [], more: false })
         expect(page.records.map((r) => r.did)).toEqual(["did:plc:a"])
         expect(delivered.records).toEqual(current.records)
     })
@@ -297,14 +297,13 @@ describe("readSummaryPage", () => {
     })
 
     it("pages changed records in (did, collection, rkey) order, the owner's first", async () => {
-        const graph = graphOf([])
         const records = [
             entryOf("did:plc:b", "c1", "z"),
             entryOf("did:plc:b", "c2", "a"),
             entryOf("did:plc:a", "c3"),
             entryOf(OWNER, "c4"),
         ]
-        const current = indexOf(records, graph)
+        const current = indexOf(records)
         const { page } = await readSummaryPage(null, current, pageWorld(records).deps, 10)
         expect(page.records.map((r) => `${r.did}/${r.rkey}`)).toEqual([
             `${OWNER}/self`,
@@ -324,17 +323,17 @@ describe("readSummaryPage", () => {
         expect(done.delivered.more).toBeUndefined()
     })
 
-    it("delivered is base minus removals plus the delivered records, with the current graph", async () => {
-        const oldGraph = graphOf([edge("did:plc:old")])
-        const newGraph = graphOf([edge("did:plc:new")])
-        const base = indexOf(
-            [entryOf("did:plc:keep", "k1"), entryOf("did:plc:change", "v1"), entryOf("did:plc:gone", "g1")],
-            oldGraph
-        )
-        const current = indexOf(
-            [entryOf("did:plc:added", "n1"), entryOf("did:plc:change", "v2"), entryOf("did:plc:keep", "k1")],
-            newGraph
-        )
+    it("delivered is base minus removals plus the delivered records", async () => {
+        const base = indexOf([
+            entryOf("did:plc:keep", "k1"),
+            entryOf("did:plc:change", "v1"),
+            entryOf("did:plc:gone", "g1"),
+        ])
+        const current = indexOf([
+            entryOf("did:plc:added", "n1"),
+            entryOf("did:plc:change", "v2"),
+            entryOf("did:plc:keep", "k1"),
+        ])
         const { delivered, page } = await readSummaryPage(base, current, pageWorld(current.records).deps, 10)
         expect(delivered).toEqual(current)
         expect(page.removed).toEqual([refOf("did:plc:gone")])
@@ -397,22 +396,9 @@ describe("readSummaryPage", () => {
         expect(delivered.records).toEqual([])
     })
 
-    it("the graph is carried on the first page it changed on, and null after", async () => {
-        const base = indexOf([], graphOf([]))
-        const current = indexOf([entryOf("did:plc:a", "c1"), entryOf("did:plc:b", "c2")], graphOf([edge("did:plc:a")]))
-        const w = pageWorld(current.records)
-        const first = await readSummaryPage(base, current, w.deps, 1)
-        expect(first.page.graph).toEqual(current.graph)
-        const second = await readSummaryPage(first.delivered, current, w.deps, 1)
-        expect(second.page.graph).toBeNull()
-        const unchanged = await readSummaryPage(current, current, w.deps, 1)
-        expect(unchanged.page).toMatchObject({ graph: null, records: [], removed: [], more: false })
-    })
-
     it("paging from each delivered index converges to current with more unset", async () => {
         const current = indexOf(
-            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`)),
-            graphOf([edge("did:plc:d1")])
+            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`))
         )
         const w = pageWorld(current.records)
         let held: SummaryIndex | null = null
@@ -435,7 +421,6 @@ describe("summary delta codec", () => {
     const delta: SummaryDelta = {
         token: "tok",
         full: false,
-        graph: null,
         ownBlocks: null,
         records: [],
         removed: [],
@@ -454,7 +439,6 @@ describe("summary delta codec", () => {
             new Map<string, CoseValue>([
                 [SUMMARY_DELTA_KEYS.token, "t"],
                 [SUMMARY_DELTA_KEYS.full, false],
-                [SUMMARY_DELTA_KEYS.graph, null],
                 [SUMMARY_DELTA_KEYS.records, []],
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])
