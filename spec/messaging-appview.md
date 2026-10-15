@@ -45,10 +45,34 @@ Two consequences for the read surface:
   the summary and from the public record read. **Built.**
 
 The inputs it keeps are the follow-edge index, the block index and the
-monitor's interest policy below. None of them is served raw. Declaration
+monitor's interest policy, which limits both to the host's users and the DIDs
+they follow. None of them is served raw. Declaration
 snapshots and DID documents belong to the key monitor
 ([serving them to devices](key-transparency.md#serving-held-snapshots-and-documents-to-devices)).
 
+## Keeping the indexes current
+
+The follow and block indexes are sized for every holder, like the key monitor,
+so they follow the same rule
+([freshness from coverage](key-transparency.md#freshness-comes-from-coverage-not-polling)):
+they MUST NOT be kept current by re-listing repos on a schedule.
+
+- **The live stream is the source.** Follow and block commits arrive on the
+  firehose and are applied as they come, so cost grows with the number of
+  changes.
+- **A listing** (a verified `getRepo`, or `listRecords` pages) runs when a DID
+  enters interest or registers, and after a stream gap the stream cannot
+  replay. Never on a timer.
+- **Edges and blocks are hints, not proof**, whichever path wrote them. A
+  verdict built on them is a hint the device can check against the signed
+  records.
+
 ## Known gap
 
-A newly registered user's existing inbound blocks from in-interest DIDs that are not their followees reach the index only at each blocker's next stale re-list (`FOLLOW_RELIST_AFTER_MS`); their followees' blocks are caught by the followee listings registration already queues.
+A newly registered user's existing inbound blocks are kept only for blockers
+the index already lists, and it keeps a non-owner's blocks of registered DIDs
+only. So a block that an in-interest DID made before the user registered, when
+that DID is not one of the user's followees, is not caught: no re-list will
+come. The user's followees' blocks are caught, because registration queues
+their listings. Closing the gap needs a lookup at registration of who blocks
+the user, or keeping every in-interest DID's blocks. **Open.**
