@@ -329,6 +329,7 @@ export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorInge
                     cid,
                     verifiedWith,
                     freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+                    ...(metadata.policies ? { policies: metadata.policies } : {}),
                 }
             })
         },

@@ -131,7 +131,7 @@ describe("kvSummaryIndexReader", () => {
         ]
         expect(await kvSummaryIndexReader(testEnv).entries(refs)).toEqual([
             { ...refs[0], cid: "cid-b", verifiedWith: "zOther", freshAtMs: 1_000 },
-            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", freshAtMs: 1_000 },
+            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", freshAtMs: 1_000, policies: { found: false, code: "undecodable" } },
             null,
         ])
     })

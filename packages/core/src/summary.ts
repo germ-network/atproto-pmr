@@ -15,6 +15,7 @@ import { readRecordFromCar } from "./repo-proof.js"
 import { servableUnderRotation, type ReadSigningKey, type ReadSigningKeys } from "./read-signing-key.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
+import type { StoredPolicies } from "./policy.js"
 import type { WatchedRecord } from "./watched.js"
 
 export interface SummaryRecordRef {
@@ -106,6 +107,12 @@ export const SUMMARY_PAGE_RECORDS = 300
 /** A held, ingest-verified record's index entry, read without its CAR. */
 export interface SummaryHeldEntry extends SummaryIndexEntry {
     freshAtMs: number
+    /**
+     * A declaration's stored policies; absent on other records and on a
+     * declaration stored before they were kept. Dropped before an entry
+     * joins a {@link SummaryIndex}.
+     */
+    policies?: StoredPolicies
 }
 
 export interface SummaryIndexReader {
@@ -221,7 +228,7 @@ export async function buildSummaryIndex(
         ) {
             lapsed.add(entry.did)
         }
-        const { freshAtMs: _freshAtMs, ...indexed } = entry
+        const { freshAtMs: _freshAtMs, policies: _policies, ...indexed } = entry
         records.push(indexed)
     }
     for (const lapse of lapsed) deps.onLapse(lapse)

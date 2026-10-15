@@ -471,3 +471,9 @@ export {
 } from "./can-message"
 export { allowPoliciesOf, readAnchorPolicy, type AnchorPolicy } from "./anchor-policy"
 export { type StoredPolicies } from "./policy"
+
+export {
+    indexPolicySource,
+    SUMMARY_VERDICT_KEYS,
+    type SummaryVerdict,
+} from "./summary-verdicts"
