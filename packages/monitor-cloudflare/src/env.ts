@@ -80,6 +80,8 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     GRAPH_STATEMENT_BUDGET?: string
     /** DIDs mirrored to D1 per alarm, default 50. */
     GRAPH_MIRROR_BATCH?: string
+    /** DIDs the graph projector writes per alarm, default 200 (each a KV write). */
+    GRAPH_PROJECTOR_BATCH?: string
     /** `graph_changes` rows pruned per alarm, default 1000. */
     GRAPH_PRUNE_BATCH?: string
     /** DIDs checked per page of the daily mirror reconcile, default 25. */
