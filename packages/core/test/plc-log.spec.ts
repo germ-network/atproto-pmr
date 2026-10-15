@@ -51,6 +51,9 @@ const body = (rotationKeys: TestKey[], signingKey: TestKey, prev: string | null,
     prev,
 })
 
+/** The CID with its last character changed, whatever it was. */
+const otherCid = (cid: string) => cid.slice(0, -1) + (cid.endsWith("a") ? "b" : "a")
+
 let clock = Date.parse("2026-01-01T00:00:00.000Z")
 function entry(operation: Record<string, unknown>, nullified = false): PlcLogEntry {
     clock += 1000
@@ -258,12 +261,12 @@ describe("verifyPlcLog", () => {
             expect((error as PlcLogError).kind).toBe("unrenderable")
         }
         const { g, did } = chain()
-        expect(() => verifyPlcLog(did, [{ ...g, cid: g.cid.slice(0, -1) + "a" }])).toThrow(PlcLogError)
+        expect(() => verifyPlcLog(did, [{ ...g, cid: otherCid(g.cid) }])).toThrow(PlcLogError)
     })
 
     it("a CID that is not the operation's own throws", () => {
         const { g, did, second } = chain()
-        expect(() => verifyPlcLog(did, [g, { ...second, cid: g.cid.slice(0, -1) + "a" }])).toThrow(
+        expect(() => verifyPlcLog(did, [g, { ...second, cid: otherCid(g.cid) }])).toThrow(
             /cid/
         )
         expect(() => verifyPlcLog(did, [{ ...g, cid: second.cid }])).toThrow(/cid/)
