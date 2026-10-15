@@ -69,8 +69,7 @@ Two consequences follow for the read surface:
   them, plus the contact's declaration and profile. The PMR does not publish
   raw follow or block lists. This is not because they are secret. Devices
   don't consume them, and keeping them projected for publication costs the
-  host writes. The public graph read and its projection, listed as built
-  below, are to be removed.
+  host writes.
 
 ## Reads and the 24-hour rule
 
