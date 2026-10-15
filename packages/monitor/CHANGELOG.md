@@ -1,5 +1,36 @@
 # @germ-network/atproto-pmr-monitor
 
+## 0.1.6
+
+### Patch Changes
+
+- [#55](https://github.com/germ-network/atproto-pmr/pull/55) [`848de1e`](https://github.com/germ-network/atproto-pmr/commit/848de1e573f0237f8498cf8a9f2f41250e7e642d) Thanks [@germ-mark](https://github.com/germ-mark)! - The monitor ingests `app.bsky.graph.block` records and serves an owner their own block list through the authenticated summary.
+
+  Blocks of a served graph's owner, and a non-owner in interest's blocks of registered DIDs, are kept in a new D1 `blocks` table (migration `0002_blocks.sql`; apply it before deploying) beside the follows. They arrive on the follow socket, which now subscribes to the block collection (a one-time change of its URL), and listings read them with the follows: owner repos verify both collections in one `getRepo` pass (`verifyRepoCollections`, each under its own cap, with the new optional `MAX_BLOCKS`), paged and mutual listings page follows then blocks. A DID's blocks are pruned with its follows. Blocks are not projected or served publicly, since no device reads other DIDs' block lists and serving them would cost; they have no projection or route.
+
+  The owner's summary carries their own blocks under `b` (`SummaryDelta.ownBlocks`, null when unchanged). The ingest object answers `ownBlocks(did)` over RPC (`MonitorOwnBlocksRequest`), and a relay passes `blocks: monitorOwnBlocks(env)` in its summary deps; a failed read answers `503`, an unserved graph `409`. `BlockEdgeStore.isBlocked` answers whether one DID's kept block names another. `MONITOR_COLLECTIONS` now refuses the follow and block collections.
+
+- [#60](https://github.com/germ-network/atproto-pmr/pull/60) [`2d32f67`](https://github.com/germ-network/atproto-pmr/commit/2d32f67dac1182b3effddec2aa77301252ced37e) Thanks [@germ-mark](https://github.com/germ-mark)! - The follow-edge index no longer keeps a change log. Nothing read the D1 `graph_changes` table once the graph projector left, yet every edge, holder and served change wrote rows into it that the alarm then pruned.
+
+  Removed: `GraphChangeReason`, `GraphChangeRow` and `GraphChangeLog` (core); `d1GraphChangeLog`; `pruneGraphChanges`, `GRAPH_CHANGE_RETENTION_MS` and `FollowEdgeWriter.pruneChanges` (monitor); the `GRAPH_PRUNE_BATCH` variable, which can be dropped from the Worker config. The writers send fewer statements, so the budgets are smaller: a mirrored DID takes 5 statements (was 11), a flushed chunk of 25 follow creates 2 (was 5) and of deletes 1 (was 3), a drained chunk 2 (was 4). One alarm clears about 4,950 listed edges (was 2,450).
+
+  Schema: `0001_follow_graph.sql` no longer creates `graph_changes`; it is edited in place, so a D1 that has not applied it needs nothing. A D1 that already applied 0.1.5's `0001` keeps an orphan table: `DROP TABLE graph_changes`.
+
+- [#58](https://github.com/germ-network/atproto-pmr/pull/58) [`8f8356c`](https://github.com/germ-network/atproto-pmr/commit/8f8356cdc14c06595e32ecbca1357ec80d5c05b5) Thanks [@germ-mark](https://github.com/germ-mark)! - No route, store or job publishes a follow graph, and the summary carries none.
+
+  Removed: `GET /pmr/v1/graph/{did}` (`handleGraphRead`), the `graph:<did>` KV projection (`kvGraphProjections`), the graph projector (`runGraphProjector`, `GRAPH_PROJECTOR_BATCH` and its types), the projection store types (`GraphProjectionStore`, `GraphProjectionWriter`, `GraphReadDeps`), `projectGraph`, and the graph wire types and codecs (`GraphReadResponse`, `GraphEdge`, `GRAPH_READ_KEYS`, `GRAPH_EDGE_KEYS`, `encodeGraphReadResponse`, `decodeGraphReadResponse`). The summary no longer has `g` (`SummaryDelta.graph`; the key is retired), and the stored baseline holds the owner's DID instead of a graph. Devices read the record and DID-document routes and the owner's summary only.
+
+  The summary chooses its contacts privately: the ingest object answers `ownGraph(did)` over RPC (`MonitorOwnGraphRequest`, one D1 batch via `FollowEdgeStore.ownEdges`), and a relay passes `graph: monitorOwnGraph(env)` in its summary deps instead of `projections`. A summary poll now makes two ingest RPCs (`ownGraph` and `ownBlocks`) where it made one KV read. `409` now means the owner's graph is not served yet; a failed graph or blocks read answers `503`. `SummaryOwnBlocksError` is now `SummaryOwnerReadError`, and `FollowEdgeStore.following`/`followers` are replaced by `ownEdges`; core exports `ownerGraph`, `OwnerGraph` and `OwnerGraphEdge`. When deploying, unmount the graph route, remove `GRAPH_PROJECTOR_BATCH` from the Worker config, and delete any `graph:<did>` keys left in the records KV.
+
+- [#61](https://github.com/germ-network/atproto-pmr/pull/61) [`79a62ba`](https://github.com/germ-network/atproto-pmr/commit/79a62ba915a06ff7ffc087fe43c51310ea461607) Thanks [@germ-mark](https://github.com/germ-mark)! - A pair put is judged when it arrives: does the hosted recipient accept this sender? The relay routes it in one `PMRStore.receive` call: delivered to an admitted mailbox, pooled with the verdict's reasons, or handled as from a blocked sender. The recipient's Bsky blocks are mirrored into the relay block at accept and at each catch-up. Every outcome stays a `202` or `429`.
+
+  Added: `PairPutDeps.admission` (`AdmissionSource`, `admissionOrUnavailable`, `admissionOf`), `PMRStore.receive`, `syncBskyBlocks` and `listBskyBlocked`, `block(key, now, source)`, `syncOwnerBlocks`, `EventsDeps.blocks` and `OwnerDeps.blocks`, and `d1AdmissionSource` in monitor-cloudflare. `d1SenderGraphReader` and `d1BlockEdgeStore` now take `Pick<D1Database, "prepare" | "batch">`. `GET /pmr/v1/pool` entries gain `v` and `r` for a sender the relay judged, and `GET /pmr/v1/blocks` gains `bs`. A yes admitted only by `open` is held back and pools as unknown until a relay bounds admitted senders.
+
+  When deploying, pass `admission: d1AdmissionSource({ db, snapshots })` in the pair-put deps and `blocks: monitorOwnBlocks(env)` in the owner deps. The relay Worker then needs bindings to the monitor's D1 database and records KV; it only reads them (graph reads go through a D1 session that may be served by a replica), but D1 has no read-only binding. Without `admission`, puts behave as before.
+
+- Updated dependencies [[`848de1e`](https://github.com/germ-network/atproto-pmr/commit/848de1e573f0237f8498cf8a9f2f41250e7e642d), [`fb8969d`](https://github.com/germ-network/atproto-pmr/commit/fb8969d03d33aea86d9bbc44a34f349b3fdf01d2), [`2d32f67`](https://github.com/germ-network/atproto-pmr/commit/2d32f67dac1182b3effddec2aa77301252ced37e), [`8f8356c`](https://github.com/germ-network/atproto-pmr/commit/8f8356cdc14c06595e32ecbca1357ec80d5c05b5), [`79a62ba`](https://github.com/germ-network/atproto-pmr/commit/79a62ba915a06ff7ffc087fe43c51310ea461607), [`8381ebe`](https://github.com/germ-network/atproto-pmr/commit/8381ebe100e1ad751abf84d598abb4f11e36230a)]:
+  - @germ-network/atproto-pmr-core@0.1.6
+
 ## 0.1.5
 
 ### Patch Changes
