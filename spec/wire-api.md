@@ -1183,6 +1183,7 @@ response is a delta against a state the client names by **token**:
 | `t` | `token`: name this on the next read |
 | `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` is empty |
 | `g` | `graph`: the owner's graph, absent (null) if unchanged |
+| `b` | `ownBlocks`: the owner's own block list, each `{d: blocked DID, k: rkey of the block record}`, sent whole when it changed and absent (null) when unchanged; a client that reads no `b` keeps the list it holds |
 | `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
 | `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
 | `m` | `more`: changes remain; read again at once naming this token |
@@ -1191,7 +1192,10 @@ response is a delta against a state the client names by **token**:
 A read with no `since`, or one naming an unknown or dropped token, gets the
 whole summary as `full`. A relay keeps the last four states it served an
 owner, so a second device or a lost response never leaves a client wrong.
-`409` with `Retry-After` while the owner has no projection yet.
+`409` with `Retry-After` while the owner has no projection yet or their graph is
+not yet served for blocks, and `503` with `Retry-After` when the relay cannot
+read their blocks; neither changes the states the relay holds, so a retry names
+the same token.
 
 One response carries at most a page of records. When `m` is true the client
 reads again naming the response's token and continues from what that response
@@ -1204,6 +1208,14 @@ lowest priority first (the owner, then mutual follows, following, followers),
 by a cap that scales inversely with the number of watched collections; a
 contact pushed past the cap arrives in `x` though its records still exist, and
 costs full CARs when it returns.
+
+The block list is private to the owner: it appears only here, never in the
+graph or on any public route, and is diffed independently of the graph, so a
+change to blocks alone issues a new token. Each entry names the block record's
+rkey in the owner's repo, so a device can verify it against the signed record
+before relying on it; like graph edges, a block is a hint until then. These are
+the owner's `app.bsky.graph.block` records, unrelated to the relay's
+[blocked senders](#blocked-senders).
 
 A summary includes a record only if the relay holds it, ingest verified it and
 it passes the same trusted-current-key check as a record read, with the same
