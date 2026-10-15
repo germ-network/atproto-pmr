@@ -163,14 +163,6 @@ export {
     type DrainPlcLogsDeps,
     type PlcLogIndex,
 } from "./plc-log"
-export {
-    PROJECT_STATEMENTS_PER_DID,
-    runGraphProjector,
-    type GraphProjectorDeps,
-    type GraphProjectorIndex,
-    type MirroredGraphStanding,
-    type ProjectorCursor,
-} from "./graph-projector"
 export { listEdgeRecords, type ListEdgeRecordsOptions } from "./list-records"
 
 // The change digest.

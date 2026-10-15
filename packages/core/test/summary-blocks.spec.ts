@@ -12,7 +12,7 @@ import {
 } from "../src/summary"
 
 const index = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
-    graph: { did: "did:plc:me", following: [], followers: [] },
+    owner: "did:plc:me",
     ownBlocks,
     records: [],
 })
@@ -25,7 +25,6 @@ const deps = {
 const delta = (ownBlocks: SummaryDelta["ownBlocks"]): SummaryDelta => ({
     token: "tok",
     full: true,
-    graph: null,
     ownBlocks,
     records: [],
     removed: [],

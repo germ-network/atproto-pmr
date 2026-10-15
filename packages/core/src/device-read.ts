@@ -1,20 +1,14 @@
 /**
- * The device read API's public routes (`spec/proxy-cache.md`): records and
- * the follow graph, served from the monitor's processed KV output. Both are
- * unauthenticated and answer every caller identically, so a response says
- * nothing about who else has asked. Neither route reaches a PDS on the
- * response path.
+ * The device read API's public record route (`spec/proxy-cache.md`), served
+ * from the monitor's processed KV output. It is unauthenticated and answers
+ * every caller identically, so a response says nothing about who else has
+ * asked. It never reaches a PDS on the response path.
  */
 
 import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
-import type { FollowEdge } from "./follow-edges.js"
 import {
-    GRAPH_EDGE_KEYS,
-    GRAPH_READ_KEYS,
     RECORD_READ_KEYS,
-    type GraphEdge,
-    type GraphReadResponse,
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api.js"
@@ -246,163 +240,4 @@ export function decodeRecordReadResponse(bytes: Uint8Array): RecordReadResponse 
         ),
         reason: field(K.reason, isString),
     }
-}
-
-/**
- * The owner's graph from the index's edges, which the index has already
- * restricted to declaration holders: an edge is `mutual` iff a reverse edge
- * is also present. Two follow records of the same pair are two edges. Edges
- * come back sorted by `did` then `rkey`, so equal inputs encode to equal
- * bytes.
- */
-export function projectGraph(
-    did: string,
-    following: FollowEdge[],
-    followers: FollowEdge[]
-): GraphReadResponse {
-    const followingDids = new Set(following.map((e) => e.subject))
-    const followerDids = new Set(followers.map((e) => e.follower))
-    return {
-        did,
-        following: sortEdges(
-            following.map((e) => ({
-                did: e.subject,
-                rkey: e.rkey,
-                mutual: followerDids.has(e.subject),
-            }))
-        ),
-        followers: sortEdges(
-            followers.map((e) => ({
-                did: e.follower,
-                rkey: e.rkey,
-                mutual: followingDids.has(e.follower),
-            }))
-        ),
-    }
-}
-
-function sortEdges(edges: GraphEdge[]): GraphEdge[] {
-    return edges.sort((a, b) => compareStrings(a.did, b.did) || compareStrings(a.rkey, b.rkey))
-}
-
-function compareStrings(a: string, b: string): number {
-    return a < b ? -1 : a > b ? 1 : 0
-}
-
-export function encodeGraphReadResponse(response: GraphReadResponse): Uint8Array {
-    return encodeCose(graphToCose(response))
-}
-
-/** The graph as a CBOR map, for embedding in another body. */
-export function graphToCose(response: GraphReadResponse): Map<string, CoseValue> {
-    const edges = (list: GraphEdge[]): CoseValue[] =>
-        list.map(
-            (e) =>
-                new Map<string, CoseValue>([
-                    [GRAPH_EDGE_KEYS.did, e.did],
-                    [GRAPH_EDGE_KEYS.rkey, e.rkey],
-                    [GRAPH_EDGE_KEYS.mutual, e.mutual],
-                ])
-        )
-    return new Map<string, CoseValue>([
-        [GRAPH_READ_KEYS.did, response.did],
-        [GRAPH_READ_KEYS.following, edges(response.following)],
-        [GRAPH_READ_KEYS.followers, edges(response.followers)],
-    ])
-}
-
-/** Ignores keys it does not know; throws on a body missing a required field. */
-export function decodeGraphReadResponse(bytes: Uint8Array): GraphReadResponse {
-    return graphFromCose(decodeCoseMap(bytes))
-}
-
-export function graphFromCose(map: Map<number | string, CoseValue>): GraphReadResponse {
-    const did = map.get(GRAPH_READ_KEYS.did)
-    if (typeof did !== "string") throw new Error("graph read: missing or malformed did")
-    const edges = (key: string): GraphEdge[] => {
-        const list = map.get(key)
-        if (!Array.isArray(list)) throw new Error(`graph read: missing or malformed "${key}"`)
-        return list.map((item) => {
-            if (!(item instanceof Map)) throw new Error("graph read: malformed edge")
-            const edgeDid = item.get(GRAPH_EDGE_KEYS.did)
-            const rkey = item.get(GRAPH_EDGE_KEYS.rkey)
-            const mutual = item.get(GRAPH_EDGE_KEYS.mutual)
-            if (
-                typeof edgeDid !== "string" ||
-                typeof rkey !== "string" ||
-                typeof mutual !== "boolean"
-            ) {
-                throw new Error("graph read: malformed edge")
-            }
-            return { did: edgeDid, rkey, mutual }
-        })
-    }
-    return {
-        did,
-        following: edges(GRAPH_READ_KEYS.following),
-        followers: edges(GRAPH_READ_KEYS.followers),
-    }
-}
-
-/**
- * The public graph projections, kept current by the monitor's projector for
- * the DIDs whose graphs this deployment serves: by default its registered
- * users only, never arbitrary DIDs; a private deployment may project every
- * declaration holder. A DID with no projection is not served.
- */
-export interface GraphProjectionStore {
-    /** Null if none is held. A thrown error is a relay fault and propagates. */
-    get(did: string): Promise<GraphReadResponse | null>
-}
-
-/** The projector's side of the store. */
-export interface GraphProjectionWriter extends GraphProjectionStore {
-    put(projection: GraphReadResponse): Promise<void>
-    delete(did: string): Promise<void>
-    /** Held projections' DIDs, paged, so a rebuild can sweep those no longer served. */
-    listDids(
-        cursor: string | null,
-        limit: number
-    ): Promise<{ dids: string[]; cursor: string | null }>
-}
-
-export interface GraphReadDeps {
-    projections: GraphProjectionStore
-}
-
-/**
- * `GET /pmr/v1/graph/{did}` — the DID's held projection as a CBOR
- * {@link GraphReadResponse}, `cache-control: no-store`, `404` when no
- * projection is held for the DID. An aggregation, so an unauthenticated hint: a device verifies
- * an edge against the follower's signed follow record before relying on it.
- */
-export async function handleGraphRead(
-    request: Request,
-    deps: GraphReadDeps
-): Promise<Response> {
-    const parts = new URL(request.url).pathname.split("/")
-    // "", "pmr", "v1", "graph", did
-    let did: string | null = null
-    if (parts.length === 5 && parts[1] === "pmr" && parts[2] === "v1" && parts[3] === "graph") {
-        try {
-            const decoded = decodeURIComponent(parts[4])
-            if (DID_SYNTAX.test(decoded)) did = decoded
-        } catch {
-            // malformed escape: same 400 as any other bad path
-        }
-    }
-    if (did === null) {
-        return new Response("Malformed path", {
-            status: 400,
-            headers: { "cache-control": "no-store" },
-        })
-    }
-    const projection = await deps.projections.get(did)
-    if (!projection) {
-        return new Response(null, { status: 404, headers: { "cache-control": "no-store" } })
-    }
-    return new Response(toResponseBody(encodeGraphReadResponse(projection)), {
-        status: 200,
-        headers: { "content-type": "application/cbor", "cache-control": "no-store" },
-    })
 }

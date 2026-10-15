@@ -4,7 +4,7 @@ import {
     buildSummaryIndex,
     diffSummaryIndex,
     readSummaryPage,
-    SummaryOwnBlocksError,
+    SummaryOwnerReadError,
     type SummaryIndex,
     type SummaryPageDeps,
 } from "@germ-network/atproto-pmr-core"
@@ -51,7 +51,7 @@ describe("monitorOwnBlocks", () => {
 })
 
 const baseline = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
-    graph: { did: "did:plc:me", following: [], followers: [] },
+    owner: "did:plc:me",
     ownBlocks,
     records: [],
 })
@@ -63,7 +63,7 @@ const freshPMR = (): DurableObjectStub<PMRObject> => {
 }
 const summaryDeps = (did: string) =>
     ({
-        projections: { get: async () => ({ did, following: [], followers: [] }) },
+        graph: { ownGraph: async () => ({ did, following: [], followers: [] }) },
         blocks: monitorOwnBlocks(testEnv),
         index: { entries: async () => [] },
         records: { get: async () => null },
@@ -104,15 +104,15 @@ describe("summary read — own blocks", () => {
         await ingest().setOwnBlocks(did, [{ blocker: did, rkey: "3k1", subject: "did:plc:x" }])
         const second = (await buildSummaryIndex(did, summaryDeps(did)))!
         const diff = diffSummaryIndex(first.index, second.index)
-        expect(diff).toMatchObject({ blocksChanged: true, graphChanged: false, changed: [], removed: [] })
+        expect(diff).toMatchObject({ blocksChanged: true, changed: [], removed: [] })
     })
 
-    it("a failed blocks read over the RPC rejects with SummaryOwnBlocksError and touches no baseline", async () => {
+    it("a failed blocks read over the RPC rejects with SummaryOwnerReadError and touches no baseline", async () => {
         const did = freshDID()
         await ingest().setOwnBlocks(did, "throw")
         await inPMR(freshPMR(), async (pmr) => {
             await pmr.putSummaryIndex("t1", baseline([{ did: "did:plc:x", rkey: "3k1" }]), 1000)
-            await expect(buildSummaryIndex(did, summaryDeps(did))).rejects.toBeInstanceOf(SummaryOwnBlocksError)
+            await expect(buildSummaryIndex(did, summaryDeps(did))).rejects.toBeInstanceOf(SummaryOwnerReadError)
             expect((await pmr.getSummaryIndex("t1"))!.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
         })
     })

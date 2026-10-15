@@ -41,26 +41,6 @@ export type RecordReadResponse =
     | { found: false; code: RecordReadMiss; reason: string }
 
 /**
- * One edge of the owner's graph, from the owner's side. `rkey` locates the
- * follow record in the follower's repo — the owner's for `following`, the
- * other party's for `followers` — so the device can verify the edge.
- */
-export interface GraphEdge {
-    /** The other party. */
-    did: string
-    rkey: string
-    /** The other party also has the reverse edge. */
-    mutual: boolean
-}
-
-/** The owner's graph, restricted to DIDs carrying a Germ declaration. */
-export interface GraphReadResponse {
-    did: string
-    following: GraphEdge[]
-    followers: GraphEdge[]
-}
-
-/**
  * One of the owner's own blocks, carried only by the owner's summary. `rkey`
  * locates the block record in the owner's repo, so the device can verify it.
  */
@@ -83,20 +63,8 @@ export const RECORD_READ_KEYS = {
     reason: "m",
 } as const satisfies WireKeys<RecordReadResponse>
 
-export const GRAPH_READ_KEYS = {
-    did: "d",
-    following: "o",
-    followers: "n",
-} as const satisfies WireKeys<GraphReadResponse>
-
 export const OWN_BLOCK_KEYS = {
     did: "d",
     rkey: "k",
 } as const satisfies WireKeys<OwnBlock>
-
-export const GRAPH_EDGE_KEYS = {
-    did: "d",
-    rkey: "k",
-    mutual: "u",
-} as const satisfies WireKeys<GraphEdge>
 
