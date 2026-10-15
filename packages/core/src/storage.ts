@@ -401,7 +401,8 @@ export interface PMRStore {
     ): Promise<void>
     /**
      * Null for a token never served here or since dropped. The token is
-     * client-supplied: one that cannot be a key is simply not held.
+     * client-supplied: one that cannot be a key is simply not held. An index
+     * stored without verdicts reads with `verdicts` empty.
      */
     getSummaryIndex(token: string): Promise<SummaryIndex | null>
 

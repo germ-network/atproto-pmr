@@ -840,9 +840,11 @@ export async function handleMessagesAcks(
  * most recent, so polling devices do not push each other's states out; a page
  * read since a token that left `more` set takes over that token's slot, so a
  * paged sync holds one. `409` with `Retry-After` when the owner's graph is
- * not served yet, and `503` with `Retry-After` when their graph or blocks
- * cannot be read; either leaves the held state as it was. The summary
- * carries the owner's own block list, null when unchanged. Never requests a re-check.
+ * not served yet, and `503` with `Retry-After` when their graph, blocks or
+ * contacts' graph facts cannot be read; either leaves the held state as it was. The summary
+ * carries the owner's own block list, null when unchanged, and the owner's
+ * can-message verdict for each contact whose verdict changed, and the
+ * contacts that no longer have one. Never requests a re-check.
  */
 export async function handleSummaryRead(
     request: Request,
@@ -902,6 +904,8 @@ export async function handleSummaryRead(
         page.ownBlocks === null &&
         page.records.length === 0 &&
         page.removed.length === 0 &&
+        page.verdicts.length === 0 &&
+        page.droppedVerdicts.length === 0 &&
         !page.more
 
     const token = unchanged ? since! : binaryToBase64URL(deps.randomBytes(SUMMARY_TOKEN_BYTES))

@@ -15,6 +15,7 @@ const index = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
     owner: "did:plc:me",
     ownBlocks,
     records: [],
+    verdicts: [],
 })
 const block = (did: string, rkey: string) => ({ did, rkey })
 const deps = {
@@ -28,6 +29,8 @@ const delta = (ownBlocks: SummaryDelta["ownBlocks"]): SummaryDelta => ({
     ownBlocks,
     records: [],
     removed: [],
+    verdicts: [],
+    droppedVerdicts: [],
     more: false,
     truncated: false,
 })

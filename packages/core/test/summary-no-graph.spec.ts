@@ -30,6 +30,7 @@ const depsFor = (graph: OwnerGraph, held: string[]): SummaryPageDeps => ({
                 held.includes(r.did) ? { ...r, cid: `cid-${r.did}`, verifiedWith: "k", freshAtMs: 0 } : null
             ),
     },
+    senderGraph: { forSender: async () => new Map() },
     records: { get: async () => null },
     signingKeys: { keysFor: async (dids) => new Map(dids.map((d) => [d, { kind: "trusted", key: "k" } as const])) },
     watched: [{ collection: COLL, rkey: "self" }],
@@ -48,6 +49,8 @@ describe("summary without a graph", () => {
             ownBlocks: [{ did: "did:plc:x", rkey: "r" }],
             records: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
             more: false,
             truncated: false,
         }
@@ -57,7 +60,7 @@ describe("summary without a graph", () => {
 
     it("a summary index holds the owner, the owner's blocks and record entries, and no edges", async () => {
         const index = await build(graphOf(["did:plc:a"], ["did:plc:b"]), [OWNER, "did:plc:a"])
-        expect(Object.keys(index).sort()).toEqual(["ownBlocks", "owner", "records"])
+        expect(Object.keys(index).sort()).toEqual(["ownBlocks", "owner", "records", "verdicts"])
         expect(index.owner).toBe(OWNER)
         expect(index.ownBlocks).toEqual([{ did: "did:plc:blocked", rkey: "b1" }])
         expect(index.records.map((r) => r.did)).toEqual(["did:plc:a", OWNER])
@@ -72,6 +75,8 @@ describe("summary without a graph", () => {
             blocksChanged: false,
             changed: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
         })
     })
 
@@ -84,6 +89,8 @@ describe("summary without a graph", () => {
             blocksChanged: false,
             changed: [],
             removed: [{ did: "did:plc:a", collection: COLL, rkey: "self" }],
+            verdicts: [],
+            droppedVerdicts: [],
         })
     })
 })

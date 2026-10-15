@@ -52,6 +52,7 @@ describe("monitorOwnBlocks", () => {
 
 const baseline = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
     owner: "did:plc:me",
+    verdicts: [],
     ownBlocks,
     records: [],
 })
@@ -66,6 +67,7 @@ const summaryDeps = (did: string) =>
         graph: { ownGraph: async () => ({ did, following: [], followers: [] }) },
         blocks: monitorOwnBlocks(testEnv),
         index: { entries: async () => [] },
+        senderGraph: { forSender: async () => new Map() },
         records: { get: async () => null },
         signingKeys: { keysFor: async () => new Map() },
         watched: [],
