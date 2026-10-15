@@ -38,6 +38,20 @@ export function d1BlockEdgeStore(db: D1Database): BlockEdgeStore {
                 .first()
             return row !== null
         },
+        async blockersOf(subject: string, blockers: readonly string[]): Promise<Set<string>> {
+            if (blockers.length === 0) return new Set()
+            const list = blockers.map((_, i) => `?${i + 2}`).join(",")
+            const { results } = await db
+                .prepare(
+                    "SELECT blocker FROM blocks WHERE subject = ?1 AND blocker IN (" +
+                        list +
+                        ") AND (EXISTS (SELECT 1 FROM graph_owners WHERE did = blocks.blocker) OR " +
+                        "EXISTS (SELECT 1 FROM interest WHERE did = ?1 AND registered = 1))"
+                )
+                .bind(subject, ...blockers)
+                .all<{ blocker: string }>()
+            return new Set(results.map((r) => r.blocker))
+        },
     }
 }
 

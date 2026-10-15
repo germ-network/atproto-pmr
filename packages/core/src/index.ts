@@ -431,3 +431,30 @@ export {
     type SummaryRecord,
     type SummaryRecordRef,
 } from "./summary"
+export {
+    CAN_MESSAGE_KEYS,
+    canMessageFromCose,
+    canMessageToCose,
+    computeCanMessage,
+    computeCanMessageMany,
+    declaredPoliciesOf,
+    decodeCanMessageVerdict,
+    encodeCanMessageVerdict,
+    evaluateCanMessage,
+    handleCanMessageRead,
+    snapshotPolicySource,
+    type AllowPolicy,
+    type CanMessageFacts,
+    type CanMessageNoReason,
+    type CanMessageDeps,
+    type CanMessageUnknownReason,
+    type CanMessageVerdict,
+    type DeclaredPolicies,
+    type PairFact,
+    type RecipientGraphFacts,
+    type SenderGraphReader,
+    type PolicySource,
+    type SnapshotPolicySourceDeps,
+} from "./can-message"
+export { allowPoliciesOf, readAnchorPolicy, type AnchorPolicy } from "./anchor-policy"
+export { type StoredPolicies } from "./policy"

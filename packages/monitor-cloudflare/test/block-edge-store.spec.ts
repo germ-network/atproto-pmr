@@ -1,6 +1,6 @@
 /** The block index in D1: writes, and the two reads that never list another DID's blocks. */
 import { env } from "cloudflare:test"
-import { beforeEach, describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import { D1_ROWS_PER_STATEMENT } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "../src/env"
 import { d1BlockEdgeStore, d1BlockEdgeWriter } from "../src/block-edge-store"
@@ -143,5 +143,56 @@ describe("d1BlockEdgeStore", () => {
         expect(await store.isBlocked("did:member", "did:reg")).toBe(false)
         await run("DELETE FROM interest WHERE did = ?", "did:reg")
         expect(await store.isBlocked("did:member", "did:reg")).toBe(false)
+    })
+})
+
+describe("d1BlockEdgeStore.blockersOf", () => {
+    it("b is in blockersOf(s, [b]) exactly when isBlocked(b, s), across owner, non-owner, stale and registered-subject fixtures", async () => {
+        await serve("did:owner")
+        await interest("did:reg", 1)
+        await interest("did:stale", 0)
+        await writer().putBlocks(
+            [
+                block("did:owner", "1", "did:x"),
+                block("did:owner", "2", "did:reg"),
+                block("did:member", "1", "did:reg"),
+                block("did:member", "2", "did:x"),
+                block("did:member", "3", "did:stale"),
+            ],
+            1
+        )
+        const blockers = ["did:owner", "did:member", "did:nobody"]
+        for (const subject of ["did:x", "did:reg", "did:stale", "did:none"]) {
+            for (const b of blockers) {
+                const set = await store.blockersOf(subject, [b])
+                expect(set.has(b), `${b} -> ${subject}`).toBe(await store.isBlocked(b, subject))
+            }
+        }
+        expect(await store.blockersOf("did:x", blockers)).toEqual(new Set(["did:owner"]))
+        expect(await store.blockersOf("did:reg", blockers)).toEqual(new Set(["did:owner", "did:member"]))
+    })
+
+    it("answers many blockers of one subject in one statement", async () => {
+        await serve("did:o1")
+        await serve("did:o2")
+        await writer().putBlocks([block("did:o1", "1", "did:x"), block("did:o2", "1", "did:x")], 1)
+        const prepare = vi.spyOn(db, "prepare")
+        try {
+            const set = await store.blockersOf("did:x", ["did:o1", "did:o2", "did:o3"])
+            expect(set).toEqual(new Set(["did:o1", "did:o2"]))
+            expect(prepare).toHaveBeenCalledTimes(1)
+        } finally {
+            prepare.mockRestore()
+        }
+    })
+
+    it("an empty blockers list reads nothing and returns an empty set", async () => {
+        const prepare = vi.spyOn(db, "prepare")
+        try {
+            expect(await store.blockersOf("did:x", [])).toEqual(new Set())
+            expect(prepare).not.toHaveBeenCalled()
+        } finally {
+            prepare.mockRestore()
+        }
     })
 })
