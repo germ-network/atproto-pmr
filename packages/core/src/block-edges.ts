@@ -34,9 +34,18 @@ export interface BlockEdgeStore {
 }
 
 /**
- * The monitor ingest object's RPC for the owner's own blocks, reached
- * across Workers by the relay's summary read. Throws when D1 cannot answer,
- * so a failed read is never mistaken for an empty list.
+ * The monitor ingest object's RPC for the owner's own blocks, reached across
+ * Workers by the relay's summary read.
+ *
+ * This is the pattern for any owner-private read the monitor holds: one
+ * request interface here; one ingest-object method implementing it, which
+ * reads D1 directly and lets a failure throw; and one relay adapter that
+ * forwards over the `MONITOR_INGEST` binding and throws on a missing binding
+ * or any failure, so a failed read is never mistaken for an empty list. A
+ * DID whose graph is not served answers null.
+ *
+ * The monitor does not authenticate: it answers any DID for any holder of the
+ * binding. The relay must have authenticated the owner before it asks.
  */
 export interface MonitorOwnBlocksRequest {
     ownBlocks(did: string): Promise<BlockEdge[] | null>

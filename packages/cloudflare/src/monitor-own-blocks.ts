@@ -8,9 +8,7 @@ import type { PMREnv } from "./env"
  * answers 503 rather than delivering an empty list that would clear every
  * device's blocks.
  *
- * This is the relay half of the owner-private read pattern: the request
- * interface lives in core, the ingest object implements it, and an adapter
- * like this one forwards over `MONITOR_INGEST` and never swallows a failure.
+ * The relay half of `MonitorOwnBlocksRequest`, which describes the pattern.
  */
 export function monitorOwnBlocks(
     env: Pick<PMREnv, "MONITOR_INGEST" | "MONITOR_INGEST_NAME">

@@ -1477,12 +1477,8 @@ export class MonitorIngest
     }
 
     /**
-     * The owner's own blocks, for the relay's authenticated summary read over
-     * the cross-Worker binding. This is the pattern for any owner-private
-     * read the monitor holds: one request interface in core, one method here
-     * that reads D1 directly (outside the alarm's statement budget) and lets
-     * a failure throw, and one relay adapter that throws too, so a failed
-     * read is never delivered as an empty answer.
+     * `MonitorOwnBlocksRequest`: the owner's own blocks, read from D1 outside
+     * the alarm's statement budget. A D1 failure throws.
      */
     async ownBlocks(did: string): Promise<BlockEdge[] | null> {
         return d1BlockEdgeStore(this.env.graph!).ownBlocks(did)

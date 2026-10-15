@@ -24,6 +24,14 @@ describe("MonitorIngest.ownBlocks", () => {
         ])
     })
 
+    it("answers over the Durable Object RPC boundary", async () => {
+        await db.prepare("INSERT INTO graph_owners (did) VALUES ('did:o')").run()
+        await put("did:o", "a", "did:x")
+        expect(await registeredStub("rpc").ownBlocks("did:o")).toEqual([
+            { blocker: "did:o", rkey: "a", subject: "did:x" },
+        ])
+    })
+
     it("returns null for a DID whose graph is not served", async () => {
         await put("did:o", "a", "did:x")
         expect(await inObj(registeredStub("rpc"), (obj) => obj.ownBlocks("did:o"))).toBeNull()
@@ -40,6 +48,6 @@ describe("MonitorIngest.ownBlocks", () => {
                 ;(obj as unknown as { env: unknown }).env = { ...obj.env, graph: undefined }
                 return obj.ownBlocks("did:o")
             })
-        ).rejects.toThrow()
+        ).rejects.toThrow(TypeError)
     })
 })
