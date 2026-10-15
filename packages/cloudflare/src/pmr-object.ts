@@ -13,6 +13,7 @@ import {
     reconcileWatchState,
     type AppendResult,
     type Admission,
+    type PoolVerdict,
     type ReceiveResult,
     type PairMailboxKey,
     type EffectiveCapabilities,
@@ -114,11 +115,14 @@ const POOL_PREFIX = "pool:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
+/** A pooled sender's latest receive-time verdict, kept as long as its `pool:` entries. */
+const POOL_VERDICT_PREFIX = "poolv:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
 const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
+const poolVerdictKey = (k: MailboxKey) => `${POOL_VERDICT_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
 const grantRowKey = (address: string) => `${GRANT_ROW_PREFIX}${address}`
@@ -773,7 +777,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         ref: MessageRef,
         nonce: Nonce,
-        nowSeconds: number
+        nowSeconds: number,
+        verdict?: PoolVerdict
     ): Promise<PoolAppendResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
@@ -820,6 +825,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
 
         await this.db.put(poolKey(key), existing)
+        if (verdict !== undefined) await this.db.put(poolVerdictKey(key), verdict)
         await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
         await this.recordNonce(key, nonce, seen)
         return { outcome: "pooled", persistBody: true }
@@ -834,10 +840,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      */
     async poolSenders(): Promise<PoolSender[]> {
         const entries = await this.db.list<MessageRef[]>({ prefix: POOL_PREFIX })
-        return [...entries].map(([k, refs]) => ({
-            did: k.slice(POOL_PREFIX.length),
-            count: refs.length,
-        }))
+        const verdicts = await this.db.list<PoolVerdict>({
+            prefix: POOL_VERDICT_PREFIX,
+        })
+        return [...entries].map(([k, refs]) => {
+            const did = k.slice(POOL_PREFIX.length)
+            const verdict = verdicts.get(poolVerdictKey(did as MailboxKey))
+            return {
+                did,
+                count: refs.length,
+                ...(verdict !== undefined ? { verdict } : {}),
+            }
+        })
     }
 
     /**
@@ -937,6 +951,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
         const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
         await this.db.delete(poolKey(key))
+        await this.db.delete(poolVerdictKey(key))
         await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
     }
 

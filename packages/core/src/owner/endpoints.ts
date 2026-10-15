@@ -408,7 +408,10 @@ export async function handleBlockSet(
 
 // MARK: - Pool
 
-/** `GET /pmr/v1/pool` — DIDs only, never bodies. */
+/**
+ * `GET /pmr/v1/pool` — DIDs only, never bodies. An entry the relay judged
+ * carries `v` (`no` | `unknown`) and `r` (reason codes).
+ */
 export async function handlePoolList(
     request: Request,
     deps: OwnerDeps
@@ -425,6 +428,12 @@ export async function handlePoolList(
                 (s) => new Map<string, CoseValue>([
                     ["did", s.did],
                     ["n", s.count],
+                    ...(s.verdict !== undefined
+                        ? ([
+                              ["v", s.verdict.verdict],
+                              ["r", [...s.verdict.why]],
+                          ] as [string, CoseValue][])
+                        : []),
                 ])
             ),
         ],

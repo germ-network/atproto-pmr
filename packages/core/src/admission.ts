@@ -63,9 +63,10 @@ export async function admissionOrUnavailable(
         verdict: "unknown",
         why: [ADMISSION_UNAVAILABLE],
     }
-    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancel = () => {}
     const deadline = new Promise<Admission>((resolve) => {
-        timer = setTimeout(() => resolve(unavailable), deadlineMs)
+        const timer = setTimeout(() => resolve(unavailable), deadlineMs)
+        cancel = () => clearTimeout(timer)
     })
     try {
         return await Promise.race([
@@ -75,7 +76,7 @@ export async function admissionOrUnavailable(
     } catch {
         return unavailable
     } finally {
-        clearTimeout(timer)
+        cancel()
     }
 }
 
