@@ -232,9 +232,11 @@ PDS on a fixed schedule.
   export stream.
 - **Backoff re-confirmation, a continuity backup.** A stream can drop an event
   without leaving a gap the monitor can see, so a monitor still values an
-  affirmative direct read. It re-confirms each held DID against its PDS on an
-  **exponential backoff**: the interval doubles after each confirmation that
-  finds nothing changed, and is capped at **30 days**. A firehose event for the
+  affirmative direct read. It re-confirms each held DID's declaration against its
+  PDS, comparing the record's CID (not the repo head, which moves on every
+  commit), on an **exponential backoff**: the first interval is **one day**, it
+  doubles after each confirmation that finds nothing changed, and it is capped
+  at **30 days**. A firehose event for the
   DID, which already prompts a direct fetch, resets the backoff. Each
   confirmation is **jittered** within its interval, which spreads the requests
   out and keeps their time of day from tracking when the DID last changed. A

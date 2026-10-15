@@ -63,6 +63,18 @@ they MUST NOT be kept current by re-listing repos on a schedule.
 - **A listing** (a verified `getRepo`, or `listRecords` pages) runs when a DID
   enters interest or registers, and after a stream gap the stream cannot
   replay. Never on a timer.
+- **Repair on anomalies.** An event the index cannot apply cleanly, such as a
+  delete of an rkey it does not hold or a create that re-points a held rkey,
+  marks the DID for a listing at once.
+- **A cheap probe, a continuity backup.** Per indexed DID, the appview asks
+  for the newest follow record and the newest block record (one record each).
+  Record keys are time-ordered, so a newest key the index does not hold means
+  it missed a create, and that collection is re-listed. The probe runs on an
+  exponential backoff: the first interval is **one week**, it doubles after
+  each probe that finds nothing missed, and it is capped at **30 days**. It is
+  jittered, and a follow or block event for the DID resets it. The probe
+  cannot see a missed delete; those are repaired by anomalies, a gap's
+  listing, or the DID's next listing.
 - **Edges and blocks are hints, not proof**, whichever path wrote them. A
   verdict built on them is a hint the device can check against the signed
   records.
