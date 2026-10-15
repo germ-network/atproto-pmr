@@ -597,9 +597,10 @@ denial-of-service surface on the (sender, recipient) relationship. Closure
 does not depend on anonymous puts — it is preserved by uniform acceptance.
 
 **No open DMs.** A *provisioned* pair mailbox MUST come into being only
-from something the recipient controls — their follow graph, or their
-device's own contact provisioning. An implementation MUST NOT provision a
-pair mailbox on a sender's request. Which recipient-side sources a
+from something the recipient controls — their follow graph, their declared
+messaging policy, or their device's own contact provisioning. An
+implementation MUST NOT provision a pair mailbox on a sender's request, and
+a sender's own declaration never opens one. Which recipient-side sources a
 deployment honors is implementation-defined; that provisioning is
 recipient-side is not. A sender with no provisioned mailbox is not
 refused: see [the recovery pool](#the-recovery-pool).
@@ -611,6 +612,39 @@ state, so the tier reveals nothing a sender could not compute. A tier
 resting on an aggregation means trusting an appview for an authorization
 decision; see
 [`trust-model.md`](trust-model.md#the-clients-fetch-posture).
+
+#### Receive-time admission
+
+A relay that can evaluate its recipient's messaging policy SHOULD judge each
+pair put when it arrives: does the recipient accept this sender? The verdict
+comes from the recipient's declared allow policies, social graph and blocks,
+as for the [can-message verdict](#can-message-verdict) with the put's signed
+sender as sender and the recipient as recipient. A sender the device
+provisioned is not judged by policy, only by blocks. Otherwise a put the
+policy admits is delivered as to a provisioned mailbox, and one it refuses or
+cannot yet decide goes to the [recovery pool](#the-recovery-pool) with the
+verdict's reasons, for the device to judge. A put from a sender the
+recipient blocks is handled as from a [blocked sender](#blocked-senders).
+
+Admission is per put: an admitted sender is judged again on its next put
+until the device provisions it, and mail already accepted is not re-judged
+when the recipient's graph later changes, except that a Bsky block clears it.
+On a yes, the sender's pooled entries move into the mailbox, oldest first, as
+far as capacity allows; the rest stay pooled. An admitted put is delivered even
+while the device's discard of that sender is live. The verdict never changes
+the response vocabulary: every outcome is a `202` or the `429` of a full
+mailbox. A relay that cannot read a verdict in time treats it as undecided; it
+MUST NOT answer `5xx` for that. Grant puts name no sender and are never
+adjudicated.
+
+A relay MUST NOT admit senders under a policy that admits strangers (such as
+`open`) until it bounds what an admitted sender can cost the recipient —
+mailbox depth and push wakes — as the recovery pool does. A put that only
+such a policy admits is pooled as `unknown`. A relay's own reasons for an
+undecided put include `admission-unavailable` (no verdict was readable in
+time), `recipient-not-held` (the relay holds no declaration for the
+recipient) and `policy-not-enabled` (the put is admitted only by a policy the
+relay does not yet honour).
 
 ### The grant-put payload
 
@@ -803,7 +837,7 @@ block may notice the transition from real to synthetic.
 
 | method | path | notes |
 |---|---|---|
-| `GET` | `/pmr/v1/blocks` | list blocked sender DIDs |
+| `GET` | `/pmr/v1/blocks` | blocked sender DIDs in `b`; those the relay mirrored from Bsky also in `bs` |
 | `PUT` | `/pmr/v1/blocks/{did}` | block |
 | `DELETE` | `/pmr/v1/blocks/{did}` | unblock; reversible by construction |
 
@@ -821,6 +855,22 @@ that peer, because only the device knows which addresses those are. A
 relay implementer should not attempt to synthesize the second half;
 inventing it would require exactly the sender-to-address mapping grants
 exist to prevent.
+
+**Bsky blocks.** A relay that indexes its recipient's Bsky blocks MUST treat
+a sender the recipient blocks on Bsky as blocked: it clears the sender's
+queued and pooled messages and handles later puts on the synthetic path. It
+applies a block it sees at accept immediately, and one made since no later
+than the next catch-up (socket drain, first page of the message catch-up,
+pool listing). A Bsky unblock lifts only a block the relay set from Bsky; a
+block the device set stands until the device lifts it, and a device unblock
+holds only until the relay next sees the Bsky block, at the sender's next put. `GET /pmr/v1/blocks` lists all
+blocked senders in `b` and those the relay has mirrored from Bsky in `bs`
+(the summary's block list is the owner's full list); a client
+republishing its block list to a new relay publishes only its own. The first
+put after a Bsky block may take measurably longer while the relay clears
+state; the block record is public, so this reveals nothing the sender cannot
+read. Messages delivered or pushed before the relay saw the block are not
+recalled; the device removes them using the summary's block list.
 
 Blocks do not need to migrate when a user changes relays. The client holds
 the block list durably and publishes it to a new relay as part of bringing
@@ -865,12 +915,17 @@ Instead the pool is **adjudicated in batch** by the device:
 
 | method | path | notes |
 |---|---|---|
-| `GET` | `/pmr/v1/pool` | list the DIDs holding pool entries — **DIDs only, never bodies** |
+| `GET` | `/pmr/v1/pool` | list the DIDs holding pool entries — **DIDs only, never bodies** — each with `v` and `r` when the relay judged it |
 | `POST` | `/pmr/v1/pool/adjudication` | provision-or-discard per DID; bodies are delivered for the provisioned and dropped for the rest |
 
-The server pooled these senders because it could not evaluate them, so it
-offers the device the only judgement that exists — provision these,
-discard those — and acts on the answer. "No open DMs" becomes a protocol
+The server pooled these senders because it could not admit them — the
+recipient's policy refused them, or it could not decide yet — or, without
+receive-time admission, could not evaluate them. Each listing entry carries
+`v` (`no` | `unknown`) and `r` (reason codes) from the sender's latest pooled
+put when the relay judged it, so the device need not recompute the reason.
+The device's own contacts are not visible to the relay, so the device keeps
+the final say: it offers the only judgement that remains — provision these,
+discard those — and the server acts on the answer. "No open DMs" becomes a protocol
 step rather than an unstated client-side filter, and the pool becomes
 self-clearing, its size governed by the adjudication cycle rather than by
 an eviction policy.
@@ -890,7 +945,9 @@ independently rate-limitable.
 
 **Discard is time-bounded** — neither one-shot nor standing. While a
 sender's discard window is live, arriving puts from that sender are
-dropped without pooling; once it lapses, the sender pools normally again.
+dropped without pooling, unless
+[receive-time admission](#receive-time-admission) admits the put; once it
+lapses, the sender pools normally again.
 One-shot would make adjudication a treadmill (an attacker re-sends
 immediately and the same DIDs reappear next round); standing would be a
 block in all but name, drawing a permanent consequence from a judgement
@@ -902,10 +959,9 @@ to being pooled and later discarded, so the sender cannot distinguish
 suppression from ordinary pooling.
 
 This is safe to drain because the device verifies senders itself: the
-relay cannot evaluate admission for a sender it does not know, but an
-attacker flooding the pool cannot impersonate a permitted DID, so the
-client's filter rests on cryptography rather than a relay decision that
-was never made.
+relay's verdict is a hint, since it cannot see the device's own contacts, and
+an attacker flooding the pool cannot impersonate a permitted DID, so the
+client's filter rests on cryptography rather than a relay decision.
 
 Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 
@@ -919,6 +975,14 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
+
+Devices need not recompute admission; it is routing advice, not authority
+([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
+mailbox is from a sender the device provisioned or one the relay admitted
+under the recipient's policy at that put or a later one; the pool lists only senders the relay refused or could not
+decide, with `v` and `r`. A Bsky-blocked sender's mail stops appearing in
+catch-up once the relay has seen the block, and earlier deliveries are
+cleared on the device using the summary's block list.
 
 A pair-mailbox delivery carries the relay's **verification hint**: `sd`, the
 sender DID, and `dc`, the CID of the sender's declaration record as the relay

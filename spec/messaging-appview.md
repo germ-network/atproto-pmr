@@ -122,4 +122,7 @@ blockers when they register, but not who. **Not yet built.**
 A block is enforced by the recipient's own PMR, which keeps all of its users'
 blocks and treats a blocked sender as
 [§Blocked senders](wire-api.md#blocked-senders) requires: the sender cannot
-tell. Receive-time enforcement against the block index is **not yet built.**
+tell. Receive-time enforcement is **built**, where the relay is wired to the monitor's graph: the PMR mirrors the recipient's
+Bsky blocks into the relay block at accept and at each catch-up, and judges
+each pair put against the recipient's policy
+([wire API](wire-api.md#receive-time-admission)).
