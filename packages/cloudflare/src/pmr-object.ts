@@ -753,10 +753,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         if (admission.verdict === "yes") {
             return this.admit(key, ref, nonce, nowSeconds, queue ?? [], seen)
         }
-        // `blocked` and `yes` returned above; only no/unknown reach the pool.
-        if (admission.verdict === "yes" || admission.verdict === "blocked") {
-            throw new Error("unreachable")
-        }
+        // A blocked verdict always ends on the synthetic path above.
+        if (admission.verdict === "blocked") throw new Error("unreachable")
         const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
             verdict: admission.verdict,
             why: admission.why,
