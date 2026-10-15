@@ -22,7 +22,8 @@ export interface BlockEdge {
 /**
  * The read surface of the block index. There is deliberately no listing of
  * another DID's blocks: `ownBlocks` is for the owner's own authenticated
- * read, and `isBlocked` answers one pair.
+ * read, `isBlocked` answers one pair, and `blockersOf` answers many pairs
+ * that share a subject.
  */
 export interface BlockEdgeStore {
     /**
@@ -32,6 +33,12 @@ export interface BlockEdgeStore {
     ownBlocks(did: string): Promise<BlockEdge[] | null>
     /** Whether a kept block by `blocker` names `subject`. */
     isBlocked(blocker: string, subject: string): Promise<boolean>
+    /**
+     * Which of `blockers` have a kept block naming `subject`: exactly those
+     * for which `isBlocked(blocker, subject)` is true. The caller bounds
+     * `blockers` to one IN-list (at most 50).
+     */
+    blockersOf(subject: string, blockers: readonly string[]): Promise<Set<string>>
 }
 
 /**
