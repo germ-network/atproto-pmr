@@ -1,5 +1,15 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.1.8
+
+### Patch Changes
+
+- [#66](https://github.com/germ-network/atproto-pmr/pull/66) [`c973d81`](https://github.com/germ-network/atproto-pmr/commit/c973d812f150e4c1adde7e9ea7f8191c86c9cb02) Thanks [@germ-mark](https://github.com/germ-mark)! - Include the HTTP status and response body in the error when a Jetstream or export socket upgrade is refused.
+
+- Updated dependencies []:
+  - @germ-network/atproto-pmr-core@0.1.8
+  - @germ-network/atproto-pmr-monitor@0.1.8
+
 ## 0.1.7
 
 ### Patch Changes
