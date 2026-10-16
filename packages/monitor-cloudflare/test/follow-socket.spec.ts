@@ -51,10 +51,10 @@ function stubJetstream() {
         restore: () => {
             globalThis.fetch = original
         },
-        followRequests: () => requests.filter((u) => u.searchParams.get("collections")?.includes(FOLLOW)),
+        followRequests: () => requests.filter((u) => u.searchParams.getAll("collections").includes(FOLLOW)),
         declarationRequests: () =>
             requests.filter((u) => u.searchParams.get("collections") === testEnv.MONITOR_COLLECTION),
-        followServer: () => servers.filter((s) => s.url.searchParams.get("collections")?.includes(FOLLOW)).at(-1)!,
+        followServer: () => servers.filter((s) => s.url.searchParams.getAll("collections").includes(FOLLOW)).at(-1)!,
     }
 }
 
@@ -104,7 +104,9 @@ describe("follow/profile socket", () => {
         const stub = registeredStub()
         await inObj(stub, (obj) => obj.connectFollow())
         const [req] = jet.followRequests()
-        expect(req!.searchParams.get("collections")!.split(",").sort()).toEqual([FOLLOW, BLOCK, PROFILE].sort())
+        // Jetstream rejects a comma list; each collection must be its own param.
+        expect(req!.searchParams.getAll("collections").sort()).toEqual([FOLLOW, BLOCK, PROFILE].sort())
+        expect(req!.search).not.toContain("%2C")
         expect(req!.searchParams.has("dids")).toBe(false)
         expect(req!.searchParams.has("wantedDids")).toBe(false)
         expect(req!.searchParams.has("cursor")).toBe(false)

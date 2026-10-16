@@ -3543,7 +3543,7 @@ export class MonitorIngest
             BLOCK_COLLECTION_NSID,
             ...new Set(monitorCollections(this.env).map((r) => r.collection)),
         ]
-        url.searchParams.set("collections", collections.join(","))
+        for (const nsid of collections) url.searchParams.append("collections", nsid)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
 
         const ws = await this.upgrade(url, "jetstream follow stream")
