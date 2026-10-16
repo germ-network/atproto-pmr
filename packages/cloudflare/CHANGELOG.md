@@ -1,5 +1,12 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @germ-network/atproto-pmr-core@0.1.8
+
 ## 0.1.7
 
 ### Patch Changes
