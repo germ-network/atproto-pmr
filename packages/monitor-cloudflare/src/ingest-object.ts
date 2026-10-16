@@ -3616,7 +3616,12 @@ export class MonitorIngest
             clearTimeout(timer)
         }
         const ws = response.webSocket
-        if (ws === null) throw new Error(`${what} did not upgrade`)
+        if (ws === null) {
+            const body = await response.text().catch(() => "")
+            throw new Error(
+                `${what} did not upgrade: HTTP ${response.status} ${body.slice(0, 200)} (${url.search})`
+            )
+        }
         ws.accept()
         return ws
     }

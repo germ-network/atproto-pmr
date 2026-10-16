@@ -112,6 +112,22 @@ describe("follow/profile socket", () => {
         expect(req!.searchParams.has("cursor")).toBe(false)
     })
 
+    it("a refused upgrade reports Jetstream's status and body", async () => {
+        const original = globalThis.fetch
+        globalThis.fetch = (async () =>
+            new Response('{"error":"InvalidRequest"}', { status: 400 })) as typeof fetch
+        try {
+            const stub = registeredStub()
+            const err = await inObj(stub, (obj) => obj.connectFollow()).then(
+                () => null,
+                (e: unknown) => String(e)
+            )
+            expect(err).toMatch(/did not upgrade: HTTP 400 .*InvalidRequest/)
+        } finally {
+            globalThis.fetch = original
+        }
+    })
+
     it("resumes from its own cursor and never writes meta.cursor", async () => {
         jet = stubJetstream()
         const stub = registeredStub()
