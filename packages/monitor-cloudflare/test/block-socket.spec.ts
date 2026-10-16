@@ -91,7 +91,7 @@ describe("follow socket — blocks", () => {
             return new Response(null, { status: 101, webSocket: client })
         }) as typeof fetch
         await inObj(registeredStub(), (obj) => obj.connectFollow())
-        expect(urls[0]!.searchParams.get("collections")!.split(",")).toContain(BLOCK)
+        expect(urls[0]!.searchParams.getAll("collections")).toContain(BLOCK)
     })
 
     it("flushes a kept block create and delete to the D1 blocks table", async () => {
