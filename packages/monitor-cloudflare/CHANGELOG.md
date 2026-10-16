@@ -1,5 +1,15 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.1.7
+
+### Patch Changes
+
+- [#64](https://github.com/germ-network/atproto-pmr/pull/64) [`d593945`](https://github.com/germ-network/atproto-pmr/commit/d593945a5df22e75d0df8ce863c342078a3ee72e) Thanks [@germ-mark](https://github.com/germ-mark)! - Fix the follow/profile/block Jetstream socket: send one `collections` parameter per collection instead of a comma-joined list, which Jetstream rejects with HTTP 400.
+
+- Updated dependencies []:
+  - @germ-network/atproto-pmr-core@0.1.7
+  - @germ-network/atproto-pmr-monitor@0.1.7
+
 ## 0.1.6
 
 ### Patch Changes
