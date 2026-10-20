@@ -83,7 +83,6 @@ describe("deregistration", () => {
         await register(did, key, directory)
         await directory.deregister(did, thumb(key))
         expect(await directory.resolve(did)).toBeNull()
-        expect((await directory.registrations(did, T0)).active).toBeNull()
     })
 
     it("the same anchor cannot register again", async () => {
@@ -124,12 +123,12 @@ describe("deregistration", () => {
         const key2 = ed25519.utils.randomSecretKey()
         await register(did, key1, directory)
         const first = (await directory.resolve(did))!
+        await directory.deactivate(did, T0, first)
         await register(did, key2, directory)
         await directory.deregister(did, thumb(key2))
 
-        const set = await directory.registrations(did, T0)
-        expect(set.active).toBeNull()
-        expect(set.inactive.map((e) => e.locator)).toEqual([first])
+        expect(await directory.resolve(did)).toBeNull()
+        expect(await pmrStore(first, testEnv).readInactive()).not.toBeNull()
         expect(await pmrStore(first, testEnv).load()).not.toBeNull()
     })
 })

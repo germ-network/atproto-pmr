@@ -41,7 +41,6 @@ export type {
     VerificationHint,
     WatchState,
     InactiveRegistration,
-    RegistrationSet,
     VerifiedAnchorObservation,
 } from "./storage"
 

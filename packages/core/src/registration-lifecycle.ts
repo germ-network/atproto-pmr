@@ -1,12 +1,11 @@
 /**
  * Registration lifecycle (`spec/wire-api.md`, "Registration lifecycle").
  *
- * A DID has at most one active registration. Registering under a different
- * anchor key, or the monitor verifying that the declaration names a
- * different anchor or none, retires the active registration to inactive:
- * terminal, no new mail, its backlog readable by its own key until the
- * retention deadline. Registrations under different anchors are unrelated:
- * nothing of one is visible to another.
+ * A DID has at most one active registration. The monitor verifying that the
+ * declaration names a different anchor or none retires it to inactive:
+ * terminal, no new mail, its backlog kept unread until the retention
+ * deadline and then destroyed. Registrations under different anchors are
+ * unrelated: nothing of one is visible to another.
  */
 
 import { parseOkpEd25519Key } from "./cose/key.js"
@@ -17,9 +16,7 @@ import { bytesEqual } from "./watch.js"
 export const INACTIVE_BACKLOG_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 /**
- * Inactive registrations kept per DID. Bounds the candidate keys an owner
- * request is verified against; past it the oldest is destroyed early, and
- * its key stops authenticating at once.
+ * Inactive registrations kept per DID; past it the oldest is destroyed early.
  */
 export const MAX_INACTIVE_REGISTRATIONS = 4
 

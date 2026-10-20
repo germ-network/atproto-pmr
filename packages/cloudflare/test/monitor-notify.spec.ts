@@ -5,13 +5,19 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it, vi } from "vitest"
-import type { RegistrationFields } from "@germ-network/atproto-pmr-core"
+import {
+    encodeOkpEd25519Key,
+    thumbprintOkpEd25519,
+    type RegistrationFields,
+} from "@germ-network/atproto-pmr-core"
 import { KVDirectory } from "../src/directory"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
 import type { MonitorIngestStub } from "./worker"
 
 const testEnv = env as unknown as PMREnv<PMRObject>
+
+const T0 = Math.floor(Date.now() / 1000)
 
 let didCounter = 0
 /** A fresh DID per test — the ingest stub's record persists across tests. */
@@ -58,6 +64,22 @@ describe("KVDirectory monitor notify", () => {
         await directory.delete(did)
         expect(await callsFor(did)).toEqual([`register:${did}`, `unregister:${did}`])
         expect((await ingest().rowSeen())[`unregister:${did}`]).toBe(false)
+    })
+
+    it("deactivate and deregister notify unregister when bound", async () => {
+        const x = new Uint8Array(32).fill(5)
+        const directory = new KVDirectory(testEnv)
+
+        const a = freshDID()
+        const locator = await directory.create(a, registration(a))
+        await directory.deactivate(a, T0, locator)
+        expect(await callsFor(a)).toEqual([`register:${a}`, `unregister:${a}`])
+
+        const b = freshDID()
+        await directory.create(b, { ...registration(b), anchorKey: encodeOkpEd25519Key({ x }) })
+        await directory.deregister(b, thumbprintOkpEd25519({ x }))
+        expect(await callsFor(b)).toEqual([`register:${b}`, `unregister:${b}`])
+        expect((await ingest().rowSeen())[`unregister:${b}`]).toBe(false)
     })
 
     it("an unbound monitor is a no-op", async () => {

@@ -21,10 +21,8 @@
  * `PMRObject.fetch` serves `GET /pmr/v1/events` and authenticates nothing:
  * it accepts any upgrade request reaching it and drains that relay's
  * backlog. A router MUST verify the RFC 9421 signature over the upgrade
- * request (`authenticateOwner`) and build the stub from the outcome's
- * `locator` — `pmrStore(auth.locator, env)`, never from the DID or from what
- * the request names — before forwarding. A request signed by an inactive
- * registration's key must reach that registration, not the DID's active one.
+ * request (`authenticateOwner`) and resolve the stub from the
+ * authenticated DID, never from what the request names, before forwarding.
  *
  * `ctx.acceptWebSocket` runs only inside the Durable Object, while the
  * challenge store and directory a signature is checked against belong to

@@ -77,6 +77,13 @@ function world() {
             deleted.push(did)
             rows.delete(did)
         },
+        async deactivate() {
+            return null
+        },
+        async deregister() {},
+        async isTombstoned() {
+            return false
+        },
     }
 
     const store = (locator: Locator): PMRStore => {

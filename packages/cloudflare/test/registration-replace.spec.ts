@@ -20,6 +20,7 @@ import {
     encodeBinding,
     handleRegistrationCreate,
     parseOkpEd25519Key,
+    thumbprintOkpEd25519,
     signRequest,
     type ChallengeStore,
     type Locator,
@@ -176,5 +177,40 @@ describe("a same declared key stays an idempotent in-place refresh", () => {
 
         const queue = await store1.list(sender, 100)
         expect(queue.map((r) => r.messageId)).toEqual(["m1"])
+    })
+})
+
+describe("tombstones and monitor-retired registrations", () => {
+    it("a deregistered anchor cannot register again, another key of the DID can", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key1 = ed25519.utils.randomSecretKey()
+        const x1 = ed25519.getPublicKey(key1)
+        await register(did, key1, challenges, directory)
+        await directory.deregister(did, thumbprintOkpEd25519({ x: x1 }))
+
+        const refused = await handleRegistrationCreate(
+            signedRequest(key1, await challengeFor(challenges, did)),
+            deps(challenges, async () => x1)
+        )
+        expect(refused.status).toBe(401)
+        expect(await directory.resolve(did)).toBeNull()
+
+        await register(did, ed25519.utils.randomSecretKey(), challenges, directory)
+    })
+
+    it("re-registering the anchor of a monitor-retired registration creates a fresh active one", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key = ed25519.utils.randomSecretKey()
+        const retired = await register(did, key, challenges, directory)
+        await directory.deactivate(did, Math.floor(Date.now() / 1000), retired)
+
+        const fresh = await register(did, key, challenges, directory)
+        expect(fresh).not.toBe(retired)
+        expect(await pmrStore(retired, testEnv).readInactive()).not.toBeNull()
+        expect(await pmrStore(fresh, testEnv).readInactive()).toBeNull()
     })
 })

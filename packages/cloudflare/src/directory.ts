@@ -6,7 +6,6 @@ import {
     type MonitorRegistrationNotify,
     type PMRStore,
     type RegistrationFields,
-    type RegistrationSet,
     INACTIVE_BACKLOG_RETENTION_SECONDS,
     MAX_INACTIVE_REGISTRATIONS,
     type ResolvedAddress,
@@ -24,8 +23,6 @@ interface DirectoryRow {
     a?: { l: Locator }
     i: Array<{
         l: Locator
-        /** The anchor `COSE_Key`, base64url. */
-        k: string
         at: number
         until: number
     }>
@@ -203,19 +200,15 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         return locator
     }
 
-    async registrations(did: string, nowSeconds: number): Promise<RegistrationSet> {
+    /** Removes the active registration and destroys it; the inactive set stays. */
+    async delete(did: string): Promise<void> {
         const row = await this.readRow(did)
-        return {
-            active: row.a?.l ?? null,
-            inactive: row.i
-                .filter((e) => e.until > nowSeconds)
-                .map((e) => ({
-                    locator: e.l,
-                    anchorKey: base64URLToBinary(e.k),
-                    inactiveAt: e.at,
-                    destroyAt: e.until,
-                })),
-        }
+        if (row.a === undefined) return
+        // Unlink first: the authoritative step. A crash before the teardown
+        // leaves an orphaned object, never a row pointing at a wiped one.
+        await this.writeRow(did, { i: row.i })
+        await this.destroyQuietly(row.a.l, did)
+        await this.notifyMonitor("unregister", did)
     }
 
     async deactivate(
@@ -226,27 +219,20 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         const row = await this.readRow(did)
         if (row.a === undefined || row.a.l !== expectedActive) return null
         const locator = row.a.l
-        const until = nowSeconds + this.lifecycle.inactiveRetentionSeconds
 
         const store = this.env.pmrs.get(this.env.pmrs.idFromString(locator))
-        const fields = await store.load()
-        await store.markInactive(nowSeconds, until)
+        await store.markInactive(
+            nowSeconds,
+            nowSeconds + this.lifecycle.inactiveRetentionSeconds
+        )
         // A retried deactivate keeps the object's first times; the row follows.
-        const marked = (await store.readInactive()) ?? { inactiveAt: nowSeconds, destroyAt: until }
+        const marked = (await store.readInactive())!
 
         const live = row.i.filter((e) => e.until > nowSeconds)
-        if (fields !== null) {
-            live.unshift({
-                l: locator,
-                k: binaryToBase64URL(fields.anchorKey),
-                at: marked.inactiveAt,
-                until: marked.destroyAt,
-            })
-        }
+        live.unshift({ l: locator, at: marked.inactiveAt, until: marked.destroyAt })
         const evicted = live.splice(this.lifecycle.maxInactive)
         await this.writeRow(did, { i: live })
         for (const e of evicted) await this.destroyQuietly(e.l, did)
-        if (fields === null) await this.destroyQuietly(locator, did)
 
         await this.notifyMonitor("unregister", did)
         return locator

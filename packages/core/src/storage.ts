@@ -341,29 +341,15 @@ export type VerifiedAnchorObservation =
     | { state: "unknown" }
 
 /**
- * A registration retired by a newer key's registration or by the monitor's
- * verified view. Terminal: it accepts no new mail and never becomes active
- * again; its own key may read its backlog until `inactiveAt` plus the
- * retention period, after which it is destroyed.
+ * A registration the monitor's verified view retired. Terminal: it accepts no
+ * new mail and never becomes active again; its backlog is kept, unread, until
+ * `destroyAt`, then destroyed.
  */
 export interface InactiveRegistration {
     locator: Locator
-    /**
-     * The registration's anchor key, a `COSE_Key` blob, carried here so owner
-     * authentication verifies every candidate from one directory read.
-     */
-    anchorKey: Uint8Array
     inactiveAt: number
     /** Fixed once, at deactivation: the backlog is destroyed then. */
     destroyAt: number
-}
-
-/** Every live registration of one DID. */
-export interface RegistrationSet {
-    /** The only registration that accepts new mail; `null` if none. */
-    active: Locator | null
-    /** Newest first, already limited to those still within retention. */
-    inactive: InactiveRegistration[]
 }
 
 /** Global, small, read on every inbound request. */
@@ -385,14 +371,15 @@ export interface Directory {
     create(did: string, registration: RegistrationFields): Promise<Locator>
 
     /**
-     * The DID's active registration and its inactive ones still within
-     * retention at `nowSeconds`. Owner authentication tries each.
+     * Deregistration and dormancy eviction, and the replace path of a new
+     * key's registration: removes the DID's active registration and destroys
+     * it with its mail. Inactive registrations and tombstones are untouched.
      */
-    registrations(did: string, nowSeconds: number): Promise<RegistrationSet>
+    delete(did: string): Promise<void>
 
     /**
      * Retires the active registration: it becomes inactive at `nowSeconds`
-     * and keeps its backlog for its own key until the retention deadline.
+     * and keeps its backlog, unread, until the retention deadline.
      * Beyond the inactive cap the oldest inactive registration is destroyed.
      * Does nothing, returning `null`, unless the active registration is
      * `expectedActive`: a caller that read an earlier registration must not
@@ -414,7 +401,7 @@ export interface Directory {
      * Deregisters the active registration if `anchorThumbprint` is its
      * anchor's, destroys it, and tombstones that anchor so it never registers
      * again. A tombstone is written once and never rewritten. Other anchors
-     * of the same DID, active or inactive, are unaffected.
+     * of the same DID are unaffected.
      */
     deregister(did: string, anchorThumbprint: Uint8Array): Promise<void>
 
