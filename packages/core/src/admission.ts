@@ -25,8 +25,7 @@ export type Admission =
     | { verdict: "unknown"; why: readonly string[] }
     /**
      * The recipient blocks the sender on Bsky: mirror into the relay block.
-     * Only `yes` proves there is no such block; `no` and `unknown` may hide
-     * one the relay could not read.
+     * No verdict lifts a block the relay already holds; only the device does.
      */
     | { verdict: "blocked" }
 

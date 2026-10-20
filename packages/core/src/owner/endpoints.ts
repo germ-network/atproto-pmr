@@ -367,7 +367,7 @@ export async function handleRegistrationDelete(
 
 /**
  * `GET /pmr/v1/blocks` — every blocked sender in `b`, and in `bs` those whose
- * block mirrors a Bsky block, which a Bsky unblock lifts.
+ * block mirrors a Bsky block and the device has not taken over or lifted.
  */
 export async function handleBlocksList(
     request: Request,

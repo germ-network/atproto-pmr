@@ -1,7 +1,8 @@
 /**
  * The owner's Bsky blocks are mirrored into the relay block: a blocked sender's
- * queued and pooled mail is cleared and their puts go synthetic, a Bsky unblock
- * lifts only what the mirror set, and a device block always stands.
+ * queued and pooled mail is cleared and their puts go synthetic, and only a
+ * device unblock lifts the block: the relay's view of a Bsky unblock is
+ * unproven, so it never lifts anything.
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
@@ -89,13 +90,26 @@ describe("PMRObject Bsky block mirror", () => {
         })
     })
 
-    it("syncBskyBlocks lifts a bsky marker whose sender left the set", async () => {
+    it("syncBskyBlocks never lifts a bsky marker whose sender left the set", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await put(pmr, B, "m1", YES)
             await pmr.syncBskyBlocks(new Set([B]))
             await pmr.syncBskyBlocks(new Set())
+            expect(await pmr.listBlocked()).toEqual([B])
+            expect(await pmr.listBskyBlocked()).toEqual([B])
+        })
+    })
+
+    it("a device unblock lifts a mirrored block the owner's Bsky blocks no longer list, and an empty sync does not re-block it", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await put(pmr, B, "m1", YES)
+            await pmr.syncBskyBlocks(new Set([B]))
+            await pmr.syncBskyBlocks(new Set())
+            await pmr.unblock(B)
             expect(await pmr.listBlocked()).toEqual([])
-            expect(await raw(pmr, `bsky:${B}`)).toBeUndefined()
+            expect(await pmr.listBskyBlocked()).toEqual([])
+            await pmr.syncBskyBlocks(new Set())
+            expect(await pmr.listBlocked()).toEqual([])
         })
     })
 
@@ -205,6 +219,18 @@ describe("PMRObject catch-up wiring", () => {
         const frames = await drain(stub)
         expect(frames.filter((f) => f.type === "delivery")).toEqual([])
         await inPMR(stub, async (pmr) => {
+            expect(await pmr.listBskyBlocked()).toEqual([B])
+        })
+    })
+
+    it("a block row deleted from the monitor does not lift the mirrored block at the next drain", async () => {
+        const { owner, stub } = await ownerWithQueue()
+        await ingest().setOwnBlocks(owner, [{ blocker: owner, rkey: "3k1", subject: B }])
+        await drain(stub)
+        await ingest().setOwnBlocks(owner, [])
+        await drain(stub)
+        await inPMR(stub, async (pmr) => {
+            expect(await pmr.listBlocked()).toEqual([B])
             expect(await pmr.listBskyBlocked()).toEqual([B])
         })
     })

@@ -214,9 +214,10 @@ A mailbox the relay opened for a sender the recipient's policy admitted
 carries an *admitted* mark, kept beside the queue. It marks a sender judged
 again on every put; provisioning the sender clears it and makes the sender a
 device contact, judged only by blocks. A block mirrored from Bsky carries its
-own mark, so a Bsky unblock lifts it, a device unblock holds only until the relay next
-sees the Bsky block (at the sender's next put), and a device block takes it
-over.
+own mark. Neither a verdict nor the Bsky block's absence lifts it; only a
+device unblock does, and that holds only until the relay next sees the Bsky
+block (the sender's next put or the catch-up after it). A device block takes
+it over.
 
 The concrete synthetic behavior is the implementer's, deliberately
 unpublished, and free to change. This document specifies the storage

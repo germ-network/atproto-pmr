@@ -125,7 +125,7 @@ const POOL_VERDICT_PREFIX = "poolv:"
  * treats every mailbox, marked or not, as a device contact's.
  */
 const ADMITTED_PREFIX = "adm:"
-/** Marks a relay block (`syn:`) that mirrors a Bsky block, so only a Bsky unblock lifts it. */
+/** Marks a relay block (`syn:`) that mirrors a Bsky block, so a device takeover or unblock can tell it from a device block. */
 const BSKY_BLOCK_PREFIX = "bsky:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
@@ -737,12 +737,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         if (admission.verdict === "blocked" && blocked === undefined) {
             await this.block(key, nowSeconds, "bsky")
             blocked = await this.db.get<SyntheticState>(syntheticKey(key))
-        } else if (
-            admission.verdict === "yes" &&
-            (await this.db.get(bskyBlockKey(key))) !== undefined
-        ) {
-            await this.unblock(key)
-            blocked = undefined
         }
         if (blocked !== undefined) {
             const result = await this.advanceSynthetic(key, blocked, nowSeconds)
@@ -1067,8 +1061,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         _nowSeconds: number,
         source: BlockSource = "device"
     ): Promise<void> {
-        // A device block takes over a mirrored one, so a Bsky unblock no
-        // longer lifts it; the marker is dropped before the early return.
+        // A device block takes over a mirrored one, so it leaves
+        // `bs`; the marker is dropped before the early return.
         if (source === "device") await this.db.delete(bskyBlockKey(key))
         if ((await this.db.get(syntheticKey(key))) !== undefined) return
 
@@ -1101,11 +1095,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void> {
         const held = new Set<string>()
-        const mirrored = new Set<string>()
         for (const [prefix, family] of [
             [POOL_PREFIX, "pool"],
             [ADMITTED_PREFIX, "adm"],
-            [BSKY_BLOCK_PREFIX, "bsky"],
             [MAILBOX_PREFIX, "mbox"],
         ] as const) {
             const keys = await this.db.list({ prefix })
@@ -1114,16 +1106,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 // Grant mailboxes name no sender.
                 if (family === "mbox" && !isPairMailboxKey(sender)) continue
                 held.add(sender)
-                if (family === "bsky") mirrored.add(sender)
             }
         }
         for (const sender of held) {
             const key = sender as PairMailboxKey
-            if (blocked.has(sender)) {
-                await this.block(key, 0, "bsky")
-            } else if (mirrored.has(sender)) {
-                await this.unblock(key)
-            }
+            if (blocked.has(sender)) await this.block(key, 0, "bsky")
         }
     }
 

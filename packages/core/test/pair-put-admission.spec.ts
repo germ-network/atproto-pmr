@@ -59,6 +59,7 @@ function world(opts: {
             return opts.result ?? { outcome: "pooled", persistBody: true }
         },
         hasMailbox: async () => opts.hasMailbox ?? true,
+        unblock: async () => void events.push("unblock"),
         append: async () => {
             events.push("append")
             return { outcome: "appended", persistBody: true }
@@ -185,6 +186,15 @@ describe("handlePairPut with admission", () => {
         const response = await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)
         await w.settle()
         expect(response.status).toBe(202)
+        expect(w.events).toEqual([])
+    })
+
+    it("a yes admission is passed to the store unchanged and the put path never unblocks the sender", async () => {
+        const { secretKey, publicKey } = keyPair()
+        const w = world({ publicKey, result: { outcome: "queued", persistBody: false } })
+        expect((await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)).status).toBe(202)
+        await w.settle()
+        expect(w.received.map((r) => r.admission)).toEqual([{ verdict: "yes" }])
         expect(w.events).toEqual([])
     })
 

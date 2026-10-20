@@ -186,12 +186,23 @@ describe("PMRObject.receive", () => {
         })
     })
 
-    it("yes lifts a bsky marker, then routes the put", async () => {
+    it("yes does not lift a bsky marker: the sender stays blocked and the put is absorbed synthetically", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await put(pmr, "m1", BLOCKED)
+            expect(await put(pmr, "m2", YES)).toEqual({ outcome: "queued", persistBody: false })
+            expect(await pmr.listBlocked()).toEqual([B])
+            expect(await raw(pmr, `bsky:${B}`)).toBeDefined()
+            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
+            expect(await ids(pmr)).toEqual([])
+        })
+    })
+
+    it("after a device unblock of a bsky-mirrored sender, a yes routes the put to an admitted mailbox", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await put(pmr, "m1", BLOCKED)
+            await pmr.unblock(B)
             expect(await put(pmr, "m2", YES)).toEqual({ outcome: "queued", persistBody: true })
             expect(await pmr.listBlocked()).toEqual([])
-            expect(await raw(pmr, `bsky:${B}`)).toBeUndefined()
             expect(await ids(pmr)).toEqual(["m2"])
         })
     })

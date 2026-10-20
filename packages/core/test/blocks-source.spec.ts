@@ -1,6 +1,6 @@
 /**
- * The device can tell which relay blocks mirror Bsky, so it knows which
- * unblocks will hold and keeps them out of the block list it republishes.
+ * The device can tell which relay blocks mirror Bsky, so it keeps them out of
+ * the block list it republishes and can lift a stale one itself.
  */
 import { describe, expect, it } from "vitest"
 import { handleBlockSet, handleBlocksList } from "../src/owner/endpoints"
