@@ -6,7 +6,12 @@ import {
     type MonitorRegistrationNotify,
     type PMRStore,
     type RegistrationFields,
+    type RegistrationSet,
+    INACTIVE_BACKLOG_RETENTION_SECONDS,
+    MAX_INACTIVE_REGISTRATIONS,
     type ResolvedAddress,
+    parseOkpEd25519Key,
+    thumbprintOkpEd25519,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
 import type { PMRObject } from "./pmr-object"
@@ -14,12 +19,29 @@ import type { PMRObject } from "./pmr-object"
 /** Minimum TTL Cloudflare KV accepts, seconds. Below this it errors. */
 const MIN_KV_TTL_SECONDS = 60
 
+/** The DID's row: one active registration and its inactive ones, newest first. */
+interface DirectoryRow {
+    a?: { l: Locator }
+    i: Array<{
+        l: Locator
+        /** The anchor `COSE_Key`, base64url. */
+        k: string
+        at: number
+        until: number
+    }>
+}
+
 interface GrantAddressRow {
     locator: string
     /** Base64url — `KVNamespace` JSON values are not typed for raw bytes. */
     authKey: string
     closed?: boolean
     expiresAt: number
+}
+
+/** Write-once: a tombstone is never rewritten or removed. */
+function tombstoneKey(did: string, anchorThumbprint: Uint8Array): string {
+    return `tomb:${did}:${binaryToBase64URL(anchorThumbprint)}`
 }
 
 function ttlFor(expiresAt: number): number {
@@ -35,10 +57,44 @@ function ttlFor(expiresAt: number): number {
 export class KVDirectory<TPMR extends PMRObject = PMRObject>
     implements Directory
 {
-    constructor(private readonly env: PMREnv<TPMR>) {}
+    constructor(
+        private readonly env: PMREnv<TPMR>,
+        private readonly lifecycle: {
+            inactiveRetentionSeconds: number
+            maxInactive: number
+        } = {
+            inactiveRetentionSeconds: INACTIVE_BACKLOG_RETENTION_SECONDS,
+            maxInactive: MAX_INACTIVE_REGISTRATIONS,
+        }
+    ) {}
 
     async resolve(did: string): Promise<Locator | null> {
-        return (await this.env.pmrDirectory.get(did)) ?? null
+        return (await this.readRow(did)).a?.l ?? null
+    }
+
+    /** A bare locator string is a row written before registration sets: one active registration. */
+    private async readRow(did: string): Promise<DirectoryRow> {
+        const raw = await this.env.pmrDirectory.get(did)
+        if (raw === null) return { i: [] }
+        if (!raw.startsWith("{")) return { a: { l: raw }, i: [] }
+        const row = JSON.parse(raw) as Partial<DirectoryRow>
+        return { a: row.a, i: row.i ?? [] }
+    }
+
+    private async writeRow(did: string, row: DirectoryRow): Promise<void> {
+        if (row.a === undefined && row.i.length === 0) {
+            await this.env.pmrDirectory.delete(did)
+            return
+        }
+        await this.env.pmrDirectory.put(did, JSON.stringify(row))
+    }
+
+    private async destroyQuietly(locator: Locator, did: string): Promise<void> {
+        try {
+            await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
+        } catch (err) {
+            console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
+        }
     }
 
     /**
@@ -128,43 +184,101 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         }
     }
 
-    /** Idempotent on DID. */
+    /** Idempotent on the active registration; the inactive set is kept. */
     async create(
         did: string,
         registration: RegistrationFields
     ): Promise<Locator> {
-        const existing = await this.resolve(did)
-        if (existing !== null) {
+        const row = await this.readRow(did)
+        if (row.a !== undefined) {
             await this.notifyMonitor("register", did)
-            return existing
+            return row.a.l
         }
 
         const id = this.env.pmrs.newUniqueId()
         const locator = id.toString()
-        await this.env.pmrDirectory.put(did, locator)
+        await this.writeRow(did, { a: { l: locator }, i: row.i })
         await this.env.pmrs.get(id).update(registration)
         await this.notifyMonitor("register", did)
         return locator
     }
 
-    /** Unlinks the DID, then tears down the DO's storage — best-effort. */
-    async delete(did: string): Promise<void> {
-        // Capture the locator BEFORE removing the routing row (resolve keys off it).
-        const locator = await this.resolve(did)
-        // Unlink first: this is the authoritative step. A crash between here and the
-        // teardown below degrades to an orphaned-but-intact DO (the prior behavior),
-        // never to a routing row pointing at a half-wiped DO.
-        await this.env.pmrDirectory.delete(did)
-        if (locator !== null) {
-            try {
-                await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
-            } catch (err) {
-                // Best-effort reclamation: a failed teardown just leaves the orphan
-                // (the prior behavior), it must not fail the deregistration/replace.
-                console.warn(`KVDirectory.delete: DO teardown failed for ${did}:`, err)
-            }
+    async registrations(did: string, nowSeconds: number): Promise<RegistrationSet> {
+        const row = await this.readRow(did)
+        return {
+            active: row.a?.l ?? null,
+            inactive: row.i
+                .filter((e) => e.until > nowSeconds)
+                .map((e) => ({
+                    locator: e.l,
+                    anchorKey: base64URLToBinary(e.k),
+                    inactiveAt: e.at,
+                    destroyAt: e.until,
+                })),
         }
+    }
+
+    async deactivate(
+        did: string,
+        nowSeconds: number,
+        expectedActive: Locator
+    ): Promise<Locator | null> {
+        const row = await this.readRow(did)
+        if (row.a === undefined || row.a.l !== expectedActive) return null
+        const locator = row.a.l
+        const until = nowSeconds + this.lifecycle.inactiveRetentionSeconds
+
+        const store = this.env.pmrs.get(this.env.pmrs.idFromString(locator))
+        const fields = await store.load()
+        await store.markInactive(nowSeconds, until)
+        // A retried deactivate keeps the object's first times; the row follows.
+        const marked = (await store.readInactive()) ?? { inactiveAt: nowSeconds, destroyAt: until }
+
+        const live = row.i.filter((e) => e.until > nowSeconds)
+        if (fields !== null) {
+            live.unshift({
+                l: locator,
+                k: binaryToBase64URL(fields.anchorKey),
+                at: marked.inactiveAt,
+                until: marked.destroyAt,
+            })
+        }
+        const evicted = live.splice(this.lifecycle.maxInactive)
+        await this.writeRow(did, { i: live })
+        for (const e of evicted) await this.destroyQuietly(e.l, did)
+        if (fields === null) await this.destroyQuietly(locator, did)
+
         await this.notifyMonitor("unregister", did)
+        return locator
+    }
+
+    async deregister(did: string, anchorThumbprint: Uint8Array): Promise<void> {
+        const row = await this.readRow(did)
+        if (row.a === undefined) return
+        const locator = row.a.l
+        const fields = await this.env.pmrs
+            .get(this.env.pmrs.idFromString(locator))
+            .load()
+        if (
+            fields === null ||
+            binaryToBase64URL(thumbprintOkpEd25519(parseOkpEd25519Key(fields.anchorKey))) !==
+                binaryToBase64URL(anchorThumbprint)
+        ) {
+            return
+        }
+        // The tombstone is written before the registration goes: a crash in
+        // between leaves it active-but-tombstoned until the DELETE is retried.
+        const key = tombstoneKey(did, anchorThumbprint)
+        if ((await this.env.pmrDirectory.get(key)) === null) {
+            await this.env.pmrDirectory.put(key, "1")
+        }
+        await this.writeRow(did, { i: row.i })
+        await this.destroyQuietly(locator, did)
+        await this.notifyMonitor("unregister", did)
+    }
+
+    async isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean> {
+        return (await this.env.pmrDirectory.get(tombstoneKey(did, anchorThumbprint))) !== null
     }
 }
 

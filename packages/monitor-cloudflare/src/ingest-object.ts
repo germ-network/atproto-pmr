@@ -29,6 +29,7 @@ import {
     type Cursor,
     type FetchedRecord,
     type HeadRev,
+    type GoneCause,
     type HolderState,
     type IndexedRecord,
     type IngestDeps,
@@ -114,6 +115,10 @@ import {
     type OwnerGraph,
     ownerGraph,
     type MonitorRecheckRequest,
+    type MonitorVerifiedAnchorRequest,
+    type VerifiedAnchorObservation,
+    declarationAnchorKeyOf,
+    readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
     type PlcCoverage,
@@ -326,6 +331,7 @@ export class MonitorIngest
         RecountQueueIndex,
         MonitorRegistrationNotify,
         MonitorRecheckRequest,
+        MonitorVerifiedAnchorRequest,
         MonitorOwnBlocksRequest,
         MonitorOwnGraphRequest
 {
@@ -511,6 +517,13 @@ export class MonitorIngest
                     requested_at INTEGER NOT NULL
                 );
             `)
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('holder_state') WHERE name = 'cause'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE holder_state ADD COLUMN cause TEXT")
+            }
             if (
                 this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'quiet'")
@@ -1212,7 +1225,7 @@ export class MonitorIngest
         // DID is not re-marked here: refresh never visits one.
         this.db.sql.exec(
             "INSERT INTO holder_state (did, state, held_at) VALUES (?1, 'held', ?2) " +
-                "ON CONFLICT(did) DO UPDATE SET state = 'held', " +
+                "ON CONFLICT(did) DO UPDATE SET state = 'held', cause = NULL, " +
                 "held_at = CASE WHEN state = 'held' THEN held_at ELSE ?2 END",
             did,
             observedAtMs
@@ -1225,20 +1238,21 @@ export class MonitorIngest
      * re-assert the state with no digest entry and no push. Stays
      * gone-permanent for a DID with a `deleted` row.
      */
-    async markGoneReversible(did: string): Promise<void> {
-        this.ctx.storage.transactionSync(() => this.setGoneState(did, false))
+    async markGoneReversible(did: string, cause: GoneCause): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.setGoneState(did, false, cause))
     }
 
-    private setGoneState(did: string, permanent: boolean): void {
+    private setGoneState(did: string, permanent: boolean, cause: GoneCause): void {
         const ownedBefore = this.ownsSync(did)
         // A DID already permanently gone stays so under a reversible answer.
         this.db.sql.exec(
-            "INSERT INTO holder_state (did, state) VALUES (?1, ?2) " +
+            "INSERT INTO holder_state (did, state, cause) VALUES (?1, ?2, ?3) " +
                 "ON CONFLICT(did) DO UPDATE SET state = CASE " +
                 "WHEN EXISTS (SELECT 1 FROM deleted WHERE did = ?1) THEN 'gone-permanent' " +
-                "ELSE excluded.state END",
+                "ELSE excluded.state END, cause = excluded.cause",
             did,
-            permanent ? "gone-permanent" : "gone-reversible"
+            permanent ? "gone-permanent" : "gone-reversible",
+            cause
         )
         this.reevaluateInterest(did, Date.now(), ownedBefore)
     }
@@ -1289,7 +1303,8 @@ export class MonitorIngest
         did: string,
         observedAtMs: number,
         permanent: boolean,
-        quiet = false
+        quiet = false,
+        cause: GoneCause = "repo"
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             if (permanent) {
@@ -1301,7 +1316,7 @@ export class MonitorIngest
                 )
                 this.dropPlcLogSync(did)
             }
-            this.setGoneState(did, permanent)
+            this.setGoneState(did, permanent, cause)
             // Only the declaration goes: other collections' snapshots outlive it.
             this.db.sql.exec(
                 "DELETE FROM records WHERE did = ? AND collection = ?",
@@ -1487,6 +1502,43 @@ export class MonitorIngest
     async ownGraph(did: string): Promise<OwnerGraph | null> {
         const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
         return edges === null ? null : ownerGraph(did, edges.following, edges.followers)
+    }
+
+    /**
+     * The anchor the stored, verified declaration names. Only an exclusion
+     * proof from a live repo is `absent`; a repo-level reversible state
+     * (deactivated, taken down, suspended) and an unproven `RecordNotFound`
+     * are `unknown`, since only a verified absence may retire a registration.
+     * Reads through the ingest object, as `ownBlocks` does.
+     */
+    async verifiedAnchorOf(did: string): Promise<VerifiedAnchorObservation> {
+        const unknown = { state: "unknown" } as const
+        const holder = this.db.sql
+            .exec<{ state: HolderState; cause: GoneCause | null }>(
+                "SELECT state, cause FROM holder_state WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        if (holder === undefined) return unknown
+        if (holder.state === "gone-reversible") {
+            return holder.cause === "record" ? { state: "absent" } : unknown
+        }
+        if (holder.state !== "held") return unknown
+
+        const row = (await this.recordsOf(did)).find(
+            (r) => r.collection === this.env.MONITOR_COLLECTION && r.rkey === "self"
+        )
+        if (row === undefined) return unknown
+        const entry = await kvSnapshotStore(this.env).getRecord(did)
+        if (entry === null) return unknown
+        try {
+            const found = readRecordFromCar(entry.car, this.env.MONITOR_COLLECTION, "self")
+            if (found === null || found.cid !== row.cid) return unknown
+            const anchorKey = declarationAnchorKeyOf(found.record)
+            return anchorKey === null ? unknown : { state: "present", anchorKey }
+        } catch {
+            return unknown
+        }
     }
 
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {

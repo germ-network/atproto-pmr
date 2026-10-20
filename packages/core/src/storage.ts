@@ -238,8 +238,8 @@ export interface RegistrationFields {
 export interface WatchState {
     /**
      * True while the owner's declared anchor key is confirmed gone or changed.
-     * While set, DID-addressed mail is absorbed (see `append`/`appendToPool`)
-     * and grant-addressed mail is unaffected. Reversible: cleared when the
+     * While set the registration stops acting on the DID's behalf, but still
+     * queues all mail. Reversible: cleared when the
      * trusted key is observed present again. Never triggers deregistration.
      */
     paused: boolean
@@ -319,9 +319,56 @@ export interface MonitorRecheckRequest {
     requestRefresh(did: string, requestedAtMs: number): Promise<void>
 }
 
+/**
+ * A monitor that answers, from its verified snapshot, what a DID's
+ * declaration currently names as its anchor. The only source that may
+ * inactivate a registration (R88): unlike the owner-PDS read in `watch.ts`,
+ * it is proof-checked, so a misserving PDS cannot retire a registration.
+ */
+export interface MonitorVerifiedAnchorRequest {
+    verifiedAnchorOf(did: string): Promise<VerifiedAnchorObservation>
+}
+
+/**
+ * - `present`: the verified declaration names `anchorKey` (a `COSE_Key` blob).
+ * - `absent`: the declaration record is verifiably gone from a live repo.
+ * - `unknown`: anything else — not yet verified, no snapshot, or a
+ *   repo-level state such as deactivation, which only pauses (R88).
+ */
+export type VerifiedAnchorObservation =
+    | { state: "present"; anchorKey: Uint8Array }
+    | { state: "absent" }
+    | { state: "unknown" }
+
+/**
+ * A registration retired by a newer key's registration or by the monitor's
+ * verified view. Terminal: it accepts no new mail and never becomes active
+ * again; its own key may read its backlog until `inactiveAt` plus the
+ * retention period, after which it is destroyed.
+ */
+export interface InactiveRegistration {
+    locator: Locator
+    /**
+     * The registration's anchor key, a `COSE_Key` blob, carried here so owner
+     * authentication verifies every candidate from one directory read.
+     */
+    anchorKey: Uint8Array
+    inactiveAt: number
+    /** Fixed once, at deactivation: the backlog is destroyed then. */
+    destroyAt: number
+}
+
+/** Every live registration of one DID. */
+export interface RegistrationSet {
+    /** The only registration that accepts new mail; `null` if none. */
+    active: Locator | null
+    /** Newest first, already limited to those still within retention. */
+    inactive: InactiveRegistration[]
+}
+
 /** Global, small, read on every inbound request. */
 export interface Directory {
-    /** Hot path: routes every pair put and every owner request. */
+    /** Hot path: routes every pair put. The active registration only. */
     resolve(did: string): Promise<Locator | null>
 
     /**
@@ -334,11 +381,44 @@ export interface Directory {
      */
     resolveAddress(address: string): Promise<ResolvedAddress | null>
 
-    /** Idempotent on DID. */
+    /** Idempotent on the DID's active registration; its inactive set is kept. */
     create(did: string, registration: RegistrationFields): Promise<Locator>
 
-    /** Deregistration and dormancy eviction. */
-    delete(did: string): Promise<void>
+    /**
+     * The DID's active registration and its inactive ones still within
+     * retention at `nowSeconds`. Owner authentication tries each.
+     */
+    registrations(did: string, nowSeconds: number): Promise<RegistrationSet>
+
+    /**
+     * Retires the active registration: it becomes inactive at `nowSeconds`
+     * and keeps its backlog for its own key until the retention deadline.
+     * Beyond the inactive cap the oldest inactive registration is destroyed.
+     * Does nothing, returning `null`, unless the active registration is
+     * `expectedActive`: a caller that read an earlier registration must not
+     * retire the one that replaced it. Returns the retired locator.
+     *
+     * Order: the object is marked inactive before the row moves it, so a
+     * crash between leaves an active-looking row over an object that already
+     * refuses mail, never an inactive entry that still accepts it. The row is
+     * rewritten without compare-and-swap; a lost update can orphan an
+     * inactive object, which its own retention alarm still destroys.
+     */
+    deactivate(
+        did: string,
+        nowSeconds: number,
+        expectedActive: Locator
+    ): Promise<Locator | null>
+
+    /**
+     * Deregisters the active registration if `anchorThumbprint` is its
+     * anchor's, destroys it, and tombstones that anchor so it never registers
+     * again. A tombstone is written once and never rewritten. Other anchors
+     * of the same DID, active or inactive, are unaffected.
+     */
+    deregister(did: string, anchorThumbprint: Uint8Array): Promise<void>
+
+    isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean>
 
     /**
      * Writes the GLOBAL routing row a grant put resolves against. Always a
@@ -375,6 +455,24 @@ export interface Directory {
 export interface PMRStore {
     load(): Promise<RegistrationFields | null>
     update(fields: Partial<RegistrationFields>): Promise<void>
+
+    /**
+     * Makes this registration inactive from `atSeconds`: from then on it
+     * stores no new mail of any kind, and at `destroyAtSeconds` it destroys
+     * itself. Idempotent; the first call's times stand.
+     */
+    markInactive(atSeconds: number, destroyAtSeconds: number): Promise<void>
+
+    /**
+     * Whether the monitor has verified this registration's own anchor. Until
+     * then the monitor's view may predate the registration, so it cannot
+     * retire it.
+     */
+    isMonitorConfirmed(): Promise<boolean>
+    markMonitorConfirmed(): Promise<void>
+
+    /** `null` while active. */
+    readInactive(): Promise<{ inactiveAt: number; destroyAt: number } | null>
 
     /**
      * The own-DID declaration watch's state (`watch.ts`, `WatchState`).
@@ -443,20 +541,11 @@ export interface PMRStore {
      * mailbox if the sender is blocked. **The caller cannot tell which
      * happened, and neither can the sender.**
      *
-     * PAUSE (`watch.ts`): when this registration's `readWatchState().paused`
-     * is set — the owner's own declared anchor key is confirmed gone — a
-     * DID-addressed (`did:`-keyed, pair) put from any sender MUST be absorbed:
-     * no bytes, no delivery, no nonce recorded, and an accepted-shaped outcome
-     * so the response stays the uniform 202 a real append yields. (The
-     * already-seen-nonce check runs first, as always, so a replay of a
-     * pre-pause envelope answers `duplicate` — also a no-op 202 — rather than
-     * the absorb; observationally identical.) `append` also receives
-     * `grant:`-keyed puts (see `grant-put.ts`), which MUST pass through
-     * untouched — pause stops DID-addressed mail and keeps grant-addressed
-     * mail. The nonce is deliberately NOT recorded on a paused absorb: the
-     * pause is transient, so a resend after the key returns must still land.
-     * Mail already queued when the pause begins is left in place (pause is not
-     * teardown); only new admission is gated.
+     * PAUSE does not gate admission: a paused registration (`watch.ts`)
+     * queues `did:`- and `grant:`-keyed puts exactly as an active one.
+     * INACTIVE (`markInactive`) does: every put, grant-keyed included, is
+     * answered as a real append would be — `appended` with `persistBody:
+     * false`, no bytes, no delivery, no nonce recorded.
      *
      * CONSISTENCY CONTRACT (1): the capacity check and the write MUST be
      * one atomic step, or two concurrent puts both observe room and both
@@ -542,8 +631,8 @@ export interface PMRStore {
      *  - `no` / `unknown` pools the put with its verdict, as `appendToPool`
      *    (so a live discard window drops it).
      *
-     * Order: nonce and pause checks first (nothing at all is written for a
-     * duplicate or a paused registration), then the block-marker transition,
+     * Order: nonce and inactive checks first (nothing at all is written for a
+     * duplicate or an inactive registration), then the block-marker transition,
      * then capacity: a `yes` is refused only when the new ref itself does not
      * fit (a refusal writes no mailbox, mark or move); otherwise the oldest
      * pooled entries that fit ahead of it move in and the rest stay pooled
@@ -589,11 +678,9 @@ export interface PMRStore {
      * CONSISTENCY CONTRACT (7) applies here too, and the discard check MUST
      * run inside this call — see `PoolAppendResult`.
      *
-     * PAUSE: the pool is DID-addressed by construction (a `PairMailboxKey`),
-     * so when this registration is paused (`readWatchState().paused`) every
-     * pooled put MUST be absorbed — `pooled` with `persistBody: false`, no
-     * bytes and no nonce recorded — exactly as `append` absorbs a paused pair
-     * put. See `append`.
+     * An inactive registration (`markInactive`) answers `pooled` with
+     * `persistBody: false` and records nothing; a paused one pools as an
+     * active one does.
      */
     appendToPool(
         key: PairMailboxKey,

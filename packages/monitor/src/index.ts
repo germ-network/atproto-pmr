@@ -54,6 +54,7 @@ export {
     type RevComparison,
     type SnapshotEntry,
     type HolderState,
+    type GoneCause,
     type IndexedRecord,
     type VerifiedWrite,
     type SigningKeyCacheWriter,

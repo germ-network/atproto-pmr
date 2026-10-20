@@ -108,6 +108,21 @@ export function snapshotDeclarationResolver(
 }
 
 /**
+ * The anchor key a declaration record names, as a `COSE_Key` blob, or `null`
+ * when the record has no readable, supported `currentKey`. For a record read
+ * from a verified repo CAR, where the field is already raw bytes.
+ */
+export function declarationAnchorKeyOf(record: unknown): Uint8Array | null {
+    const currentKey = (record as { currentKey?: unknown } | null)?.currentKey
+    if (!(currentKey instanceof Uint8Array)) return null
+    try {
+        return encodeOkpEd25519Key(parseFrozenAnchorKeyField(currentKey))
+    } catch {
+        return null
+    }
+}
+
+/**
  * The germ declaration's anchor-key field: NOT COSE. One field —
  * an algorithm identifier byte followed by the raw key bytes — because this
  * is the frozen, published record format existing clients already parse

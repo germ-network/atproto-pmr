@@ -27,6 +27,7 @@ export type {
     MessageRef,
     MonitorRegistrationNotify,
     MonitorRecheckRequest,
+    MonitorVerifiedAnchorRequest,
     Nonce,
     OpenMailboxesPage,
     PairMailboxKey,
@@ -39,7 +40,16 @@ export type {
     ResolvedAddress,
     VerificationHint,
     WatchState,
+    InactiveRegistration,
+    RegistrationSet,
+    VerifiedAnchorObservation,
 } from "./storage"
+
+export {
+    INACTIVE_BACKLOG_RETENTION_SECONDS,
+    MAX_INACTIVE_REGISTRATIONS,
+    applyVerifiedAnchorObservation,
+} from "./registration-lifecycle"
 
 // The own-DID declaration watch — pause-not-teardown decision logic.
 export {
@@ -225,6 +235,7 @@ export {
 // Declaration resolution and content addressing.
 export {
     DECLARATION_COLLECTION_NSID,
+    declarationAnchorKeyOf,
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,

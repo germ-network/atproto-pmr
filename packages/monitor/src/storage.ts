@@ -71,6 +71,15 @@ export interface SnapshotEntry {
 /** Whether a DID's declaration is held, and if not, whether that can reverse. */
 export type HolderState = "held" | "gone-reversible" | "gone-permanent"
 
+/**
+ * Why a reversible gone was recorded: `record` only when a live repo's
+ * exclusion proof verified the declaration absent; `repo` for everything
+ * else (a deactivated, taken-down or suspended repo, or an unproven
+ * not-found answer). Only `record` may retire a relay registration; `repo`
+ * only pauses it.
+ */
+export type GoneCause = "record" | "repo"
+
 /** What a completion records about the bytes it just stored. */
 export interface VerifiedWrite {
     /** The record's CID, as verified. */
@@ -271,7 +280,9 @@ export interface MonitorIndex {
         observedAtMs: number,
         permanent: boolean,
         /** Owed by a join, not a change: no window entry. */
-        quiet?: boolean
+        quiet: boolean | undefined,
+        /** Why a reversible gone was recorded; meaningless when `permanent`. */
+        cause: GoneCause
     ): Promise<void>
 
     /**

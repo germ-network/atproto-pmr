@@ -227,7 +227,7 @@ describe("PMRObject.receive", () => {
         })
     })
 
-    it("a duplicate nonce or a paused registration writes nothing, including no block-marker transition", async () => {
+    it("a duplicate nonce or an inactive registration writes nothing, including no block-marker transition", async () => {
         await inPMR(freshStub(), async (pmr) => {
             const nonce = freshNonce()
             await put(pmr, "m1", YES, T0, nonce)
@@ -236,7 +236,7 @@ describe("PMRObject.receive", () => {
             expect(await ids(pmr)).toEqual(["m1"])
         })
         await inPMR(freshStub(), async (pmr) => {
-            await pmr.writeWatchState({ paused: true, lastCheckAt: 5 })
+            await pmr.markInactive(T0, Math.floor(Date.now() / 1000) + 3600)
             for (const admission of [BLOCKED, YES, NO]) {
                 expect(await put(pmr, "m1", admission)).toEqual({ outcome: "queued", persistBody: false })
             }

@@ -2,11 +2,8 @@
  * The own-DID declaration watch as the Durable Object implements it — the two
  * halves that live in this package:
  *
- *   - PAUSE ENFORCEMENT in the admission path: a paused registration absorbs
- *     DID-addressed mail (pair AND pool) — no bytes, no delivery, no nonce
- *     recorded, the same accepted response a real append gives — while
- *     GRANT-addressed mail keeps flowing; and because no nonce is recorded, a
- *     resend after the key returns still lands.
+ *   - A paused registration QUEUES mail exactly as an active one does (pair,
+ *     pool and grant alike); inactivity, not pause, is what stops admission.
  *   - `applyDeclarationOutcome`: the atomic read-modify-write of the paused
  *     flag a driver calls with a re-check's conclusion.
  *
@@ -44,58 +41,55 @@ function freshStub(): DurableObjectStub<PMRObject> {
     return testEnv.pmrs.get(testEnv.pmrs.idFromName(`watch-${counter}`))
 }
 
-describe("pause enforcement in the admission path", () => {
-    it("absorbs a DID-addressed pair put: appended, no bytes, no delivery", async () => {
+describe("a paused registration queues mail", () => {
+    it("queues a DID-addressed pair put with its body", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
             const r = await pmr.append("did:plc:sender", ref("m1"), freshNonce(), T0)
-            expect(r.outcome).toBe("appended")
-            expect(r.outcome === "appended" && r.persistBody).toBe(false)
-            expect(await pmr.list("did:plc:sender", 100)).toHaveLength(0)
-        })
-    })
-
-    it("absorbs a DID-addressed pool put: pooled, no bytes", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
-            const r = await pmr.appendToPool("did:plc:sender", ref("p1"), freshNonce(), T0)
-            expect(r.outcome).toBe("pooled")
-            expect(r.outcome === "pooled" && r.persistBody).toBe(false)
-            expect(await pmr.poolSenders()).toHaveLength(0)
-        })
-    })
-
-    it("keeps accepting GRANT-addressed mail while paused", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
-            const r = await pmr.append("grant:someaddr", ref("g1"), freshNonce(), T0)
-            expect(r.outcome).toBe("appended")
-            expect(r.outcome === "appended" && r.persistBody).toBe(true)
-            expect(await pmr.list("grant:someaddr", 100)).toHaveLength(1)
-        })
-    })
-
-    it("records no nonce on a paused absorb, so a resend after unpause lands", async () => {
-        const nonce = freshNonce()
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
-            await pmr.append("did:plc:sender", ref("m1"), nonce, T0) // absorbed
-            expect(await pmr.list("did:plc:sender", 100)).toHaveLength(0)
-
-            // Key returns.
-            await pmr.writeWatchState({ paused: false, lastCheckAt: T0 })
-            const r = await pmr.append("did:plc:sender", ref("m1"), nonce, T0)
-            // Not "duplicate": the nonce was never recorded during the pause.
             expect(r.outcome).toBe("appended")
             expect(r.outcome === "appended" && r.persistBody).toBe(true)
             expect(await pmr.list("did:plc:sender", 100)).toHaveLength(1)
         })
     })
 
-    it("a live (unpaused) registration stores normally — the pause is what changes behavior", async () => {
+    it("pools a DID-addressed pool put with its body", async () => {
         await inPMR(freshStub(), async (pmr) => {
-            const r = await pmr.append("did:plc:sender", ref("m1"), freshNonce(), T0)
+            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
+            const r = await pmr.appendToPool("did:plc:sender", ref("p1"), freshNonce(), T0)
+            expect(r.outcome).toBe("pooled")
+            expect(r.outcome === "pooled" && r.persistBody).toBe(true)
+            expect(await pmr.poolSenders()).toHaveLength(1)
+        })
+    })
+
+    it("queues an admitted pair put (receive)", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
+            const r = await pmr.receive("did:plc:sender", ref("m1"), freshNonce(), T0, {
+                verdict: "yes",
+            })
+            expect(r.outcome).toBe("queued")
+            expect(r.outcome === "queued" && r.persistBody).toBe(true)
+            expect(await pmr.list("did:plc:sender", 100)).toHaveLength(1)
+        })
+    })
+
+    it("queues GRANT-addressed mail too", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
+            const r = await pmr.append("grant:someaddr", ref("g1"), freshNonce(), T0)
             expect(r.outcome === "appended" && r.persistBody).toBe(true)
+            expect(await pmr.list("grant:someaddr", 100)).toHaveLength(1)
+        })
+    })
+
+    it("a resend of a queued envelope is a duplicate", async () => {
+        const nonce = freshNonce()
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
+            await pmr.append("did:plc:sender", ref("m1"), nonce, T0)
+            const r = await pmr.append("did:plc:sender", ref("m1"), nonce, T0)
+            expect(r.outcome).toBe("duplicate")
             expect(await pmr.list("did:plc:sender", 100)).toHaveLength(1)
         })
     })
@@ -179,6 +173,24 @@ describe("applyDeclarationOutcome enforces the monotonic-rev watermark", () => {
             const s = await pmr.readWatchState()
             expect(s.paused).toBe(false)
             expect(s.lastObservedRev).toBe("3m1")
+        })
+    })
+})
+
+describe("inactivity is terminal", () => {
+    it("an inactive registration never returns to active on a present re-check", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.markInactive(T0, Math.floor(Date.now() / 1000) + 3600)
+            await pmr.applyDeclarationOutcome("absent", T0 + 1, "3m1")
+            await pmr.applyDeclarationOutcome("present", T0 + 2, "3m2")
+            expect((await pmr.readWatchState()).paused).toBe(false)
+
+            const r = await pmr.receive("did:plc:sender", ref("m1"), freshNonce(), T0 + 3, {
+                verdict: "yes",
+            })
+            expect(r.outcome === "queued" && r.persistBody).toBe(false)
+            expect(await pmr.list("did:plc:sender", 100)).toHaveLength(0)
+            expect((await pmr.readInactive())?.inactiveAt).toBe(T0)
         })
     })
 })

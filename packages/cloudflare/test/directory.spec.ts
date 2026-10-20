@@ -5,7 +5,12 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { asPairMailboxKey, type RegistrationFields } from "@germ-network/atproto-pmr-core"
+import {
+    asPairMailboxKey,
+    encodeOkpEd25519Key,
+    thumbprintOkpEd25519,
+    type RegistrationFields,
+} from "@germ-network/atproto-pmr-core"
 import { KVDirectory, pmrStore } from "../src/directory"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
@@ -100,13 +105,14 @@ describe("deleteGrantAddress", () => {
     })
 })
 
-describe("delete", () => {
+describe("deregister", () => {
     it("tears down the registration's Durable Object, not just the routing row", async () => {
         const dir = directory()
         const did = freshDID()
+        const x = new Uint8Array(32).fill(1)
         const fields: RegistrationFields = {
             did,
-            anchorKey: new Uint8Array(32).fill(1),
+            anchorKey: encodeOkpEd25519Key({ x }),
             lastActive: T0,
         }
 
@@ -120,7 +126,7 @@ describe("delete", () => {
         )
         expect(appended.outcome).toBe("appended")
 
-        await dir.delete(did)
+        await dir.deregister(did, thumbprintOkpEd25519({ x }))
 
         // Unlinked: the DID no longer resolves.
         expect(await dir.resolve(did)).toBeNull()
@@ -128,5 +134,140 @@ describe("delete", () => {
         expect(await store.load()).toBeNull()
         const page = await store.openMailboxes(null, 100)
         expect(page.entries).toEqual([])
+    })
+})
+
+describe("registration sets", () => {
+    const RETENTION = 30 * 86400
+
+    function fields(did: string, fill: number): RegistrationFields {
+        return { did, anchorKey: new Uint8Array(32).fill(fill), lastActive: T0 }
+    }
+
+    it("a row written before registration sets reads as one active registration", async () => {
+        const did = freshDID()
+        await testEnv.pmrDirectory.put(did, "legacy-locator")
+        const dir = directory()
+        expect(await dir.resolve(did)).toBe("legacy-locator")
+        expect(await dir.registrations(did, T0)).toEqual({
+            active: "legacy-locator",
+            inactive: [],
+        })
+    })
+
+    it("deactivate moves the active registration to the inactive set and marks its object inactive", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const locator = await dir.create(did, fields(did, 1))
+
+        expect(await dir.deactivate(did, T0, locator)).toBe(locator)
+
+        expect(await dir.resolve(did)).toBeNull()
+        const set = await dir.registrations(did, T0)
+        expect(set.active).toBeNull()
+        expect(set.inactive).toHaveLength(1)
+        expect(set.inactive[0]!.locator).toBe(locator)
+        expect([...set.inactive[0]!.anchorKey]).toEqual([...new Uint8Array(32).fill(1)])
+        expect(set.inactive[0]!.destroyAt).toBe(T0 + RETENTION)
+        expect(await pmrStore(locator, testEnv).readInactive()).toEqual({
+            inactiveAt: T0,
+            destroyAt: T0 + RETENTION,
+        })
+    })
+
+    it("deactivate with no active registration returns null and changes nothing", async () => {
+        const dir = directory()
+        const did = freshDID()
+        expect(await dir.deactivate(did, T0, "loc")).toBeNull()
+        expect(await testEnv.pmrDirectory.get(did)).toBeNull()
+    })
+
+    it("deactivate does nothing when the active registration is not the expected one", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const first = await dir.create(did, fields(did, 1))
+        await dir.deactivate(did, T0, first)
+        const second = await dir.create(did, fields(did, 2))
+
+        expect(await dir.deactivate(did, T0 + 1, first)).toBeNull()
+        expect((await dir.registrations(did, T0 + 1)).active).toBe(second)
+        expect(await pmrStore(second, testEnv).readInactive()).toBeNull()
+    })
+
+    it("registrations omits inactive entries past retention", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const locator = await dir.create(did, fields(did, 1))
+        await dir.deactivate(did, T0, locator)
+        expect((await dir.registrations(did, T0 + RETENTION - 1)).inactive).toHaveLength(1)
+        expect((await dir.registrations(did, T0 + RETENTION)).inactive).toHaveLength(0)
+    })
+
+    it("past the inactive cap, deactivate destroys the oldest inactive registration", async () => {
+        const dir = new KVDirectory(testEnv, {
+            inactiveRetentionSeconds: RETENTION,
+            maxInactive: 2,
+        })
+        const did = freshDID()
+        const locators: string[] = []
+        for (let n = 1; n <= 3; n++) {
+            locators.push(await dir.create(did, fields(did, n)))
+            await dir.deactivate(did, T0 + n, locators[n - 1]!)
+        }
+        const set = await dir.registrations(did, T0 + 3)
+        expect(set.inactive.map((e) => e.locator)).toEqual([locators[2], locators[1]])
+        expect(await pmrStore(locators[0]!, testEnv).load()).toBeNull()
+        expect(await pmrStore(locators[1]!, testEnv).load()).not.toBeNull()
+    })
+
+    it("create after deactivate allocates a fresh object and keeps the inactive set", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const first = await dir.create(did, fields(did, 1))
+        await dir.deactivate(did, T0, first)
+        const second = await dir.create(did, fields(did, 2))
+
+        expect(second).not.toBe(first)
+        const set = await dir.registrations(did, T0)
+        expect(set.active).toBe(second)
+        expect(set.inactive.map((e) => e.locator)).toEqual([first])
+        expect(await dir.create(did, fields(did, 2))).toBe(second)
+    })
+
+    function cose(fill: number): RegistrationFields {
+        return {
+            did: "",
+            anchorKey: encodeOkpEd25519Key({ x: new Uint8Array(32).fill(fill) }),
+            lastActive: T0,
+        }
+    }
+    const thumb = (fill: number) =>
+        thumbprintOkpEd25519({ x: new Uint8Array(32).fill(fill) })
+
+    it("deregister tombstones only that anchor", async () => {
+        const dir = directory()
+        const did = freshDID()
+        await dir.create(did, { ...cose(1), did })
+
+        await dir.deregister(did, thumb(2))
+        expect(await dir.resolve(did)).not.toBeNull()
+        expect(await dir.isTombstoned(did, thumb(2))).toBe(false)
+
+        await dir.deregister(did, thumb(1))
+        expect(await dir.resolve(did)).toBeNull()
+        expect(await dir.isTombstoned(did, thumb(1))).toBe(true)
+        expect(await dir.isTombstoned(did, thumb(2))).toBe(false)
+        expect(await dir.isTombstoned(freshDID(), thumb(1))).toBe(false)
+    })
+
+    it("a tombstone survives a later deactivate or create of the row", async () => {
+        const dir = directory()
+        const did = freshDID()
+        await dir.create(did, { ...cose(1), did })
+        await dir.deregister(did, thumb(1))
+        const second = await dir.create(did, { ...cose(2), did })
+        await dir.deactivate(did, T0, second)
+        await dir.create(did, { ...cose(3), did })
+        expect(await dir.isTombstoned(did, thumb(1))).toBe(true)
     })
 })
