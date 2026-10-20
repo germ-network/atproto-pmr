@@ -1,6 +1,6 @@
 /**
  * An inactive registration: terminal, no new mail of any kind, its backlog
- * kept for its own key until the retention deadline, then destroyed.
+ * kept unread until the retention deadline, then destroyed.
  */
 import { env, runDurableObjectAlarm } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
@@ -78,7 +78,7 @@ describe("an inactive registration", () => {
         })
     })
 
-    it("keeps its backlog readable and acknowledgeable", async () => {
+    it("keeps its stored backlog until the deadline", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.append("did:plc:sender", ref("m1"), freshNonce(), T0)
             await pmr.markInactive(T0, DEADLINE)

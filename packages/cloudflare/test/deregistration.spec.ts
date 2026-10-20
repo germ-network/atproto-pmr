@@ -128,6 +128,7 @@ describe("deregistration", () => {
         await directory.deregister(did, thumb(key2))
 
         expect(await directory.resolve(did)).toBeNull()
+        expect(JSON.parse((await testEnv.pmrDirectory.get(did))!).i.map((e: { l: string }) => e.l)).toEqual([first])
         expect(await pmrStore(first, testEnv).readInactive()).not.toBeNull()
         expect(await pmrStore(first, testEnv).load()).not.toBeNull()
     })

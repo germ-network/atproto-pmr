@@ -199,6 +199,16 @@ describe("registration sets", () => {
         expect(await pmrStore(second, testEnv).readInactive()).toBeNull()
     })
 
+    it("a retried deactivate records the object's first times in the row", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const locator = await dir.create(did, fields(did, 1))
+        await pmrStore(locator, testEnv).markInactive(T0, T0 + 99)
+        await dir.deactivate(did, T0 + 500, locator)
+        const row = JSON.parse((await testEnv.pmrDirectory.get(did))!)
+        expect(row.i).toEqual([{ l: locator, at: T0, until: T0 + 99 }])
+    })
+
     it("deactivate drops inactive entries past retention from the row", async () => {
         const dir = directory()
         const did = freshDID()

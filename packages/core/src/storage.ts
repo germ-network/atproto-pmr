@@ -340,21 +340,9 @@ export type VerifiedAnchorObservation =
     | { state: "absent" }
     | { state: "unknown" }
 
-/**
- * A registration the monitor's verified view retired. Terminal: it accepts no
- * new mail and never becomes active again; its backlog is kept, unread, until
- * `destroyAt`, then destroyed.
- */
-export interface InactiveRegistration {
-    locator: Locator
-    inactiveAt: number
-    /** Fixed once, at deactivation: the backlog is destroyed then. */
-    destroyAt: number
-}
-
 /** Global, small, read on every inbound request. */
 export interface Directory {
-    /** Hot path: routes every pair put. The active registration only. */
+    /** Hot path: routes every pair put and every owner request. The active registration only. */
     resolve(did: string): Promise<Locator | null>
 
     /**

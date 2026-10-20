@@ -19,6 +19,7 @@ import {
     asPairMailboxKey,
     encodeBinding,
     handleRegistrationCreate,
+    handleRegistrationDelete,
     parseOkpEd25519Key,
     thumbprintOkpEd25519,
     signRequest,
@@ -181,6 +182,27 @@ describe("a same declared key stays an idempotent in-place refresh", () => {
 })
 
 describe("tombstones and monitor-retired registrations", () => {
+    it("DELETE /registration tombstones the authenticated anchor", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key = ed25519.utils.randomSecretKey()
+        await register(did, key, challenges, directory)
+
+        const url = "https://relay.example/pmr/v1/registration"
+        const nonce = await challengeFor(challenges, did)
+        const parts = signRequest({ method: "DELETE", url, nonce, keyid: "t", secretKey: key })
+        const response = await handleRegistrationDelete(
+            new Request(url, { method: "DELETE", headers: parts.headers }),
+            deps(challenges, async () => null)
+        )
+        expect(response.status).toBe(204)
+        expect(await directory.resolve(did)).toBeNull()
+        expect(
+            await directory.isTombstoned(did, thumbprintOkpEd25519({ x: ed25519.getPublicKey(key) }))
+        ).toBe(true)
+    })
+
     it("a deregistered anchor cannot register again, another key of the DID can", async () => {
         const did = freshDID()
         const directory = new KVDirectory(testEnv)

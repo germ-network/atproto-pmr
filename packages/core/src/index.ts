@@ -40,7 +40,6 @@ export type {
     ResolvedAddress,
     VerificationHint,
     WatchState,
-    InactiveRegistration,
     VerifiedAnchorObservation,
 } from "./storage"
 
