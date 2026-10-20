@@ -10,7 +10,7 @@ import type { PMRStore } from "./storage.js"
  * A read slower than `BLOCK_SYNC_DEADLINE_MS` counts as a failed one, so a
  * slow monitor never stalls a catch-up.
  *
- * Never throws and never lifts a block it cannot see: with no source, an
+ * Never throws and never lifts a block: with no source, an
  * owner whose graph is not served (`ownBlocks` null), or a failed read, the
  * mirror is left as it was and delivery proceeds on the last-known blocks.
  * Subjects that are not DIDs a storage key can hold are skipped, so one bad

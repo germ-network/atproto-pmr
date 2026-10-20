@@ -861,9 +861,17 @@ a sender the recipient blocks on Bsky as blocked: it clears the sender's
 queued and pooled messages and handles later puts on the synthetic path. It
 applies a block it sees at accept immediately, and one made since no later
 than the next catch-up (socket drain, first page of the message catch-up,
-pool listing). A Bsky unblock lifts only a block the relay set from Bsky; a
-block the device set stands until the device lifts it, and a device unblock
-holds only until the relay next sees the Bsky block, at the sender's next put. `GET /pmr/v1/blocks` lists all
+pool listing). A relay MUST NOT lift a block because it no longer sees the
+Bsky block, or because a verdict admits the sender: neither proves the recipient unblocked.
+Only a device unblock lifts a block, whoever set it. A device block takes a
+mirrored one over, and a device unblock holds only until the relay next sees
+the Bsky block, at the sender's next put or the catch-up after it (a put the
+verdict does not block leaves a pool entry or an admitted mailbox, which the
+next sync re-blocks). `bs` can therefore hold senders the recipient has
+since unblocked on Bsky; the device compares `bs` with its own
+`app.bsky.graph.block` records (the summary's block list is a hint of the
+same kind) and lifts a stale entry with `DELETE /pmr/v1/blocks/{did}`.
+`GET /pmr/v1/blocks` lists all
 blocked senders in `b` and those the relay has mirrored from Bsky in `bs`
 (the summary's block list is the owner's full list); a client
 republishing its block list to a new relay publishes only its own. The first

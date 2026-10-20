@@ -21,6 +21,9 @@ function recordingStore(log: string[] = []) {
             log.push("sync")
             synced.push(set)
         },
+        unblock: async () => {
+            log.push("unblock")
+        },
         openMailboxes: async () => {
             log.push("openMailboxes")
             return { entries: [], nextCursor: null }
@@ -57,6 +60,17 @@ describe("syncOwnerBlocks", () => {
             ],
         })
         expect(synced).toEqual([new Set(["did:plc:ok"])])
+    })
+
+    it("a block row that leaves ownBlocks reaches the store only as a smaller set, never as an unblock", async () => {
+        const { store, synced, log } = recordingStore()
+        let edges = [edge("did:plc:a"), edge("did:plc:b")]
+        const source = { ownBlocks: async () => edges }
+        await syncOwnerBlocks(store, OWNER, source)
+        edges = [edge("did:plc:a")]
+        await syncOwnerBlocks(store, OWNER, source)
+        expect(synced).toEqual([new Set(["did:plc:a", "did:plc:b"]), new Set(["did:plc:a"])])
+        expect(log).not.toContain("unblock")
     })
 
     it("does nothing without a blocks source", async () => {

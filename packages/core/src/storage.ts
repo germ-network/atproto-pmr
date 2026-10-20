@@ -192,7 +192,8 @@ export type ReceiveResult =
 
 /**
  * Who set a relay block. A `bsky` marker mirrors the owner's Bsky block and
- * is lifted when that block is; a `device` marker is lifted only by the device.
+ * is not lifted by the relay's own view of Bsky; only a device unblock lifts a
+ * block, whichever marker it carries.
  */
 export type BlockSource = "device" | "bsky"
 
@@ -532,9 +533,8 @@ export interface PMRStore {
      *  - a `blocked` admission mirrors the Bsky block (`block(key, now,
      *    "bsky")`; no marker is written over a device block) and the put is
      *    absorbed synthetically;
-     *  - only a `yes` lifts a `bsky` marker the relay holds for the sender:
-     *    no other verdict proves the Bsky block is gone (an unavailable read
-     *    is `unknown`), so a Bsky-blocked sender stays synthetic otherwise;
+     *  - no verdict lifts a block marker: a Bsky-blocked sender stays
+     *    synthetic until the device unblocks it;
      *  - a device-blocked sender is absorbed synthetically;
      *  - a device-provisioned sender is appended, whatever the verdict;
      *  - `yes` appends to a mailbox marked admitted, opened if none is held,
@@ -640,18 +640,18 @@ export interface PMRStore {
      * The behavior this switches on comes from `SyntheticBehavior`.
      *
      * `source` defaults to `device`. A device block of a sender already
-     * blocked from Bsky takes the marker over, so a Bsky unblock no longer
-     * lifts it; a Bsky block of a device-blocked sender changes nothing.
+     * blocked from Bsky takes the marker over, so it leaves the Bsky-mirrored
+     * set; a Bsky block of a device-blocked sender changes nothing.
      * `unblock` removes the marker whoever set it.
      */
     block(key: PairMailboxKey, nowSeconds: number, source?: BlockSource): Promise<void>
 
     /**
      * Mirror the owner's current Bsky blocks: block (`bsky`) every sender in
-     * `blocked` the relay holds a mailbox or pool entry for, and lift every
-     * `bsky` marker whose sender is no longer in `blocked`. A `device` marker
-     * is never lifted here. Walks the relay's own keys, not `blocked`, so the
-     * cost follows what the relay holds rather than how many the owner blocks.
+     * `blocked` the relay holds a mailbox or pool entry for. Never lifts a
+     * marker: absence from `blocked` proves nothing. Walks the relay's own keys,
+     * not `blocked`, so the cost follows what the relay holds rather than how
+     * many the owner blocks.
      */
     syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void>
 
