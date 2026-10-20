@@ -176,21 +176,3 @@ describe("applyDeclarationOutcome enforces the monotonic-rev watermark", () => {
         })
     })
 })
-
-describe("inactivity is terminal", () => {
-    it("an inactive registration never returns to active on a present re-check", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.markInactive(T0, Math.floor(Date.now() / 1000) + 3600)
-            await pmr.applyDeclarationOutcome("absent", T0 + 1, "3m1")
-            await pmr.applyDeclarationOutcome("present", T0 + 2, "3m2")
-            expect((await pmr.readWatchState()).paused).toBe(false)
-
-            const r = await pmr.receive("did:plc:sender", ref("m1"), freshNonce(), T0 + 3, {
-                verdict: "yes",
-            })
-            expect(r.outcome === "queued" && r.persistBody).toBe(false)
-            expect(await pmr.list("did:plc:sender", 100)).toHaveLength(0)
-            expect((await pmr.readInactive())?.inactiveAt).toBe(T0)
-        })
-    })
-})

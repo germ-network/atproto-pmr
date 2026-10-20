@@ -5,7 +5,7 @@
  * Germ declaration; when the declared anchor key disappears it **pauses**
  * rather than tears down — it keeps queuing all mail and keeps watching that
  * one declaration to see whether the key returns. Only a monitor-verified
- * change makes a registration inactive (`registration-lifecycle.ts`); this
+ * change retires a registration (`registration-lifecycle.ts`); this
  * watch never does.
  *
  * This module is the platform-neutral decision logic: pure functions over a

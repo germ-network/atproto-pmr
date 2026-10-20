@@ -54,10 +54,10 @@ exact signatures belong to an implementation.
 |---|---|
 | `resolve(did) -> Locator?` | hot path; routes every pair put and every owner request |
 | `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
-| `create(did, registration) -> Locator` | idempotent on the DID's active registration; keeps its inactive set |
-| `delete(did)` | removes and destroys the DID's active registration (a new key's registration replaces it this way); inactive registrations and tombstones are untouched |
-| `deactivate(did, now, expectedActive) -> Locator?` | retires the active registration, if it is `expectedActive`, to inactive for the retention period; past the per-DID cap the oldest inactive one is destroyed. Marks the registration before the directory moves it, so a crash never leaves an inactive entry that still accepts mail |
-| `deregister(did, anchorThumbprint)` | when the thumbprint is the active registration's anchor: tombstones it (write-once), removes and destroys the registration |
+| `create(did, registration) -> Locator` | idempotent on DID |
+| `delete(did)` | removes and destroys the DID's active registration with its mail: dormancy eviction, and the replace path of a new key's registration |
+| `retire(did, expectedActive) -> Locator?` | destroys the active registration with its mail if it is `expectedActive`, else does nothing; does not tombstone its anchor. Used only for a monitor-verified change of anchor or verified absence |
+| `deregister(did, anchorThumbprint)` | when the thumbprint is the active registration's anchor: tombstones it (write-once), then removes and destroys the registration |
 | `isTombstoned(did, anchorThumbprint) -> bool` | one lookup; a tombstone is never rewritten or removed |
 | `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not key monitoring, which is push-driven — see [Scheduling](#scheduling) |
 
@@ -67,9 +67,7 @@ exact signatures belong to an implementation.
 the Web Push subscription and content key this relay holds (if the
 deployment uses
 [push delivery](wire-api.md#push-delivery--web-push-optional)), policy
-configuration, a last-active timestamp, and record timestamps. An **inactive** registration
-additionally records when it became inactive and when it will be destroyed;
-from then it stores no new mail and destroys itself at that deadline.
+configuration, a last-active timestamp, and record timestamps.
 
 Registration state is an identity and trusted-key record, not a mailbox one
 ([`wire-api.md` §Registration](wire-api.md#registration)). There is no
@@ -103,8 +101,8 @@ DIDs, because it pauses when a declared key disappears
 (§[Registration state](#registration-state)): the last observed
 declaration revision, the last check time, the currently trusted anchor
 key, and the paused flag. A pause is reversible and still queues mail; only a
-monitor-verified change of anchor or verified absence of the record makes a
-registration inactive, and that never reverses. That is a relay concern and stays here; serving
+monitor-verified change of anchor or verified absence of the record retires
+the registration, which destroys it. That is a relay concern and stays here; serving
 monitoring *to others* is not.
 
 The **last observed declaration revision is a monotonic watermark**
@@ -308,8 +306,7 @@ state, which is evaluated when a put arrives and needs no sweep at all.
 
 What remains is work that must **enumerate** rather than wait on a timer —
 principally dormancy eviction, finding registrations quiet long enough to
-remove. An inactive registration's destruction at the end of its retention
-period is not enumerated: it is a timer the registration sets for itself. `dueForWork(kind, before, limit)` covers that, and an adapter
+remove. `dueForWork(kind, before, limit)` covers that, and an adapter
 serving mailboxes needs it.
 
 `scheduleWork(at, kind)` / `cancelWork(kind)` are offered for a backend with

@@ -60,7 +60,6 @@ const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
-const KEY_INACTIVE = "inactive"
 const KEY_MONITOR_CONFIRMED = "monitorConfirmed"
 
 /** One served summary state per entry, so storing one never rewrites another. */
@@ -430,31 +429,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
-    async markInactive(atSeconds: number, destroyAtSeconds: number): Promise<void> {
-        if ((await this.readInactive()) !== null) return
-        await this.db.put(KEY_INACTIVE, { inactiveAt: atSeconds, destroyAt: destroyAtSeconds })
-        await this.db.setAlarm(destroyAtSeconds * 1000)
-    }
-
     async isMonitorConfirmed(): Promise<boolean> {
         return (await this.db.get<boolean>(KEY_MONITOR_CONFIRMED)) === true
     }
 
     async markMonitorConfirmed(): Promise<void> {
         await this.db.put(KEY_MONITOR_CONFIRMED, true)
-    }
-
-    async readInactive(): Promise<{ inactiveAt: number; destroyAt: number } | null> {
-        return (
-            (await this.db.get<{ inactiveAt: number; destroyAt: number }>(KEY_INACTIVE)) ??
-            null
-        )
-    }
-
-    /** The inactive backlog's retention deadline: destroy everything. */
-    async alarm(): Promise<void> {
-        if ((await this.readInactive()) === null) return
-        await this.destroy()
     }
 
     // MARK: - The declaration watch
@@ -627,11 +607,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             return { outcome: "duplicate" }
         }
 
-        // Inactive is terminal: the same accepted response, no bytes, no nonce.
-        if ((await this.readInactive()) !== null) {
-            return { outcome: "appended", persistBody: false }
-        }
-
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         const result =
             blocked !== undefined
@@ -749,9 +724,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<ReceiveResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
-        if ((await this.readInactive()) !== null) {
-            return { outcome: "queued", persistBody: false }
-        }
 
         let blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         if (admission.verdict === "blocked" && blocked === undefined) {
@@ -899,10 +871,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
-        }
-
-        if ((await this.readInactive()) !== null) {
-            return { outcome: "pooled", persistBody: false }
         }
 
         const discardedUntil = await this.db.get<number>(discardKey(key))
@@ -1212,12 +1180,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     // MARK: - Teardown
 
     /**
-     * Tear down all of this registration's stored state, including any
-     * pending retention alarm. Reached by locator, not by DID: the caller has
-     * already removed the routing row, or the retention alarm fired.
+     * Tear down all of this registration's stored state. Reached by locator,
+     * not by DID: the caller has already removed the routing row.
      */
     async destroy(): Promise<void> {
-        await this.db.deleteAlarm()
         await this.db.deleteAll()
     }
 }

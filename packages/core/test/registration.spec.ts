@@ -77,7 +77,7 @@ function world() {
             deleted.push(did)
             rows.delete(did)
         },
-        async deactivate() {
+        async retire() {
             return null
         },
         async deregister() {},

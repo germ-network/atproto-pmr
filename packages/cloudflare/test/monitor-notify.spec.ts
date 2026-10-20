@@ -17,7 +17,6 @@ import type { MonitorIngestStub } from "./worker"
 
 const testEnv = env as unknown as PMREnv<PMRObject>
 
-const T0 = Math.floor(Date.now() / 1000)
 
 let didCounter = 0
 /** A fresh DID per test — the ingest stub's record persists across tests. */
@@ -66,13 +65,13 @@ describe("KVDirectory monitor notify", () => {
         expect((await ingest().rowSeen())[`unregister:${did}`]).toBe(false)
     })
 
-    it("deactivate and deregister notify unregister when bound", async () => {
+    it("retire and deregister notify unregister when bound", async () => {
         const x = new Uint8Array(32).fill(5)
         const directory = new KVDirectory(testEnv)
 
         const a = freshDID()
         const locator = await directory.create(a, registration(a))
-        await directory.deactivate(a, T0, locator)
+        await directory.retire(a, locator)
         expect(await callsFor(a)).toEqual([`register:${a}`, `unregister:${a}`])
 
         const b = freshDID()

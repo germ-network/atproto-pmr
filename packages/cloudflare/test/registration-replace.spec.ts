@@ -222,17 +222,17 @@ describe("tombstones and monitor-retired registrations", () => {
         await register(did, ed25519.utils.randomSecretKey(), challenges, directory)
     })
 
-    it("re-registering the anchor of a monitor-retired registration creates a fresh active one", async () => {
+    it("re-registering the anchor of a monitor-retired registration creates a fresh one", async () => {
         const did = freshDID()
         const directory = new KVDirectory(testEnv)
         const challenges = memoryChallenges()
         const key = ed25519.utils.randomSecretKey()
         const retired = await register(did, key, challenges, directory)
-        await directory.deactivate(did, Math.floor(Date.now() / 1000), retired)
+        await directory.retire(did, retired)
 
         const fresh = await register(did, key, challenges, directory)
         expect(fresh).not.toBe(retired)
-        expect(await pmrStore(retired, testEnv).readInactive()).not.toBeNull()
-        expect(await pmrStore(fresh, testEnv).readInactive()).toBeNull()
+        expect(await pmrStore(retired, testEnv).load()).toBeNull()
+        expect(await pmrStore(fresh, testEnv).load()).not.toBeNull()
     })
 })

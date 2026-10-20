@@ -82,7 +82,7 @@ function world() {
         async delete(did) {
             registrations.delete(did)
         },
-        async deactivate() {
+        async retire() {
             return null
         },
         async deregister() {},

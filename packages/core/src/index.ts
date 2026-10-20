@@ -43,11 +43,7 @@ export type {
     VerifiedAnchorObservation,
 } from "./storage"
 
-export {
-    INACTIVE_BACKLOG_RETENTION_SECONDS,
-    MAX_INACTIVE_REGISTRATIONS,
-    applyVerifiedAnchorObservation,
-} from "./registration-lifecycle"
+export { applyVerifiedAnchorObservation } from "./registration-lifecycle"
 
 // The own-DID declaration watch — pause-not-teardown decision logic.
 export {

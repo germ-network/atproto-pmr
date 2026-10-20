@@ -9,18 +9,17 @@ import { applyVerifiedAnchorObservation } from "../src/registration-lifecycle"
 
 const DID = "did:plc:lifecycle"
 const LOC = "loc:active"
-const T0 = 1_760_000_000
 const keyOf = (fill: number) => encodeOkpEd25519Key({ x: new Uint8Array(32).fill(fill) })
 
 function world(opts: { active?: string | null; confirmed?: boolean } = {}) {
-    const deactivated: Array<[string, number, string]> = []
+    const retired: Array<[string, string]> = []
     let confirmed = opts.confirmed ?? true
     return {
-        deactivated,
+        retired,
         confirmed: () => confirmed,
         directory: {
-            deactivate: async (did: string, now: number, expected: string) => {
-                deactivated.push([did, now, expected])
+            retire: async (did: string, expected: string) => {
+                retired.push([did, expected])
                 return opts.active === undefined ? LOC : opts.active
             },
         },
@@ -34,19 +33,19 @@ function world(opts: { active?: string | null; confirmed?: boolean } = {}) {
 }
 
 const apply = (w: ReturnType<typeof world>, observation: Parameters<typeof applyVerifiedAnchorObservation>[5], active = keyOf(1)) =>
-    applyVerifiedAnchorObservation(w.directory, w.store, DID, LOC, active, observation, T0)
+    applyVerifiedAnchorObservation(w.directory, w.store, DID, LOC, active, observation)
 
 describe("applyVerifiedAnchorObservation", () => {
     it("a verified different anchor retires the active registration", async () => {
         const w = world()
         expect(await apply(w, { state: "present", anchorKey: keyOf(2) })).toBe("retired")
-        expect(w.deactivated).toEqual([[DID, T0, LOC]])
+        expect(w.retired).toEqual([[DID, LOC]])
     })
 
     it("a verified record-level absence retires the active registration", async () => {
         const w = world()
         expect(await apply(w, { state: "absent" })).toBe("retired")
-        expect(w.deactivated).toHaveLength(1)
+        expect(w.retired).toHaveLength(1)
     })
 
     it("the same verified anchor changes nothing, even re-encoded", async () => {
@@ -62,13 +61,13 @@ describe("applyVerifiedAnchorObservation", () => {
         )
         expect(reencoded).not.toEqual(keyOf(1))
         expect(await apply(w, { state: "present", anchorKey: reencoded })).toBe("unchanged")
-        expect(w.deactivated).toEqual([])
+        expect(w.retired).toEqual([])
     })
 
     it("unknown changes nothing", async () => {
         const w = world()
         expect(await apply(w, { state: "unknown" })).toBe("unchanged")
-        expect(w.deactivated).toEqual([])
+        expect(w.retired).toEqual([])
     })
 
     it("reports unchanged when the directory retired nothing", async () => {
@@ -85,7 +84,7 @@ describe("applyVerifiedAnchorObservation", () => {
         const w = world({ confirmed: false })
         expect(await apply(w, { state: "present", anchorKey: keyOf(2) })).toBe("unchanged")
         expect(await apply(w, { state: "absent" })).toBe("unchanged")
-        expect(w.deactivated).toEqual([])
+        expect(w.retired).toEqual([])
         expect(w.confirmed()).toBe(false)
     })
 

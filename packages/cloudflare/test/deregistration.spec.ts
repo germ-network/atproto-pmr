@@ -115,21 +115,4 @@ describe("deregistration", () => {
         expect((await register(did, ed25519.utils.randomSecretKey(), directory)).status).toBe(201)
         expect(await directory.resolve(did)).not.toBeNull()
     })
-
-    it("leaves the DID's inactive registrations as they were", async () => {
-        const did = freshDID()
-        const directory = new KVDirectory(testEnv)
-        const key1 = ed25519.utils.randomSecretKey()
-        const key2 = ed25519.utils.randomSecretKey()
-        await register(did, key1, directory)
-        const first = (await directory.resolve(did))!
-        await directory.deactivate(did, T0, first)
-        await register(did, key2, directory)
-        await directory.deregister(did, thumb(key2))
-
-        expect(await directory.resolve(did)).toBeNull()
-        expect(JSON.parse((await testEnv.pmrDirectory.get(did))!).i.map((e: { l: string }) => e.l)).toEqual([first])
-        expect(await pmrStore(first, testEnv).readInactive()).not.toBeNull()
-        expect(await pmrStore(first, testEnv).load()).not.toBeNull()
-    })
 })

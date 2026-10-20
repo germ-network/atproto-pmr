@@ -6,8 +6,6 @@ import {
     type MonitorRegistrationNotify,
     type PMRStore,
     type RegistrationFields,
-    INACTIVE_BACKLOG_RETENTION_SECONDS,
-    MAX_INACTIVE_REGISTRATIONS,
     type ResolvedAddress,
     parseOkpEd25519Key,
     thumbprintOkpEd25519,
@@ -17,16 +15,6 @@ import type { PMRObject } from "./pmr-object"
 
 /** Minimum TTL Cloudflare KV accepts, seconds. Below this it errors. */
 const MIN_KV_TTL_SECONDS = 60
-
-/** The DID's row: one active registration and its inactive ones, newest first. */
-interface DirectoryRow {
-    a?: { l: Locator }
-    i: Array<{
-        l: Locator
-        at: number
-        until: number
-    }>
-}
 
 interface GrantAddressRow {
     locator: string
@@ -54,44 +42,10 @@ function ttlFor(expiresAt: number): number {
 export class KVDirectory<TPMR extends PMRObject = PMRObject>
     implements Directory
 {
-    constructor(
-        private readonly env: PMREnv<TPMR>,
-        private readonly lifecycle: {
-            inactiveRetentionSeconds: number
-            maxInactive: number
-        } = {
-            inactiveRetentionSeconds: INACTIVE_BACKLOG_RETENTION_SECONDS,
-            maxInactive: MAX_INACTIVE_REGISTRATIONS,
-        }
-    ) {}
+    constructor(private readonly env: PMREnv<TPMR>) {}
 
     async resolve(did: string): Promise<Locator | null> {
-        return (await this.readRow(did)).a?.l ?? null
-    }
-
-    /** A bare locator string is a row written before registration sets: one active registration. */
-    private async readRow(did: string): Promise<DirectoryRow> {
-        const raw = await this.env.pmrDirectory.get(did)
-        if (raw === null) return { i: [] }
-        if (!raw.startsWith("{")) return { a: { l: raw }, i: [] }
-        const row = JSON.parse(raw) as Partial<DirectoryRow>
-        return { a: row.a, i: row.i ?? [] }
-    }
-
-    private async writeRow(did: string, row: DirectoryRow): Promise<void> {
-        if (row.a === undefined && row.i.length === 0) {
-            await this.env.pmrDirectory.delete(did)
-            return
-        }
-        await this.env.pmrDirectory.put(did, JSON.stringify(row))
-    }
-
-    private async destroyQuietly(locator: Locator, did: string): Promise<void> {
-        try {
-            await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
-        } catch (err) {
-            console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
-        }
+        return (await this.env.pmrDirectory.get(did)) ?? null
     }
 
     /**
@@ -181,67 +135,56 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         }
     }
 
-    /** Idempotent on the active registration; the inactive set is kept. */
+    /** Idempotent on DID. */
     async create(
         did: string,
         registration: RegistrationFields
     ): Promise<Locator> {
-        const row = await this.readRow(did)
-        if (row.a !== undefined) {
+        const existing = await this.resolve(did)
+        if (existing !== null) {
             await this.notifyMonitor("register", did)
-            return row.a.l
+            return existing
         }
 
         const id = this.env.pmrs.newUniqueId()
         const locator = id.toString()
-        await this.writeRow(did, { a: { l: locator }, i: row.i })
+        await this.env.pmrDirectory.put(did, locator)
         await this.env.pmrs.get(id).update(registration)
         await this.notifyMonitor("register", did)
         return locator
     }
 
-    /** Removes the active registration and destroys it; the inactive set stays. */
+    /** Unlinks the DID, then tears down the DO's storage — best-effort. */
     async delete(did: string): Promise<void> {
-        const row = await this.readRow(did)
-        if (row.a === undefined) return
-        // Unlink first: the authoritative step. A crash before the teardown
-        // leaves an orphaned object, never a row pointing at a wiped one.
-        await this.writeRow(did, { i: row.i })
-        await this.destroyQuietly(row.a.l, did)
-        await this.notifyMonitor("unregister", did)
+        const locator = await this.resolve(did)
+        if (locator === null) return
+        await this.unlinkAndDestroy(did, locator)
     }
 
-    async deactivate(
-        did: string,
-        nowSeconds: number,
-        expectedActive: Locator
-    ): Promise<Locator | null> {
-        const row = await this.readRow(did)
-        if (row.a === undefined || row.a.l !== expectedActive) return null
-        const locator = row.a.l
+    async retire(did: string, expectedActive: Locator): Promise<Locator | null> {
+        if ((await this.resolve(did)) !== expectedActive) return null
+        await this.unlinkAndDestroy(did, expectedActive)
+        return expectedActive
+    }
 
-        const store = this.env.pmrs.get(this.env.pmrs.idFromString(locator))
-        await store.markInactive(
-            nowSeconds,
-            nowSeconds + this.lifecycle.inactiveRetentionSeconds
-        )
-        // A retried deactivate keeps the object's first times; the row follows.
-        const marked = (await store.readInactive())!
-
-        const live = row.i.filter((e) => e.until > nowSeconds)
-        live.unshift({ l: locator, at: marked.inactiveAt, until: marked.destroyAt })
-        const evicted = live.splice(this.lifecycle.maxInactive)
-        await this.writeRow(did, { i: live })
-        for (const e of evicted) await this.destroyQuietly(e.l, did)
-
+    private async unlinkAndDestroy(did: string, locator: Locator): Promise<void> {
+        // Unlink first: this is the authoritative step. A crash between here and the
+        // teardown below degrades to an orphaned-but-intact DO, never to a routing
+        // row pointing at a half-wiped DO.
+        await this.env.pmrDirectory.delete(did)
+        try {
+            await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
+        } catch (err) {
+            // Best-effort reclamation: a failed teardown just leaves the orphan, it
+            // must not fail the deregistration/replace.
+            console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
+        }
         await this.notifyMonitor("unregister", did)
-        return locator
     }
 
     async deregister(did: string, anchorThumbprint: Uint8Array): Promise<void> {
-        const row = await this.readRow(did)
-        if (row.a === undefined) return
-        const locator = row.a.l
+        const locator = await this.resolve(did)
+        if (locator === null) return
         const fields = await this.env.pmrs
             .get(this.env.pmrs.idFromString(locator))
             .load()
@@ -258,9 +201,7 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         if ((await this.env.pmrDirectory.get(key)) === null) {
             await this.env.pmrDirectory.put(key, "1")
         }
-        await this.writeRow(did, { i: row.i })
-        await this.destroyQuietly(locator, did)
-        await this.notifyMonitor("unregister", did)
+        await this.unlinkAndDestroy(did, locator)
     }
 
     async isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean> {

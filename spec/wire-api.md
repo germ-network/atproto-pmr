@@ -372,14 +372,6 @@ everything such a component needs, and a parallel mechanism would be a
 second place for the trusted key to be wrong.
 
 A registration lives while the anchor key stays in the DID's declaration.
-A DID has at most one **active** registration and a bounded set of
-**inactive** ones, each a separate store; registrations under different
-anchor keys are unrelated. Nothing of one (queued mail, blocks, grants, any
-other per-registration state) is visible to or carried into another, so a
-device that registers a new key **MUST** re-send its block set to the new
-registration. Registering a different anchor key replaces the prior active
-registration and its mail.
-
 An implementation SHOULD monitor that declaration, and when the declared key
 disappears it SHOULD **pause** rather than tear down: stop acting on behalf
 of the DID and continue monitoring that one DID's declaration to see
@@ -387,21 +379,19 @@ whether the key returns. A paused registration still **queues** all mail it
 is sent — pair, pool and grant alike — so nothing is lost while the key is
 away, and unpausing changes nothing about what it holds.
 
-A registration becomes **inactive** only on a verified observation: the
+A registration is **retired** only on a verified observation: the
 declaration, as proven by a monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface)),
-names a different anchor key, or the record is verifiably absent from a
-live repo. A repo-level state (deactivated, taken down, suspended) and an
-observation the monitor could not verify only pause. Inactive is terminal:
-the registration accepts no new mail of any kind and never becomes active
-again.
+names a different anchor key, or the record is verifiably absent from a live
+repo. A repo-level state (deactivated, taken down, suspended) and an
+observation the monitor could not verify only pause. A retired registration
+is destroyed with its queued mail; the same anchor key may register again
+later and gets a new registration.
 
-An inactive registration's queued mail is retained, unread, for at least
-**30 days** from inactivation (the retention period is
-[implementation-defined](#limits-are-implementation-defined), but no shorter
-than that); after that the relay destroys the backlog. A relay bounds the
-inactive registrations it keeps per DID and destroys the oldest early past
-that bound. Registering the anchor of an inactive registration creates a new
-active registration; the inactive one stays inactive.
+Registrations under different anchor keys are unrelated. Nothing of one
+(queued mail, blocks, grants, any other per-registration state) is visible to
+or carried into another, so a device that registers a new key **MUST**
+re-send its block set to the new registration. Registering a different anchor
+key replaces the prior registration and its mail.
 
 **Deregistration** (`DELETE /pmr/v1/registration`) destroys the registration
 and **tombstones its anchor key**, identified by its RFC 9679 COSE Key
@@ -411,8 +401,7 @@ another anchor key of the same DID may still register.
 
 Per-DID state MUST be keyed by **DID**, never by anchor key, so that key
 replacement does not foreclose either possible future semantics (rebind
-under a fresh challenge, or a fresh registration). What the DID's directory
-entry points to is one active registration and the bounded inactive set.
+under a fresh challenge, or a fresh registration).
 
 ### Grants — the core capability
 
@@ -1851,8 +1840,7 @@ The owner-facing error **body** format is
 
 ## Limits are implementation-defined
 
-Message and attachment size caps, attachment budgets, retention windows
-(an inactive registration's backlog is kept at least 30 days, as above),
+Message and attachment size caps, attachment budgets, retention windows,
 recovery-pool sizing, discard-window length, challenge TTL, and dormancy
 policy are implementation-defined. The operator picks them and advertises
 the peer-visible ones in the enabler document. No constants appear in
