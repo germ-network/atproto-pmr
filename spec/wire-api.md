@@ -399,10 +399,6 @@ thumbprint. Mail for the destroyed registration is dropped, and that anchor
 cannot register again. The tombstone covers that one key, not the DID:
 another anchor key of the same DID may still register.
 
-Per-DID state MUST be keyed by **DID**, never by anchor key, so that key
-replacement does not foreclose either possible future semantics (rebind
-under a fresh challenge, or a fresh registration).
-
 ### Grants — the core capability
 
 | method | path | notes |
