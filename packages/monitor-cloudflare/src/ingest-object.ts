@@ -1020,9 +1020,10 @@ export class MonitorIngest
             )
             return { outcome: "duplicate" }
         }
+        // A new event is news about the DID: it ends any retry backoff.
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before, owed_at) VALUES (?, ?, 0, 0, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, attempts = 0, not_before = 0",
             event.did,
             event.rev,
             Date.now()
@@ -1039,7 +1040,7 @@ export class MonitorIngest
     async owe(did: string, rev: string): Promise<void> {
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before, owed_at) VALUES (?, ?, 0, 0, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, attempts = 0, not_before = 0",
             did,
             rev,
             Date.now()
@@ -3295,7 +3296,9 @@ export class MonitorIngest
     }
 
     private verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
-        if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
+        if (record.signingKey === null) {
+            return Promise.resolve({ kind: "unverifiable", reason: "no #atproto signing key" })
+        }
         try {
             const outcome = verifyRecordProofOutcome(record.car, {
                 did: ref.did,
@@ -3309,7 +3312,9 @@ export class MonitorIngest
                     : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
             )
         } catch (err) {
-            if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
+            if (err instanceof RepoProofError) {
+                return Promise.resolve({ kind: "unverifiable", reason: err.message })
+            }
             throw err
         }
     }
@@ -3505,6 +3510,16 @@ export class MonitorIngest
                 }
                 return SETTLE_RETRY_CAP_MS
             },
+            onSettleFailure: ({ did, attempts, failure, notBeforeMs }) =>
+                console.warn("monitor: settle deferred", {
+                    did,
+                    attempts,
+                    kind: failure.kind,
+                    ...(failure.kind === "threw"
+                        ? { error: `${failure.errorName}: ${failure.message}` }
+                        : { reason: failure.reason }),
+                    notBefore: new Date(notBeforeMs).toISOString(),
+                }),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),

@@ -2908,9 +2908,9 @@ describe("verifying a fetched record", () => {
             key,
             records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
         })
-        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(repo.car, null))).toEqual({ kind: "unverifiable" })
+        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(repo.car, null))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
     })
 
     it("the snapshot store round-trips verifiedWith, cid and seenKey", async () => {

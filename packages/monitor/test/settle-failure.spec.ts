@@ -3,9 +3,12 @@ import {
     settle,
     settleDue,
     settleRetryBackoffMs,
+    PENDING_FAILURE_MESSAGE_MAX,
     SETTLE_RETRY_CAP_MS,
+    type SettleFailureEvent,
     type IngestDeps,
 } from "../src/ingest"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import type { MonitorIndex, PendingFailure } from "../src/storage"
 
 const DID = "did:plc:alice"
@@ -83,7 +86,7 @@ function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
     }
     const owe = (did: string, attempts = 0, quiet = false) =>
         void pending.set(did, { rev: "3m2", attempts, notBeforeMs: 0, quiet })
-    return { deps, pending, deferrals, attempted, cleared, owe }
+    return { deps, pending, revs, deferrals, attempted, cleared, owe }
 }
 
 const unverifiable: IngestDeps["verify"] = async () => ({ kind: "unverifiable" })
@@ -167,14 +170,159 @@ describe("settle retry backoff", () => {
     })
 })
 
+function spy() {
+    const events: SettleFailureEvent[] = []
+    return { events, onSettleFailure: (e: SettleFailureEvent) => void events.push(e) }
+}
+
 describe("settle failure reporting", () => {
-    it.todo("a throwing settle reports one event with the DID, attempts, error name and message, and not-before")
-    it.todo("a never-held unverifiable DID reports one event of kind unverifiable with the verifier's reason")
-    it.todo("the failure handed to deferPending is the one reported, with the attempts deferPending answered")
-    it.todo("no event when deferPending finds no pending row (settle outside the retry queue)")
-    it.todo("a long error message or unverifiable reason is truncated once, identically in the stored failure and the event")
-    it.todo("a confirmed deletion (RecordNotFoundError) reports nothing")
-    it.todo("a verified absence, a regression and a DID that left interest report nothing")
-    it.todo("a stored settle reports nothing")
-    it.todo("a throwing onSettleFailure does not stop the drain or lose the deferral")
+    it("a throwing settle reports one event with the DID, attempts, error name and message, and not-before", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({
+            onSettleFailure,
+            fetchRecord: async () => {
+                throw new TypeError("fetch failed")
+            },
+        })
+        h.owe(DID, 2)
+        await settleDue(h.deps)
+        expect(events).toEqual([
+            {
+                did: DID,
+                attempts: 3,
+                failure: { kind: "threw", errorName: "TypeError", message: "fetch failed", atMs: NOW },
+                notBeforeMs: NOW + settleRetryBackoffMs(2),
+            },
+        ])
+    })
+
+    it("a never-held unverifiable DID reports one event of kind unverifiable with the verifier's reason", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({
+            onSettleFailure,
+            verify: async () => ({ kind: "unverifiable", reason: "signature mismatch" }),
+        })
+        h.owe(DID, 0)
+        await settleDue(h.deps)
+        expect(events).toEqual([
+            {
+                did: DID,
+                attempts: 1,
+                failure: { kind: "unverifiable", reason: "signature mismatch", atMs: NOW },
+                notBeforeMs: NOW + 3_600_000,
+            },
+        ])
+    })
+
+    it("the failure handed to deferPending is the one reported, with the attempts deferPending answered", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({ onSettleFailure, fetchRecord: throwing })
+        h.owe(DID, 4)
+        const store = h.deps.index.deferPending.bind(h.deps.index)
+        h.deps.index.deferPending = async (...args) => (await store(...args), 99)
+        await settleDue(h.deps)
+        expect(h.deferrals).toHaveLength(1)
+        expect(events[0]?.failure).toEqual(h.deferrals[0]?.failure)
+        expect(events[0]?.notBeforeMs).toBe(h.deferrals[0]?.notBeforeMs)
+        expect(events[0]?.attempts).toBe(99)
+    })
+
+    it("no event when deferPending finds no pending row (settle outside the retry queue)", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({ onSettleFailure, verify: unverifiable })
+        expect(await settle(h.deps, DID)).toBe("unverifiable")
+        expect(h.deferrals).toHaveLength(1)
+        expect(events).toEqual([])
+    })
+
+    it("a long error message or unverifiable reason is truncated once, identically in the stored failure and the event", async () => {
+        const long = "x".repeat(PENDING_FAILURE_MESSAGE_MAX * 4)
+        const threw = spy()
+        const a = harness({
+            onSettleFailure: threw.onSettleFailure,
+            fetchRecord: async () => {
+                throw new Error(long)
+            },
+        })
+        a.owe(DID)
+        await settleDue(a.deps)
+        const unv = spy()
+        const b = harness({
+            onSettleFailure: unv.onSettleFailure,
+            verify: async () => ({ kind: "unverifiable", reason: long }),
+        })
+        b.owe(DID)
+        await settleDue(b.deps)
+        for (const [h, got] of [
+            [a, threw],
+            [b, unv],
+        ] as const) {
+            const stored = h.deferrals[0]?.failure
+            const text = stored?.kind === "threw" ? stored.message : stored?.reason
+            expect(text).toHaveLength(PENDING_FAILURE_MESSAGE_MAX)
+            expect(got.events[0]?.failure).toEqual(stored)
+        }
+    })
+
+    it("a confirmed deletion (RecordNotFoundError) reports nothing", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({
+            onSettleFailure,
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RecordNotFound", false)
+            },
+        })
+        h.owe(DID)
+        await settleDue(h.deps)
+        expect(h.deferrals).toEqual([])
+        expect(events).toEqual([])
+    })
+
+    it("a verified absence, a regression and a DID that left interest report nothing", async () => {
+        const { events, onSettleFailure } = spy()
+        const absent = harness({
+            onSettleFailure,
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m2" }),
+        })
+        absent.owe(DID)
+        await settleDue(absent.deps)
+
+        const regressed = harness({ onSettleFailure }, [DID])
+        regressed.revs.set(DID, "3m9")
+        regressed.owe(DID)
+        await settleDue(regressed.deps)
+
+        let calls = 0
+        const left = harness({
+            onSettleFailure,
+            interest: { inInterest: async () => true, interestEpoch: async () => calls++ },
+        })
+        left.owe(DID)
+        await settleDue(left.deps)
+
+        expect([absent, regressed, left].flatMap((h) => h.deferrals)).toEqual([])
+        expect(events).toEqual([])
+    })
+
+    it("a stored settle reports nothing", async () => {
+        const { events, onSettleFailure } = spy()
+        const h = harness({ onSettleFailure })
+        h.owe(DID)
+        expect(await settleDue(h.deps)).toBe(1)
+        expect(events).toEqual([])
+    })
+
+    it("a throwing onSettleFailure does not stop the drain or lose the deferral", async () => {
+        const h = harness({
+            fetchRecord: throwing,
+            onSettleFailure: () => {
+                throw new Error("log sink down")
+            },
+        })
+        h.owe("did:plc:one")
+        h.owe("did:plc:two")
+        await expect(settleDue(h.deps)).resolves.toBe(0)
+        expect(h.pending.get("did:plc:one")?.attempts).toBe(1)
+        expect(h.pending.get("did:plc:two")?.attempts).toBe(1)
+    })
 })

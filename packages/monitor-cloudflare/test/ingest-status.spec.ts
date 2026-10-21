@@ -1,6 +1,8 @@
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
+import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
+    settleDue,
     SETTLE_RETRY_CAP_MS,
     type IngestDeps,
     type PendingFailure,
@@ -112,6 +114,7 @@ describe("pending row bookkeeping", () => {
         const stub = freshStub()
         await inObj(stub, async (obj, sql) => {
             sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:held', '3m1', 0)")
+            sql.exec("INSERT INTO interest (did, member) VALUES ('did:plc:held', 1)")
             sql.exec("INSERT INTO interest (did, member) VALUES ('did:plc:member', 1)")
             const { retryCapMs } = depsOf(obj)
             expect(await retryCapMs?.("did:plc:held")).toBe(Number(testEnv.REFRESH_STALE_AFTER_MS))
@@ -120,18 +123,144 @@ describe("pending row bookkeeping", () => {
         })
     })
 
-    it.todo("a firehose intake resets attempts and not_before but keeps owed_at and the last failure")
-    it.todo("an event-driven owe (identity event, PLC key rotation) resets attempts and not_before")
-    it.todo("a quiet deferral to the declaration does not reset an existing row")
-    it.todo("an interest join does not reset an existing row")
+    async function backedOff(obj: MonitorIngest, sql: SqlStorage, did: string) {
+        await obj.owe(did, "3m1")
+        sql.exec("UPDATE pending SET owed_at = 5 WHERE did = ?", did)
+        await obj.deferPending(did, 9_000_000_000_000, THREW)
+        await obj.deferPending(did, 9_000_000_000_000, THREW)
+        expect(pendingRow(sql, did)?.attempts).toBe(2)
+    }
+
+    it("a firehose intake resets attempts and not_before but keeps owed_at and the last failure", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            await backedOff(obj, sql, DID)
+            await obj.intake({ did: DID, rev: "3m2" }, "1")
+            const row = pendingRow(sql, DID)
+            expect(row).toMatchObject({ rev: "3m2", attempts: 0, not_before: 0, owed_at: 5 })
+            expect(JSON.parse(row?.last_failure ?? "null")).toEqual(THREW)
+        })
+    })
+
+    it("an event-driven owe (identity event, PLC key rotation) resets attempts and not_before", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            await backedOff(obj, sql, DID)
+            await obj.owe(DID, "3m1")
+            expect(pendingRow(sql, DID)).toMatchObject({ attempts: 0, not_before: 0, owed_at: 5 })
+        })
+    })
+
+    it("a quiet deferral to the declaration does not reset an existing row", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            await backedOff(obj, sql, DID)
+            sql.exec("DELETE FROM revs WHERE did = ?", DID)
+            await secondaryDepsOf(obj).deferToDeclaration(DID)
+            expect(pendingRow(sql, DID)?.attempts).toBe(2)
+            expect(pendingRow(sql, DID)?.not_before).toBe(9_000_000_000_000)
+        })
+    })
+
+    it("an interest join does not reset an existing row", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            await backedOff(obj, sql, DID)
+            await obj.oweJoin(DID, [], 0)
+            expect(pendingRow(sql, DID)?.attempts).toBe(2)
+            expect(pendingRow(sql, DID)?.not_before).toBe(9_000_000_000_000)
+        })
+    })
 })
 
 describe("settle failure log line", () => {
-    it.todo("a settle that throws writes one 'monitor: settle deferred' line naming the DID, attempts, error and next not-before")
-    it.todo("a never-held unverifiable DID writes one line of kind unverifiable with its reason")
-    it.todo("a DID with no #atproto signing key is unverifiable with that reason (real verifier, not stubVerify)")
-    it.todo("a non-terminal XRPC error is logged with its XRPC error name, e.g. 400 InvalidRequest")
-    it.todo("a RecordNotFound settle writes no settle-deferred line")
+    const PREFIX = "monitor: settle deferred"
+
+    /** Owes `DID`, settles it through the object's real deps, and returns the settle-deferred lines. */
+    async function settleLogged(
+        stubs: {
+            fetchRecord: () => Promise<unknown>
+            verifyRecord?: () => Promise<unknown>
+        },
+        attempts = 0
+    ) {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            await inObj(freshStub(), async (obj, sql) => {
+                const o = obj as unknown as Record<string, unknown>
+                o.fetchRecord = stubs.fetchRecord
+                if (stubs.verifyRecord !== undefined) o.verifyRecord = stubs.verifyRecord
+                await obj.owe(DID, "3m1")
+                sql.exec("UPDATE pending SET attempts = ?", attempts)
+                await settleDue(depsOf(obj))
+            })
+            return warn.mock.calls.filter((c) => c[0] === PREFIX).map((c) => c[1] as Record<string, unknown>)
+        } finally {
+            warn.mockRestore()
+        }
+    }
+
+    const record = (signingKey: string | null) => async () => ({
+        car: new Uint8Array([1]),
+        source: "https://pds.example",
+        signingKey,
+    })
+
+    it("a settle that throws writes one 'monitor: settle deferred' line naming the DID, attempts, error and next not-before", async () => {
+        const before = Date.now()
+        const lines = await settleLogged(
+            {
+                fetchRecord: async () => {
+                    throw new TypeError("fetch failed")
+                },
+            },
+            2
+        )
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toMatchObject({
+            did: DID,
+            attempts: 3,
+            kind: "threw",
+            error: "TypeError: fetch failed",
+        })
+        const notBefore = Date.parse(String(lines[0]?.notBefore))
+        expect(notBefore).toBeGreaterThanOrEqual(before + 4000)
+        expect(notBefore).toBeLessThan(before + 60_000)
+    })
+
+    it("a never-held unverifiable DID writes one line of kind unverifiable with its reason", async () => {
+        const lines = await settleLogged({
+            fetchRecord: record("did:key:zQ3sh"),
+            verifyRecord: async () => ({ kind: "unverifiable", reason: "bad commit signature" }),
+        })
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toMatchObject({
+            did: DID,
+            attempts: 1,
+            kind: "unverifiable",
+            reason: "bad commit signature",
+        })
+    })
+
+    it("a DID with no #atproto signing key is unverifiable with that reason (real verifier, not stubVerify)", async () => {
+        const lines = await settleLogged({ fetchRecord: record(null) })
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toMatchObject({ kind: "unverifiable", reason: "no #atproto signing key" })
+    })
+
+    it("a non-terminal XRPC error is logged with its XRPC error name, e.g. 400 InvalidRequest", async () => {
+        const lines = await settleLogged({
+            fetchRecord: async () => {
+                throw new Error("endpoint answered 400 InvalidRequest")
+            },
+        })
+        expect(String(lines[0]?.error)).toContain("endpoint answered 400 InvalidRequest")
+    })
+
+    it("a RecordNotFound settle writes no settle-deferred line", async () => {
+        const lines = await settleLogged({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RecordNotFound", false)
+            },
+        })
+        expect(lines).toEqual([])
+    })
 })
 
 describe("ingestStatus", () => {
