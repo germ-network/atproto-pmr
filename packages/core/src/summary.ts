@@ -54,7 +54,8 @@ export interface SummaryIndex {
     /**
      * The owner's can-message verdict for each covered contact the relay
      * holds a servable declaration for, by DID. A baseline stored before
-     * verdicts existed has none and reads as empty.
+     * verdicts existed has none and reads as empty; a verdict stored before
+     * mutual bits has no `mutual`, and is re-sent once.
      */
     verdicts: SummaryVerdict[]
     /** Delivered by a page that left more: a client holding it is mid-sync. */
@@ -187,6 +188,11 @@ export class SummaryOwnerReadError extends Error {
     }
 }
 
+/** The contacts the owner follows who follow the owner, by either edge list. */
+function mutualDids(graph: OwnerGraph): Set<string> {
+    return new Set([...graph.following, ...graph.followers].filter((e) => e.mutual).map((e) => e.did))
+}
+
 /**
  * The DIDs a summary covers, the owner first, then mutuals, following and
  * followers, each by DID; at most `maxContacts` (`SUMMARY_MAX_RECORDS` over
@@ -197,7 +203,7 @@ export function summaryContacts(
     graph: OwnerGraph,
     maxContacts: number
 ): { dids: string[]; truncated: boolean } {
-    const mutuals = graph.following.filter((e) => e.mutual).map((e) => e.did)
+    const mutuals = [...mutualDids(graph)]
     const following = graph.following.map((e) => e.did)
     const followers = graph.followers.map((e) => e.did)
     const seen = new Set<string>([owner])
@@ -236,6 +242,7 @@ export async function buildSummaryIndex(
         .sort((a, b) => compareStrings(a.rkey, b.rkey) || compareStrings(a.did, b.did))
     const maxContacts = Math.floor(SUMMARY_MAX_RECORDS / Math.max(1, deps.watched.length))
     const { dids, truncated } = summaryContacts(did, graph, maxContacts)
+    const mutuals = mutualDids(graph)
     const refs = dids.flatMap((d) =>
         deps.watched.map((w) => ({ did: d, collection: w.collection, rkey: w.rkey }))
     )
@@ -271,7 +278,7 @@ export async function buildSummaryIndex(
             { policies: indexPolicySource(servable), graph: deps.senderGraph }
         )
         verdicts = [...computed]
-            .map(([contact, verdict]) => ({ did: contact, verdict }))
+            .map(([contact, verdict]) => ({ did: contact, verdict, mutual: mutuals.has(contact) }))
             .sort((a, b) => compareStrings(a.did, b.did))
     } catch (error) {
         throw new SummaryOwnerReadError(error)
@@ -401,7 +408,9 @@ export const refKey = (r: SummaryRecordRef) => JSON.stringify([r.did, r.collecti
 
 /**
  * What changed from `base` to `current`. With no `base`, everything changed
- * and `full` is set. Entries are compared on `(cid, verifiedWith)`.
+ * and `full` is set. Entries are compared on `(cid, verifiedWith)`. A verdict
+ * is changed when its encoded bytes or its mutual bit differ; one held without
+ * a mutual bit (stored before it existed) counts as changed.
  */
 export function diffSummaryIndex(
     base: SummaryIndex | null,
@@ -425,7 +434,13 @@ export function diffSummaryIndex(
         }
     }
     const heldVerdicts = new Map(
-        (base.verdicts ?? []).map((v) => [v.did, encodeCanMessageVerdict(v.verdict)] as const)
+        (base.verdicts ?? []).map(
+            (v) =>
+                [
+                    v.did,
+                    { bytes: encodeCanMessageVerdict(v.verdict), mutual: v.mutual as boolean | undefined },
+                ] as const
+        )
     )
     const currentVerdicts = new Set(current.verdicts.map((v) => v.did))
     const before = new Map(base.records.map((e) => [refKey(e), e]))
@@ -446,7 +461,11 @@ export function diffSummaryIndex(
             .map(({ did, collection, rkey }) => ({ did, collection, rkey })),
         verdicts: current.verdicts.filter((v) => {
             const prior = heldVerdicts.get(v.did)
-            return prior === undefined || !bytesEqual(prior, encodeCanMessageVerdict(v.verdict))
+            return (
+                prior === undefined ||
+                prior.mutual !== v.mutual ||
+                !bytesEqual(prior.bytes, encodeCanMessageVerdict(v.verdict))
+            )
         }),
         droppedVerdicts: [...heldVerdicts.keys()].filter((d) => !currentVerdicts.has(d)).sort(compareStrings),
     }
@@ -526,6 +545,7 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
                         new Map<string, CoseValue>([
                             [SUMMARY_VERDICT_KEYS.did, v.did],
                             [SUMMARY_VERDICT_KEYS.verdict, canMessageToCose(v.verdict)],
+                            [SUMMARY_VERDICT_KEYS.mutual, v.mutual],
                         ])
                 ),
             ],
@@ -600,7 +620,13 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
         verdicts: optionalItems(D.verdicts).map((m) => {
             const verdict = m.get(SUMMARY_VERDICT_KEYS.verdict)
             if (!(verdict instanceof Map)) throw new Error("summary: missing or malformed verdict")
-            return { did: str(m, SUMMARY_VERDICT_KEYS.did), verdict: canMessageFromCose(verdict) }
+            const mutual = m.get(SUMMARY_VERDICT_KEYS.mutual)
+            if (mutual !== undefined && typeof mutual !== "boolean") throw new Error("summary: malformed mutual")
+            return {
+                did: str(m, SUMMARY_VERDICT_KEYS.did),
+                verdict: canMessageFromCose(verdict),
+                mutual: mutual === true,
+            }
         }),
         droppedVerdicts: dropped,
         more: map.get(D.more) === true,

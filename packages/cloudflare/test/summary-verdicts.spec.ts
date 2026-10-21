@@ -13,6 +13,7 @@ describe("stored summary verdicts", () => {
         const verdicts: SummaryIndex["verdicts"] = Array.from({ length: 1_200 }, (_, i) => ({
             did: did(i),
             verdict: i % 2 === 0 ? { verdict: "yes", via: ["open"] } : { verdict: "no", why: ["blocked"] },
+            mutual: i % 3 === 0,
         }))
         // Past one 1,000,000-character part, so the verdicts are split.
         expect(JSON.stringify(verdicts).length).toBeGreaterThan(2_000_000)

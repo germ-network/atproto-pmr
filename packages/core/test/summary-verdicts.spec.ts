@@ -110,14 +110,16 @@ describe("summary verdicts", () => {
         const first = await read(await get())
         w.senderFacts.set(`${OWNER}|${PEER}`, { blocks: "yes", follows: "no" })
         const second = await read(await get(first.token))
-        expect(second.verdicts).toEqual([{ did: PEER, verdict: { verdict: "no", why: ["blocked"] } }])
+        expect(second.verdicts).toEqual([
+            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
+        ])
 
-        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] } }] }
+        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: false }] }
         // Same verdict, fields in another order: equal on the wire.
-        const same = { ...held, verdicts: [{ did: PEER, verdict: { via: ["open"], verdict: "yes" } as const }] }
+        const same = { ...held, verdicts: [{ did: PEER, verdict: { via: ["open"], verdict: "yes" } as const, mutual: false }] }
         const { page } = await readSummaryPage(held, same, w.deps, 10)
         expect(page.verdicts).toEqual([])
-        const other = { ...held, verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open", "bsky-follows"] } }] }
+        const other = { ...held, verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open", "bsky-follows"] }, mutual: false }] }
         expect((await readSummaryPage(held, other, w.deps, 10)).page.verdicts).toHaveLength(1)
     })
 
@@ -184,7 +186,7 @@ describe("summary verdicts", () => {
         const held = (await store.getSummaryIndex(first.token))!
         await store.putSummaryIndex(
             "tok",
-            { ...held, verdicts: [...held.verdicts, { did: THIRD, verdict: { verdict: "yes", via: ["open"] } }] },
+            { ...held, verdicts: [...held.verdicts, { did: THIRD, verdict: { verdict: "yes", via: ["open"] }, mutual: false }] },
             0
         )
         const next = await read(await get("tok"))
@@ -198,7 +200,9 @@ describe("summary verdicts", () => {
         const w = world()
         w.senderFacts.set(`${OWNER}|${PEER}`, { blocks: "yes", follows: "no" })
         const built = await buildSummaryIndex(OWNER, w.deps)
-        expect(built!.index.verdicts).toEqual([{ did: PEER, verdict: { verdict: "no", why: ["blocked"] } }])
+        expect(built!.index.verdicts).toEqual([
+            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
+        ])
     })
 
     it("index records carry no policies field", async () => {
@@ -311,7 +315,7 @@ describe("summary verdicts", () => {
         expect(page.droppedVerdicts).toEqual([])
     })
 
-    it("encodes c as a list of {d, v} with v the canMessageToCose map, and y as a list of DIDs", () => {
+    it("encodes c as a list of {d, u, v} with v the canMessageToCose map, and y as a list of DIDs", () => {
         const verdict = { verdict: "yes", via: ["open"] } as const
         const delta = {
             token: "t",
@@ -319,7 +323,7 @@ describe("summary verdicts", () => {
             ownBlocks: null,
             records: [],
             removed: [],
-            verdicts: [{ did: PEER, verdict }],
+            verdicts: [{ did: PEER, verdict, mutual: true }],
             droppedVerdicts: [THIRD],
             more: false,
             truncated: false,
@@ -327,7 +331,13 @@ describe("summary verdicts", () => {
         const wire = decodeCoseMap(encodeSummaryDelta(delta))
         expect(SUMMARY_DELTA_KEYS.verdicts).toBe("c")
         expect(SUMMARY_DELTA_KEYS.droppedVerdicts).toBe("y")
-        expect(wire.get("c")).toEqual([new Map([["d", PEER], ["v", canMessageToCose(verdict)]])])
+        expect(wire.get("c")).toEqual([
+            new Map([
+                ["d", PEER],
+                ["u", true],
+                ["v", canMessageToCose(verdict)],
+            ]),
+        ])
         expect(wire.get("y")).toEqual([THIRD])
         expect(decodeSummaryDelta(encodeSummaryDelta(delta))).toEqual(delta)
     })

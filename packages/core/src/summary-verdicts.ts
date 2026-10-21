@@ -12,11 +12,18 @@ import type { SummaryHeldEntry, SummaryIndex } from "./summary.js"
 export interface SummaryVerdict {
     did: string
     verdict: CanMessageVerdict
+    /**
+     * The owner follows the contact and the contact follows the owner, as the
+     * relay's graph read for ordering sees it. Always on the wire; a decoder
+     * reads an entry from a relay that predates it as not mutual.
+     */
+    mutual: boolean
 }
 
 export const SUMMARY_VERDICT_KEYS = {
     did: "d",
     verdict: "v",
+    mutual: "u",
 } as const satisfies { readonly [K in keyof SummaryVerdict]: string }
 
 /**
