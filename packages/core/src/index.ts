@@ -24,6 +24,8 @@ export type {
     MailboxKey,
     MailboxSnapshot,
     MessageId,
+    ExtensionFields,
+    ExtensionValue,
     MessageRef,
     MonitorRegistrationNotify,
     MonitorRecheckRequest,
@@ -159,7 +161,10 @@ export {
     handleRegistrationRead,
     type GrantConfig,
     type MessagesConfig,
+    RegistrationFieldError,
+    type CommittedRegistration,
     type OwnerDeps,
+    type RegistrationExtension,
 } from "./owner/endpoints.js"
 
 // Receive-time admission and the Bsky block mirror.
@@ -183,6 +188,14 @@ export {
     type PairPutDeps,
 } from "./pair-put"
 
+// Storing a put whose sender was authenticated by other means.
+export {
+    ingestAuthenticatedPut,
+    type AuthenticatedPut,
+    type AuthenticatedPutDeps,
+    type AuthenticatedPutOutcome,
+} from "./authenticated-put"
+
 // The grant-put endpoint.
 export { handleGrantPut, type GrantPutDeps } from "./grant-put"
 
@@ -195,6 +208,7 @@ export {
     encodeCapabilitiesFrame,
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
+    RESERVED_ENTRY_KEYS,
     encodePoolFrame,
     handleAckFrame,
     type AckPayload,

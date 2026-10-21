@@ -1,14 +1,13 @@
-import { admissionOrUnavailable, type AdmissionSource } from "./admission.js"
+import type { AdmissionSource } from "./admission.js"
+import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
-import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import {
     BodyStore,
     Directory,
     Locator,
-    MessageRef,
     PairMailboxKey,
     PMRStore,
 } from "./storage.js"
@@ -151,129 +150,40 @@ export async function handlePairPut(
             : new Response(null, { status: 202 })
     }
 
-    const locator = await deps.directory.resolve(recipientDID)
-    if (locator === null) {
-        // Unknown recipient relay. The RESPONSE is the same `202` a
-        // registered recipient's mailbox eventually produces.
-        //
-        // KNOWN, ACCEPTED GAP: this returns before touching any per-relay
-        // store, while a registered recipient costs at least one round
-        // trip — a timing difference that could reveal registration status
-        // to an attacker who can measure it, even though the content never
-        // does. Closing it means doing comparable work against a DID with
-        // no store to touch, and the obvious approach — instantiating a
-        // store for every unregistered DID an unauthenticated request names
-        // — is its own resource-exhaustion surface. Flagged in
-        // `spec/trust-model.md` rather than papered over.
-        return new Response(null, { status: 202 })
-    }
-    const store = deps.store(locator)
-
-    const mailboxKey = senderKey
-    const messageId = deriveMessageId(envelope.payload.payload)
-    const ref = {
-        messageId,
-        byteLength: envelope.payload.payload.byteLength,
-        hint: {
-            senderDID: envelope.payload.senderDID,
+    const result = await ingestAuthenticatedPut(
+        {
+            recipientDID,
+            senderDID: senderKey,
             declarationCID: declaration.declarationCID,
+            payload: envelope.payload.payload,
+            replayKey: envelope.payload.nonce,
         },
-    }
-
-    const storeBody = () =>
-        deps.bodies.putBody(
-            messageId,
-            envelope.payload.payload,
-            nowSeconds + config.limits.messageExpirySeconds
-        )
-
-    if (deps.admission) {
-        const admission = await admissionOrUnavailable(
-            deps.admission,
-            senderKey,
-            recipientDID
-        )
-        const received = await store.receive(
-            mailboxKey,
-            ref,
-            envelope.payload.nonce,
-            nowSeconds,
-            admission
-        )
-        if (received.outcome === "refused") {
-            return new Response(null, {
-                status: 429,
-                headers: {
-                    "Retry-After": String(
-                        Math.max(0, received.retryAfter - nowSeconds)
-                    ),
-                },
-            })
-        }
-        if (received.outcome === "queued" && received.persistBody) {
-            deps.defer(
-                deliverQueued(
-                    store,
-                    mailboxKey,
-                    ref,
-                    envelope.payload.payload,
-                    storeBody,
-                    received.moved?.map((moved) => ({
-                        ref: moved,
-                        // Stored when the entry was pooled.
-                        body: () => deps.bodies.getBody(moved.messageId),
-                    }))
-                )
-            )
-        } else if (received.outcome === "pooled" && received.persistBody) {
-            deps.defer(storeBody())
-        }
-        return new Response(null, { status: 202 })
-    }
-
-    if (await store.hasMailbox(mailboxKey)) {
-        const result = await store.append(
-            mailboxKey,
-            ref,
-            envelope.payload.nonce,
-            nowSeconds
-        )
-        if (result.outcome === "refused") {
-            return new Response(null, {
-                status: 429,
-                headers: {
-                    "Retry-After": String(
-                        Math.max(0, result.retryAfter - nowSeconds)
-                    ),
-                },
-            })
-        }
-        if (result.outcome === "appended" && result.persistBody) {
-            // `persistBody` is false when the append was absorbed by the
-            // synthetic mailbox; checking it is what keeps "no bytes for a
-            // blocked sender" true although this code cannot tell blocked
-            // from real.
-            deps.defer(
-                deliverQueued(store, mailboxKey, ref, envelope.payload.payload, storeBody)
-            )
-        }
-        return new Response(null, { status: 202 })
-    }
-
-    // Unprovisioned: the recovery pool. Discard status is checked INSIDE
-    // `appendToPool`, not by a separate call this code branches on — a
-    // discarded sender's put must cost the same round trip a pooled one
-    // does, or the count itself becomes an oracle.
-    const pooled = await store.appendToPool(
-        mailboxKey,
-        ref,
-        envelope.payload.nonce,
+        deps,
         nowSeconds
     )
-    if (pooled.outcome === "pooled" && pooled.persistBody) {
-        deps.defer(storeBody())
+    switch (result.outcome) {
+        case "refused":
+            return new Response(null, {
+                status: 429,
+                headers: {
+                    "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)),
+                },
+            })
+        case "tooLarge":
+            return new Response("Payload exceeds the advertised maximum", { status: 413 })
+        // An unknown recipient answers the same `202` a registered one does.
+        // KNOWN, ACCEPTED GAP: that return skips every per-relay store, while a
+        // registered recipient costs at least one round trip. The timing
+        // difference could reveal registration status to an attacker who can
+        // measure it, though the content never does. Closing it means doing
+        // comparable work against a DID with no store to touch, and the obvious
+        // approach (instantiating a store for every unregistered DID an
+        // unauthenticated request names) is its own resource-exhaustion
+        // surface. Flagged in `spec/trust-model.md`.
+        case "accepted":
+        case "noRecipient":
+            return new Response(null, { status: 202 })
     }
-    return new Response(null, { status: 202 })
 }
 
 function declarationUnverifiable(): Response {
@@ -281,38 +191,4 @@ function declarationUnverifiable(): Response {
         status: 409,
         headers: { "Retry-After": String(DECLARATION_RETRY_AFTER_SECONDS) },
     })
-}
-
-/**
- * Store the body, then deliver a queued message live and by push. `moved`
- * (pooled entries a yes moved into the mailbox) goes live first, in order,
- * so the device sees the mailbox in queue order; the one push covers them all.
- *
- * Best effort and sequenced after the body write: a failed delivery costs the
- * recipient a reconnect-drain, never a message, since the entry stays queued
- * either way. The body MUST land even if a delivery doesn't, and each
- * delivery's failure is swallowed separately so one cannot prevent another.
- * A duplicate never reaches this: its body already landed.
- */
-async function deliverQueued(
-    store: PMRStore,
-    key: PairMailboxKey,
-    ref: MessageRef,
-    message: Uint8Array,
-    storeBody: () => Promise<void>,
-    moved: Array<{ ref: MessageRef; body: () => Promise<Uint8Array | null> }> = []
-): Promise<void> {
-    await storeBody()
-    for (const entry of moved) {
-        try {
-            const body = await entry.body()
-            if (body) await store.deliverLive?.(key, entry.ref, body)
-        } catch {}
-    }
-    try {
-        await store.deliverLive?.(key, ref, message)
-    } catch {}
-    try {
-        await store.deliverPush?.(key, ref, message)
-    } catch {}
 }

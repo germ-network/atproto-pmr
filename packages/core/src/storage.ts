@@ -80,10 +80,26 @@ export interface VerificationHint {
     declarationCID: string
 }
 
+/**
+ * Deployment-defined keys a relay stores alongside an entry or a
+ * registration. Opaque to this package, which only carries and emits them;
+ * a key may never shadow one the specification defines.
+ */
+export type ExtensionFields = Readonly<Record<string, ExtensionValue>>
+
+/**
+ * Scalars only: these cross Durable Object RPC inside `MessageRef` and
+ * `RegistrationFields`, where a recursive value type defeats the RPC typings.
+ * Numbers must be safe integers; the wire grammar has no floats.
+ */
+export type ExtensionValue = string | number | boolean | null | Uint8Array
+
 export interface MessageRef {
     messageId: MessageId
     byteLength: number
     hint?: VerificationHint
+    /** Emitted beside `sd`/`dc`, so only on an entry that carries a hint. */
+    ext?: ExtensionFields
 }
 
 export type AppendResult =
@@ -221,6 +237,11 @@ export interface RegistrationFields {
         keyId: number
     }
     lastActive: number
+    /**
+     * Set only through `RegistrationExtension`. Every create replaces it
+     * whole, so an absent deployment key means withdrawn, not "unchanged".
+     */
+    ext?: ExtensionFields
 }
 
 /**
