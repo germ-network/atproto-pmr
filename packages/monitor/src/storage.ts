@@ -172,6 +172,12 @@ export interface PendingFetch {
     quiet: boolean
 }
 
+/** Why a pending fetch was deferred instead of settled. */
+export type PendingFailure =
+    | { kind: "threw"; errorName: string; message: string; atMs: number }
+    /** `reason` is null where the verifier gave none. */
+    | { kind: "unverifiable"; reason: string | null; atMs: number }
+
 export type IntakeOutcome =
     /** Already applied. The common case just after a reconnect. */
     | { outcome: "duplicate" }
@@ -318,7 +324,10 @@ export interface MonitorIndex {
 
     /** Retry queue. A fetch that failed is owed until it succeeds. */
     duePending(nowMs: number, limit: number): Promise<PendingFetch[]>
-    deferPending(did: string, notBeforeMs: number): Promise<void>
+    /** Counts the attempt and keeps `failure` on the row, so an operator can
+     * see why a DID is still owed without searching logs. Answers the row's
+     * attempts after the update, or null when the DID has no pending row. */
+    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
 
     /** The indexed rev, for regression detection and duplicate suppression. */
     revOf(did: string): Promise<string | null>

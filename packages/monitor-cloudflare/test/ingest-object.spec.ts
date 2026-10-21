@@ -348,7 +348,12 @@ describe("settling what is owed", () => {
         const stub = freshStub()
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.intake({ did: DID, rev: "3m1" }, "100")
-            await obj.deferPending(DID, Date.now() + 10 ** 6)
+            await obj.deferPending(DID, Date.now() + 10 ** 6, {
+                kind: "threw",
+                errorName: "Error",
+                message: "held back",
+                atMs: Date.now(),
+            })
         })
         const dueNow = await runInDurableObject(stub, (obj: MonitorIngest) =>
             obj.duePending(Date.now(), 10)

@@ -49,7 +49,12 @@ import {
     type SecondaryWriteAnswer,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type MonitorIngestStatus,
+    type MonitorIngestStatusRequest,
+    type MonitorPendingDetail,
     type OwedKeyUpdate,
+    SETTLE_RETRY_CAP_MS,
+    type PendingFailure,
     type PendingFetch,
     type RefreshIndex,
     type SigningKeyUpdate,
@@ -333,7 +338,8 @@ export class MonitorIngest
         MonitorRecheckRequest,
         MonitorVerifiedAnchorRequest,
         MonitorOwnBlocksRequest,
-        MonitorOwnGraphRequest
+        MonitorOwnGraphRequest,
+        MonitorIngestStatusRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -530,6 +536,20 @@ export class MonitorIngest
                     .toArray().length === 0
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
+            // Rows owed before these columns existed keep NULL: their first
+            // owed time and failure are unknown.
+            for (const column of ["owed_at INTEGER", "last_failure TEXT"]) {
+                if (
+                    this.db.sql
+                        .exec(
+                            "SELECT 1 FROM pragma_table_info('pending') WHERE name = ?",
+                            column.split(" ")[0]
+                        )
+                        .toArray().length === 0
+                ) {
+                    this.db.sql.exec(`ALTER TABLE pending ADD COLUMN ${column}`)
+                }
             }
             if (
                 this.db.sql
@@ -1001,10 +1021,11 @@ export class MonitorIngest
             return { outcome: "duplicate" }
         }
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_at) VALUES (?, ?, 0, 0, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
             event.did,
-            event.rev
+            event.rev,
+            Date.now()
         )
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
@@ -1017,10 +1038,11 @@ export class MonitorIngest
     /** Owe a fetch the dedupe check would otherwise suppress. */
     async owe(did: string, rev: string): Promise<void> {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_at) VALUES (?, ?, 0, 0, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
             did,
-            rev
+            rev,
+            Date.now()
         )
     }
 
@@ -1401,12 +1423,31 @@ export class MonitorIngest
             }))
     }
 
-    async deferPending(did: string, notBeforeMs: number): Promise<void> {
-        this.db.sql.exec(
-            "UPDATE pending SET attempts = attempts + 1, not_before = ? WHERE did = ?",
-            notBeforeMs,
-            did
-        )
+    async deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ attempts: number }>(
+                "UPDATE pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
+                    "WHERE did = ? RETURNING attempts",
+                notBeforeMs,
+                JSON.stringify(failure),
+                did
+            )
+            .toArray()[0]
+        return row?.attempts ?? null
+    }
+
+    /** Aggregate ingest progress for an operator; names no DID. */
+    async ingestStatus(): Promise<MonitorIngestStatus> {
+        throw new Error("unimplemented")
+    }
+
+    /** What the ingest index holds for one DID, including why it is still owed. */
+    async pendingDetail(did: string): Promise<MonitorPendingDetail> {
+        throw new Error("unimplemented")
     }
 
     async revOf(did: string): Promise<string | null> {
@@ -2035,9 +2076,10 @@ export class MonitorIngest
                 this.db.sql.exec("SELECT 1 FROM deleted WHERE did = ?", did).toArray().length > 0
             if (!indexed && !deleted) {
                 this.db.sql.exec(
-                    "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                        "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                    did
+                    "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                        "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                    did,
+                    Date.now()
                 )
             }
             if (did.startsWith("did:plc:") && !deleted) {
@@ -3452,6 +3494,17 @@ export class MonitorIngest
             fetchRecord: (did) => this.fetchRecord(did),
             verify: (did, record) => this.verifyRecord(did, record),
             unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
+            // A pending row takes a DID out of the refresh schedule, so a retry
+            // never waits longer than refresh would have.
+            retryCapMs: async (did) => {
+                if ((await this.revOf(did)) !== null) {
+                    return this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000)
+                }
+                if (await this.inInterest(did)) {
+                    return this.envInt(this.env.REFRESH_NONHOLDER_STALE_AFTER_MS, 86_400_000)
+                }
+                return SETTLE_RETRY_CAP_MS
+            },
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
@@ -3500,9 +3553,10 @@ export class MonitorIngest
                 const held = await this.revOf(did)
                 if (held === null) {
                     this.db.sql.exec(
-                        "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                            "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                        did
+                        "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                            "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                        did,
+                        Date.now()
                     )
                     return
                 }

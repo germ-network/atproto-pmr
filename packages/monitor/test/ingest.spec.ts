@@ -108,7 +108,9 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
                 .map(([did, p]) => ({ did, ...p })),
         deferPending: async (did, notBeforeMs) => {
             const p = pending.get(did)
-            if (p !== undefined) pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
+            if (p === undefined) return null
+            pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
+            return p.attempts + 1
         },
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
