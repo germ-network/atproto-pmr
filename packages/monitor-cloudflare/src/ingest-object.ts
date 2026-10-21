@@ -84,10 +84,15 @@ import {
     mirrorGraph,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
+    computeFirehoseCoverage,
+    isResumeJump,
+    isStaleCursor,
+    streamTimeUs,
     relistStale,
     runListings,
 } from "@germ-network/atproto-pmr-monitor"
 import type {
+    OwedStreamEvent,
     FollowBackfillConfig,
     FollowBackfillDeps,
     ListingProgress,
@@ -121,6 +126,10 @@ import {
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
+    FIREHOSE_COVERAGE_MAX_LAG_MS,
+    FIREHOSE_LAGGING_CAP,
+    KV_VISIBILITY_MS,
+    type FirehoseCoverage,
     type PlcCoverage,
     type RepoCollectionsExpectation,
     type VerifiedCollections,
@@ -134,12 +143,19 @@ import {
 } from "./did-document-store"
 import { interestPolicy as policyFromEnv, monitorCollections, type MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
+import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
+
+/** On a conflict an owed row keeps the earlier stream stamp; a row owed by no stream event takes the new one. */
+const KEEP_EARLIER_STAMP =
+    "owed_since_us = CASE WHEN pending.owed_since_us IS NULL THEN excluded.owed_since_us " +
+    "WHEN excluded.owed_since_us IS NULL THEN pending.owed_since_us " +
+    "ELSE MIN(pending.owed_since_us, excluded.owed_since_us) END"
 
 /** DIDs the refresh queue covers; `policy` names the bound parameter holding the interest policy. */
 const refreshCandidates = (policy: string) =>
@@ -358,6 +374,8 @@ export class MonitorIngest
     /** What `plc:coverage` last claimed in this run. */
     private plcCoveredThroughMs: number | null = null
     private draining: Promise<void> | null = null
+    /** The cursor this connection resumed from, until its first timed frame has been checked. */
+    private resumeFromUs: number | null = null
     private drainAgain = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
@@ -375,6 +393,11 @@ export class MonitorIngest
                     rev TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     not_before INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS applied_recent (
+                    did TEXT PRIMARY KEY,
+                    owed_since_us INTEGER NOT NULL,
+                    applied_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS meta (
                     k TEXT PRIMARY KEY,
@@ -530,6 +553,24 @@ export class MonitorIngest
                     .toArray().length === 0
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_gen'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(
+                    "ALTER TABLE pending ADD COLUMN owed_gen INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_since_us'")
+                    .toArray().length === 0
+            ) {
+                // Rows owed before stamps existed lag at once.
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN owed_since_us INTEGER")
+                this.db.sql.exec("UPDATE pending SET owed_since_us = 0")
             }
             if (
                 this.db.sql
@@ -965,6 +1006,30 @@ export class MonitorIngest
         await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
     }
 
+    /**
+     * Publish `firehose:coverage`: the stream cursor held back by what is
+     * still owed, as one value. The run starts when this first runs; a gap
+     * starts a new one.
+     */
+    async publishFirehoseCoverage(nowMs: number = Date.now()): Promise<FirehoseCoverage> {
+        const cursor = this.metaOf("cursor")
+        const cursorUs = cursor === undefined ? 0 : streamTimeUs(cursor)
+        if (this.metaOf("firehose_since") === undefined) {
+            this.setMeta("firehose_since", String(nowMs))
+        }
+        const coverage = computeFirehoseCoverage({
+            cursorUs: cursorUs > 0 ? cursorUs : null,
+            owed: await this.owedStreamEvents(nowMs),
+            continuousSinceMs: Number(this.metaOf("firehose_since")),
+            nowMs,
+            maxLagMs: FIREHOSE_COVERAGE_MAX_LAG_MS,
+            kvVisibilityMs: KV_VISIBILITY_MS,
+            laggingCap: FIREHOSE_LAGGING_CAP,
+        })
+        await this.env.records.put(FIREHOSE_COVERAGE_KEY, JSON.stringify(coverage))
+        return coverage
+    }
+
     // ---- MonitorIndex -----------------------------------------------------
 
     async readCursor(): Promise<Cursor | null> {
@@ -1001,10 +1066,14 @@ export class MonitorIngest
             return { outcome: "duplicate" }
         }
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                "VALUES (?, ?, 0, 0, ?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             event.did,
-            event.rev
+            event.rev,
+            this.nextOweGen(),
+            streamTimeUs(cursor)
         )
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
@@ -1015,18 +1084,97 @@ export class MonitorIngest
     }
 
     /** Owe a fetch the dedupe check would otherwise suppress. */
-    async owe(did: string, rev: string): Promise<void> {
+    async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                "VALUES (?, ?, 0, 0, ?, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             did,
-            rev
+            rev,
+            this.nextOweGen(),
+            owedSinceUs ?? null
         )
     }
 
+    /**
+     * A counter shared by every row, so a generation is never reused after
+     * a row is deleted and owed again.
+     */
+    private nextOweGen(): number {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('owe_seq', '1') " +
+                "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)"
+        )
+        return Number(
+            this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'owe_seq'").one().v
+        )
+    }
+
+    async owedGenOf(did: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ owed_gen: number }>("SELECT owed_gen FROM pending WHERE did = ?", did)
+            .toArray()[0]
+        return row?.owed_gen ?? null
+    }
+
+    /** The generation clause of a discharge: unconditional, or only the generation fetched for. */
+    private dischargePending(did: string, gen: number | null | undefined, quietOnly = false): void {
+        if (gen === null) return
+        const where =
+            (gen === undefined ? "did = ?1" : "did = ?1 AND owed_gen = ?2") +
+            (quietOnly ? " AND quiet = 1" : "")
+        const args = gen === undefined ? [did] : [did, gen]
+        const appliedAt = Date.now()
+        // The stamp outlives the row for the KV visibility window: the record
+        // this discharge stored may not yet be readable everywhere.
+        this.db.sql.exec(
+            "INSERT INTO applied_recent (did, owed_since_us, applied_at) " +
+                `SELECT did, owed_since_us, ${appliedAt} FROM pending ` +
+                `WHERE ${where} AND owed_since_us IS NOT NULL ` +
+                "ON CONFLICT(did) DO UPDATE SET " +
+                "owed_since_us = MIN(applied_recent.owed_since_us, excluded.owed_since_us), " +
+                "applied_at = excluded.applied_at",
+            ...args
+        )
+        this.db.sql.exec(`DELETE FROM pending WHERE ${where}`, ...args)
+    }
+
+    /**
+     * Stream-owed events and recently applied fetches of the DIDs the monitor
+     * holds or held, for the coverage watermark; prunes applied fetches past
+     * the visibility window on the way. A gone DID counts: its deletion is a
+     * KV write with the same window. A DID never held serves nothing, so its
+     * stamp is left out.
+     */
+    async owedStreamEvents(nowMs: number): Promise<OwedStreamEvent[]> {
+        this.db.sql.exec(
+            "DELETE FROM applied_recent WHERE applied_at <= ?",
+            nowMs - KV_VISIBILITY_MS
+        )
+        const held = "did IN (SELECT did FROM holder_state)"
+        const owed = this.db.sql
+            .exec<{ did: string; owed_since_us: number }>(
+                `SELECT did, owed_since_us FROM pending WHERE owed_since_us IS NOT NULL AND ${held}`
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, owedSinceUs: r.owed_since_us, appliedAtMs: null }))
+        const applied = this.db.sql
+            .exec<{ did: string; owed_since_us: number; applied_at: number }>(
+                `SELECT did, owed_since_us, applied_at FROM applied_recent WHERE ${held}`
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                owedSinceUs: r.owed_since_us,
+                appliedAtMs: r.applied_at,
+            }))
+        return [...owed, ...applied]
+    }
+
     /** Discharge an obligation without indexing: a terminal, unstorable answer. */
-    async clearPending(did: string): Promise<void> {
-        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    async clearPending(did: string, gen?: number | null): Promise<void> {
+        this.dischargePending(did, gen)
     }
 
     /**
@@ -1274,7 +1422,8 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
@@ -1284,7 +1433,7 @@ export class MonitorIngest
                 windowOf(observedAtMs, this.digestWidthMs()),
                 did
             )
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.dischargePending(did, gen)
             this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
         })
     }
@@ -1304,7 +1453,8 @@ export class MonitorIngest
         observedAtMs: number,
         permanent: boolean,
         quiet = false,
-        cause: GoneCause = "repo"
+        cause: GoneCause = "repo",
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             if (permanent) {
@@ -1331,7 +1481,7 @@ export class MonitorIngest
                     did
                 )
             }
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.dischargePending(did, gen)
         })
     }
 
@@ -1581,13 +1731,14 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
             // A live record again: the join obligation and any deletion mark
             // are spent, but a commit's obligation is still owed.
-            this.db.sql.exec("DELETE FROM pending WHERE did = ? AND quiet = 1", did)
+            this.dischargePending(did, gen, true)
             this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
         })
     }
@@ -3556,6 +3707,8 @@ export class MonitorIngest
     async connect(): Promise<void> {
         if (this.socket !== null) return
         const cursor = await this.readCursor()
+        this.resumeFromUs = null
+        if (cursor !== null) this.checkStaleCursor(cursor, Date.now())
         const url = new URL(this.env.JETSTREAM_URL)
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
@@ -3572,6 +3725,59 @@ export class MonitorIngest
         ws.addEventListener("close", drop)
         ws.addEventListener("error", drop)
         await this.armWatchdog()
+    }
+
+    /**
+     * A cursor older than the replay window cannot resume without losing
+     * events: start a new coverage run and owe every served declaration. Every
+     * connect attempt with such a cursor does, since a holder fetched while the
+     * stream stays down lost its events too; owing again keeps the earlier
+     * stamps. Otherwise the next frame is checked for a jump past it, which
+     * relies on identity and account events keeping the cursor moving on a
+     * quiet collection.
+     */
+    private checkStaleCursor(cursor: string, nowMs: number): void {
+        const cursorUs = streamTimeUs(cursor)
+        if (cursorUs === 0) return
+        const lookbackMs = this.envInt(this.env.JETSTREAM_LOOKBACK_MS, 129_600_000)
+        if (!isStaleCursor(cursorUs, nowMs, lookbackMs)) {
+            this.resumeFromUs = cursorUs
+            return
+        }
+        this.startFirehoseRun(nowMs)
+    }
+
+    /**
+     * After a resume, a first frame well past the cursor means the stream
+     * skipped events.
+     */
+    private checkResumeFrame(frameMs: number | null): void {
+        if (this.resumeFromUs === null || frameMs === null) return
+        const cursorUs = this.resumeFromUs
+        this.resumeFromUs = null
+        const toleranceMs = this.envInt(this.env.JETSTREAM_RESUME_TOLERANCE_MS, 60_000)
+        if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) this.startFirehoseRun(Date.now())
+    }
+
+    /**
+     * A new unbroken run begins at `nowMs`, and every served declaration is
+     * owed a fetch stamped just before it, so coverage stays null until each
+     * has been fetched or has become lagging. A DID held as gone is not
+     * served and is not owed: re-owing it would fire its deletion again.
+     */
+    private startFirehoseRun(nowMs: number): void {
+        this.ctx.storage.transactionSync(() => {
+            this.setMeta("firehose_since", String(nowMs))
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                    "SELECT did, rev, 0, 0, ?1, ?2 FROM records WHERE collection = ?3 " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0, owed_gen = excluded.owed_gen, " +
+                    KEEP_EARLIER_STAMP,
+                this.nextOweGen(),
+                (nowMs - 1) * 1000,
+                this.env.MONITOR_COLLECTION
+            )
+        })
     }
 
     /**
@@ -3772,6 +3978,7 @@ export class MonitorIngest
     private async onFrame(raw: string): Promise<void> {
         const event = decodeEvent(raw)
         if (event === null) return
+        this.checkResumeFrame(event.timeMs)
         // A frame without a parseable time still carries a DID worth
         // looking at; only the cursor is unknown, so hold the last one
         // rather than discard the event. Replaying a little on resume is
@@ -3969,6 +4176,11 @@ export class MonitorIngest
                 )
             } catch (err) {
                 console.error("monitor: secondary settle failed", err)
+            }
+            try {
+                await this.publishFirehoseCoverage()
+            } catch (err) {
+                console.error("monitor: firehose coverage publish failed", err)
             }
             // After settling (a just-stored snapshot is not yet due) and
             // before sealing (a change it finds lands in a window that has

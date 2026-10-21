@@ -161,6 +161,8 @@ describe("summary read", () => {
             droppedVerdicts: [],
             more: false,
             truncated: false,
+            coveredThroughMs: null,
+            lagging: [],
         })
         expect(new Set(w.puts.map((p) => p.token))).toEqual(new Set([first.token]))
     })
@@ -510,6 +512,8 @@ describe("summary codec", () => {
         full: false,
         more: false,
         truncated: false,
+        coveredThroughMs: null,
+        lagging: [],
         ownBlocks: [{ did: "did:plc:x", rkey: "3k1" }],
         records: [
             {
@@ -573,6 +577,8 @@ describe("summary codec", () => {
             SUMMARY_DELTA_KEYS.ownBlocks,
             SUMMARY_DELTA_KEYS.verdicts,
             SUMMARY_DELTA_KEYS.droppedVerdicts,
+            SUMMARY_DELTA_KEYS.coveredThroughMs,
+            SUMMARY_DELTA_KEYS.lagging,
         ]
         for (const key of Object.values(SUMMARY_DELTA_KEYS)) {
             if (optional.includes(key)) continue

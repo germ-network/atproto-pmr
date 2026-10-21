@@ -340,6 +340,14 @@ export {
     type PlcCoverage,
     type StoredSigningKeyResolverDeps,
 } from "./did-document"
+export {
+    FIREHOSE_COVERAGE_MAX_LAG_MS,
+    FIREHOSE_LAGGING_CAP,
+    summaryCoverageAtMs,
+    KV_VISIBILITY_MS,
+    type FirehoseCoverage,
+    type SummaryCoverageDeps,
+} from "./firehose-coverage"
 
 // A verified read of one record from a third party's snapshot (24 h rule included).
 export {

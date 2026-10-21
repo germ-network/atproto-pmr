@@ -33,6 +33,8 @@ const delta = (ownBlocks: SummaryDelta["ownBlocks"]): SummaryDelta => ({
     droppedVerdicts: [],
     more: false,
     truncated: false,
+    coveredThroughMs: null,
+    lagging: [],
 })
 
 describe("summary — own blocks", () => {

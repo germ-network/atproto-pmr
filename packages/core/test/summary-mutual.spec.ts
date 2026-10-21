@@ -181,11 +181,13 @@ const VECTOR_DELTA: SummaryDelta = {
     droppedVerdicts: [],
     more: false,
     truncated: false,
+    coveredThroughMs: 1_700_000_000_000,
+    lagging: ["did:plc:b"],
 }
 
 /** Hand-assembled from the spec's diagnostic notation under RFC 8949 §4.2.1, not from the encoder. */
 const VECTOR_HEX = [
-    "a9",
+    "ab",
     "6162f6",
     "616382",
     "a3" + "616469" + "6469643a706c633a61" + "6175f5",
@@ -193,10 +195,12 @@ const VECTOR_HEX = [
     "a3" + "616469" + "6469643a706c633a62" + "6175f4",
     "6176a2" + "617281" + "6c" + "6e6f742d61646d6974746564" + "617662" + "6e6f",
     "6166f4",
+    "616c81" + "69" + "6469643a706c633a62",
     "616df4",
     "616ef4",
     "617280",
     "617463616263",
+    "6177" + "1b" + "0000018bcfe56800",
     "617880",
     "617980",
 ].join("")

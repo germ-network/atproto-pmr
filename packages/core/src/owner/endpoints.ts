@@ -30,6 +30,7 @@ import {
     type SummaryDelta,
     type SummaryPageDeps,
 } from "../summary.js"
+import { summaryCoverageAtMs, type SummaryCoverageDeps } from "../firehose-coverage.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
     authenticateOwner,
@@ -881,9 +882,11 @@ export async function handleSummaryRead(
     if (!a.ok) return a.response
     const { did, store } = a.auth
 
+    // Before the index and any CAR, so nothing served is older than `w` claims.
+    const coverage = await readSummaryCoverage(deps)
     let built
     try {
-        built = await buildSummaryIndex(did, deps)
+        built = await buildSummaryIndex(did, deps, coverage.lagging)
     } catch (error) {
         if (!(error instanceof SummaryOwnerReadError)) throw error
         return amortize(
@@ -938,7 +941,13 @@ export async function handleSummaryRead(
         !unchanged && base?.more === true ? since! : undefined
     )
 
-    const delta: SummaryDelta = { token, ...page, truncated: built.truncated }
+    const delta: SummaryDelta = {
+        token,
+        ...page,
+        truncated: built.truncated,
+        coveredThroughMs: coverage.coveredThroughMs,
+        lagging: built.lagging,
+    }
     return amortize(
         new Response(toResponseBody(encodeSummaryDelta(delta)), {
             status: 200,
@@ -947,6 +956,24 @@ export async function handleSummaryRead(
         did,
         deps
     )
+}
+
+/** A watermark that cannot be read is no coverage, never a failed summary. */
+async function readSummaryCoverage(
+    deps: SummaryCoverageDeps
+): Promise<{ coveredThroughMs: number | null; lagging: readonly string[] }> {
+    try {
+        const [firehose, plc] = await Promise.all([
+            deps.getFirehoseCoverage(),
+            deps.getPlcCoverage(),
+        ])
+        return {
+            coveredThroughMs: summaryCoverageAtMs(firehose, plc),
+            lagging: firehose?.lagging ?? [],
+        }
+    } catch {
+        return { coveredThroughMs: null, lagging: [] }
+    }
 }
 
 const SUMMARY_RETRY_AFTER_SECONDS = 60

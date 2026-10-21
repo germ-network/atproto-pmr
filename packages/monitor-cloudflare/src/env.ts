@@ -138,6 +138,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      */
     JETSTREAM_LOOKBACK_MS?: string
 
+    /**
+     * How far (ms) past the resume cursor the declaration stream's first frame
+     * may be before the stream is treated as having skipped events, default
+     * one minute. Such a gap starts a new coverage run and owes every served
+     * declaration.
+     */
+    JETSTREAM_RESUME_TOLERANCE_MS?: string
+
     /** A listing older than this (ms) is re-queued, default 7 days. */
     FOLLOW_RELIST_AFTER_MS?: string
 
