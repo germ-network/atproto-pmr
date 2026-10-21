@@ -8,8 +8,10 @@ produced and checked by `gen-ml-dsa-65.sh` using OpenSSL alone (no code from
 any implementation of this specification), so an implementation can test
 itself against them without them resting on it.
 
-Generated with OpenSSL 3.6.2 (`ML-DSA-65` needs 3.5 or later). All byte
-strings are lowercase hex unless the field name says base64 or base64url.
+Generated with OpenSSL 3.6.2 (`ML-DSA-65` needs 3.5 or later; the script
+also needs `jq` and `xxd`). Byte strings are lowercase hex unless the field
+name says base64 or base64url, except `keyid` and `nonce` (base64url text)
+and `content_digest` (an RFC 9530 field value).
 
 | Field | Meaning |
 | --- | --- |
