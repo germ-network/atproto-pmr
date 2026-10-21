@@ -33,7 +33,9 @@ Signature: pmr=:<base64>:
 ```
 
 Ed25519 is a registered algorithm (§3.3.6), so existing key material works
-unchanged. The signature base canonicalization is specified with test
+unchanged. The example shows `ed25519`; the profile below also admits
+`ml-dsa-65` for an ML-DSA-65 key, under the same components and parameters.
+The signature base canonicalization is specified with test
 vectors, so it is not this document's job to define what "exactly what is
 signed" means. Body integrity rides `Content-Digest`
 ([RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.html)) as a signed field
@@ -47,9 +49,12 @@ carrying a server challenge is conformant use.
 - MUST carry a `nonce` parameter holding a challenge the server issued, and
   the server MUST reject a signature whose challenge is unknown, expired,
   or bound to a different realm or destination.
-- MUST use `alg="ed25519"`. A verifier MUST pin the algorithm to what the
-  signer's *known* key type implies and MUST NOT trust the `alg` carried in
-  the message.
+- MUST use the `alg` its key type implies: `ed25519` for an OKP/Ed25519
+  key, `ml-dsa-65` for an AKP/ML-DSA-65 key (see
+  [Key material](#key-material)). A verifier MUST pin the algorithm to what
+  the signer's *known* key type implies, MUST reject a message whose `alg`
+  differs, and MUST NOT trust the `alg` carried in the message. A verifier
+  never accepts two names for one key type.
 - MUST set `keyid` to the
   [RFC 9679](https://www.rfc-editor.org/rfc/rfc9679.html) COSE Key
   Thumbprint of the key that signs — the declared anchor key or a
@@ -216,6 +221,53 @@ parses the declaration's key package, never writes a declaration, and
 every other key on every other surface here is COSE. The record's full
 field inventory belongs to the declaration's own format and is out of
 scope for this document.
+
+#### AKP / ML-DSA-65 signing keys
+
+A request-signing key MAY be an ML-DSA-65 key
+([FIPS 204](https://csrc.nist.gov/pubs/fips/204/final)), expressed as a
+`COSE_Key` of type AKP as defined by
+[RFC 9964](https://www.rfc-editor.org/rfc/rfc9964.html) §3 and §5:
+
+| Label | Name | Value |
+| --- | --- | --- |
+| 1 | `kty` | `7` (AKP) |
+| 3 | `alg` | `-49` (ML-DSA-65) |
+| -1 | `pub` | the ML-DSA-65 public key, a byte string of exactly 1952 bytes |
+
+- `alg` is REQUIRED, and `-49` is the only value accepted: a key labelled
+  ML-DSA-44 or ML-DSA-87 is not valid here.
+- A public key MUST NOT carry `priv` (label -2) (RFC 9964 §3); a relay
+  rejects one that does, so a leaked seed is never stored as a registration.
+  Other labels are ignored, as for OKP keys.
+- The map is encoded per [Deterministic CBOR](#deterministic-cbor), which
+  puts the labels in the order 1, 3, -1: the encoding is
+  `a3 01 07 03 38 30 20 59 07 a0` followed by the 1952 `pub` bytes.
+- The RFC 9679 thumbprint is SHA-256 over the deterministic encoding of
+  exactly `{1: 7, 3: -49, -1: pub}`, the required parameters RFC 9964 §6
+  names, with no other label.
+- The private key is its 32-byte seed (RFC 9964 §4), never an expanded key.
+
+The signature is pure ML-DSA-65 with the **empty context string** and no
+prehash: the message is the signature base, and the signature is the
+3309-byte output. The request's `Signature` field carries it exactly as for
+Ed25519. The `alg` name `ml-dsa-65` is the one
+[draft-skokan-httpbis-message-signatures-ml-dsa](https://panva.github.io/draft-httpbis-message-signatures-ml-dsa/draft-skokan-httpbis-message-signatures-ml-dsa.html)
+§3.2 proposes; this document does not claim it is a registered value.
+[RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) §3.3 says an `alg`
+chosen with the `alg` parameter MUST come from its registry, so a signer
+that emits `ml-dsa-65` before registration departs from that requirement.
+A verifier that accepts the name stays within the RFC, because the key type
+and this profile, not the message, select the algorithm.
+
+An ML-DSA-65 key is a request-signing key only. The anchor key stays
+Ed25519 — the declaration's key byte `3` is the only one accepted — and the
+grantPut realm is unchanged. A relay that registers owners by key MAY
+require ML-DSA-65 by policy, refusing an Ed25519 key with an explicit 4xx.
+
+Known-answer vectors, produced and checked with OpenSSL alone, are in
+[`vectors/ml-dsa-65.json`](vectors/ml-dsa-65.json); see
+[`vectors/README.md`](vectors/README.md).
 
 Keys persist self-describing, never as fixed-width columns, so a new
 algorithm arrives as a new identifier rather than a schema migration. On
