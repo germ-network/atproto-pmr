@@ -104,10 +104,12 @@ export {
     BODY_COMPONENT,
     DEFAULT_LABEL,
     REQUIRED_COMPONENTS,
+    requestSignatureAlg,
+    type RequestSignatureAlg,
     type VerifyInput,
     type VerifyOutcome as RequestVerifyOutcome,
 } from "./http-sig/verify.js"
-export { signRequest, type SignOptions } from "./http-sig/sign.js"
+export { signRequest, type SignOptions, type SigningKey } from "./http-sig/sign.js"
 export {
     parseSignature,
     parseSignatureInput,
@@ -213,9 +215,18 @@ export {
     type VerifyOutcome,
 } from "./cose/sign1"
 export {
+    encodeAkpMlDsa65Key,
+    encodeCosePublicKey,
     encodeOkpEd25519Key,
+    ML_DSA_65_PUBLIC_KEY_BYTES,
+    parseAkpMlDsa65Key,
+    parseCosePublicKey,
     parseOkpEd25519Key,
+    thumbprintAkpMlDsa65,
+    thumbprintCosePublicKey,
     thumbprintOkpEd25519,
+    type AkpMlDsa65Key,
+    type CosePublicKey,
     type OkpEd25519Key,
 } from "./cose/key"
 export {
