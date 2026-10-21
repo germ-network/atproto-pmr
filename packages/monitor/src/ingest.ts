@@ -49,6 +49,14 @@ export interface FetchedRecord {
     didDocument?: FetchedDidDocument
 }
 
+/** The declaration a settle just stored, as verified. */
+export interface SettledDeclaration {
+    rev: string
+    cid: string
+    /** The record's CAR, exactly as stored. */
+    car: Uint8Array
+}
+
 /** A DID document as fetched from its directory. */
 export interface FetchedDidDocument {
     document: DidDocument
@@ -93,6 +101,14 @@ export interface IngestDeps {
     retryCapMs?(did: string): Promise<number>
     /** Own-DID push, where a registration holds this DID. */
     onChange?(did: string, rev: string): Promise<void>
+    /**
+     * Every verified declaration stored (settle, quiet or not, and quiet
+     * refresh) and every one disposed of (deletion, interest leave), after
+     * the index write that discharges it. A snapshot-store read may still see
+     * the previous value; this argument is authoritative. `null` for a
+     * disposal. Raised before `onChange`; a throw is swallowed.
+     */
+    onSettled?(did: string, settled: SettledDeclaration | null): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
     onRegression?(did: string, indexed: string, observed: string): Promise<void>
     /**
@@ -304,6 +320,7 @@ export async function settleDeletion(
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
     await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause, gen)
+    await raiseSettled(deps, did, null)
     if (!quiet) await deps.onDelete?.(did)
 }
 
@@ -371,6 +388,20 @@ export async function settle(
         await withdrawFetchedDocument(deps, did, record.didDocument)
     }
     return outcome
+}
+
+/**
+ * Raises `onSettled`. A throw is swallowed: whatever a deployment keeps
+ * beside the index must not hold up the discharge it follows.
+ */
+export async function raiseSettled(
+    deps: IngestDeps,
+    did: string,
+    settled: SettledDeclaration | null
+): Promise<void> {
+    try {
+        await deps.onSettled?.(did, settled)
+    } catch {}
 }
 
 /** No declaration was ever indexed for `did`, held or gone. */
@@ -442,11 +473,14 @@ async function settleFetched(
         cid: verified.cid,
     })
     const written = { cid: verified.cid, verifiedWith: verified.key }
+    const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
     if (quiet) {
         await deps.index.completeQuietly(did, verified.rev, observedAtMs, written, gen)
+        await raiseSettled(deps, did, settled)
         return "stored"
     }
     await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
+    await raiseSettled(deps, did, settled)
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"

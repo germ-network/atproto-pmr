@@ -67,10 +67,17 @@ export function decodeFrame(bytes: Uint8Array): DecodedFrame {
 }
 
 /**
+ * Keys an entry extension may never use: the entry's own vocabulary, plus the
+ * push payload's type key `t`, which is merged into the same map.
+ */
+export const RESERVED_ENTRY_KEYS: ReadonlySet<string> = new Set(["k", "id", "m", "sd", "dc", "t"])
+
+/**
  * A queued message's field vocabulary, pair or grant mailbox alike — the
  * socket does not distinguish them, matching `openMailboxes`. `sd`/`dc`
  * (the relay's verification hint) are present only when the ref carries
- * one, which pair mailboxes do and grant mailboxes never do.
+ * one, which pair mailboxes do and grant mailboxes never do. A ref's `ext`
+ * rides with the hint, minus any key in `RESERVED_ENTRY_KEYS`.
  *
  * Shared with the REST catch-up route (`owner/endpoints.ts`'s
  * `handleMessagesList`), which reuses these exact keys unwrapped in a
@@ -92,6 +99,11 @@ export function messageEntryFields(
     if (ref.hint !== undefined && typeof ref.hint.declarationCID === "string") {
         entries.push(["sd", ref.hint.senderDID])
         entries.push(["dc", ref.hint.declarationCID])
+        if (ref.ext !== undefined) {
+            for (const [key, value] of Object.entries(ref.ext)) {
+                if (!RESERVED_ENTRY_KEYS.has(key)) entries.push([key, value])
+            }
+        }
     }
     return new Map(entries)
 }

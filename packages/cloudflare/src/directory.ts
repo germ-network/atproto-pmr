@@ -167,6 +167,15 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         return expectedActive
     }
 
+    /**
+     * Raised once per registration removed: replace, retire and deregister
+     * all pass through here. `locator` names the removed registration, so a
+     * late call can be told apart from a newer registration of the same DID.
+     * Runs after the unlink; a throw is logged and swallowed, so a deployment
+     * index keyed to it must tolerate a missed call (re-check on use).
+     */
+    protected async onRemoved(_did: string, _locator: Locator): Promise<void> {}
+
     private async unlinkAndDestroy(did: string, locator: Locator): Promise<void> {
         // Unlink first: this is the authoritative step. A crash between here and the
         // teardown below degrades to an orphaned-but-intact DO, never to a routing
@@ -178,6 +187,11 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
             // Best-effort reclamation: a failed teardown just leaves the orphan, it
             // must not fail the deregistration/replace.
             console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
+        }
+        try {
+            await this.onRemoved(did, locator)
+        } catch (err) {
+            console.warn(`KVDirectory: onRemoved failed for ${did}:`, err)
         }
         await this.notifyMonitor("unregister", did)
     }

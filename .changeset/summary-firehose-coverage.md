@@ -1,7 +1,7 @@
 ---
-"@germ-network/atproto-pmr-core": minor
-"@germ-network/atproto-pmr-monitor": minor
-"@germ-network/atproto-pmr-monitor-cloudflare": minor
+"@germ-network/atproto-pmr-core": patch
+"@germ-network/atproto-pmr-monitor": patch
+"@germ-network/atproto-pmr-monitor-cloudflare": patch
 ---
 
 The owner's summary carries the monitor's coverage: `w`, the earlier of the firehose and PLC covered-through instants in ms (null when either is missing), and `l`, the summary's contacts the monitor has not caught up on (sorted DIDs). Both appear on every `200`, are per response and not part of a stored state, so old decoders ignore them. `SummaryPageDeps` gains `getFirehoseCoverage` and `getPlcCoverage` (wire `kvFirehoseCoverage(env)` and `kvPlcCoverage(env)`; `PLC_EXPORT_STREAM_URL` must stay set or `w` is always null), and the summary reads coverage before the index and any record.

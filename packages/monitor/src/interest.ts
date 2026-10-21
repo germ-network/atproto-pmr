@@ -6,6 +6,7 @@
  * since nothing will keep that current any more.
  */
 import type { WatchedRecord } from "@germ-network/atproto-pmr-core"
+import type { IngestDeps } from "./ingest"
 import type {
     DidDocumentSink,
     InterestIndex,
@@ -21,6 +22,8 @@ export interface InterestDeps {
     secondaries: readonly WatchedRecord[]
     didDocuments?: DidDocumentSink
     nowMs(): number
+    /** Raised with `null` once a leave has disposed of the DID; see `IngestDeps.onSettled`. */
+    onSettled?: IngestDeps["onSettled"]
 }
 
 /**
@@ -70,4 +73,7 @@ async function dispose(deps: InterestDeps, did: string): Promise<void> {
     }
     await deps.didDocuments?.markDidDocumentStale(did, deps.nowMs())
     await deps.interest.forgetLeft(did)
+    try {
+        await deps.onSettled?.(did, null)
+    } catch {}
 }

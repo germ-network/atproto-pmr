@@ -17,6 +17,8 @@ import { bytesEqual } from "../watch.js"
 import type {
     BodyStore,
     Directory,
+    ExtensionFields,
+    Locator,
     PairMailboxKey,
     RegistrationFields,
 } from "../storage.js"
@@ -60,8 +62,44 @@ import {
 
 const OWNER_BODY_MAX_BYTES = 16 * 1024
 
+/**
+ * Deployment-defined registration fields. Absent, registration behaves and
+ * encodes exactly as the specification alone describes.
+ */
+export interface RegistrationExtension {
+    /**
+     * Reads the deployment's keys from a create body (an empty map when the
+     * body is empty). Called on every create; the result replaces whatever
+     * was stored, so `{}` withdraws. Unknown keys are ignored; a recognized
+     * key of the wrong type throws `RegistrationFieldError`, answered `400`.
+     */
+    parseCreateFields(body: ReadonlyMap<number | string, CoseValue>): ExtensionFields
+    /**
+     * After the registration and its fields are written, before the `201`.
+     * A throw fails the request; create is idempotent, so the client retries.
+     */
+    onCommitted?(registration: CommittedRegistration): Promise<void>
+    /**
+     * Extra `GET /pmr/v1/registration` keys. Async so an echo can confirm the
+     * deployment's own state, not just the stored fields. Cannot shadow `did`,
+     * `st` or `ps`.
+     */
+    readFields?(registration: RegistrationFields): Promise<ReadonlyArray<readonly [string, CoseValue]>>
+}
+
+export interface CommittedRegistration {
+    did: string
+    locator: Locator
+    /** `COSE_Key` blob, as stored. */
+    anchorKey: Uint8Array
+    ext: ExtensionFields
+}
+
+export class RegistrationFieldError extends Error {}
+
 export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
+    registrationExtension?: RegistrationExtension
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
     /**
@@ -247,9 +285,11 @@ export async function handleRegistrationCreate(
     // answers 400 rather than being silently dropped, since a client typo
     // would otherwise produce a registration that looks fine and never
     // receives a push.
+    let decodedBody: ReadonlyMap<number | string, CoseValue> = new Map()
     if (body !== null && body.byteLength > 0) {
         try {
             const map = decodeCoseMap(body)
+            decodedBody = map
             const endpoint = map.get("pse")
             const contentKey = map.get("psk")
             const keyId = map.get("psi")
@@ -286,6 +326,18 @@ export async function handleRegistrationCreate(
             }
         } catch {
             return new Response("Malformed body", { status: 400 })
+        }
+    }
+
+    // Replaced whole on every create, so a key the body omits is withdrawn.
+    if (deps.registrationExtension !== undefined) {
+        try {
+            fields.ext = deps.registrationExtension.parseCreateFields(decodedBody)
+        } catch (e) {
+            if (e instanceof RegistrationFieldError) {
+                return new Response("Malformed body", { status: 400 })
+            }
+            throw e
         }
     }
 
@@ -334,9 +386,29 @@ export async function handleRegistrationCreate(
         ...(fields.pushSubscription !== undefined
             ? { pushSubscription: fields.pushSubscription }
             : {}),
+        ...(fields.ext !== undefined ? { ext: fields.ext } : {}),
+    })
+
+    await deps.registrationExtension?.onCommitted?.({
+        did,
+        locator,
+        anchorKey: fields.anchorKey,
+        ext: fields.ext ?? {},
     })
 
     return cbor([["l", locator]], 201)
+}
+
+/** The extension's read keys, minus any that would shadow the core ones. */
+async function extraFields(
+    deps: OwnerDeps,
+    reg: RegistrationFields
+): Promise<Array<[string, CoseValue]>> {
+    if (deps.registrationExtension?.readFields === undefined) return []
+    const core = new Set(["did", "st", "ps"])
+    return (await deps.registrationExtension.readFields(reg))
+        .filter(([key]) => !core.has(key))
+        .map(([key, value]): [string, CoseValue] => [key, value])
 }
 
 /** `GET /pmr/v1/registration` — read own. */
@@ -357,6 +429,7 @@ export async function handleRegistrationRead(
         // The subscription's endpoint and content key are never echoed
         // back; only whether one exists.
         ["ps", reg.pushSubscription !== undefined],
+        ...(await extraFields(deps, reg)),
         ]),
         a.auth.did,
         deps
