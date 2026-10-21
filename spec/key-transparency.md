@@ -252,8 +252,9 @@ PDS on a fixed schedule.
   covered. It then **resyncs**: for each held DID it reads the declaration
   record and compares its CID with the one held, as the backoff does, and
   raises the DID's freshness as the check reaches it. The watermark advances
-  again once the resync has reached every held DID. A resync costs one record
-  read per holder, paid per gap. A restart of the PLC export stream without a
+  again once the resync has reached every held DID
+  ([the firehose coverage rule](#the-firehose-coverage-rule)). A resync costs one
+  record read per holder, paid per gap. A restart of the PLC export stream without a
   usable cursor is a gap too: it ends the PLC coverage run, and the monitor
   re-confirms each held `did:plc` document and operation log
   ([below](#the-stored-did-document)).
@@ -289,8 +290,10 @@ A monitor publishes two watermarks beside its stores, and a relay judges what
 it reads by them, never by a per-DID refresh time:
 
 - **Firehose coverage.** The instant through which every declaration commit
-  and identity or account event the firehose sequenced has been applied. A
-  snapshot's freshness is the later of this and the DID's last direct fetch.
+  and identity or account event the firehose sequenced has been applied, for
+  every held DID not on a published lagging list
+  ([the rule](#the-firehose-coverage-rule)). A snapshot's freshness is the later
+  of this and the DID's last direct fetch.
 - **PLC coverage run.** When the export stream's current unbroken run began,
   and the `createdAt` through which every operation since then has reached the
   stored documents. A run continues across a restart that resumes from the
@@ -301,6 +304,69 @@ A relay trusts a stored `did:plc` document while the document was confirmed
 inside the current run and the run's covered-through time is no more than ten
 minutes old. Any other stored document is trusted for ten minutes, the same as
 a direct fetch. A missing or unreadable watermark is no coverage.
+
+### The firehose coverage rule
+
+The monitor publishes firehose coverage as one value, so a reader never pairs
+one tick's watermark with another tick's list: `continuousSince` (ms),
+`coveredThrough` (ms, or null) and `lagging` (DIDs, sorted). A missing or
+malformed value is no coverage.
+
+- **Owed and applied.** Taking in a stream event for a held DID **owes** a
+  fetch of that DID; the stream cursor advances on taking the event in, not on
+  applying it, so the cursor alone is not coverage. A fetch is **applied** when
+  its record is stored, or at a terminal discharge: the record is gone, the
+  fetched record would regress what is held, or the monitor holds the DID
+  unverifiable (no key for the repo in the DID document, or bad bytes under the
+  same key). For a DID held unverifiable the monitor's best knowledge stands. A
+  fetch that fails for a reason that may pass (an unreachable PDS) stays owed.
+  An event that arrives while a fetch is in flight owes a fetch of its own, and
+  the fetch in flight does not discharge it.
+- **Stamps.** Each owed stream event carries a stamp: its stream time. A DID
+  owed several events carries the oldest. A fetch that has just been applied
+  keeps its stamp for **60 seconds** (`KV_VISIBILITY_MS`), so the watermark
+  never passes an event whose stored record may not yet be visible to every
+  reader of the store. An owe that no stream event caused (a backfill, a join,
+  a PLC event) carries no stamp and holds the watermark back by nothing.
+- **Covered-through** is the earlier of the stream cursor's time and the oldest
+  stamp among the held DIDs that are not lagging. With no stamp it is the
+  cursor's time.
+- **Lagging.** A held DID whose oldest stamp is more than ten minutes
+  (`FIREHOSE_COVERAGE_MAX_LAG_MS`) older than the monitor's clock, judged by
+  the event's age and not by how long the fetch has been owed, is lagging: it
+  leaves the minimum above and is listed in `lagging`, so one unreachable PDS
+  cannot hold back every other holder. A lagging DID leaves the list when its
+  fetch is applied. A stamp from before stamps existed counts as the oldest
+  possible, so it lags at once. Past 1000 lagging DIDs (`FIREHOSE_LAGGING_CAP`)
+  the monitor publishes `coveredThrough` as null: coverage that excuses that
+  many holders is not coverage.
+- **Held.** Only a held DID's stamp counts. A DID the monitor does not hold
+  serves nothing, so it cannot make a served record stale.
+- **Run.** `continuousSince` is when the current unbroken run began. Coverage
+  is null while `coveredThrough` is before `continuousSince`, and until the
+  stream has delivered a cursor, so a watermark never claims time from before
+  the stream was whole.
+- **Gaps.** A **gap** is either of two observations: at connect, a stored cursor
+  older than the stream's replay window; or, after a resume from a cursor inside
+  the window, a first frame whose time is past that cursor by more than a
+  tolerance (events were skipped). On a gap the monitor starts a new run at the
+  gap instant and owes **every served DID** (every DID it holds a declaration
+  for, not one it holds as gone), stamped with the gap instant. The ordinary rule
+  then finishes the resync: `coveredThrough` is held at the gap instant, so
+  coverage is null until each DID has been fetched or has become lagging, and
+  there is no separate resync state. A gap longer than ten minutes puts every
+  re-owed holder on `lagging` at once, and `coveredThrough` is null while there
+  are more than 1000 of them. A monitor settling 32 DIDs on each two-minute
+  alarm clears about 960 holders an hour, which an operator sizes the gap
+  response by.
+- **Key rotations.** Firehose coverage does not follow a `did:plc` key rotation;
+  the PLC coverage run does. A summary's `w` is the earlier of the two
+  ([wire API](wire-api.md#summary)).
+- **`did:web`.** No stream covers a `did:web` document, so firehose coverage
+  says nothing about the current key of a `did:web` DID.
+- **Clocks.** A watermark is a stream event time. A reader compares it with its
+  own clock, under the same assumption as the PLC run: clocks agree to well
+  within the ten-minute bound.
 
 ### Reads and the 24-hour rule
 

@@ -1227,9 +1227,10 @@ relay, and a device reads only the results.
 
 `200` whether or not a record is found, `400` for a malformed path. Found:
 `f`=true, `c` the CAR byte for byte as held, `r` the commit's `rev`, `i` the
-record's CID, `t` the snapshot's freshness (ms): the later of the monitor's
-coverage watermark and the DID's last direct fetch
-([key-transparency](key-transparency.md#the-coverage-watermarks)). Not
+record's CID, `t` the snapshot's last direct fetch (ms). It is not the
+snapshot's freshness: that is the later of the monitor's
+[coverage watermark](key-transparency.md#the-coverage-watermarks) and the last
+direct fetch, and a device reads the watermark from the summary's `w`. Not
 found: `f`=false, `e` a code, `m` a reason. `rev` and `i` are hints a device
 re-derives from the CAR.
 
@@ -1345,6 +1346,8 @@ response is a delta against a state the client names by **token**:
 | `y` | `droppedVerdicts`: DIDs that had a verdict in the named state and have none now |
 | `m` | `more`: changes remain; read again at once naming this token |
 | `n` | `truncated`: the owner has more contacts than a summary covers |
+| `w` | `coveredThrough`: the relay's monitor coverage, in ms, or null |
+| `l` | `lagging`: the summary's contacts whose coverage is not current, sorted DIDs, possibly empty |
 
 A read with no `since`, or one naming an unknown or dropped token, gets the
 whole summary as `full`. A relay keeps the last four states it served an
@@ -1380,6 +1383,33 @@ held tokens, for the same reason: a relay that stored a state for it counts the
 mutual bits as delivered. A client reading a `c` entry with no `u`, from a
 relay that predates it, holds the contact as not mutual.
 
+`w` and `l` tell the client how current what it holds is. `w` is the earlier of
+the monitor's [firehose coverage](key-transparency.md#the-firehose-coverage-rule)
+and its PLC coverage run's covered-through time, so a contact's records are
+current through `w` unless the contact is in `l`; it is null when either is
+missing, null or (for the firehose) over the lagging cap, which is no coverage.
+`l` lists, sorted, only DIDs that are among the contacts this summary covers
+(after truncation) and are on the monitor's lagging list, so it never names a
+DID outside the owner's contacts; it is empty when none lags. Both appear on every `200`,
+including a read that finds nothing changed and every page of a multi-page
+response. They describe the response and are not part of a stored state, so a
+token never depends on them and a client that predates them ignores them.
+`409` and `503` stay bodyless. The relay reads coverage **before** it reads the
+owner's graph or any record, so everything the response serves is at least as
+new as `w` says.
+
+A client adopts `w` and `l` from a response with `m` false, the last page. It
+treats a contact as **current** when `now − w` is within ten minutes, the
+contact is not in `l`, was not delivered in `x` (a contact in `x` is evicted),
+and is not a `did:web` DID, which no stream covers. For a current contact it
+sends without reading. For one that is not, it makes one summary read naming
+its token, then decides again; a contact that is still in `l`, or is `did:web`,
+is read with the [single-DID read](#records) before it is trusted. A `w` is a
+stream event time compared on the client's clock, under the clock assumption of
+[the firehose coverage rule](key-transparency.md#the-firehose-coverage-rule).
+A rotated record is not served and arrives in `x`, so the client does not take
+its absence from `r` as currency.
+
 A verdict covers a contact only while the contact is covered and the relay
 holds a servable declaration for it; a contact with none has no verdict, and that is not a `no`: a client
 treats a DID in `y`, or one never listed in `c`, as unanswered. A declaration
@@ -1406,9 +1436,10 @@ exemption for `did:web`. A record that stops passing is reported in `x`.
 ##### Summary test vector
 
 A complete non-full response with two `c` entries, a mutual `yes` and a
-non-mutual `no`, and everything else empty or null. Keys are sorted as in
+non-mutual `no`, coverage `w` at 1700000000000 ms with `did:plc:b` lagging, and
+everything else empty or null. Keys are sorted as in
 [deterministic CBOR](#deterministic-cbor) (RFC 8949 §4.2.1): in the response
-`b c f m n r t x y`, in an entry `d u v`.
+`b c f l m n r t w x y`, in an entry `d u v`.
 
 ```
 {
@@ -1417,20 +1448,24 @@ non-mutual `no`, and everything else empty or null. Keys are sorted as in
     {"d": "did:plc:a", "u": true,  "v": {"a": ["bsky-follows"], "v": "yes"}},
     {"d": "did:plc:b", "u": false, "v": {"r": ["not-admitted"], "v": "no"}}
   ],
-  "f": false, "m": false, "n": false,
-  "r": [], "t": "abc", "x": [], "y": []
+  "f": false, "l": ["did:plc:b"], "m": false, "n": false,
+  "r": [], "t": "abc", "w": 1700000000000, "x": [], "y": []
 }
 ```
 
 ```
-a9 6162 f6
+ab 6162 f6
    6163 82
       a3 6164 69 6469643a706c633a61  6175 f5
          6176 a2 6161 81 6c 62736b792d666f6c6c6f7773  6176 63 796573
       a3 6164 69 6469643a706c633a62  6175 f4
          6176 a2 6172 81 6c 6e6f742d61646d6974746564  6176 62 6e6f
-   6166 f4  616d f4  616e f4
-   6172 80  6174 63 616263  6178 80  6179 80
+   6166 f4
+   616c 81 69 6469643a706c633a62
+   616d f4  616e f4
+   6172 80  6174 63 616263
+   6177 1b 0000018bcfe56800
+   6178 80  6179 80
 ```
 
 Whitespace in the hex is for reading; the body is the bytes concatenated.
@@ -1523,23 +1558,12 @@ specified in [`key-transparency.md`](key-transparency.md).
 
 ### Observation
 
-| method | path | notes |
-|---|---|---|
-| `GET` | `/pmr/v1/observations` | list DIDs under observation |
-| `PUT` | `/pmr/v1/observations/{did}` | declare interest |
-| `DELETE` | `/pmr/v1/observations/{did}` | drop interest |
-| `GET` | `/pmr/v1/observations/{did}/record` | latest record as CAR, with its `rev` |
-
-Everything beyond the declaration: profiles, the follow graph, appview
-reads. How updates reach a client — a frame on the events socket, or a
-surface of its own — is part of this deferred design, not defined here.
-
-Unlike key monitoring, observation wants breadth and permissioned
-access rather than independence, so it is served once and sits well at a
-deployment holding the user's data — including their PDS.
-
-**Deferred.** The endpoints above are a sketch, not a specified surface;
-nothing here is normative yet.
+How a client learns that a contact's declaration changed is the
+[owner summary](#summary): its delta reports changed and removed records, and
+its `w` and `l` report whether what the client holds is current. There is no
+separate observation surface, and the events socket carries no summary frame.
+Everything beyond the declaration (profiles, the follow graph, appview reads)
+is served by the user's own deployment and is not defined here.
 
 ### Push delivery — Web Push (optional)
 
