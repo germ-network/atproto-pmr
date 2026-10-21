@@ -197,7 +197,6 @@ is an index, not a substitute for the sections it links.
 | 13 | The relay's verification verdict is delivered to the device as a hint and never as evidence; the device re-verifies | [trust](trust-model.md#p8--the-relays-verdict-is-a-hint) |
 | 14 | Both mailbox kinds are served on one inbox path, distinguished by key prefix, with a DID carried verbatim and only a grant address prefixed | [wire](wire-api.md#delivery--peer-facing) |
 | 15 | The enabler document is generated from enforced values, omits capabilities not served rather than flagging them, and its declared prefixes are where the endpoints actually answer | [wire](wire-api.md#the-enabler-document) |
-| 16 | Where implemented, relayed legacy intake reaches only registrations opted in with `lr`, attributes a put only to a unique candidate in the recipient's allow set, never letting blocks narrow the candidates, and otherwise refuses it, and keys nothing but its two lookups by anchor key | [wire](wire-api.md#relayed-legacy-intake) |
 
 Items 2 and 9 are not self-certifying. Both are timing properties, and an
 implementation that satisfies them in code can lose them to an early
