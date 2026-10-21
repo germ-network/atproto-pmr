@@ -1831,8 +1831,8 @@ Three populations, and what each may learn is a security property:
 | peer, pair put | `202`; `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
-An owner `409` is transient, with `Retry-After`, on summary, and terminal,
-without it, on registration create.
+An owner `409` on summary is transient, with `Retry-After`; on registration
+create it is terminal, without one.
 
 The dividing line is authorization and what per-sender reservation makes
 self-referential: an owner gets diagnosis, an authenticated sender learns
