@@ -257,3 +257,12 @@ export {
     type SnapshotCheck,
 } from "./refresh"
 
+
+export {
+    computeFirehoseCoverage,
+    isResumeJump,
+    isStaleCursor,
+    streamTimeUs,
+    type FirehoseCoverageInput,
+    type OwedStreamEvent,
+} from "./firehose-coverage"

@@ -84,10 +84,12 @@ import {
     mirrorGraph,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
+    streamTimeUs,
     relistStale,
     runListings,
 } from "@germ-network/atproto-pmr-monitor"
 import type {
+    OwedStreamEvent,
     FollowBackfillConfig,
     FollowBackfillDeps,
     ListingProgress,
@@ -121,6 +123,7 @@ import {
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
+    KV_VISIBILITY_MS,
     type PlcCoverage,
     type RepoCollectionsExpectation,
     type VerifiedCollections,
@@ -140,6 +143,12 @@ import { kvSnapshotStore } from "./snapshot-store"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
+
+/** On a conflict an owed row keeps the earlier stream stamp; a row owed by no stream event takes the new one. */
+const KEEP_EARLIER_STAMP =
+    "owed_since_us = CASE WHEN pending.owed_since_us IS NULL THEN excluded.owed_since_us " +
+    "WHEN excluded.owed_since_us IS NULL THEN pending.owed_since_us " +
+    "ELSE MIN(pending.owed_since_us, excluded.owed_since_us) END"
 
 /** DIDs the refresh queue covers; `policy` names the bound parameter holding the interest policy. */
 const refreshCandidates = (policy: string) =>
@@ -376,6 +385,11 @@ export class MonitorIngest
                     attempts INTEGER NOT NULL DEFAULT 0,
                     not_before INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS applied_recent (
+                    did TEXT PRIMARY KEY,
+                    owed_since_us INTEGER NOT NULL,
+                    applied_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS meta (
                     k TEXT PRIMARY KEY,
                     v TEXT NOT NULL
@@ -539,6 +553,15 @@ export class MonitorIngest
                 this.db.sql.exec(
                     "ALTER TABLE pending ADD COLUMN owed_gen INTEGER NOT NULL DEFAULT 0"
                 )
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_since_us'")
+                    .toArray().length === 0
+            ) {
+                // Rows owed before stamps existed lag at once.
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN owed_since_us INTEGER")
+                this.db.sql.exec("UPDATE pending SET owed_since_us = 0")
             }
             if (
                 this.db.sql
@@ -1010,12 +1033,14 @@ export class MonitorIngest
             return { outcome: "duplicate" }
         }
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen) VALUES (?, ?, 0, 0, ?) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                "VALUES (?, ?, 0, 0, ?, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                "owed_gen = excluded.owed_gen",
+                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             event.did,
             event.rev,
-            this.nextOweGen()
+            this.nextOweGen(),
+            streamTimeUs(cursor)
         )
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
@@ -1026,14 +1051,16 @@ export class MonitorIngest
     }
 
     /** Owe a fetch the dedupe check would otherwise suppress. */
-    async owe(did: string, rev: string): Promise<void> {
+    async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen) VALUES (?, ?, 0, 0, ?) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                "VALUES (?, ?, 0, 0, ?, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                "owed_gen = excluded.owed_gen",
+                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             did,
             rev,
-            this.nextOweGen()
+            this.nextOweGen(),
+            owedSinceUs ?? null
         )
     }
 
@@ -1061,12 +1088,55 @@ export class MonitorIngest
     /** The generation clause of a discharge: unconditional, or only the generation fetched for. */
     private dischargePending(did: string, gen: number | null | undefined, quietOnly = false): void {
         if (gen === null) return
-        const quiet = quietOnly ? " AND quiet = 1" : ""
-        if (gen === undefined) {
-            this.db.sql.exec(`DELETE FROM pending WHERE did = ?${quiet}`, did)
-            return
-        }
-        this.db.sql.exec(`DELETE FROM pending WHERE did = ? AND owed_gen = ?${quiet}`, did, gen)
+        const where =
+            (gen === undefined ? "did = ?1" : "did = ?1 AND owed_gen = ?2") +
+            (quietOnly ? " AND quiet = 1" : "")
+        const args = gen === undefined ? [did] : [did, gen]
+        const appliedAt = Date.now()
+        // The stamp outlives the row for the KV visibility window: the record
+        // this discharge stored may not yet be readable everywhere.
+        this.db.sql.exec(
+            "INSERT INTO applied_recent (did, owed_since_us, applied_at) " +
+                `SELECT did, owed_since_us, ${appliedAt} FROM pending ` +
+                `WHERE ${where} AND owed_since_us IS NOT NULL ` +
+                "ON CONFLICT(did) DO UPDATE SET " +
+                "owed_since_us = MIN(applied_recent.owed_since_us, excluded.owed_since_us), " +
+                "applied_at = excluded.applied_at",
+            ...args
+        )
+        this.db.sql.exec(`DELETE FROM pending WHERE ${where}`, ...args)
+    }
+
+    /**
+     * Stream-owed events and recently applied fetches of the DIDs the monitor
+     * holds or held, for the coverage watermark; prunes applied fetches past
+     * the visibility window on the way. A gone DID counts: its deletion is a
+     * KV write with the same window. A DID never held serves nothing, so its
+     * stamp is left out.
+     */
+    async owedStreamEvents(nowMs: number): Promise<OwedStreamEvent[]> {
+        this.db.sql.exec(
+            "DELETE FROM applied_recent WHERE applied_at <= ?",
+            nowMs - KV_VISIBILITY_MS
+        )
+        const held = "did IN (SELECT did FROM holder_state)"
+        const owed = this.db.sql
+            .exec<{ did: string; owed_since_us: number }>(
+                `SELECT did, owed_since_us FROM pending WHERE owed_since_us IS NOT NULL AND ${held}`
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, owedSinceUs: r.owed_since_us, appliedAtMs: null }))
+        const applied = this.db.sql
+            .exec<{ did: string; owed_since_us: number; applied_at: number }>(
+                `SELECT did, owed_since_us, applied_at FROM applied_recent WHERE ${held}`
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                owedSinceUs: r.owed_since_us,
+                appliedAtMs: r.applied_at,
+            }))
+        return [...owed, ...applied]
     }
 
     /** Discharge an obligation without indexing: a terminal, unstorable answer. */

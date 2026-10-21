@@ -1,7 +1,7 @@
-import { env, runInDurableObject } from "cloudflare:test"
+import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
-import { settle, type IngestDeps } from "@germ-network/atproto-pmr-monitor"
+import { KV_VISIBILITY_MS, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import { intake, settle, type IngestDeps } from "@germ-network/atproto-pmr-monitor"
 import { kvSnapshotStore } from "../src/snapshot-store"
 import type { MonitorEnv } from "../src/env"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -168,15 +168,158 @@ describe("owe generation (S2)", () => {
     })
 })
 
+const VERIFIED = { cid: "bafyreistub", verifiedWith: SIGNING_KEY }
+
+function stampOf(obj: MonitorIngest, did = DID): number | null | undefined {
+    const row = (obj as unknown as { db: DurableObjectStorage }).db.sql
+        .exec<{ owed_since_us: number | null }>(
+            "SELECT owed_since_us FROM pending WHERE did = ?",
+            did
+        )
+        .toArray()[0]
+    return row === undefined ? undefined : row.owed_since_us
+}
+
 describe("owed_since_us (S3)", () => {
-    it.todo("intake stamps owed_since_us with the event cursor")
-    it.todo("a second event for an owed DID keeps the earlier stamp")
-    it.todo("a stream identity event stamps; backfill, join and PLC owes do not")
-    it.todo("a null-time frame stamps the stored cursor")
-    it.todo("migration stamps pre-existing rows 0")
-    it.todo("a discharge moves its stamp to applied_recent for KV_VISIBILITY_MS, then prunes it")
-    it.todo("an applied_recent row is never re-settled; a new event for that DID re-owes normally")
-    it.todo("only held DIDs' rows count")
+    it("intake stamps owed_since_us with the event cursor", async () => {
+        const stamp = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "1700000000000000")
+            return stampOf(obj)
+        })
+        expect(stamp).toBe(1_700_000_000_000_000)
+    })
+
+    it("a second event for an owed DID keeps the earlier stamp", async () => {
+        const stamps = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "2000")
+            await obj.intake({ did: DID, rev: "3m2" }, "3000")
+            const later = stampOf(obj)
+            await obj.owe(DID, "3m2", 1000)
+            return [later, stampOf(obj)]
+        })
+        expect(stamps).toEqual([2000, 1000])
+    })
+
+    it("a stream identity event stamps; a plain owe and a join do not, and a later stream event stamps their row", async () => {
+        const stamps = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED)
+            await intake(
+                (obj as unknown as { deps(): IngestDeps }).deps(),
+                { collection: testEnv.MONITOR_COLLECTION, policy: "everyone" },
+                {
+                    kind: "identity",
+                    did: DID,
+                    seq: null,
+                    timeMs: 5,
+                    active: null,
+                    status: null,
+                },
+                "5000"
+            )
+            const identity = stampOf(obj)
+            await obj.owe(DID, "3m1")
+            const keptByPlainOwe = stampOf(obj)
+            await obj.clearPending(DID)
+            await obj.owe(DID, "3m1")
+            const plain = stampOf(obj)
+            await obj.oweJoin("did:plc:joiner", [], await obj.interestEpoch("did:plc:joiner"))
+            const join = stampOf(obj, "did:plc:joiner")
+            await obj.intake({ did: "did:plc:joiner", rev: "3m1" }, "9000")
+            return [identity, keptByPlainOwe, plain, join, stampOf(obj, "did:plc:joiner")]
+        })
+        expect(stamps).toEqual([5000, 5000, null, null, 9000])
+    })
+
+    it("a null-time frame stamps the stored cursor", async () => {
+        const stamp = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED)
+            await obj.intake({ did: "did:plc:other", rev: "3m1" }, "7777")
+            await (
+                obj as unknown as { onFrame(raw: string): Promise<void> }
+            ).onFrame(JSON.stringify({ payload: { $type: "#identity", did: DID } }))
+            return stampOf(obj)
+        })
+        expect(stamp).toBe(7777)
+    })
+
+    it("migration stamps pre-existing rows 0", async () => {
+        const stub = freshStub()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const sql = (obj as unknown as { db: DurableObjectStorage }).db.sql
+            sql.exec("ALTER TABLE pending DROP COLUMN owed_since_us")
+            sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen) VALUES (?, '3m1', 0, 0, 0)",
+                DID
+            )
+        })
+        await evictDurableObject(stub)
+        const stamp = await runInDurableObject(stub, async (obj: MonitorIngest) => stampOf(obj))
+        expect(stamp).toBe(0)
+    })
+
+    it("a discharge moves its stamp to applied_recent for KV_VISIBILITY_MS, then prunes it", async () => {
+        const seen = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "4000")
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED, await obj.owedGenOf(DID))
+            const now = Date.now()
+            return {
+                pending: stampOf(obj),
+                within: await obj.owedStreamEvents(now),
+                after: await obj.owedStreamEvents(now + KV_VISIBILITY_MS + 1),
+            }
+        })
+        expect(seen.pending).toBeUndefined()
+        expect(seen.within).toEqual([
+            { did: DID, owedSinceUs: 4000, appliedAtMs: expect.any(Number) },
+        ])
+        expect(seen.after).toEqual([])
+    })
+
+    it("an applied_recent row is never re-settled; a new event for that DID re-owes normally", async () => {
+        const owed = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.intake({ did: DID, rev: "3m1" }, "4000")
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED)
+            const idle = (await obj.duePending(Date.now(), 10)).length
+            await obj.intake({ did: DID, rev: "3m2" }, "6000")
+            const events = await obj.owedStreamEvents(Date.now())
+            return { idle, due: await owedRevs(obj), events }
+        })
+        expect(owed.idle).toBe(0)
+        expect(owed.due).toEqual(["3m2"])
+        expect(owed.events.map((e) => [e.owedSinceUs, e.appliedAtMs === null])).toEqual([
+            [6000, true],
+            [4000, false],
+        ])
+    })
+
+    it("a gone DID's applied fetch still counts for the visibility window", async () => {
+        const events = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED)
+            await obj.intake({ did: DID, rev: "3m2" }, "4000")
+            await obj.completeDeletion(
+                DID,
+                Date.now(),
+                false,
+                false,
+                "repo",
+                await obj.owedGenOf(DID)
+            )
+            return obj.owedStreamEvents(Date.now())
+        })
+        expect(events).toEqual([
+            { did: DID, owedSinceUs: 4000, appliedAtMs: expect.any(Number) },
+        ])
+    })
+
+    it("only held DIDs' rows count", async () => {
+        const events = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.intake({ did: "did:plc:never", rev: "3m1" }, "4000")
+            await obj.complete(DID, "3m1", Date.now(), VERIFIED)
+            await obj.intake({ did: DID, rev: "3m2" }, "5000")
+            return obj.owedStreamEvents(Date.now())
+        })
+        expect(events.map((e) => e.did)).toEqual([DID])
+    })
 })
 
 describe("publication (S5)", () => {

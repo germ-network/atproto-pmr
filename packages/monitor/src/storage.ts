@@ -203,8 +203,12 @@ export interface MonitorIndex {
      * check would suppress: a DID-document rotation, where the record is
      * unchanged but what it verifies against is not, and any operator-
      * driven re-check.
+     *
+     * `owedSinceUs` is the stream time (µs) of the event that prompted it; the
+     * row keeps the earliest while it stays owed. Without it the owe is not a
+     * stream event's and holds firehose coverage back by nothing.
      */
-    owe(did: string, rev: string): Promise<void>
+    owe(did: string, rev: string, owedSinceUs?: number): Promise<void>
 
     /**
      * The generation of the obligation owed for `did` now, or null when none

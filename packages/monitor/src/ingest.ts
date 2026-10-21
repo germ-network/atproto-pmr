@@ -19,6 +19,7 @@ import {
     type DidDocument,
     type InterestPolicy,
 } from "@germ-network/atproto-pmr-core"
+import { streamTimeUs } from "./firehose-coverage"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
@@ -160,7 +161,7 @@ export async function intake(
         // — re-owing here would only rediscover the same deletion and
         // re-push it, once per identity/account/sync event, forever.
         const reverify = known !== null && !(await deps.index.isDeleted(event.did))
-        if (reverify) await deps.index.owe(event.did, known)
+        if (reverify) await deps.index.owe(event.did, known, streamTimeUs(cursor))
         // The relay's cached key is dropped for every DID whose document the
         // monitor keeps, declaration or not. After the owe, so a holder that
         // reverifies is watched.

@@ -335,8 +335,8 @@ malformed value is no coverage.
   (`FIREHOSE_COVERAGE_MAX_LAG_MS`) older than the monitor's clock, judged by
   the event's age and not by how long the fetch has been owed, is lagging: it
   leaves the minimum above and is listed in `lagging`, so one unreachable PDS
-  cannot hold back every other holder. A lagging DID leaves the list when its
-  fetch is applied. A stamp from before stamps existed counts as the oldest
+  cannot hold back every other holder. A lagging DID leaves the list once its
+  fetch is applied and its 60 seconds have passed. A stamp from before stamps existed counts as the oldest
   possible, so it lags at once. Past 1000 lagging DIDs (`FIREHOSE_LAGGING_CAP`)
   the monitor publishes `coveredThrough` as null: coverage that excuses that
   many holders is not coverage.

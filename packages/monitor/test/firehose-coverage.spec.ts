@@ -3,6 +3,7 @@ import {
     computeFirehoseCoverage,
     isResumeJump,
     isStaleCursor,
+    streamTimeUs,
     type FirehoseCoverageInput,
     type OwedStreamEvent,
 } from "../src/firehose-coverage"
@@ -89,8 +90,8 @@ describe("computeFirehoseCoverage (S4)", () => {
             ...base,
             owed: [{ ...owed, appliedAtMs: NOW - 1000 }],
         })
-        expect(justApplied.lagging).toEqual([])
-        expect(justApplied.coveredThroughMs).toBe(NOW - 11 * MIN)
+        expect(justApplied.lagging).toEqual(["did:plc:old"])
+        expect(justApplied.coveredThroughMs).toBe(NOW - 1000)
     })
 
     it("a row stamped 0 lags at once", () => {
@@ -123,6 +124,9 @@ describe("computeFirehoseCoverage (S4)", () => {
             computeFirehoseCoverage({ ...base, continuousSinceMs: NOW - 1000 }).coveredThroughMs
         ).toBe(NOW - 1000)
         expect(computeFirehoseCoverage({ ...base, cursorUs: null }).coveredThroughMs).toBeNull()
+        expect(
+            computeFirehoseCoverage({ ...base, cursorUs: null, continuousSinceMs: 0 }).coveredThroughMs
+        ).toBeNull()
     })
 
     it("counts a DID's stamps once, whichever of its rows is older, and excuses all of a lagging DID's", () => {
@@ -135,6 +139,13 @@ describe("computeFirehoseCoverage (S4)", () => {
         })
         expect(got.lagging).toEqual(["did:plc:a"])
         expect(got.coveredThroughMs).toBe(NOW - 1000)
+    })
+})
+
+describe("streamTimeUs", () => {
+    it("is the cursor's microseconds, and 0 for anything that is not a time", () => {
+        expect(streamTimeUs("1700000000000000")).toBe(1_700_000_000_000_000)
+        for (const bad of ["", "abc", "-5", "0"]) expect(streamTimeUs(bad)).toBe(0)
     })
 })
 
