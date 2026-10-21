@@ -50,6 +50,7 @@ export {
     type OwedKeyUpdate,
     type Observation,
     type ObservationComparison,
+    type PendingFailure,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
@@ -79,6 +80,16 @@ export {
     type GraphMirrorTransition,
     type StatementBudget,
 } from "./storage"
+
+// The operator's read of ingest progress.
+export {
+    PENDING_ATTEMPT_BUCKETS,
+    type MonitorIngestStatus,
+    type MonitorIngestStatusRequest,
+    type MonitorPendingDetail,
+    type PendingRowDetail,
+    type PendingSummary,
+} from "./status"
 
 // The allow list and the secondary records it keeps.
 export { applyInterestTransitions, type InterestDeps } from "./interest"
@@ -219,6 +230,10 @@ export {
     settle,
     settleDeletion,
     settleDue,
+    settleRetryBackoffMs,
+    SETTLE_RETRY_CAP_MS,
+    PENDING_FAILURE_MESSAGE_MAX,
+    type SettleFailureEvent,
     type FetchedDidDocument,
     type FetchedRecord,
     type IngestConfig,

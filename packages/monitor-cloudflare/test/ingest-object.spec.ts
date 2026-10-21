@@ -348,7 +348,12 @@ describe("settling what is owed", () => {
         const stub = freshStub()
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.intake({ did: DID, rev: "3m1" }, "100")
-            await obj.deferPending(DID, Date.now() + 10 ** 6)
+            await obj.deferPending(DID, Date.now() + 10 ** 6, {
+                kind: "threw",
+                errorName: "Error",
+                message: "held back",
+                atMs: Date.now(),
+            })
         })
         const dueNow = await runInDurableObject(stub, (obj: MonitorIngest) =>
             obj.duePending(Date.now(), 10)
@@ -2903,9 +2908,9 @@ describe("verifying a fetched record", () => {
             key,
             records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
         })
-        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(repo.car, null))).toEqual({ kind: "unverifiable" })
+        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(repo.car, null))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
     })
 
     it("the snapshot store round-trips verifiedWith, cid and seenKey", async () => {

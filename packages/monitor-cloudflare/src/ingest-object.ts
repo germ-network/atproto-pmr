@@ -49,7 +49,13 @@ import {
     type SecondaryWriteAnswer,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type MonitorIngestStatus,
+    type MonitorIngestStatusRequest,
+    type MonitorPendingDetail,
     type OwedKeyUpdate,
+    PENDING_ATTEMPT_BUCKETS,
+    SETTLE_RETRY_CAP_MS,
+    type PendingFailure,
     type PendingFetch,
     type RefreshIndex,
     type SigningKeyUpdate,
@@ -349,7 +355,8 @@ export class MonitorIngest
         MonitorRecheckRequest,
         MonitorVerifiedAnchorRequest,
         MonitorOwnBlocksRequest,
-        MonitorOwnGraphRequest
+        MonitorOwnGraphRequest,
+        MonitorIngestStatusRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -553,6 +560,20 @@ export class MonitorIngest
                     .toArray().length === 0
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
+            }
+            // Rows owed before these columns existed keep NULL: their first
+            // owed time and failure are unknown.
+            for (const column of ["owed_at INTEGER", "last_failure TEXT"]) {
+                if (
+                    this.db.sql
+                        .exec(
+                            "SELECT 1 FROM pragma_table_info('pending') WHERE name = ?",
+                            column.split(" ")[0]
+                        )
+                        .toArray().length === 0
+                ) {
+                    this.db.sql.exec(`ALTER TABLE pending ADD COLUMN ${column}`)
+                }
             }
             if (
                 this.db.sql
@@ -1065,15 +1086,17 @@ export class MonitorIngest
             )
             return { outcome: "duplicate" }
         }
+        // A new event is news about the DID: it ends any retry backoff.
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
-                "VALUES (?, ?, 0, 0, ?, ?) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
+                "VALUES (?, ?, 0, 0, ?, ?, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             event.did,
             event.rev,
             this.nextOweGen(),
-            streamTimeUs(cursor)
+            streamTimeUs(cursor),
+            Date.now()
         )
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
@@ -1086,14 +1109,15 @@ export class MonitorIngest
     /** Owe a fetch the dedupe check would otherwise suppress. */
     async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
-                "VALUES (?, ?, 0, 0, ?, ?) " +
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
+                "VALUES (?, ?, 0, 0, ?, ?, ?) " +
                 "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                `owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
             did,
             rev,
             this.nextOweGen(),
-            owedSinceUs ?? null
+            owedSinceUs ?? null,
+            Date.now()
         )
     }
 
@@ -1551,12 +1575,122 @@ export class MonitorIngest
             }))
     }
 
-    async deferPending(did: string, notBeforeMs: number): Promise<void> {
-        this.db.sql.exec(
-            "UPDATE pending SET attempts = attempts + 1, not_before = ? WHERE did = ?",
-            notBeforeMs,
-            did
+    async deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ attempts: number }>(
+                "UPDATE pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
+                    "WHERE did = ? RETURNING attempts",
+                notBeforeMs,
+                JSON.stringify(failure),
+                did
+            )
+            .toArray()[0]
+        return row?.attempts ?? null
+    }
+
+    /** Aggregate ingest progress for an operator; names no owed or held DID. */
+    async ingestStatus(): Promise<MonitorIngestStatus> {
+        const now = Date.now()
+        const bucket =
+            "CASE " +
+            [...PENDING_ATTEMPT_BUCKETS]
+                .reverse()
+                .map((bound) => `WHEN attempts >= ${bound} THEN ${bound}`)
+                .join(" ") +
+            " END"
+        const total = this.db.sql
+            .exec<{
+                count: number
+                due: number
+                max_attempts: number
+                oldest: number | null
+                unknown: number
+                threw: number
+                unverifiable: number
+            }>(
+                "SELECT COUNT(*) AS count, " +
+                    "COALESCE(SUM(not_before <= ?), 0) AS due, " +
+                    "COALESCE(MAX(attempts), 0) AS max_attempts, " +
+                    "MIN(owed_at) AS oldest, " +
+                    "COALESCE(SUM(owed_at IS NULL), 0) AS unknown, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'threw'), 0) AS threw, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'unverifiable'), 0) AS unverifiable " +
+                    "FROM pending",
+                now
+            )
+            .one()
+        const counts = new Map(
+            this.db.sql
+                .exec<{ bound: number; n: number }>(
+                    `SELECT ${bucket} AS bound, COUNT(*) AS n FROM pending GROUP BY bound`
+                )
+                .toArray()
+                .map((r) => [r.bound, r.n])
         )
+        const held = this.db.sql
+            .exec<{ n: number }>("SELECT COUNT(*) AS n FROM holder_state WHERE state = 'held'")
+            .one().n
+        return {
+            asOfMs: now,
+            backfill: await this.readBackfillProgress(),
+            pending: {
+                count: total.count,
+                due: total.due,
+                maxAttempts: total.max_attempts,
+                attempts: PENDING_ATTEMPT_BUCKETS.map((atLeast) => ({
+                    atLeast,
+                    count: counts.get(atLeast) ?? 0,
+                })),
+                oldestOwedAtMs: total.oldest,
+                owedAtUnknown: total.unknown,
+                lastFailure: {
+                    threw: total.threw,
+                    unverifiable: total.unverifiable,
+                    none: total.count - total.threw - total.unverifiable,
+                },
+            },
+            heldDeclarations: held,
+        }
+    }
+
+    /** What the ingest index holds for one DID, including why it is still owed. */
+    async pendingDetail(did: string): Promise<MonitorPendingDetail> {
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                attempts: number
+                not_before: number
+                quiet: number
+                owed_at: number | null
+                last_failure: string | null
+            }>(
+                "SELECT rev, attempts, not_before, quiet, owed_at, last_failure FROM pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        return {
+            did,
+            pending:
+                row === undefined
+                    ? null
+                    : {
+                          rev: row.rev,
+                          attempts: row.attempts,
+                          notBeforeMs: row.not_before,
+                          quiet: row.quiet !== 0,
+                          owedAtMs: row.owed_at,
+                          lastFailure:
+                              row.last_failure === null
+                                  ? null
+                                  : (JSON.parse(row.last_failure) as PendingFailure),
+                      },
+            holderState: await this.holderStateOf(did),
+            indexedRev: await this.revOf(did),
+        }
     }
 
     async revOf(did: string): Promise<string | null> {
@@ -2186,9 +2320,10 @@ export class MonitorIngest
                 this.db.sql.exec("SELECT 1 FROM deleted WHERE did = ?", did).toArray().length > 0
             if (!indexed && !deleted) {
                 this.db.sql.exec(
-                    "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                        "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                    did
+                    "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                        "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                    did,
+                    Date.now()
                 )
             }
             if (did.startsWith("did:plc:") && !deleted) {
@@ -3404,7 +3539,9 @@ export class MonitorIngest
     }
 
     private verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
-        if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
+        if (record.signingKey === null) {
+            return Promise.resolve({ kind: "unverifiable", reason: "no #atproto signing key" })
+        }
         try {
             const outcome = verifyRecordProofOutcome(record.car, {
                 did: ref.did,
@@ -3418,7 +3555,9 @@ export class MonitorIngest
                     : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
             )
         } catch (err) {
-            if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
+            if (err instanceof RepoProofError) {
+                return Promise.resolve({ kind: "unverifiable", reason: err.message })
+            }
             throw err
         }
     }
@@ -3603,6 +3742,27 @@ export class MonitorIngest
             fetchRecord: (did) => this.fetchRecord(did),
             verify: (did, record) => this.verifyRecord(did, record),
             unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
+            // A pending row takes a DID out of the refresh schedule, so a retry
+            // never waits longer than refresh would have.
+            retryCapMs: async (did) => {
+                if ((await this.revOf(did)) !== null) {
+                    return this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000)
+                }
+                if (await this.inInterest(did)) {
+                    return this.envInt(this.env.REFRESH_NONHOLDER_STALE_AFTER_MS, 86_400_000)
+                }
+                return SETTLE_RETRY_CAP_MS
+            },
+            onSettleFailure: ({ did, attempts, failure, notBeforeMs }) =>
+                console.warn("monitor: settle deferred", {
+                    did,
+                    attempts,
+                    kind: failure.kind,
+                    ...(failure.kind === "threw"
+                        ? { error: `${failure.errorName}: ${failure.message}` }
+                        : { reason: failure.reason }),
+                    notBefore: new Date(notBeforeMs).toISOString(),
+                }),
             onChange: (did, rev) => this.onChange(did, rev),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
@@ -3651,9 +3811,10 @@ export class MonitorIngest
                 const held = await this.revOf(did)
                 if (held === null) {
                     this.db.sql.exec(
-                        "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                            "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                        did
+                        "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                            "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                        did,
+                        Date.now()
                     )
                     return
                 }
@@ -3769,13 +3930,14 @@ export class MonitorIngest
         this.ctx.storage.transactionSync(() => {
             this.setMeta("firehose_since", String(nowMs))
             this.db.sql.exec(
-                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
-                    "SELECT did, rev, 0, 0, ?1, ?2 FROM records WHERE collection = ?3 " +
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
+                    "SELECT did, rev, 0, 0, ?1, ?2, ?4 FROM records WHERE collection = ?3 " +
                     "ON CONFLICT(did) DO UPDATE SET quiet = 0, owed_gen = excluded.owed_gen, " +
                     KEEP_EARLIER_STAMP,
                 this.nextOweGen(),
                 (nowMs - 1) * 1000,
-                this.env.MONITOR_COLLECTION
+                this.env.MONITOR_COLLECTION,
+                nowMs
             )
         })
     }
@@ -4168,7 +4330,11 @@ export class MonitorIngest
                 }
             }
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
-            await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            try {
+                await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            } catch (err) {
+                console.error("monitor: settle failed", err)
+            }
             try {
                 await settleSecondaryDue(
                     this.secondaryDeps(),

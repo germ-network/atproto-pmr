@@ -30,6 +30,7 @@ import {
     type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type PendingFailure,
     type SnapshotStore,
 } from "./storage"
 
@@ -76,6 +77,20 @@ export interface IngestDeps {
      * stays owed before it is fetched again. Defaults to an hour.
      */
     unverifiableRetryMs?: number
+    /**
+     * Raised once for every deferral that counts an attempt: a settle that
+     * threw, or a never-held DID that came back unverifiable. Not raised for
+     * a confirmed deletion, a verified absence, a regression, or a DID that
+     * left interest mid-fetch. Called synchronously; a throw is swallowed.
+     */
+    onSettleFailure?(event: SettleFailureEvent): void
+    /**
+     * The longest a failed fetch for `did` waits before its next attempt. A
+     * pending row takes the DID out of the refresh schedule, so a DID that
+     * schedule covers should answer its own refresh interval, keeping it no
+     * staler than refresh would. Defaults to `SETTLE_RETRY_CAP_MS`.
+     */
+    retryCapMs?(did: string): Promise<number>
     /** Own-DID push, where a registration holds this DID. */
     onChange?(did: string, rev: string): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
@@ -118,6 +133,60 @@ export interface IngestDeps {
 }
 
 const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
+
+/** A permanently failing DID is retried about once a month, no more. */
+export const SETTLE_RETRY_CAP_MS = 30 * 24 * 3_600_000
+
+/** Longest error message kept on a pending row or logged with it. */
+export const PENDING_FAILURE_MESSAGE_MAX = 256
+
+/** 2^attempts seconds, capped at `capMs`. Finite for any attempts. */
+export function settleRetryBackoffMs(
+    attempts: number,
+    capMs: number = SETTLE_RETRY_CAP_MS
+): number {
+    return Math.min(2 ** Math.min(attempts, 40) * 1000, capMs)
+}
+
+function truncated(text: string): string {
+    return text.length > PENDING_FAILURE_MESSAGE_MAX ? text.slice(0, PENDING_FAILURE_MESSAGE_MAX) : text
+}
+
+/**
+ * Defers `did` and tells `onSettleFailure` once, with exactly what was stored.
+ * A row that is already gone counts nothing, so reports nothing. A failing
+ * hook never costs the caller its deferral or the rest of the drain.
+ */
+async function deferFailure(
+    deps: IngestDeps,
+    did: string,
+    notBeforeMs: number,
+    failure: PendingFailure
+): Promise<void> {
+    const kept: PendingFailure =
+        failure.kind === "threw"
+            ? { ...failure, message: truncated(failure.message) }
+            : { ...failure, reason: failure.reason === null ? null : truncated(failure.reason) }
+    const attempts = await deps.index.deferPending(did, notBeforeMs, kept)
+    if (attempts === null) return
+    try {
+        deps.onSettleFailure?.({ did, attempts, failure: kept, notBeforeMs })
+    } catch {}
+}
+
+/** `retryCapMs` for `did`, or the default where the deployment gives none. */
+async function retryCapFor(deps: IngestDeps, did: string): Promise<number> {
+    return (await deps.retryCapMs?.(did)) ?? SETTLE_RETRY_CAP_MS
+}
+
+export interface SettleFailureEvent {
+    did: string
+    /** As stored after this failure; a concurrent reset may make it lower
+     * than the attempts the retry was scheduled from. */
+    attempts: number
+    failure: PendingFailure
+    notBeforeMs: number
+}
 
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
@@ -211,7 +280,8 @@ export type SettleOutcome =
 export type VerifyOutcome =
     | { kind: "verified"; key: string; rev: string; cid: string }
     | { kind: "verified-absent"; key: string; rev: string }
-    | { kind: "unverifiable" }
+    /** `reason` says what failed to verify, where the verifier knows. */
+    | { kind: "unverifiable"; reason?: string }
 
 /**
  * The source confirmed this DID's declaration is gone. Nothing is left to
@@ -252,6 +322,9 @@ export async function settleDeletion(
  */
 /** How one settle reports what it finds. */
 export interface SettleOptions {
+    /** The pending row's attempts so far; spaces a never-held unverifiable
+     * DID's next fetch. 0 where settle is not driven by the retry queue. */
+    attempts?: number
     /**
      * Owed by a join, not a change: an advance is stored through
      * `completeQuietly` with no `onChange`. A not-found for a DID that held a
@@ -291,7 +364,7 @@ export async function settle(
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    const outcome = await settleFetched(deps, did, record, quiet, moved, gen)
+    const outcome = await settleFetched(deps, did, record, quiet, moved, gen, opts.attempts ?? 0)
     // A DID left unwatched has nothing keeping its document current: stop
     // vouching for the one this fetch stored.
     if (!(await deps.index.isWatched(did))) {
@@ -311,12 +384,13 @@ async function settleFetched(
     record: FetchedRecord,
     quiet: boolean,
     moved: () => Promise<boolean>,
-    gen: number | null
+    gen: number | null,
+    attempts: number
 ): Promise<SettleOutcome> {
     const verified = await deps.verify(did, record)
     if (await moved()) return "left"
     if (verified.kind === "unverifiable") {
-        await settleUnverifiable(deps, did, record, gen)
+        await settleUnverifiable(deps, did, record, gen, attempts, verified.reason)
         return "unverifiable"
     }
 
@@ -389,17 +463,24 @@ async function settleUnverifiable(
     deps: IngestDeps,
     did: string,
     record: FetchedRecord,
-    gen: number | null
+    gen: number | null,
+    attempts: number,
+    reason: string | undefined
 ): Promise<void> {
     const held = (await deps.index.revOf(did)) !== null
     if (held) {
         await deps.index.clearPending(did, gen)
         await deps.index.markAttempted(did, deps.nowMs())
     } else {
-        await deps.index.deferPending(
-            did,
-            deps.nowMs() + (deps.unverifiableRetryMs ?? DEFAULT_UNVERIFIABLE_RETRY_MS)
+        const wait = Math.max(
+            deps.unverifiableRetryMs ?? DEFAULT_UNVERIFIABLE_RETRY_MS,
+            settleRetryBackoffMs(attempts, await retryCapFor(deps, did))
         )
+        await deferFailure(deps, did, deps.nowMs() + wait, {
+            kind: "unverifiable",
+            reason: reason ?? null,
+            atMs: deps.nowMs(),
+        })
     }
     await pushNewlySeenKey(deps, did, record.signingKey)
 }
@@ -494,19 +575,30 @@ export async function withdrawFetchedDocument(
 export async function settleDue(
     deps: IngestDeps,
     limit = 32,
-    backoffMs = (attempts: number) => Math.min(2 ** attempts, 64) * 1000
+    /** Given the cap `retryCapMs` answered for the DID, so a test cannot
+     * skip the cap choice. */
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs
 ): Promise<number> {
     const now = deps.nowMs()
     const due = await deps.index.duePending(now, limit)
     let settled = 0
     for (const p of due) {
         try {
-            if ((await settle(deps, p.did, { quiet: p.quiet })) === "stored") settled += 1
-        } catch {
+            if (
+                (await settle(deps, p.did, { quiet: p.quiet, attempts: p.attempts })) === "stored"
+            ) {
+                settled += 1
+            }
+        } catch (err) {
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only
             // thing keeping this DID from being silently dropped.
-            await deps.index.deferPending(p.did, now + backoffMs(p.attempts))
+            await deferFailure(deps, p.did, now + backoffMs(p.attempts, await retryCapFor(deps, p.did)), {
+                kind: "threw",
+                errorName: err instanceof Error ? err.name : typeof err,
+                message: String(err instanceof Error ? err.message : err),
+                atMs: now,
+            })
         }
     }
     return settled
