@@ -327,6 +327,8 @@ describe("summary verdicts", () => {
             droppedVerdicts: [THIRD],
             more: false,
             truncated: false,
+            coveredThroughMs: null,
+            lagging: [],
         }
         const wire = decodeCoseMap(encodeSummaryDelta(delta))
         expect(SUMMARY_DELTA_KEYS.verdicts).toBe("c")

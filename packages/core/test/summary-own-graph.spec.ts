@@ -25,6 +25,8 @@ function depsFor(
 ) {
     const asked: string[][] = []
     const deps: SummaryPageDeps = {
+        getFirehoseCoverage: async () => null,
+        getPlcCoverage: async () => null,
         graph: { ownGraph },
         blocks: { ownBlocks },
         senderGraph: { forSender: async () => new Map() },

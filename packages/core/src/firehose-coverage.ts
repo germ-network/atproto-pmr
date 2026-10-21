@@ -1,6 +1,6 @@
 /**
- * The firehose coverage watermark (`spec/key-transparency.md`, "The coverage
- * watermarks") and what the owner summary carries of it (`spec/wire-api.md`,
+ * The firehose coverage watermark (`spec/key-transparency.md`, "The firehose
+ * coverage rule") and what the owner summary carries of it (`spec/wire-api.md`,
  * the summary's `w` and `l`).
  */
 
@@ -35,13 +35,17 @@ export interface FirehoseCoverage {
  * when either is missing — a missing watermark is no coverage.
  */
 export function summaryCoverageAtMs(
-    _firehose: FirehoseCoverage | null,
-    _plc: PlcCoverage | null
+    firehose: FirehoseCoverage | null,
+    plc: PlcCoverage | null
 ): number | null {
-    throw new Error("unimplemented")
+    if (firehose === null || plc === null) return null
+    const { coveredThroughMs: fh } = firehose
+    if (fh === null || fh < firehose.continuousSinceMs) return null
+    if (plc.coveredThroughMs < plc.continuousSinceMs) return null
+    return Math.floor(Math.min(fh, plc.coveredThroughMs))
 }
 
-/** Merged into `SummaryPageDeps` in S7. */
+/** The coverage reads the summary needs; `SummaryPageDeps` extends it. */
 export interface SummaryCoverageDeps {
     /** Read before the index and any CAR, so nothing served is older than `w`. */
     getFirehoseCoverage(): Promise<FirehoseCoverage | null>

@@ -24,6 +24,7 @@ import {
 } from "./can-message.js"
 import { indexPolicySource, SUMMARY_VERDICT_KEYS, type SummaryVerdict } from "./summary-verdicts.js"
 import type { StoredPolicies } from "./policy.js"
+import type { SummaryCoverageDeps } from "./firehose-coverage.js"
 import type { WatchedRecord } from "./watched.js"
 
 export interface SummaryRecordRef {
@@ -104,6 +105,14 @@ export interface SummaryDelta {
      * mutuals, following, followers).
      */
     truncated: boolean
+    /**
+     * The monitor's coverage as of this response (ms): everything its stream
+     * sequenced through this instant is applied, for every contact not in
+     * `lagging`. Null is no coverage. Per response, never part of a stored state.
+     */
+    coveredThroughMs: number | null
+    /** The covered contacts the monitor has not caught up on; sorted. */
+    lagging: string[]
 }
 
 /** How many served summary states a registration can name back. */
@@ -145,7 +154,7 @@ export interface SummaryIndexReader {
     entries(refs: readonly SummaryRecordRef[]): Promise<(SummaryHeldEntry | null)[]>
 }
 
-export interface SummaryPageDeps {
+export interface SummaryPageDeps extends SummaryCoverageDeps {
     /**
      * The owner's graph, from which the summary chooses its contacts. Throws
      * when it cannot be read, and returns null when the owner's graph is not
@@ -228,8 +237,9 @@ export function summaryContacts(
  */
 export async function buildSummaryIndex(
     did: string,
-    deps: SummaryPageDeps
-): Promise<{ index: SummaryIndex; truncated: boolean } | null> {
+    deps: SummaryPageDeps,
+    laggingDids: readonly string[] = []
+): Promise<{ index: SummaryIndex; truncated: boolean; lagging: string[] } | null> {
     let graph, blocks
     try {
         ;[graph, blocks] = await Promise.all([deps.graph.ownGraph(did), deps.blocks.ownBlocks(did)])
@@ -283,7 +293,9 @@ export async function buildSummaryIndex(
     } catch (error) {
         throw new SummaryOwnerReadError(error)
     }
-    return { index: { owner: did, ownBlocks, records, verdicts }, truncated }
+    const behind = new Set(laggingDids)
+    const lagging = dids.filter((d) => d !== did && behind.has(d)).sort(compareStrings)
+    return { index: { owner: did, ownBlocks, records, verdicts }, truncated, lagging }
 }
 
 /**
@@ -303,7 +315,7 @@ export async function readSummaryPage(
     limit: number
 ): Promise<{
     delivered: SummaryIndex
-    page: Omit<SummaryDelta, "token" | "truncated">
+    page: Omit<SummaryDelta, "token" | "truncated" | "coveredThroughMs" | "lagging">
 }> {
     const diff = diffSummaryIndex(base, current)
     const owner = current.owner
@@ -492,6 +504,8 @@ export const SUMMARY_DELTA_KEYS = {
     droppedVerdicts: "y",
     more: "m",
     truncated: "n",
+    coveredThroughMs: "w",
+    lagging: "l",
 } as const satisfies WireKeys<SummaryDelta>
 
 export const SUMMARY_RECORD_KEYS = {
@@ -552,6 +566,8 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
             [SUMMARY_DELTA_KEYS.droppedVerdicts, delta.droppedVerdicts],
             [SUMMARY_DELTA_KEYS.more, delta.more],
             [SUMMARY_DELTA_KEYS.truncated, delta.truncated],
+            [SUMMARY_DELTA_KEYS.coveredThroughMs, delta.coveredThroughMs],
+            [SUMMARY_DELTA_KEYS.lagging, delta.lagging],
         ])
     )
 }
@@ -596,6 +612,17 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
             throw new Error("summary: malformed own blocks")
         }
     }
+    const covered = map.get(D.coveredThroughMs)
+    if (covered !== undefined && covered !== null && !(typeof covered === "number" && Number.isSafeInteger(covered) && covered >= 0)) {
+        throw new Error("summary: malformed coverage")
+    }
+    const laggingRaw = map.get(D.lagging)
+    if (
+        laggingRaw !== undefined &&
+        !(Array.isArray(laggingRaw) && laggingRaw.every((d) => typeof d === "string"))
+    ) {
+        throw new Error("summary: malformed lagging list")
+    }
     return {
         token: str(map, D.token),
         full,
@@ -631,5 +658,7 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
         droppedVerdicts: dropped,
         more: map.get(D.more) === true,
         truncated: map.get(D.truncated) === true,
+        coveredThroughMs: covered ?? null,
+        lagging: (laggingRaw ?? []) as string[],
     }
 }

@@ -343,6 +343,7 @@ export {
 export {
     FIREHOSE_COVERAGE_MAX_LAG_MS,
     FIREHOSE_LAGGING_CAP,
+    summaryCoverageAtMs,
     KV_VISIBILITY_MS,
     type FirehoseCoverage,
     type SummaryCoverageDeps,

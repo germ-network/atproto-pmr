@@ -79,6 +79,8 @@ function indexWorld(
     const recordReads: string[] = []
     const watched = options.watched ?? [{ collection: COLL, rkey: "self" }]
     const deps: SummaryPageDeps = {
+        getFirehoseCoverage: async () => null,
+        getPlcCoverage: async () => null,
         graph: { ownGraph: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
         blocks: { ownBlocks: async () => [] },
         senderGraph: { forSender: async () => new Map() },
@@ -430,6 +432,8 @@ describe("summary delta codec", () => {
         droppedVerdicts: [],
         more: true,
         truncated: true,
+        coveredThroughMs: null,
+        lagging: [],
     }
 
     it("more and truncated round-trip", () => {
