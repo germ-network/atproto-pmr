@@ -406,6 +406,15 @@ never accepted again; register a different anchor key.
 `GET /pmr/v1/registration` also returns `st`: `"active"` or `"paused"` (a CBOR
 text string), `"paused"` exactly while the registration is paused.
 
+A relay **MUST** ignore a key it does not recognize in the
+`POST /pmr/v1/registrations` body, so a client can send a newer or
+deployment-specific field to a relay that lacks it. A client therefore MUST
+NOT treat a create-body field as in effect until `GET /pmr/v1/registration`
+reflects it. A field whose absence must be fatal cannot be added to this body:
+it needs a capability in the [enabler document](#the-enabler-document) or a
+new endpoint. The rule covers keys a relay does not recognize, never a
+recognized key with the wrong type, which is a `400`.
+
 ### Grants — the core capability
 
 | method | path | notes |
@@ -1033,6 +1042,12 @@ of `01 71 12 20 ‖ <32-byte SHA-256 of the record block>` (so it begins
 `bafyrei`). `sd` and `dc` are both present or both absent: a hint without a
 `dc` is not emitted at all. The same two fields appear in `#delivery`, in a
 `GET /pmr/v1/messages` entry, and in a full-form push.
+
+A client MUST ignore a key it does not recognize in a delivered entry: in
+`#delivery`, in a `GET /pmr/v1/messages` entry, and in a push's sealed
+payload. This lets a deployment add fields of its own, which this
+specification does not define. A device never lets such a field stand in for
+its own verification of `m`.
 
 #### Catch-up cursor
 
@@ -1988,7 +2003,8 @@ pool sizing is recipient-side state, so no refusal may turn on it.
   currently in use.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
-  CBOR schemas for registration, grant issuance, ack batches, pool
+  CBOR schemas for registration (beyond the ignore-unknown-keys rule),
+  grant issuance, ack batches, pool
   adjudication, and the enabler document are not fixed here. The
   encoding rules that govern them — deterministic CBOR, `COSE_Key`, tag-1
   integer timestamps — are.
