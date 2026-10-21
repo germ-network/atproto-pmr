@@ -40,6 +40,23 @@
  * stored copy current, and a `fetchRecord` not built on `fetchRecordCar`
  * must return the document it resolved as `didDocument`.
  *
+ * **Operator status.** `MonitorIngest` also answers two read-only Durable
+ * Object RPC methods, `ingestStatus()` and `pendingDetail(did)` (shapes in
+ * `MonitorIngestStatus` and `MonitorPendingDetail` from
+ * `@germ-network/atproto-pmr-monitor`). The first is aggregate and names no
+ * owed or held DID: whether the baseline backfill finished, how many fetches are owed, how
+ * many are due, how long the oldest has waited, and how many held
+ * declarations the index has. The second says why one DID is still owed (its
+ * attempts, next try and last failure) or that the monitor never owed or held
+ * it. Call them over the binding, or from a route of your own behind
+ * authentication; they are not part of the monitor's public surface and must
+ * stay off its public paths.
+ *
+ *     const status = await env.ingest.get(env.ingest.idFromName(MONITOR_NAME)).ingestStatus()
+ *
+ * Every failed settle also logs one `monitor: settle deferred` line carrying
+ * the DID, attempts, error or reason, and next try.
+ *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain
  * Worker, so the community view scales and caches like the public data it

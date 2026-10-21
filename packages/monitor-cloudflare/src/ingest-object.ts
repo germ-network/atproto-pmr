@@ -53,6 +53,7 @@ import {
     type MonitorIngestStatusRequest,
     type MonitorPendingDetail,
     type OwedKeyUpdate,
+    PENDING_ATTEMPT_BUCKETS,
     SETTLE_RETRY_CAP_MS,
     type PendingFailure,
     type PendingFetch,
@@ -1441,14 +1442,105 @@ export class MonitorIngest
         return row?.attempts ?? null
     }
 
-    /** Aggregate ingest progress for an operator; names no DID. */
+    /** Aggregate ingest progress for an operator; names no owed or held DID. */
     async ingestStatus(): Promise<MonitorIngestStatus> {
-        throw new Error("unimplemented")
+        const now = Date.now()
+        const bucket =
+            "CASE " +
+            [...PENDING_ATTEMPT_BUCKETS]
+                .reverse()
+                .map((bound) => `WHEN attempts >= ${bound} THEN ${bound}`)
+                .join(" ") +
+            " END"
+        const total = this.db.sql
+            .exec<{
+                count: number
+                due: number
+                max_attempts: number
+                oldest: number | null
+                unknown: number
+                threw: number
+                unverifiable: number
+            }>(
+                "SELECT COUNT(*) AS count, " +
+                    "COALESCE(SUM(not_before <= ?), 0) AS due, " +
+                    "COALESCE(MAX(attempts), 0) AS max_attempts, " +
+                    "MIN(owed_at) AS oldest, " +
+                    "COALESCE(SUM(owed_at IS NULL), 0) AS unknown, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'threw'), 0) AS threw, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'unverifiable'), 0) AS unverifiable " +
+                    "FROM pending",
+                now
+            )
+            .one()
+        const counts = new Map(
+            this.db.sql
+                .exec<{ bound: number; n: number }>(
+                    `SELECT ${bucket} AS bound, COUNT(*) AS n FROM pending GROUP BY bound`
+                )
+                .toArray()
+                .map((r) => [r.bound, r.n])
+        )
+        const held = this.db.sql
+            .exec<{ n: number }>("SELECT COUNT(*) AS n FROM holder_state WHERE state = 'held'")
+            .one().n
+        return {
+            asOfMs: now,
+            backfill: await this.readBackfillProgress(),
+            pending: {
+                count: total.count,
+                due: total.due,
+                maxAttempts: total.max_attempts,
+                attempts: PENDING_ATTEMPT_BUCKETS.map((atLeast) => ({
+                    atLeast,
+                    count: counts.get(atLeast) ?? 0,
+                })),
+                oldestOwedAtMs: total.oldest,
+                owedAtUnknown: total.unknown,
+                lastFailure: {
+                    threw: total.threw,
+                    unverifiable: total.unverifiable,
+                    none: total.count - total.threw - total.unverifiable,
+                },
+            },
+            heldDeclarations: held,
+        }
     }
 
     /** What the ingest index holds for one DID, including why it is still owed. */
     async pendingDetail(did: string): Promise<MonitorPendingDetail> {
-        throw new Error("unimplemented")
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                attempts: number
+                not_before: number
+                quiet: number
+                owed_at: number | null
+                last_failure: string | null
+            }>(
+                "SELECT rev, attempts, not_before, quiet, owed_at, last_failure FROM pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        return {
+            did,
+            pending:
+                row === undefined
+                    ? null
+                    : {
+                          rev: row.rev,
+                          attempts: row.attempts,
+                          notBeforeMs: row.not_before,
+                          quiet: row.quiet !== 0,
+                          owedAtMs: row.owed_at,
+                          lastFailure:
+                              row.last_failure === null
+                                  ? null
+                                  : (JSON.parse(row.last_failure) as PendingFailure),
+                      },
+            holderState: await this.holderStateOf(did),
+            indexedRev: await this.revOf(did),
+        }
     }
 
     async revOf(did: string): Promise<string | null> {
@@ -4030,7 +4122,11 @@ export class MonitorIngest
                 }
             }
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
-            await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            try {
+                await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            } catch (err) {
+                console.error("monitor: settle failed", err)
+            }
             try {
                 await settleSecondaryDue(
                     this.secondaryDeps(),

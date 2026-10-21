@@ -1,4 +1,4 @@
-import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
+import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
@@ -263,21 +263,193 @@ describe("settle failure log line", () => {
     })
 })
 
+function seedPending(
+    sql: SqlStorage,
+    did: string,
+    row: { attempts?: number; notBefore?: number; owedAt?: number | null; failure?: PendingFailure | null } = {}
+) {
+    sql.exec(
+        "INSERT INTO pending (did, rev, attempts, not_before, owed_at, last_failure) VALUES (?, '3m1', ?, ?, ?, ?)",
+        did,
+        row.attempts ?? 0,
+        row.notBefore ?? 0,
+        row.owedAt === undefined ? 1000 : row.owedAt,
+        row.failure ? JSON.stringify(row.failure) : null
+    )
+}
+
 describe("ingestStatus", () => {
-    it.todo("reports backfill not started, in progress with its cursor, and done")
-    it.todo("reports pending count, due count, max attempts and the attempt buckets against seeded rows")
-    it.todo("reports the oldest owed_at and how many rows have none")
-    it.todo("reports last-failure counts by kind")
-    it.todo("counts held declarations, not gone ones")
-    it.todo("carries no DID from pending, holder or rev rows, with a DID-shaped backfill cursor in the fixture")
-    it.todo("answers zeros and nulls on empty tables")
+    it("reports backfill not started, in progress with its cursor, and done", async () => {
+        await inObj(freshStub(), async (obj) => {
+            expect((await obj.ingestStatus()).backfill).toEqual({ done: false, cursor: null })
+            await obj.setBackfillProgress({ done: false, cursor: "page-7" })
+            expect((await obj.ingestStatus()).backfill).toEqual({ done: false, cursor: "page-7" })
+            await obj.setBackfillProgress({ done: true, cursor: null })
+            expect((await obj.ingestStatus()).backfill).toEqual({ done: true, cursor: null })
+        })
+    })
+
+    it("reports pending count, due count, max attempts and the attempt buckets against seeded rows", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            const far = Date.now() + 10 ** 9
+            seedPending(sql, "did:plc:a", { attempts: 0 })
+            seedPending(sql, "did:plc:b", { attempts: 1, notBefore: Date.now() - 60_000 })
+            seedPending(sql, "did:plc:c", { attempts: 3, notBefore: far })
+            seedPending(sql, "did:plc:d", { attempts: 5, notBefore: far })
+            seedPending(sql, "did:plc:e", { attempts: 20, notBefore: far })
+            // workerd holds the clock still between I/O, so this row is due exactly now.
+            seedPending(sql, "did:plc:f", { attempts: 2, notBefore: Date.now() })
+            const before = Date.now()
+            const { pending, asOfMs } = await obj.ingestStatus()
+            expect(asOfMs).toBeGreaterThanOrEqual(before)
+            expect(pending).toMatchObject({ count: 6, due: 3, maxAttempts: 20 })
+            expect(pending.attempts).toEqual([
+                { atLeast: 0, count: 1 },
+                { atLeast: 1, count: 1 },
+                { atLeast: 2, count: 2 },
+                { atLeast: 4, count: 1 },
+                { atLeast: 8, count: 0 },
+                { atLeast: 16, count: 1 },
+            ])
+        })
+    })
+
+    it("reports the oldest owed_at and how many rows have none", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            seedPending(sql, "did:plc:a", { owedAt: 700 })
+            seedPending(sql, "did:plc:b", { owedAt: 300 })
+            seedPending(sql, "did:plc:e", { owedAt: 500 })
+            seedPending(sql, "did:plc:c", { owedAt: null })
+            seedPending(sql, "did:plc:d", { owedAt: null })
+            const { pending } = await obj.ingestStatus()
+            expect(pending.oldestOwedAtMs).toBe(300)
+            expect(pending.owedAtUnknown).toBe(2)
+        })
+    })
+
+    it("reports last-failure counts by kind", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            const unverifiable: PendingFailure = { kind: "unverifiable", reason: null, atMs: 1 }
+            seedPending(sql, "did:plc:a", { failure: THREW })
+            seedPending(sql, "did:plc:b", { failure: THREW })
+            seedPending(sql, "did:plc:c", { failure: unverifiable })
+            seedPending(sql, "did:plc:d")
+            const { pending } = await obj.ingestStatus()
+            expect(pending.lastFailure).toEqual({ threw: 2, unverifiable: 1, none: 1 })
+        })
+    })
+
+    it("counts held declarations, not gone ones", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            for (const [did, state] of [
+                ["did:plc:a", "held"],
+                ["did:plc:b", "held"],
+                ["did:plc:c", "gone-reversible"],
+                ["did:plc:d", "gone-permanent"],
+            ]) {
+                sql.exec("INSERT INTO holder_state (did, state) VALUES (?, ?)", did, state)
+            }
+            expect((await obj.ingestStatus()).heldDeclarations).toBe(2)
+        })
+    })
+
+    it("carries no DID from pending, holder or rev rows, with a DID-shaped backfill cursor in the fixture", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            seedPending(sql, "did:plc:pendingrow", { failure: THREW })
+            sql.exec("INSERT INTO holder_state (did, state) VALUES ('did:plc:holderrow', 'held')")
+            sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:revrow', '3m1', 0)")
+            await obj.setBackfillProgress({ done: false, cursor: "did:plc:cursor" })
+            const text = JSON.stringify(await obj.ingestStatus())
+            expect(text).toContain("did:plc:cursor")
+            for (const did of ["did:plc:pendingrow", "did:plc:holderrow", "did:plc:revrow"]) {
+                expect(text).not.toContain(did)
+            }
+        })
+    })
+
+    it("answers zeros and nulls on empty tables", async () => {
+        await inObj(freshStub(), async (obj) => {
+            const { pending, heldDeclarations } = await obj.ingestStatus()
+            expect(heldDeclarations).toBe(0)
+            expect(pending).toEqual({
+                count: 0,
+                due: 0,
+                maxAttempts: 0,
+                attempts: [0, 1, 2, 4, 8, 16].map((atLeast) => ({ atLeast, count: 0 })),
+                oldestOwedAtMs: null,
+                owedAtUnknown: 0,
+                lastFailure: { threw: 0, unverifiable: 0, none: 0 },
+            })
+        })
+    })
 })
 
 describe("pendingDetail", () => {
-    it.todo("returns the pending row, holder state and indexed rev for an owed DID")
-    it.todo("returns all null for a DID the monitor never owed or held")
+    it("returns the pending row, holder state and indexed rev for an owed DID", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            seedPending(sql, DID, { attempts: 3, notBefore: 4242, owedAt: 99, failure: THREW })
+            sql.exec("UPDATE pending SET quiet = 1")
+            sql.exec("INSERT INTO holder_state (did, state) VALUES (?, 'held')", DID)
+            sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES (?, '3m0', 0)", DID)
+            expect(await obj.pendingDetail(DID)).toEqual({
+                did: DID,
+                pending: {
+                    rev: "3m1",
+                    attempts: 3,
+                    notBeforeMs: 4242,
+                    quiet: true,
+                    owedAtMs: 99,
+                    lastFailure: THREW,
+                },
+                holderState: "held",
+                indexedRev: "3m0",
+            })
+        })
+    })
+
+    it("returns all null for a DID the monitor never owed or held", async () => {
+        await inObj(freshStub(), async (obj) => {
+            expect(await obj.pendingDetail("did:plc:never")).toEqual({
+                did: "did:plc:never",
+                pending: null,
+                holderState: null,
+                indexedRev: null,
+            })
+        })
+    })
 })
 
 describe("alarm", () => {
-    it.todo("logs and carries on to the remaining steps and the re-arm when settleDue throws")
+    it("logs and carries on to the remaining steps and the re-arm when settleDue throws", async () => {
+        const stub = freshStub()
+        const log: string[] = []
+        await inObj(stub, async (obj) => {
+            const o = obj as unknown as Record<string, unknown>
+            o.duePending = async () => {
+                throw new Error("index unavailable")
+            }
+            const sealing = obj.windowMembers.bind(obj)
+            o.windowMembers = async (w: number) => {
+                log.push("seal")
+                return sealing(w)
+            }
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+        })
+        const error = vi.spyOn(console, "error").mockImplementation(() => {})
+        const original = globalThis.fetch
+        globalThis.fetch = (() =>
+            Promise.resolve(Response.json({ repos: [] }))) as unknown as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        const logged = error.mock.calls.some((c) => c[0] === "monitor: settle failed")
+        error.mockRestore()
+        expect(logged).toBe(true)
+        expect(log).toContain("seal")
+        expect(await runInDurableObject(stub, (_o, state) => state.storage.getAlarm())).not.toBeNull()
+    })
 })
