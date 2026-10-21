@@ -18,6 +18,7 @@ import {
     recordWatchedDocument,
     withdrawFetchedDocument,
     settle,
+    raiseSettled,
     settleDeletion,
     type IngestDeps,
 } from "./ingest"
@@ -295,6 +296,7 @@ async function refreshDeclaration(
         cid: verified.cid,
         verifiedWith: verified.key,
     })
+    await raiseSettled(ingest, did, { rev: verified.rev, cid: verified.cid, car: fetched.car })
     await confirm(deps, did, verified.rev, nowMs)
     return { outcome: "advanced-quiet", repoGone: false }
 }

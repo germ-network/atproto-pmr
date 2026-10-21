@@ -99,6 +99,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import type {
     OwedStreamEvent,
+    SettledDeclaration,
     FollowBackfillConfig,
     FollowBackfillDeps,
     ListingProgress,
@@ -3657,6 +3658,14 @@ export class MonitorIngest
     }
 
     /**
+     * Every stored or disposed declaration, after its discharge; see
+     * `IngestDeps.onSettled`. No-op by default.
+     */
+    protected onSettled(_did: string, _settled: SettledDeclaration | null): Promise<void> {
+        return Promise.resolve()
+    }
+
+    /**
      * A rev that moved backwards. Never silent in a real deployment — and,
      * like `onChange`, pushes to a registered device: a regression is
      * exactly the kind of change `spec/key-transparency.md`'s "own-DID
@@ -3764,6 +3773,7 @@ export class MonitorIngest
                     notBefore: new Date(notBeforeMs).toISOString(),
                 }),
             onChange: (did, rev) => this.onChange(did, rev),
+            onSettled: (did, settled) => this.onSettled(did, settled),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
             // The export stream is authoritative for did:plc, and a PDS's
@@ -4297,6 +4307,7 @@ export class MonitorIngest
                                 secondaries: monitorCollections(this.env),
                                 didDocuments: this,
                                 nowMs: () => Date.now(),
+                                onSettled: (did, settled) => this.onSettled(did, settled),
                             },
                             this.envInt(this.env.INTEREST_BATCH, 64)
                         ),

@@ -241,6 +241,7 @@ export {
     type IntakeDecision,
     type SettleOptions,
     type SettleOutcome,
+    type SettledDeclaration,
     type VerifyOutcome,
 } from "./ingest"
 

@@ -83,6 +83,7 @@ export {
 } from "./snapshot-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
+export { kvFirehoseCoverage } from "./firehose-coverage-store"
 export { d1FollowEdgeStore } from "./follow-edge-store"
 export { d1BlockEdgeStore } from "./block-edge-store"
 export { d1SenderGraphReader } from "./sender-graph-reader"
