@@ -399,6 +399,13 @@ thumbprint. Mail for the destroyed registration is dropped, and that anchor
 cannot register again. The tombstone covers that one key, not the DID:
 another anchor key of the same DID may still register.
 
+`POST /pmr/v1/registrations` answers `409` once the request verifies when the
+declared anchor key is tombstoned. Terminal: no `Retry-After`; that key is
+never accepted again; register a different anchor key.
+
+`GET /pmr/v1/registration` also returns `st`: `"active"` or `"paused"` (a CBOR
+text string), `"paused"` exactly while the registration is paused.
+
 ### Grants — the core capability
 
 | method | path | notes |
@@ -1823,6 +1830,9 @@ Three populations, and what each may learn is a security property:
 | peer, grant put | `202` for every address-dependent outcome — no other code, no timing difference. `400` or `413` only where the refusal is decided on the request bytes and advertised limits alone |
 | peer, pair put | `202`; `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
+
+An owner `409` on summary is transient, with `Retry-After`; on registration
+create it is terminal, without one.
 
 The dividing line is authorization and what per-sender reservation makes
 self-referential: an owner gets diagnosis, an authenticated sender learns

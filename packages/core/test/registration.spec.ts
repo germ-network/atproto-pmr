@@ -19,12 +19,14 @@ import {
     handleRegistrationCreate,
     handleRegistrationRead,
 } from "../src/owner/endpoints"
+import { INITIAL_WATCH_STATE } from "../src/watch"
 import type {
     ChallengeStore,
     Directory,
     Locator,
     PMRStore,
     RegistrationFields,
+    WatchState,
 } from "../src/storage"
 
 const T0 = 1_760_000_000
@@ -60,6 +62,8 @@ function memoryChallenges(): ChallengeStore {
 function world() {
     const rows = new Map<string, RegistrationFields>()
     const deleted: string[] = []
+    const watch = new Map<string, WatchState>()
+    const tombstoned = { value: false }
     const challenges = memoryChallenges()
 
     const directory: Directory = {
@@ -82,7 +86,7 @@ function world() {
         },
         async deregister() {},
         async isTombstoned() {
-            return false
+            return tombstoned.value
         },
     }
 
@@ -90,13 +94,14 @@ function world() {
         const did = locator.slice("loc:".length)
         return {
             load: async () => rows.get(did) ?? null,
+            readWatchState: async () => watch.get(did) ?? INITIAL_WATCH_STATE,
             update: async (fields) => {
                 rows.set(did, { ...rows.get(did), ...fields } as RegistrationFields)
             },
         } as unknown as PMRStore
     }
 
-    return { rows, deleted, challenges, directory, store }
+    return { rows, deleted, watch, tombstoned, challenges, directory, store }
 }
 
 /** The declared key, which the owner controls and can rotate. */
@@ -578,5 +583,55 @@ describe("the Web Push subscription", () => {
         )
         const map = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
         expect(map.get("ps")).toBe(false)
+    })
+})
+
+describe("registration read st", () => {
+    async function registered(w: ReturnType<typeof world>) {
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+        await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        return key
+    }
+
+    async function readSt(w: ReturnType<typeof world>, key: Uint8Array) {
+        const response = await handleRegistrationRead(
+            signedRequest(READ_URL, "GET", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        return decodeCoseMap(new Uint8Array(await response.arrayBuffer())).get("st")
+    }
+
+    it("a registration reads st active by default, as a text string", async () => {
+        const w = world()
+        const key = await registered(w)
+        expect(await readSt(w, key)).toBe("active")
+    })
+
+    it("a paused registration reads st paused", async () => {
+        const w = world()
+        const key = await registered(w)
+        w.watch.set(DID, { paused: true, lastCheckAt: T0 })
+        expect(await readSt(w, key)).toBe("paused")
+    })
+})
+
+describe("registration create for a tombstoned anchor", () => {
+    it("a create for a tombstoned declared anchor answers 409 with an empty body", async () => {
+        const w = world()
+        const key = ed25519.utils.randomSecretKey()
+        declaredKey = ed25519.getPublicKey(key)
+        w.tombstoned.value = true
+        const response = await handleRegistrationCreate(
+            signedRequest(CREATE_URL, "POST", key, await challengeFor(w, DID)),
+            deps(w)
+        )
+        expect(response.status).toBe(409)
+        expect((await response.arrayBuffer()).byteLength).toBe(0)
+        expect(response.headers.get("retry-after")).toBeNull()
+        expect(w.rows.has(DID)).toBe(false)
     })
 })

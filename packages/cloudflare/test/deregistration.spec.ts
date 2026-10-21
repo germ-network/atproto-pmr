@@ -42,12 +42,13 @@ function memoryChallenges(): ChallengeStore {
 async function register(
     did: string,
     secretKey: Uint8Array,
-    directory: KVDirectory
+    directory: KVDirectory,
+    signerKey: Uint8Array = secretKey
 ): Promise<Response> {
     const challenges = memoryChallenges()
     const nonce = `chal-${Math.random().toString(36).slice(2)}`
     await challenges.mint(nonce, encodeBinding({ realm: "anchor", subject: did }), T0 + 600)
-    const parts = signRequest({ method: "POST", url: CREATE_URL, nonce, keyid: "t", secretKey })
+    const parts = signRequest({ method: "POST", url: CREATE_URL, nonce, keyid: "t", secretKey: signerKey })
     return handleRegistrationCreate(
         new Request(CREATE_URL, { method: "POST", headers: parts.headers }),
         {
@@ -91,7 +92,7 @@ describe("deregistration", () => {
         const key = ed25519.utils.randomSecretKey()
         await register(did, key, directory)
         await directory.deregister(did, thumb(key))
-        expect((await register(did, key, directory)).status).toBe(401)
+        expect((await register(did, key, directory)).status).toBe(409)
         expect(await directory.resolve(did)).toBeNull()
     })
 
@@ -114,5 +115,30 @@ describe("deregistration", () => {
         await directory.deregister(did, thumb(key))
         expect((await register(did, ed25519.utils.randomSecretKey(), directory)).status).toBe(201)
         expect(await directory.resolve(did)).not.toBeNull()
+    })
+})
+
+describe("tombstoned create on the wire", () => {
+    it("a verified create for a tombstoned anchor answers 409 with an empty body and no content-type", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const key = ed25519.utils.randomSecretKey()
+        await register(did, key, directory)
+        await directory.deregister(did, thumb(key))
+        const res = await register(did, key, directory)
+        expect(res.status).toBe(409)
+        expect(await res.text()).toBe("")
+        expect(res.headers.get("content-type")).toBeNull()
+        expect(res.headers.get("retry-after")).toBeNull()
+    })
+
+    it("a create for a tombstoned anchor signed by another key still answers 401", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const key = ed25519.utils.randomSecretKey()
+        await register(did, key, directory)
+        await directory.deregister(did, thumb(key))
+        const res = await register(did, key, directory, ed25519.utils.randomSecretKey())
+        expect(res.status).toBe(401)
     })
 })

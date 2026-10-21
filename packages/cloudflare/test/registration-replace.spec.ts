@@ -20,6 +20,8 @@ import {
     encodeBinding,
     handleRegistrationCreate,
     handleRegistrationDelete,
+    handleRegistrationRead,
+    decodeCoseMap,
     parseOkpEd25519Key,
     thumbprintOkpEd25519,
     signRequest,
@@ -216,7 +218,7 @@ describe("tombstones and monitor-retired registrations", () => {
             signedRequest(key1, await challengeFor(challenges, did)),
             deps(challenges, async () => x1)
         )
-        expect(refused.status).toBe(401)
+        expect(refused.status).toBe(409)
         expect(await directory.resolve(did)).toBeNull()
 
         await register(did, ed25519.utils.randomSecretKey(), challenges, directory)
@@ -234,5 +236,45 @@ describe("tombstones and monitor-retired registrations", () => {
         expect(fresh).not.toBe(retired)
         expect(await pmrStore(retired, testEnv).load()).toBeNull()
         expect(await pmrStore(fresh, testEnv).load()).not.toBeNull()
+    })
+})
+
+describe("registration read reports the pause", () => {
+    it("st reads paused after an absent outcome and active after present; did and ps unchanged", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key = ed25519.utils.randomSecretKey()
+        const locator = await register(did, key, challenges, directory)
+        const store = pmrStore(locator, testEnv)
+
+        const read = async () => {
+            const url = "https://relay.example/pmr/v1/registration"
+            const nonce = await challengeFor(challenges, did)
+            const parts = signRequest({ method: "GET", url, nonce, keyid: "t", secretKey: key })
+            const response = await handleRegistrationRead(
+                new Request(url, { method: "GET", headers: parts.headers }),
+                deps(challenges, async () => null)
+            )
+            expect(response.status).toBe(200)
+            return decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        }
+
+        const before = await read()
+        expect(before.get("st")).toBe("active")
+
+        await store.applyDeclarationOutcome("absent", T0 + 10, "3k")
+        const paused = await read()
+        expect(paused.get("st")).toBe("paused")
+
+        await store.applyDeclarationOutcome("present", T0 + 20, "3l")
+        const after = await read()
+        expect(after.get("st")).toBe("active")
+
+        for (const map of [paused, after]) {
+            expect(map.get("did")).toBe(did)
+            expect(map.has("la")).toBe(false)
+            expect(map.get("ps")).toBe(false)
+        }
     })
 })
