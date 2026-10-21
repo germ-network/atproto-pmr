@@ -1,5 +1,20 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.1.8
+
+### Patch Changes
+
+- [#68](https://github.com/germ-network/atproto-pmr/pull/68) [`6975ce8`](https://github.com/germ-network/atproto-pmr/commit/6975ce845c771799d7895704402342980418584f) Thanks [@germ-mark](https://github.com/germ-mark)! - Only a device unblock lifts a block the relay mirrored from Bsky. A Bsky unblock, an admitting verdict, or a block missing from a sync no longer lifts it; deployments that relied on a Bsky unblock clearing the relay block now need the device to lift it (`bs` in `GET /pmr/v1/blocks` lists the mirrored senders).
+
+- [#69](https://github.com/germ-network/atproto-pmr/pull/69) [`f0fcede`](https://github.com/germ-network/atproto-pmr/commit/f0fcedeb35f4b95c1669b3637158271ea1975c04) Thanks [@germ-mark](https://github.com/germ-mark)! - A registration the monitor's verified view shows is for a different anchor, or whose declaration is verifiably gone, is now retired: destroyed with its mail (new `MonitorVerifiedAnchorRequest`, `applyVerifiedAnchorObservation`, `Directory.retire`). A paused registration now queues mail instead of dropping it. Deregistration tombstones the anchor, which then cannot register again. Deployments call `monitorVerifiedAnchor` + `applyVerifiedAnchorObservation` from their recheck path.
+
+- [#70](https://github.com/germ-network/atproto-pmr/pull/70) [`9069f2a`](https://github.com/germ-network/atproto-pmr/commit/9069f2a2917b61f890b3a453dfb333c573cb4e66) Thanks [@germ-mark](https://github.com/germ-mark)! - `POST /pmr/v1/registrations` now answers `409` (empty body, terminal) when a verified create names a tombstoned anchor, instead of `401`. `GET /pmr/v1/registration` returns `st`, `"active"` or `"paused"`, and no longer returns `la` (the registration's last-active time, which nothing read).
+
+- [#71](https://github.com/germ-network/atproto-pmr/pull/71) [`742b8ab`](https://github.com/germ-network/atproto-pmr/commit/742b8ab8fb57f32b0dafc6299c7c8af9682f1de5) Thanks [@germ-mark](https://github.com/germ-mark)! - Each `c` entry of the owner's summary carries `u`, whether the contact is a mutual follow (`SummaryVerdict.mutual`, key `SUMMARY_VERDICT_KEYS.mutual`). It is always encoded, a CBOR boolean, and an entry is re-sent with a new token when only its mutual bit changes. A contact with no verdict has no entry, so its mutual bit is not sent. Summary baselines stored before this change re-send every verdict once. A client that has never held `u` must read once without `since`; an entry with no `u`, from a relay that predates it, reads as not mutual. The mutuals-first tier of the contacts a summary covers now reads a mutual edge from either the following or the followers list, the same set that sets `u`.
+
+- Updated dependencies [[`6975ce8`](https://github.com/germ-network/atproto-pmr/commit/6975ce845c771799d7895704402342980418584f), [`f0fcede`](https://github.com/germ-network/atproto-pmr/commit/f0fcedeb35f4b95c1669b3637158271ea1975c04), [`9069f2a`](https://github.com/germ-network/atproto-pmr/commit/9069f2a2917b61f890b3a453dfb333c573cb4e66), [`742b8ab`](https://github.com/germ-network/atproto-pmr/commit/742b8ab8fb57f32b0dafc6299c7c8af9682f1de5)]:
+  - @germ-network/atproto-pmr-core@0.1.8
+
 ## 0.1.7
 
 ### Patch Changes
