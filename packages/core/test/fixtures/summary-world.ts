@@ -9,6 +9,8 @@ import type { ChallengeStore, Directory, Locator, PMRStore, RegistrationFields }
 import { decodeSummaryDelta, SUMMARY_TOKENS_KEPT, type SummaryIndex, type SummaryPageDeps } from "../../src/summary"
 import { DECLARATION_COLLECTION_NSID } from "../../src/declaration"
 import type { RecipientGraphFacts, StoredPolicies } from "../../src/can-message"
+import type { PlcCoverage } from "../../src/did-document"
+import type { FirehoseCoverage } from "../../src/firehose-coverage"
 import { buildRepoCar, makeKey } from "./repo-car"
 
 /** An in-memory owner summary endpoint: stores, a monitor and a signed-request client. */
@@ -74,6 +76,13 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
     const graphFail = new Set<string>()
     const notServed = new Set<string>()
     const reads: string[] = []
+    const coverage: { firehose: FirehoseCoverage | null; plc: PlcCoverage | null; fail: boolean } = {
+        firehose: null,
+        plc: null,
+        fail: false,
+    }
+    /** The first touch of coverage, the owner's graph and any record, in order. */
+    const order: string[] = []
     const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
     const repoOf = (did: string, collection: string, rkey: string) => {
         const version = versions.get(did)
@@ -94,6 +103,7 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
     const unreadable = new Set<string>()
     const records: RecordSnapshotStore = {
         async get(did, collection, rkey) {
+            order.push("car")
             reads.push(`${did}|${collection}/${rkey}`)
             if (unreadable.has(did)) return null
             const repo = repoOf(did, collection, rkey)
@@ -159,6 +169,7 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
         discardWindowSeconds: 3600,
         graph: {
             ownGraph: async (did) => {
+                order.push("index")
                 if (graphFail.has(did)) throw new Error("d1 down")
                 return ownGraphs.get(did) ?? null
             },
@@ -176,6 +187,12 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
             keysFor: async (dids) =>
                 new Map(dids.map((d) => [d, { kind: "trusted", key: key.multikey } as const])),
         },
+        getFirehoseCoverage: async () => {
+            order.push("coverage")
+            if (coverage.fail) throw new Error("kv down")
+            return coverage.firehose
+        },
+        getPlcCoverage: async () => coverage.plc,
         onLapse: () => {},
         watched: options.watched ?? WATCHED,
         randomBytes: (len) => {
@@ -200,6 +217,8 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
         served,
         puts,
         reads,
+        coverage,
+        order,
         unreadable,
         declared,
         senderFacts,

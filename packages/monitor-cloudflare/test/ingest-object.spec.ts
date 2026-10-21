@@ -1091,7 +1091,7 @@ describe("snapshot refresh", () => {
             }
             await obj.complete("did:plc:refresh-b", "3m1", old, STUB_VERIFIED)
             await kvSnapshotStore(testEnv).putRecord("did:plc:refresh-b", entry("3m1", old))
-            await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, "1")
+            await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, String(Date.now() * 1000))
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
 

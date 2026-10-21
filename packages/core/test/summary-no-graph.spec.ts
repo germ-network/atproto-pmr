@@ -22,6 +22,8 @@ const graphOf = (following: string[], followers: string[] = []): OwnerGraph => (
 
 /** A world where only the DIDs in `held` have a record. */
 const depsFor = (graph: OwnerGraph, held: string[]): SummaryPageDeps => ({
+    getFirehoseCoverage: async () => null,
+    getPlcCoverage: async () => null,
     graph: { ownGraph: async () => graph },
     blocks: { ownBlocks: async () => [{ blocker: OWNER, rkey: "b1", subject: "did:plc:blocked" }] },
     index: {
@@ -53,6 +55,8 @@ describe("summary without a graph", () => {
             droppedVerdicts: [],
             more: false,
             truncated: false,
+            coveredThroughMs: null,
+            lagging: [],
         }
         expect([...decodeCoseMap(encodeSummaryDelta(delta)).keys()]).not.toContain("g")
         expect(Object.values(SUMMARY_DELTA_KEYS)).not.toContain("g")

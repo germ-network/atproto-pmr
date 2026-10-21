@@ -43,6 +43,7 @@ function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
             pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs, failure })
             return p.attempts + 1
         },
+        owedGenOf: async () => null,
         revOf: async (did: string) => revs.get(did) ?? null,
         holderStateOf: async () => null,
         isWatched: async () => true,

@@ -64,6 +64,8 @@ const freshPMR = (): DurableObjectStub<PMRObject> => {
 }
 const summaryDeps = (did: string) =>
     ({
+        getFirehoseCoverage: async () => null,
+        getPlcCoverage: async () => null,
         graph: { ownGraph: async () => ({ did, following: [], followers: [] }) },
         blocks: monitorOwnBlocks(testEnv),
         index: { entries: async () => [] },

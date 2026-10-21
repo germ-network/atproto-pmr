@@ -22,6 +22,7 @@ function fakeIndex(overrides: Partial<MonitorIndex> = {}): {
         readCursor: async () => null,
         intake: async () => ({ outcome: "accepted" }),
         owe: async (did) => void owed.push(did),
+        owedGenOf: async () => null,
         clearPending: async () => {},
         markAttempted: async () => {},
         isWatched: async () => false,

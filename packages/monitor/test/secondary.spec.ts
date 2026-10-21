@@ -251,6 +251,7 @@ describe("a repo-level answer on the declaration path", () => {
                 holderStateOf: async () => (held ? "held" : null),
                 completeDeletion,
                 clearPending,
+                owedGenOf: async () => 1,
                 isWatched: async () => true,
             } as unknown as MonitorIndex,
             snapshot: { deleteRecord: async () => {} } as unknown as SnapshotStore,
@@ -292,7 +293,7 @@ describe("a repo-level answer on the declaration path", () => {
         const absent = declarationDeps("absent", false)
         expect(await settle(absent.deps, DID, { quiet: true })).toBe("deleted")
         expect(absent.completeDeletion).not.toHaveBeenCalled()
-        expect(absent.clearPending).toHaveBeenCalledWith(DID)
+        expect(absent.clearPending).toHaveBeenCalledWith(DID, 1)
         expect(absent.dispose).not.toHaveBeenCalled()
 
         const repo = declarationDeps(new RecordNotFoundError("gone", true, "RepoNotFound"), false)
