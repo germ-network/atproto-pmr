@@ -114,6 +114,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         recordsOf: async () => [],
         holderStateOf: async () => null,
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
+        owedGenOf: async (did) => (pending.has(did) ? 1 : null),
         clearPending: async (did) => void pending.delete(did),
         markAttempted: async (did, at) => void attempted.set(did, at),
         isWatched: async (did) =>

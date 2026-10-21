@@ -150,6 +150,7 @@ function harness(opts: {
             ]
         },
         isDeleted: async (did: string) => deleted.has(did),
+        owedGenOf: async () => null,
     } as unknown as MonitorIndex
     const snapshot = {
         getRecord: async (did: string) => records.get(did) ?? null,

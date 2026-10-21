@@ -207,14 +207,27 @@ export interface MonitorIndex {
     owe(did: string, rev: string): Promise<void>
 
     /**
+     * The generation of the obligation owed for `did` now, or null when none
+     * is. Every `intake` and `owe` gives the row a new generation, so a fetch
+     * that reads it before it starts can tell, when it finishes, whether the
+     * obligation it was started for is still the one owed.
+     */
+    owedGenOf(did: string): Promise<number | null>
+
+    /**
      * Discharge an obligation **without** indexing anything.
      *
      * For outcomes that are terminal but unstorable — a regression, a
      * record that failed verification. The look happened and the answer
      * was an alarm; leaving the row would retry the same answer in a hot
      * loop against the very DID under attack.
+     *
+     * A discharge that names `gen` (from `owedGenOf`, read before the fetch)
+     * removes the row only while it is still that generation; an event owed
+     * during the fetch stays owed. Null, no obligation at the start, removes
+     * nothing. Omitted, the discharge is unconditional.
      */
-    clearPending(did: string): Promise<void>
+    clearPending(did: string, gen?: number | null): Promise<void>
 
     /**
      * An attempt that did not confirm anything. Moves the DID to the back of
@@ -250,7 +263,9 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**
@@ -282,7 +297,9 @@ export interface MonitorIndex {
         /** Owed by a join, not a change: no window entry. */
         quiet: boolean | undefined,
         /** Why a reversible gone was recorded; meaningless when `permanent`. */
-        cause: GoneCause
+        cause: GoneCause,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**
@@ -295,7 +312,9 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**

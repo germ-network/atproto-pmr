@@ -228,10 +228,11 @@ export async function settleDeletion(
     did: string,
     permanent: boolean,
     quiet: boolean,
-    cause: GoneCause
+    cause: GoneCause,
+    gen?: number | null
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
-    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause, gen)
     if (!quiet) await deps.onDelete?.(did)
 }
 
@@ -267,6 +268,7 @@ export async function settle(
 ): Promise<SettleOutcome> {
     const quiet = opts.quiet === true
     const epoch = await deps.interest.interestEpoch(did)
+    const gen = await deps.index.owedGenOf(did)
     const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
@@ -278,17 +280,17 @@ export async function settle(
         if (quiet && (await neverHeld(deps, did))) {
             // A followee with no declaration is the ordinary case: nothing is
             // recorded for it, so it stays on the non-holder cadence.
-            await deps.index.clearPending(did)
+            await deps.index.clearPending(did, gen)
             if (repoLevel) await deps.secondaries?.dispose(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, err.permanent, quiet, "repo")
+        await settleDeletion(deps, did, err.permanent, quiet, "repo", gen)
         if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    const outcome = await settleFetched(deps, did, record, quiet, moved)
+    const outcome = await settleFetched(deps, did, record, quiet, moved, gen)
     // A DID left unwatched has nothing keeping its document current: stop
     // vouching for the one this fetch stored.
     if (!(await deps.index.isWatched(did))) {
@@ -307,12 +309,13 @@ async function settleFetched(
     did: string,
     record: FetchedRecord,
     quiet: boolean,
-    moved: () => Promise<boolean>
+    moved: () => Promise<boolean>,
+    gen: number | null
 ): Promise<SettleOutcome> {
     const verified = await deps.verify(did, record)
     if (await moved()) return "left"
     if (verified.kind === "unverifiable") {
-        await settleUnverifiable(deps, did, record)
+        await settleUnverifiable(deps, did, record, gen)
         return "unverifiable"
     }
 
@@ -320,7 +323,7 @@ async function settleFetched(
     const movement = compareRev(indexed, verified.rev)
     if (movement === "regressed" && indexed !== null) {
         await deps.onRegression?.(did, indexed, verified.rev)
-        await deps.index.clearPending(did)
+        await deps.index.clearPending(did, gen)
         return "rejected"
     }
 
@@ -328,10 +331,10 @@ async function settleFetched(
         // The repo is alive and signed to hold no such record. Reversible,
         // because the account may publish it again.
         if (quiet && (await neverHeld(deps, did))) {
-            await deps.index.clearPending(did)
+            await deps.index.clearPending(did, gen)
             return "deleted"
         }
-        await settleDeletion(deps, did, false, quiet, "record")
+        await settleDeletion(deps, did, false, quiet, "record", gen)
         return "deleted"
     }
 
@@ -365,10 +368,10 @@ async function settleFetched(
     })
     const written = { cid: verified.cid, verifiedWith: verified.key }
     if (quiet) {
-        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written)
+        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written, gen)
         return "stored"
     }
-    await deps.index.complete(did, verified.rev, observedAtMs, written)
+    await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
 
     if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
     return "stored"
@@ -384,11 +387,12 @@ async function settleFetched(
 async function settleUnverifiable(
     deps: IngestDeps,
     did: string,
-    record: FetchedRecord
+    record: FetchedRecord,
+    gen: number | null
 ): Promise<void> {
     const held = (await deps.index.revOf(did)) !== null
     if (held) {
-        await deps.index.clearPending(did)
+        await deps.index.clearPending(did, gen)
         await deps.index.markAttempted(did, deps.nowMs())
     } else {
         await deps.index.deferPending(

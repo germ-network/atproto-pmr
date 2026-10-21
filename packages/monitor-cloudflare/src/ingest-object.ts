@@ -533,6 +533,15 @@ export class MonitorIngest
             }
             if (
                 this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_gen'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(
+                    "ALTER TABLE pending ADD COLUMN owed_gen INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+            if (
+                this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('listing_stage') WHERE name = 'collection'")
                     .toArray().length === 0
             ) {
@@ -1001,10 +1010,12 @@ export class MonitorIngest
             return { outcome: "duplicate" }
         }
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen) VALUES (?, ?, 0, 0, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                "owed_gen = excluded.owed_gen",
             event.did,
-            event.rev
+            event.rev,
+            this.nextOweGen()
         )
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
@@ -1017,16 +1028,50 @@ export class MonitorIngest
     /** Owe a fetch the dedupe check would otherwise suppress. */
     async owe(did: string, rev: string): Promise<void> {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen) VALUES (?, ?, 0, 0, ?) " +
+                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                "owed_gen = excluded.owed_gen",
             did,
-            rev
+            rev,
+            this.nextOweGen()
         )
     }
 
+    /**
+     * A counter shared by every row, so a generation is never reused after
+     * a row is deleted and owed again.
+     */
+    private nextOweGen(): number {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('owe_seq', '1') " +
+                "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)"
+        )
+        return Number(
+            this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'owe_seq'").one().v
+        )
+    }
+
+    async owedGenOf(did: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ owed_gen: number }>("SELECT owed_gen FROM pending WHERE did = ?", did)
+            .toArray()[0]
+        return row?.owed_gen ?? null
+    }
+
+    /** The generation clause of a discharge: unconditional, or only the generation fetched for. */
+    private dischargePending(did: string, gen: number | null | undefined, quietOnly = false): void {
+        if (gen === null) return
+        const quiet = quietOnly ? " AND quiet = 1" : ""
+        if (gen === undefined) {
+            this.db.sql.exec(`DELETE FROM pending WHERE did = ?${quiet}`, did)
+            return
+        }
+        this.db.sql.exec(`DELETE FROM pending WHERE did = ? AND owed_gen = ?${quiet}`, did, gen)
+    }
+
     /** Discharge an obligation without indexing: a terminal, unstorable answer. */
-    async clearPending(did: string): Promise<void> {
-        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    async clearPending(did: string, gen?: number | null): Promise<void> {
+        this.dischargePending(did, gen)
     }
 
     /**
@@ -1274,7 +1319,8 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
@@ -1284,7 +1330,7 @@ export class MonitorIngest
                 windowOf(observedAtMs, this.digestWidthMs()),
                 did
             )
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.dischargePending(did, gen)
             this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
         })
     }
@@ -1304,7 +1350,8 @@ export class MonitorIngest
         observedAtMs: number,
         permanent: boolean,
         quiet = false,
-        cause: GoneCause = "repo"
+        cause: GoneCause = "repo",
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             if (permanent) {
@@ -1331,7 +1378,7 @@ export class MonitorIngest
                     did
                 )
             }
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.dischargePending(did, gen)
         })
     }
 
@@ -1581,13 +1628,14 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
             // A live record again: the join obligation and any deletion mark
             // are spent, but a commit's obligation is still owed.
-            this.db.sql.exec("DELETE FROM pending WHERE did = ? AND quiet = 1", did)
+            this.dischargePending(did, gen, true)
             this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
         })
     }
