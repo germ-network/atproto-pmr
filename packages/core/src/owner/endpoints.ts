@@ -224,9 +224,13 @@ export async function handleRegistrationCreate(
     })
     if (!verified.valid) return new Response(null, { status: 401 })
 
-    // Refused before any side effect: a deregistered anchor never registers again.
+    // Refused before any side effect: a deregistered anchor never registers
+    // again. Terminal, so no Retry-After. Checked only after the signature
+    // verifies, so just the declared key's holder learns the anchor is
+    // tombstoned; the challenge is already spent, and the refusal never
+    // amortizes into a registration.
     if (await deps.directory.isTombstoned(did, thumbprintOkpEd25519({ x: anchorKey }))) {
-        return new Response(null, { status: 401 })
+        return new Response(null, { status: 409 })
     }
 
     const fields: RegistrationFields = {
@@ -344,10 +348,12 @@ export async function handleRegistrationRead(
 
     const reg = await a.auth.store.load()
     if (reg === null) return new Response(null, { status: 404 })
+    const watch = await a.auth.store.readWatchState()
     return amortize(
         cbor([
         ["did", reg.did],
         ["la", reg.lastActive],
+        ["st", watch.paused ? "paused" : "active"],
         // The subscription's endpoint and content key are never echoed
         // back; only whether one exists.
         ["ps", reg.pushSubscription !== undefined],
