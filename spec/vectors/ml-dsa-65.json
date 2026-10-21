@@ -1,6 +1,5 @@
 {
   "description": "ML-DSA-65 (RFC 9964 AKP, alg -49) known-answer vectors. Produced and checked by gen-ml-dsa-65.sh with OpenSSL alone.",
-  "openssl": "3.6.2",
   "context": "",
   "rfc9964_figure7": {
     "note": "RFC 9964 Appendix A, Figure 7 (ML_DSA_65): the all-zero seed, its raw public key, and the COSE_Key kid (the RFC 9679 thumbprint over {kty, alg, pub}). Copied from the RFC text; not the project key.",

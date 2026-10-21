@@ -6,6 +6,7 @@
 #   sh gen-ml-dsa-65.sh --check   regenerate in a temp dir and diff against it
 #
 # OPENSSL selects the binary (default: openssl); it must be 3.5 or later.
+# Besides OpenSSL it needs jq, xxd and mktemp.
 set -eu
 
 OPENSSL=${OPENSSL:-openssl}
@@ -99,11 +100,12 @@ LABEL=pmr
 
 die() { echo "gen-ml-dsa-65: $*" >&2; exit 1; }
 
-case $($OPENSSL version) in
-    "OpenSSL 3."[5-9]* | "OpenSSL "[4-9]*) ;;
-    *) die "need OpenSSL >= 3.5 (got: $($OPENSSL version))" ;;
-esac
 OPENSSL_VERSION=$($OPENSSL version | cut -d' ' -f2)
+IFS=. read -r MAJOR MINOR _ <<EOV
+$OPENSSL_VERSION
+EOV
+{ [ "${MAJOR:-0}" -gt 3 ] 2>/dev/null || { [ "${MAJOR:-0}" -eq 3 ] && [ "${MINOR:-0}" -ge 5 ]; }; } ||
+    die "need OpenSSL >= 3.5 (got: $($OPENSSL version))"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -217,7 +219,6 @@ must_refuse key "$TMP/base.ed25519" "$TMP/sig.valid"
 
 # --- Assemble.
 jq -n \
-    --arg openssl "$OPENSSL_VERSION" \
     --arg seed "$SEED" --arg pub "$PUB" --arg cose "$COSE_KEY" \
     --arg thumb_hex "$THUMB_HEX" --arg thumb_b64url "$THUMB_B64URL" \
     --arg zero_seed "$ZERO_SEED" --arg fig7_pub "$FIG7_PUB" --arg fig7_kid "$FIG7_KID" \
@@ -231,7 +232,6 @@ jq -n \
     --arg flip_hex "$(hex "$TMP/sig.flipped")" --arg flip_b64 "$(b64 "$TMP/sig.flipped")" '
 {
   description: "ML-DSA-65 (RFC 9964 AKP, alg -49) known-answer vectors. Produced and checked by gen-ml-dsa-65.sh with OpenSSL alone.",
-  openssl: $openssl,
   context: "",
   rfc9964_figure7: {
     note: "RFC 9964 Appendix A, Figure 7 (ML_DSA_65): the all-zero seed, its raw public key, and the COSE_Key kid (the RFC 9679 thumbprint over {kty, alg, pub}). Copied from the RFC text; not the project key.",
@@ -296,7 +296,10 @@ jq -n \
 }' > "$TMP/out.json"
 
 if [ "${1-}" = "--check" ]; then
-    diff "$TMP/out.json" "$OUT" > /dev/null || die "$OUT is out of date; re-run without --check and review the diff"
+    jq -S . "$TMP/out.json" > "$TMP/out.sorted"
+    jq -S . "$OUT" > "$TMP/committed.sorted"
+    diff "$TMP/out.sorted" "$TMP/committed.sorted" > /dev/null ||
+        die "$OUT differs from what OpenSSL $OPENSSL_VERSION produces; investigate before regenerating"
     echo "ok: $OUT matches OpenSSL $OPENSSL_VERSION"
 else
     cp "$TMP/out.json" "$OUT"
