@@ -352,7 +352,6 @@ export async function handleRegistrationRead(
     return amortize(
         cbor([
         ["did", reg.did],
-        ["la", reg.lastActive],
         ["st", watch.paused ? "paused" : "active"],
         // The subscription's endpoint and content key are never echoed
         // back; only whether one exists.

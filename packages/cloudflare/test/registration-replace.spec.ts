@@ -240,7 +240,7 @@ describe("tombstones and monitor-retired registrations", () => {
 })
 
 describe("registration read reports the pause", () => {
-    it("st reads paused after an absent outcome and active after present; did, la and ps unchanged", async () => {
+    it("st reads paused after an absent outcome and active after present; did and ps unchanged", async () => {
         const did = freshDID()
         const directory = new KVDirectory(testEnv)
         const challenges = memoryChallenges()
@@ -273,7 +273,7 @@ describe("registration read reports the pause", () => {
 
         for (const map of [paused, after]) {
             expect(map.get("did")).toBe(did)
-            expect(map.get("la")).toBe(before.get("la"))
+            expect(map.has("la")).toBe(false)
             expect(map.get("ps")).toBe(false)
         }
     })
