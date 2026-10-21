@@ -109,7 +109,7 @@ export {
     type VerifyInput,
     type VerifyOutcome as RequestVerifyOutcome,
 } from "./http-sig/verify.js"
-export { signRequest, type SignOptions } from "./http-sig/sign.js"
+export { signRequest, type SignOptions, type SigningKey } from "./http-sig/sign.js"
 export {
     parseSignature,
     parseSignatureInput,

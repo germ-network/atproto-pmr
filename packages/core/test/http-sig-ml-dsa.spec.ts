@@ -242,6 +242,17 @@ describe("verifyRequestSignature with an ML-DSA-65 key", () => {
         })
     })
 
+    it("refuses a malformed bare key before reading any signature header", () => {
+        expect(
+            verifyRequestSignature({
+                request: new Request(URL_, { method: "POST" }),
+                body: null,
+                publicKey: new Uint8Array(31),
+                nowSeconds: T0,
+            })
+        ).toEqual({ valid: false, reason: "malformed key" })
+    })
+
     it("refuses bare key bytes that are not 32 long as a malformed key, before any crypto", () => {
         const request = signed({ alg: "ml-dsa-65", sign: signMl() })
         for (const bare of [mlKey.publicKey, encodeAkpMlDsa65Key({ pub: mlKey.publicKey }), new Uint8Array(31)]) {
@@ -302,8 +313,87 @@ describe("Ed25519 verification is unchanged", () => {
 })
 
 describe("signRequest with an ML-DSA-65 key", () => {
-    it.todo("emits alg=\"ml-dsa-65\" and a 3309-byte signature")
-    it.todo("is hedged by default: two signatures of the same base differ and both verify")
-    it.todo("is deterministic with deterministic: true")
-    it.todo("refuses, at runtime, untyped options that set both secretKey and key, or neither")
+    const seed = new Uint8Array(32).fill(7)
+    const base = {
+        method: "POST",
+        url: URL_,
+        nonce: "n1",
+        keyid: "k",
+        body: BODY,
+        created: T0,
+    }
+    const sign = (deterministic?: true) =>
+        signRequest({
+            ...base,
+            key: { alg: "ml-dsa-65", seed, ...(deterministic ? { deterministic } : {}) },
+        })
+    const signatureOf = (parts: { headers: Record<string, string> }) =>
+        parts.headers.signature.slice("pmr=:".length, -1)
+
+    it("emits alg=\"ml-dsa-65\" and a 3309-byte signature", () => {
+        const parts = sign()
+        expect(parts.headers["signature-input"]).toMatch(/;alg="ml-dsa-65"$/)
+        expect(atob(signatureOf(parts))).toHaveLength(3309)
+        expect(
+            verify(
+                { headers: parts.headers, body: BODY } as ReturnType<typeof signed>,
+                mlCose(mlKey.publicKey)
+            )
+        ).toMatchObject({ valid: true })
+    })
+
+    it("is hedged by default: two signatures of the same base differ and both verify", () => {
+        const a = sign()
+        const b = sign()
+        expect(a.base).toBe(b.base)
+        expect(signatureOf(a)).not.toBe(signatureOf(b))
+        for (const parts of [a, b]) {
+            expect(
+                verify(
+                    { headers: parts.headers, body: BODY } as ReturnType<typeof signed>,
+                    mlCose(mlKey.publicKey)
+                )
+            ).toMatchObject({ valid: true })
+        }
+    })
+
+    it("is deterministic with deterministic: true", () => {
+        expect(signatureOf(sign(true))).toBe(signatureOf(sign(true)))
+        expect(
+            verify(
+                { headers: sign(true).headers, body: BODY } as ReturnType<typeof signed>,
+                mlCose(mlKey.publicKey)
+            )
+        ).toMatchObject({ valid: true })
+    })
+
+    it("refuses, at runtime, untyped options that set both secretKey and key, or neither", () => {
+        const key = { alg: "ml-dsa-65", seed } as const
+        expect(() =>
+            signRequest({ ...base, key, secretKey: edSecret } as never)
+        ).toThrow()
+        expect(() => signRequest({ ...base } as never)).toThrow()
+    })
+
+    it("takes only a 32-byte seed, never an expanded secret key", () => {
+        for (const bad of [mlKey.secretKey, new Uint8Array(31)]) {
+            expect(() =>
+                signRequest({ ...base, key: { alg: "ml-dsa-65", seed: bad } })
+            ).toThrow(/seed/)
+        }
+    })
+
+    it("still signs Ed25519 through a typed key, emitting alg=\"ed25519\"", () => {
+        const parts = signRequest({
+            ...base,
+            key: { alg: "ed25519", secretKey: edSecret },
+        })
+        expect(parts.headers["signature-input"]).toMatch(/;alg="ed25519"$/)
+        expect(
+            verify(
+                { headers: parts.headers, body: BODY } as ReturnType<typeof signed>,
+                edPublic
+            )
+        ).toMatchObject({ valid: true })
+    })
 })
