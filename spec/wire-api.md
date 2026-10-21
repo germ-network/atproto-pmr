@@ -210,9 +210,12 @@ The identifiers are numbered 0 AES-GCM-256, 1 ChaCha20-Poly1305,
 byte is `3`, and a relay accepts only `3` there.
 
 An implementation MUST convert that field to a `COSE_Key` at ingest, once,
-and MUST NOT propagate the foreign encoding any further. That field is the
-whole of an implementer's exposure to the foreign format: the relay never
-parses the declaration's key package, never writes a declaration, and
+and MUST NOT propagate the foreign encoding any further. That field is
+nearly the whole of an implementer's exposure to the foreign format: the
+relay reads the declaration's key package only as far as its signed policy
+byte and, where it checks the possession proof under [relayed legacy
+intake](#relayed-legacy-intake), its outer signature. It never writes a
+declaration, and
 every other key on every other surface here is COSE. The record's full
 field inventory belongs to the declaration's own format and is out of
 scope for this document.
@@ -350,7 +353,7 @@ need no identifier in the path.
 
 | method | path | notes |
 |---|---|---|
-| `POST` | `/pmr/v1/registrations` | create: DID + declared anchor key (`COSE_Key`) + optionally a [Web Push subscription and content key](#push-delivery--web-push-optional). **Never a push token** |
+| `POST` | `/pmr/v1/registrations` | create: DID + declared anchor key (`COSE_Key`) + optionally a [Web Push subscription and content key](#push-delivery--web-push-optional) and the [`lr` opt-in](#the-lr-opt-in). **Never a push token** |
 | `GET` | `/pmr/v1/registration` | read own |
 | `PATCH` | `/pmr/v1/registration` | mutable registration fields |
 | `DELETE` | `/pmr/v1/registration` | deregister |
@@ -405,6 +408,54 @@ never accepted again; register a different anchor key.
 
 `GET /pmr/v1/registration` also returns `st`: `"active"` or `"paused"` (a CBOR
 text string), `"paused"` exactly while the registration is paused.
+
+A relay **MUST** ignore a key it does not recognize in the
+`POST /pmr/v1/registrations` body, so a client can send a newer field to an
+older relay. A client therefore MUST NOT treat a create-body field as in
+effect until `GET /pmr/v1/registration` reflects it. A field whose absence
+must be fatal cannot be added to this body: it needs a capability in the
+[enabler document](#the-enabler-document) or a new endpoint. The rule covers
+keys a relay does not recognize, never a recognized key with the wrong type.
+
+#### The `lr` opt-in
+
+The create body MAY carry `lr`, a CBOR boolean. `lr: true` declares that the
+registering device's intake handles [relayed legacy
+entries](#relayed-legacy-intake), and is the only way a registration comes to
+receive them. An absent `lr` and `lr: false` mean the same thing, and a client
+SHOULD omit the key rather than send `false`. Every create sets the opt-in
+afresh: re-registering the same anchor key without `lr` withdraws it. A
+relay that recognizes `lr` MUST answer `400` to an `lr` that is not a CBOR
+boolean, as it does for a malformed push field.
+
+`GET /pmr/v1/registration` returns `lr: true` exactly while the opt-in is in
+effect, and omits `lr` otherwise. A relay that does not implement relayed
+legacy intake ignores `lr` on create and never returns it, so a client MUST
+treat the opt-in as in effect only once the read returns it, not once the
+create succeeds.
+
+##### Registration test vectors
+
+A create body carrying only the opt-in, and the read of an
+active, opted-in registration, showing only the keys this section defines
+(a real read carries other keys too). Keys are sorted as in [deterministic
+CBOR](#deterministic-cbor):
+
+```
+{"lr": true}
+```
+
+```
+a1 626c72 f5
+```
+
+```
+{"lr": true, "st": "active"}
+```
+
+```
+a2 626c72 f5  627374 66 616374697665
+```
 
 ### Grants — the core capability
 
@@ -800,6 +851,9 @@ period); one long enough for recovery leaves replay open just as long.
 Scoping to the pre-session handshake resolves this. A plain freshness
 window MUST NOT be substituted for the nonce.
 
+The one entry kind exempt from the nonce is a [relayed
+legacy](#relayed-legacy-intake) entry, which states its weaker boundary there.
+
 Nonce width and seen-set retention are [not yet specified](#not-yet-specified).
 
 #### Malleability
@@ -997,6 +1051,128 @@ client's filter rests on cryptography rather than a relay decision.
 
 Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 
+### Relayed legacy intake
+
+A deployment MAY carry puts from a **legacy anchor inbox** into its
+recipients' pair mailboxes. A legacy anchor inbox is an earlier service that
+addresses mail by anchor key, not DID, and whose senders cannot form a pair
+put. How that service hands a put to the relay is internal to the
+deployment, and there is no public route for it. This section fixes what the
+relay does with such a put and what a device receives. It changes nothing
+about the [pair-put payload](#the-pair-put-payload), the peer-facing
+responses, or how an ordinary pair put is stored.
+
+A relayed put presents four things: the recipient's anchor key, the sender's
+anchor key, the message bytes, and the SHA-256 digest of those bytes. Each
+key is a raw 32-byte Ed25519 public key, the same bytes that follow the
+algorithm byte in the declaration's key field (§[Key material](#key-material)).
+The legacy service MUST have authenticated the sender's possession of the
+sender key. The relay MUST recompute the digest and refuse a put whose digest
+does not match its bytes. It MUST refuse a put whose message exceeds its
+advertised pair-put payload maximum: the same ceiling applies to both.
+
+**Finding the recipient.** The relay keeps a **recipient index**: the RFC 9679
+thumbprint of an anchor key, mapped to the DID registered under that key. An
+entry is written only by a create carrying [`lr: true`](#the-lr-opt-in), and
+removed when the opt-in is withdrawn and when the registration is replaced,
+retired or deregistered. On every use the relay re-checks that the DID holds
+a registration under that same anchor key and that the registration is opted
+in. If the recipient key has no entry, or the entry fails the re-check, the
+put is **not opted in**: the relay stores nothing and reports that to the
+legacy service, which keeps its own handling of the put. A paused
+registration is still opted in, and it queues relayed mail as it queues all
+mail. Once the relay has found an opted-in recipient, every later failure,
+including a timeout, is a retryable refusal, never "not opted in".
+
+**Naming the sender.** The relay attributes the put to a sender DID chosen
+only from the recipient's **allow set**: the recipient's follow graph as the
+relay's follow-edge index holds it for that owner
+([`messaging-appview.md`](messaging-appview.md#keeping-the-indexes-current)),
+meaning the declaration holders the recipient follows and those that follow
+the recipient. A **candidate** is a DID in the allow set whose declared anchor
+key equals the sender key, read from the same declaration the relay would
+verify a pair put from that DID against. A relay SHOULD exclude a declaration
+whose key package does not carry a signature by that anchor key over that
+DID, where it can verify one. A declaration that merely copies another DID's
+key then yields no candidate. The key-package format is the declaration's,
+not this specification's.
+
+*Blocked* below means the set the [blocked-sender](#blocked-senders) path
+applies to a pair put from that DID: the recipient's own blocks and any
+blocks the relay mirrors.
+
+- **Exactly one candidate, not blocked:** the put is attributed to it.
+- **Exactly one candidate, blocked:** the put takes the blocked-sender path
+  and is answered exactly as that path answers a pair put.
+- **More than one candidate, blocked or not:** the relay MUST refuse the put
+  and store nothing. It MUST NOT choose among them, and the recipient's blocks
+  MUST NOT narrow the set. A sender who can add a candidate could otherwise
+  read the recipient's blocks off the answer.
+- **No candidate:** the relay MUST refuse the put and store nothing. This
+  includes a recipient whose graph the follow-edge index does not serve, whose
+  allow set is empty. Relayed mail is never stored without a sender DID.
+- **The allow set, the blocks, or a candidate's declaration cannot be read in
+  time:** the relay MUST refuse the put as retryable, not attribute it from
+  partial state.
+
+A copier inside the recipient's follow graph that declares the victim's key
+therefore makes the victim's relayed puts to that recipient ambiguous for as
+long as its declaration carries the key, unless the possession check above
+excludes it. Blocking the copier does not clear it. The sender's recourse is
+a pair put.
+
+**Storing it.** An attributed put is then handled as a verified pair put from
+the attributed DID to the recipient. It takes [receive-time
+admission](#receive-time-admission): it lands in the sender's pair mailbox,
+goes to the [recovery pool](#the-recovery-pool), or takes the blocked-sender
+path, and it counts against the sender's reservation. The relay answers the
+same way for every sender: a put that is mailboxed, pooled or synthetically
+absorbed is accepted, and a put the store refuses is refused as full. The
+quota a real sender sees is produced for a blocked one too, as the
+blocked-sender path requires.
+
+A relayed put carries no pair-put nonce, so the relay has no sender-supplied
+freshness for it. In the attributed sender's seen-set, the relay uses the
+put's [content address](#content-addressing-and-idempotency) over `m` where a
+pair put's nonce would go.
+So relaying the same bytes to the same recipient again stores nothing new
+while that record lives. That is the content dedupe [Anti-replay](#anti-replay)
+says is no substitute for a nonce: once the entry is acked or expires, the
+same bytes store again. Relayed legacy intake does not meet this
+specification's anti-replay requirement at the relay, and the device's intake
+MUST treat a relayed entry as replayable and apply its own single-use
+handling before acting on it.
+
+The stored entry carries the [verification hint](#delivery--owner-facing):
+`sd` is the attributed DID and `dc` the CID of the declaration that matched,
+plus the relayed-legacy flag `rl`. The flag stays with the entry for its
+whole life, including a move from the pool into the mailbox.
+
+**Two lookups keyed by key material.** Everything else a relay keeps for a
+registration is keyed by DID. Relayed legacy intake adds exactly two
+lookups keyed by anchor-key material, each of which resolves to DIDs and holds
+nothing else:
+
+1. the recipient index above, written only by `lr` registrations;
+2. a declared-key index, from the thumbprint of a declared anchor key to the
+   DIDs declaring it, consulted only through one recipient's allow set.
+
+No mail, policy, block, grant or other per-registration state is keyed by
+anchor key.
+
+**What the device does.** A relayed entry's `m` is the legacy message,
+verbatim. It is not a pair-put payload: no pair-put signature covers it, and
+`sd` is the relay's attribution, not something the sender signed. A device
+MUST authenticate `m` by `m`'s own means before acting on it, and MUST NOT
+let `sd` stand in for that. Where `m` carries a sender attestation, the
+attested DID MUST equal `sd`, and `m`'s signature MUST verify under the anchor
+key in `sd`'s declaration, as the device itself verifies that declaration.
+Where `m` is authenticated some other way, for example by a commitment an
+earlier verified message made, the device MUST NOT use `sd` for anything: not
+to route, not to display, and not to record a contact. The relay never
+supplies a key ([P1](trust-model.md#p1--key-blindness)). The format of `m` is
+outside this specification.
+
 ### Delivery — owner-facing
 
 | method | path | notes |
@@ -1034,6 +1210,42 @@ of `01 71 12 20 ‖ <32-byte SHA-256 of the record block>` (so it begins
 `dc` is not emitted at all. The same two fields appear in `#delivery`, in a
 `GET /pmr/v1/messages` entry, and in a full-form push.
 
+A [relayed legacy](#relayed-legacy-intake) entry also carries `rl`, the CBOR
+boolean `true`, beside `sd` and `dc`. It means `m` is a relayed legacy
+message, not a pair-put payload, and that `sd` is the relay's attribution.
+`rl` is never `false`. It is absent from every other entry, and it appears
+only together with `sd` and `dc`, in the same three places. A relay sends `rl`
+entries only to a registration [opted in](#the-lr-opt-in) with `lr`.
+
+#### Relayed legacy delivery test vector
+
+A `#delivery` body, which is also the shape of a
+`GET /pmr/v1/messages` entry, for a relayed legacy entry in the pair mailbox
+of `did:plc:sender000000000000000000`. `id` and `m` are placeholders. Keys are
+sorted as in [deterministic CBOR](#deterministic-cbor): `k m dc id rl sd`.
+
+```
+{
+  "k":  "did:plc:sender000000000000000000",
+  "m":  h'010203',
+  "dc": "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e",
+  "id": "m1",
+  "rl": true,
+  "sd": "did:plc:sender000000000000000000"
+}
+```
+
+```
+a6 616b 78 20 6469643a706c633a73656e646572303030303030303030303030303030303030
+   616d 43 010203
+   626463 78 3b 62616679726569646a686866337a796e6e76337175676968706d683735376a3775686578646b36326b6d743462676a71777361636a693735643465
+   626964 62 6d31
+   62726c f5
+   627364 78 20 6469643a706c633a73656e646572303030303030303030303030303030303030
+```
+
+Whitespace in the hex is for reading; the body is the bytes concatenated.
+
 #### Catch-up cursor
 
 `GET /pmr/v1/messages?cursor=` pages through mailboxes. The `cursor` is a
@@ -1066,7 +1278,7 @@ body   = { ... type-specific fields ... }
 | `t` | direction | body | notes |
 |---|---|---|---|
 | `#capabilities` | server → client | `{gr}` | the grant lifecycle effective *for this registration* — see below |
-| `#delivery` | server → client | `{k, id, m, sd?, dc?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`dc` (the verification hint, see [Delivery — owner-facing](#delivery--owner-facing)) are present together, and only for a pair-mailbox entry |
+| `#delivery` | server → client | `{k, id, m, sd?, dc?, rl?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`dc` (the verification hint, see [Delivery — owner-facing](#delivery--owner-facing)) are present together, and only for a pair-mailbox entry. `rl: true` is present only on a [relayed legacy](#relayed-legacy-intake) entry |
 | `#ack` | client → server | `{k, id}` | acknowledges one message. Idempotent — acking an already-removed message MUST succeed, matching the REST ack endpoint |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
@@ -1637,6 +1849,7 @@ socket frames use:
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
 | `sd` / `dc` | present under the same condition as `m`, for a pair-mailbox entry: the verification hint, identical to `#delivery`'s `sd`/`dc` |
+| `rl` | present under the same condition as `sd`/`dc`, for a relayed legacy entry only: `true`, identical to `#delivery`'s `rl` |
 
 ```json
 { "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }
@@ -1963,7 +2176,8 @@ pool sizing is recipient-side state, so no refusal may turn on it.
   currently in use.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
-  CBOR schemas for registration, grant issuance, ack batches, pool
+  CBOR schemas for registration (beyond [`lr`](#the-lr-opt-in) and the
+  ignore-unknown-keys rule), grant issuance, ack batches, pool
   adjudication, and the enabler document are not fixed here. The
   encoding rules that govern them — deterministic CBOR, `COSE_Key`, tag-1
   integer timestamps — are.

@@ -231,6 +231,14 @@ Storage-side, the hint is stored *alongside* the body and never inside it.
 An implementation that loses hints degrades performance; one that lets a
 hint substitute for verification degrades security.
 
+A [relayed legacy](wire-api.md#relayed-legacy-intake) entry's `sd` is weaker
+still: it is the relay's attribution of a legacy message, not the result of
+verifying a signed pair put. Where the message carries a sender attestation,
+the device verifies it under `sd`'s declaration and confirms that it attests
+`sd`. Where it does not, the device uses `sd` for nothing
+([relayed legacy intake](wire-api.md#relayed-legacy-intake)).
+The relay picks the DID and never a key, so P1 holds.
+
 The same posture applies to every routing-shaped assertion a relay makes:
 act on it, verify by outcome, never treat it as authoritative. A relay
 could already withhold mail, so routing advice adds no new power — but it
@@ -251,6 +259,7 @@ move. This is the only structural answer to a relay that misbehaves.
 | message content, attachment content | **No** | end-to-end encrypted; the relay moves opaque bytes and is key-blind by construction |
 | the served DID (whose relay it is) | Yes | definitional |
 | sender DID on a pair-mailbox put | **Yes** | the direct cost of requiring authenticated puts: a signed put names the sender |
+| sender and recipient anchor keys on a relayed legacy put | Yes | the legacy inbox already addresses by anchor key; attribution adds the sender DID a pair put would name ([relayed legacy intake](wire-api.md#relayed-legacy-intake)). While a legacy inbox is still live, a refusal also tells a legacy sender that the recipient has opted in |
 | counterpart identity on a grant-addressed put | No | grant addresses are derived and opaque, and name nobody. This is why steady-state traffic offloads to them |
 | timing, sizes, message and attachment counts | Yes | unavoidable for a store-and-forward mailbox |
 | the user's social graph and interest set | Only if non-public data is an input | |
