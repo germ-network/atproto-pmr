@@ -1,7 +1,11 @@
 import type { BlockEdgeStore } from "../block-edges.js"
 import { syncOwnerBlocks } from "../block-sync.js"
 import { redeemChallenge } from "../challenge.js"
-import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
+import {
+    encodeOkpEd25519Key,
+    parseOkpEd25519Key,
+    thumbprintOkpEd25519,
+} from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { messageEntryFields } from "../events.js"
 import { deriveGrantAddress } from "../grant.js"
@@ -220,6 +224,11 @@ export async function handleRegistrationCreate(
     })
     if (!verified.valid) return new Response(null, { status: 401 })
 
+    // Refused before any side effect: a deregistered anchor never registers again.
+    if (await deps.directory.isTombstoned(did, thumbprintOkpEd25519({ x: anchorKey }))) {
+        return new Response(null, { status: 401 })
+    }
+
     const fields: RegistrationFields = {
         did,
         // Self-describing on the way in, so nothing downstream has to know
@@ -356,10 +365,18 @@ export async function handleRegistrationDelete(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    await deps.directory.delete(a.auth.did)
-    // Idempotent: deleting an already-deleted registration succeeds, so a
-    // retry inside the challenge TTL is safe. No next-challenge here — the
-    // registration this one would be bound to no longer exists.
+    const reg = await a.auth.store.load()
+    let thumbprint: Uint8Array | null = null
+    try {
+        if (reg !== null) thumbprint = thumbprintOkpEd25519(parseOkpEd25519Key(reg.anchorKey))
+    } catch {
+        // An unparseable stored key names no anchor to tombstone.
+    }
+    if (thumbprint !== null) await deps.directory.deregister(a.auth.did, thumbprint)
+    // Idempotent: deregistering an already-deregistered registration
+    // succeeds, so a retry inside the challenge TTL is safe. No
+    // next-challenge here — the registration this one would be bound to no
+    // longer exists.
     return new Response(null, { status: 204 })
 }
 

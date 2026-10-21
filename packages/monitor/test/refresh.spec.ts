@@ -88,6 +88,7 @@ function harness(opts: {
     const quiet: string[] = []
     const quietVerified: Array<{ cid: string; verifiedWith: string }> = []
     const goneReversible: string[] = []
+    const goneCauses: string[] = []
     const deleted = new Set<string>()
     const onChange = vi.fn(async () => {})
     const onRegression = vi.fn(async () => {})
@@ -115,7 +116,14 @@ function harness(opts: {
             revs.set(did, rev)
             windows.push(did)
         },
-        completeDeletion: async (did: string, _at: number, permanent: boolean) => {
+        completeDeletion: async (
+            did: string,
+            _at: number,
+            permanent: boolean,
+            _quiet?: boolean,
+            cause?: string
+        ) => {
+            goneCauses.push(`${cause}`)
             windows.push(did)
             if (permanent) deleted.add(did)
             revs.delete(did)
@@ -228,7 +236,10 @@ function harness(opts: {
             markChecked: async (did, at) => void checkedAt.set(did, at),
             markAttempted: async (did, at) => void attempted.set(did, at),
             requestRefresh: async () => {},
-            markGoneReversible: async (did) => void goneReversible.push(did),
+            markGoneReversible: async (did, cause) => {
+                goneReversible.push(did)
+                goneCauses.push(cause)
+            },
             completeQuietly: async (did, rev, _at, verified) => {
                 revs.set(did, rev)
                 quiet.push(did)
@@ -244,7 +255,7 @@ function harness(opts: {
             records: opts.watchProfile === true ? [{ collection: PROFILE, rkey: RKEY }] : [],
         },
     }
-    return { profileRows, profileChecks, profileStored, disposed, deferred, deps, quietVerified, goneReversible, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
+    return { profileRows, profileChecks, profileStored, disposed, deferred, deps, quietVerified, goneReversible, goneCauses, attempted, revs, records, checks, checkedAt, windows, quiet, deleted, onChange, onRegression, onDelete, dueCalls }
 }
 
 const run = (h: ReturnType<typeof harness>, limit = 64) =>
@@ -337,6 +348,7 @@ describe("refreshDue", () => {
         expect(h.deleted.has(DID)).toBe(true)
         expect(h.windows).toEqual([DID])
         expect(h.onDelete).toHaveBeenCalledWith(DID)
+        expect(h.goneCauses).toEqual(["repo"])
     })
 
     it("an advanced rev whose CAR proves no record at the path is a non-permanent deletion", async () => {
@@ -351,6 +363,20 @@ describe("refreshDue", () => {
         expect(h.records.has(DID)).toBe(false)
         expect(h.deleted.has(DID)).toBe(false)
         expect(h.windows).toEqual([DID])
+        expect(h.goneCauses).toEqual(["record"])
+    })
+
+    it("a bare record-level not-found is unproven and records the repo cause", async () => {
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            head: async () => headAt("3m2"),
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RecordNotFound", false)
+            },
+        })
+        await run(h)
+        expect(h.goneReversible).toEqual([DID])
+        expect(h.goneCauses).toEqual(["repo"])
     })
 
     it("a reversible deletion already applied is re-confirmed without another window entry or push", async () => {
@@ -365,6 +391,7 @@ describe("refreshDue", () => {
         expect(h.windows).toEqual([])
         expect(h.onDelete).not.toHaveBeenCalled()
         expect(h.goneReversible).toEqual([DID])
+        expect(h.goneCauses).toEqual(["repo"])
         expect(h.checkedAt.get(DID)).toBe(NOW)
     })
 

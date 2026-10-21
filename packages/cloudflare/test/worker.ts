@@ -35,6 +35,17 @@ export class MonitorIngestStub extends DurableObject {
         return answer === undefined ? null : answer
     }
 
+    /** Set what `verifiedAnchorOf(did)` answers: an observation, or "throw". */
+    async setVerifiedAnchor(did: string, answer: unknown): Promise<void> {
+        await this.ctx.storage.put(`verifiedAnchor:${did}`, answer)
+    }
+
+    async verifiedAnchorOf(did: string): Promise<unknown> {
+        const answer = await this.ctx.storage.get(`verifiedAnchor:${did}`)
+        if (answer === "throw") throw new Error("monitor down")
+        return answer ?? { state: "unknown" }
+    }
+
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
         await this.ctx.storage.put("refreshes", [
             ...(await this.refreshes()),

@@ -60,6 +60,7 @@ const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
+const KEY_MONITOR_CONFIRMED = "monitorConfirmed"
 
 /** One served summary state per entry, so storing one never rewrites another. */
 const SUMMARY_PREFIX = "summary:"
@@ -428,6 +429,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
+    async isMonitorConfirmed(): Promise<boolean> {
+        return (await this.db.get<boolean>(KEY_MONITOR_CONFIRMED)) === true
+    }
+
+    async markMonitorConfirmed(): Promise<void> {
+        await this.db.put(KEY_MONITOR_CONFIRMED, true)
+    }
+
     // MARK: - The declaration watch
 
     async readWatchState(): Promise<WatchState> {
@@ -598,19 +607,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             return { outcome: "duplicate" }
         }
 
-        // PAUSE (watch.ts): the owner's own declared anchor key is confirmed
-        // gone, so DID-addressed mail is absorbed — no bytes, no delivery, and
-        // (unlike an accepted append) no nonce recorded, because the pause is
-        // transient and a resend after the key returns must still land. Only
-        // pair (`did:`) keys pause; a `grant:`-keyed put (grant-put.ts) passes
-        // through untouched, since pause stops DID-addressed mail and keeps
-        // grant-addressed mail. The response is the same 202 a real append
-        // yields; the trigger (the owner's declaration) is public, so this is
-        // not a blocking-style secret that needs timing parity.
-        if (isPairMailboxKey(key) && (await this.readWatchState()).paused) {
-            return { outcome: "appended", persistBody: false }
-        }
-
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         const result =
             blocked !== undefined
@@ -728,10 +724,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<ReceiveResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
-        // Paused: absorbed as `append` does, before any marker is touched.
-        if ((await this.readWatchState()).paused) {
-            return { outcome: "queued", persistBody: false }
-        }
 
         let blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         if (admission.verdict === "blocked" && blocked === undefined) {
@@ -879,13 +871,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
-        }
-
-        // PAUSE (watch.ts): the pool is DID-addressed by construction, so a
-        // paused registration absorbs every pooled put — no bytes, no nonce
-        // recorded — exactly as `append` absorbs a paused pair put. See there.
-        if ((await this.readWatchState()).paused) {
-            return { outcome: "pooled", persistBody: false }
         }
 
         const discardedUntil = await this.db.get<number>(discardKey(key))
@@ -1195,11 +1180,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     // MARK: - Teardown
 
     /**
-     * Tear down all of this registration's stored state — the deregistration /
-     * replace teardown. `KVDirectory.delete` calls this after unlinking the DID,
-     * so an orphaned DO does not leak its storage forever (nothing else reclaims
-     * it — there is no alarm or sweep). Reached by locator, not by DID: the caller
-     * has already removed the routing row.
+     * Tear down all of this registration's stored state. Reached by locator,
+     * not by DID: the caller has already removed the routing row.
      */
     async destroy(): Promise<void> {
         await this.db.deleteAll()

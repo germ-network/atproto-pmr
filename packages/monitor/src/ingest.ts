@@ -25,6 +25,7 @@ import {
     FETCH_AS_OF_SKEW_MS,
     type Cursor,
     type DidDocumentSink,
+    type GoneCause,
     type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
@@ -226,10 +227,11 @@ export async function settleDeletion(
     deps: IngestDeps,
     did: string,
     permanent: boolean,
-    quiet = false
+    quiet: boolean,
+    cause: GoneCause
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
-    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause)
     if (!quiet) await deps.onDelete?.(did)
 }
 
@@ -280,7 +282,7 @@ export async function settle(
             if (repoLevel) await deps.secondaries?.dispose(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, err.permanent, quiet)
+        await settleDeletion(deps, did, err.permanent, quiet, "repo")
         if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
@@ -329,7 +331,7 @@ async function settleFetched(
             await deps.index.clearPending(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, false, quiet)
+        await settleDeletion(deps, did, false, quiet, "record")
         return "deleted"
     }
 

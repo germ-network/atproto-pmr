@@ -5,7 +5,12 @@
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { asPairMailboxKey, type RegistrationFields } from "@germ-network/atproto-pmr-core"
+import {
+    asPairMailboxKey,
+    encodeOkpEd25519Key,
+    thumbprintOkpEd25519,
+    type RegistrationFields,
+} from "@germ-network/atproto-pmr-core"
 import { KVDirectory, pmrStore } from "../src/directory"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
@@ -100,17 +105,21 @@ describe("deleteGrantAddress", () => {
     })
 })
 
+function fields(did: string, fill: number): RegistrationFields {
+    return {
+        did,
+        anchorKey: encodeOkpEd25519Key({ x: new Uint8Array(32).fill(fill) }),
+        lastActive: T0,
+    }
+}
+const thumb = (fill: number) =>
+    thumbprintOkpEd25519({ x: new Uint8Array(32).fill(fill) })
+
 describe("delete", () => {
     it("tears down the registration's Durable Object, not just the routing row", async () => {
         const dir = directory()
         const did = freshDID()
-        const fields: RegistrationFields = {
-            did,
-            anchorKey: new Uint8Array(32).fill(1),
-            lastActive: T0,
-        }
-
-        const locator = await dir.create(did, fields)
+        const locator = await dir.create(did, fields(did, 1))
         const store = pmrStore(locator, testEnv)
         const appended = await store.append(
             asPairMailboxKey("did:plc:some-sender"),
@@ -122,11 +131,75 @@ describe("delete", () => {
 
         await dir.delete(did)
 
-        // Unlinked: the DID no longer resolves.
         expect(await dir.resolve(did)).toBeNull()
-        // Torn down, not merely orphaned: the old DO's state is gone too.
         expect(await store.load()).toBeNull()
-        const page = await store.openMailboxes(null, 100)
-        expect(page.entries).toEqual([])
+        expect((await store.openMailboxes(null, 100)).entries).toEqual([])
+    })
+})
+
+describe("retire", () => {
+    it("destroys the expected active registration with its mail and does not tombstone it", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const locator = await dir.create(did, fields(did, 1))
+        const store = pmrStore(locator, testEnv)
+        await store.append(
+            asPairMailboxKey("did:plc:some-sender"),
+            { messageId: "m1", byteLength: 42 },
+            new Uint8Array(16).fill(2),
+            T0
+        )
+
+        expect(await dir.retire(did, locator)).toBe(locator)
+
+        expect(await dir.resolve(did)).toBeNull()
+        expect(await store.load()).toBeNull()
+        expect(await dir.isTombstoned(did, thumb(1))).toBe(false)
+    })
+
+    it("does nothing when the active registration is not the expected one", async () => {
+        const dir = directory()
+        const did = freshDID()
+        const first = await dir.create(did, fields(did, 1))
+        await dir.delete(did)
+        const second = await dir.create(did, fields(did, 2))
+
+        expect(await dir.retire(did, first)).toBeNull()
+        expect(await dir.resolve(did)).toBe(second)
+        expect(await pmrStore(second, testEnv).load()).not.toBeNull()
+    })
+
+    it("does nothing when the DID has no registration", async () => {
+        expect(await directory().retire(freshDID(), "loc")).toBeNull()
+    })
+})
+
+describe("tombstones", () => {
+    it("deregister tombstones only that anchor", async () => {
+        const dir = directory()
+        const did = freshDID()
+        await dir.create(did, fields(did, 1))
+
+        await dir.deregister(did, thumb(2))
+        expect(await dir.resolve(did)).not.toBeNull()
+        expect(await dir.isTombstoned(did, thumb(2))).toBe(false)
+
+        await dir.deregister(did, thumb(1))
+        expect(await dir.resolve(did)).toBeNull()
+        expect(await dir.isTombstoned(did, thumb(1))).toBe(true)
+        expect(await dir.isTombstoned(did, thumb(2))).toBe(false)
+        expect(await dir.isTombstoned(freshDID(), thumb(1))).toBe(false)
+    })
+
+    it("a tombstone survives a later delete, retire or create", async () => {
+        const dir = directory()
+        const did = freshDID()
+        await dir.create(did, fields(did, 1))
+        await dir.deregister(did, thumb(1))
+        const second = await dir.create(did, fields(did, 2))
+        await dir.retire(did, second)
+        await dir.create(did, fields(did, 3))
+        await dir.delete(did)
+        expect(await dir.isTombstoned(did, thumb(1))).toBe(true)
     })
 })

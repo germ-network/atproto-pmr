@@ -19,7 +19,9 @@ import {
     asPairMailboxKey,
     encodeBinding,
     handleRegistrationCreate,
+    handleRegistrationDelete,
     parseOkpEd25519Key,
+    thumbprintOkpEd25519,
     signRequest,
     type ChallengeStore,
     type Locator,
@@ -176,5 +178,61 @@ describe("a same declared key stays an idempotent in-place refresh", () => {
 
         const queue = await store1.list(sender, 100)
         expect(queue.map((r) => r.messageId)).toEqual(["m1"])
+    })
+})
+
+describe("tombstones and monitor-retired registrations", () => {
+    it("DELETE /registration tombstones the authenticated anchor", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key = ed25519.utils.randomSecretKey()
+        await register(did, key, challenges, directory)
+
+        const url = "https://relay.example/pmr/v1/registration"
+        const nonce = await challengeFor(challenges, did)
+        const parts = signRequest({ method: "DELETE", url, nonce, keyid: "t", secretKey: key })
+        const response = await handleRegistrationDelete(
+            new Request(url, { method: "DELETE", headers: parts.headers }),
+            deps(challenges, async () => null)
+        )
+        expect(response.status).toBe(204)
+        expect(await directory.resolve(did)).toBeNull()
+        expect(
+            await directory.isTombstoned(did, thumbprintOkpEd25519({ x: ed25519.getPublicKey(key) }))
+        ).toBe(true)
+    })
+
+    it("a deregistered anchor cannot register again, another key of the DID can", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key1 = ed25519.utils.randomSecretKey()
+        const x1 = ed25519.getPublicKey(key1)
+        await register(did, key1, challenges, directory)
+        await directory.deregister(did, thumbprintOkpEd25519({ x: x1 }))
+
+        const refused = await handleRegistrationCreate(
+            signedRequest(key1, await challengeFor(challenges, did)),
+            deps(challenges, async () => x1)
+        )
+        expect(refused.status).toBe(401)
+        expect(await directory.resolve(did)).toBeNull()
+
+        await register(did, ed25519.utils.randomSecretKey(), challenges, directory)
+    })
+
+    it("re-registering the anchor of a monitor-retired registration creates a fresh one", async () => {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const key = ed25519.utils.randomSecretKey()
+        const retired = await register(did, key, challenges, directory)
+        await directory.retire(did, retired)
+
+        const fresh = await register(did, key, challenges, directory)
+        expect(fresh).not.toBe(retired)
+        expect(await pmrStore(retired, testEnv).load()).toBeNull()
+        expect(await pmrStore(fresh, testEnv).load()).not.toBeNull()
     })
 })

@@ -61,6 +61,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const members = new Map<number, Set<string>>()
     const deleted = new Set<string>()
     const quietDeletions: string[] = []
+    const causes: Array<string | undefined> = []
     const quietCompletions: string[] = []
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
@@ -86,7 +87,8 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
             pending.delete(did)
             deleted.delete(did)
         },
-        completeDeletion: async (did, observedAtMs, permanent, quiet) => {
+        completeDeletion: async (did, observedAtMs, permanent, quiet, cause) => {
+            causes.push(cause)
             if (permanent) deleted.add(did)
             if (quiet !== true) addToWindow(did, observedAtMs)
             else quietDeletions.push(did)
@@ -148,7 +150,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         nowMs: () => 1_000_000,
         ...depOverrides,
     }
-    return { deps, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
+    return { deps, causes, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake by policy", () => {
@@ -527,6 +529,7 @@ describe("settle", () => {
 
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(h.records.has(DID)).toBe(false)
+        expect(h.causes).toEqual(["repo"])
         expect(onDelete).toHaveBeenCalledWith(DID)
         expect(await h.deps.index.windowMembers(0)).toContain(DID)
         expect(await h.deps.index.isDeleted(DID)).toBe(false)
@@ -906,6 +909,19 @@ describe("settle verifies at ingest", () => {
         expect(h.records.has(DID)).toBe(false)
         expect(h.deleted.has(DID)).toBe(false)
         expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(h.causes).toEqual(["record"])
+    })
+
+    it("a bare RecordNotFound is unproven and records the repo cause", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RecordNotFound", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.causes).toEqual(["repo"])
     })
 
     it("older exclusion proof does not delete a newer record", async () => {

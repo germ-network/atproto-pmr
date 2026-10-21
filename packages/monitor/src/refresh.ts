@@ -23,7 +23,7 @@ import {
 } from "./ingest"
 import type { HeadRev } from "./fetch-record"
 import { settleSecondary, type SecondaryDeps } from "./secondary"
-import { compareRev, type VerifiedWrite } from "./storage"
+import { compareRev, type GoneCause, type VerifiedWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
 export interface SnapshotCheck {
@@ -66,7 +66,7 @@ export interface RefreshIndex {
      * The declaration is reversibly gone and already disposed of: re-assert
      * that state, with no digest-window entry and no push.
      */
-    markGoneReversible(did: string): Promise<void>
+    markGoneReversible(did: string, cause: GoneCause): Promise<void>
 
     /** Advance the rev index without a digest-window entry. */
     completeQuietly(
@@ -182,7 +182,7 @@ async function refreshOne(
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
         // A repo that does not answer a head read is gone, whatever the name.
-        return disposeGone(deps, did, err.permanent, true, nowMs)
+        return disposeGone(deps, did, err.permanent, true, nowMs, "repo")
     }
 
     // A DID that never held a declaration has none to fetch: the declaration
@@ -235,7 +235,7 @@ async function refreshDeclaration(
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
         return {
-            outcome: await disposeGone(deps, did, err.permanent, repoLevel(err), nowMs),
+            outcome: await disposeGone(deps, did, err.permanent, repoLevel(err), nowMs, "repo"),
             repoGone: repoLevel(err),
         }
     }
@@ -251,7 +251,7 @@ async function refreshDeclaration(
     if (verified.kind === "verified-absent") {
         // A 200 with an exclusion proof: the repo is alive and the record is
         // gone. Reversible, because the account may publish it again.
-        const outcome = await disposeGone(deps, did, false, false, nowMs)
+        const outcome = await disposeGone(deps, did, false, false, nowMs, "record")
         // A document stored for a DID this left unwatched would be trusted
         // with nothing following it. Unguarded on purpose: a failed check is
         // not "unwatched", and the caller marks the DID attempted.
@@ -372,7 +372,8 @@ async function disposeGone(
     did: string,
     permanent: boolean,
     repoWide: boolean,
-    nowMs: number
+    nowMs: number,
+    cause: GoneCause
 ): Promise<RefreshOutcome> {
     const { ingest } = deps
     if ((await ingest.index.revOf(did)) === null) {
@@ -384,15 +385,15 @@ async function disposeGone(
     if ((await ingest.snapshot.getRecord(did)) === null) {
         // An earlier reversible answer can harden into a permanent one.
         if (permanent && !(await ingest.index.isDeleted(did))) {
-            await settleDeletion(ingest, did, true)
+            await settleDeletion(ingest, did, true, false, cause)
             outcome = "deleted"
         } else {
-            if (!permanent) await deps.refreshIndex.markGoneReversible(did)
+            if (!permanent) await deps.refreshIndex.markGoneReversible(did, cause)
             await deps.refreshIndex.markChecked(did, nowMs)
             outcome = "confirmed"
         }
     } else {
-        await settleDeletion(ingest, did, permanent)
+        await settleDeletion(ingest, did, permanent, false, cause)
         outcome = "deleted"
     }
     if (repoWide) await ingest.secondaries?.dispose(did)

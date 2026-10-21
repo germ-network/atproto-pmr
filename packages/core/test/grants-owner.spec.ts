@@ -82,6 +82,13 @@ function world() {
         async delete(did) {
             registrations.delete(did)
         },
+        async retire() {
+            return null
+        },
+        async deregister() {},
+        async isTombstoned() {
+            return false
+        },
         async createGrantAddress(locator, address, authKey, _expiresAt) {
             if (failRoutingWrite) throw new Error("routing write failed")
             addressRows.set(address, { locator, authKey, closed: false })

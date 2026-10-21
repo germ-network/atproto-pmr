@@ -55,7 +55,10 @@ exact signatures belong to an implementation.
 | `resolve(did) -> Locator?` | hot path; routes every pair put and every owner request |
 | `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
 | `create(did, registration) -> Locator` | idempotent on DID |
-| `delete(did)` | deregistration and dormancy eviction |
+| `delete(did)` | removes and destroys the DID's active registration with its mail: dormancy eviction, and the replace path of a new key's registration |
+| `retire(did, expectedActive) -> Locator?` | destroys the active registration with its mail if it is `expectedActive`, else does nothing; does not tombstone its anchor. Used only for a monitor-verified change of anchor or verified absence |
+| `deregister(did, anchorThumbprint)` | when the thumbprint is the active registration's anchor: tombstones it (write-once), then removes and destroys the registration |
+| `isTombstoned(did, anchorThumbprint) -> bool` | one lookup; a tombstone is never rewritten or removed |
 | `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not key monitoring, which is push-driven — see [Scheduling](#scheduling) |
 
 ### Registration state
@@ -97,7 +100,9 @@ A relay still keeps a little monitor-shaped state for its **own** registered
 DIDs, because it pauses when a declared key disappears
 (§[Registration state](#registration-state)): the last observed
 declaration revision, the last check time, the currently trusted anchor
-key, and the paused flag. That is a relay concern and stays here; serving
+key, and the paused flag. A pause is reversible and still queues mail; only a
+monitor-verified change of anchor or verified absence of the record retires
+the registration, which destroys it. That is a relay concern and stays here; serving
 monitoring *to others* is not.
 
 The **last observed declaration revision is a monotonic watermark**
