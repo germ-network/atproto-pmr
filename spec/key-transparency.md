@@ -351,8 +351,9 @@ malformed value is no coverage.
   the window, a first frame whose time is past that cursor by more than a
   tolerance (events were skipped). On a gap the monitor starts a new run at the
   gap instant and owes **every served DID** (every DID it holds a declaration
-  for, not one it holds as gone), stamped with the gap instant. The ordinary rule
-  then finishes the resync: `coveredThrough` is held at the gap instant, so
+  for, not one it holds as gone), stamped one millisecond before the gap
+  instant. The ordinary rule
+  then finishes the resync: `coveredThrough` is held before the gap instant, so
   coverage is null until each DID has been fetched or has become lagging, and
   there is no separate resync state. A gap longer than ten minutes puts every
   re-owed holder on `lagging` at once, and `coveredThrough` is null while there

@@ -1,7 +1,17 @@
-import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
+import {
+    env,
+    evictDurableObject,
+    runDurableObjectAlarm,
+    runInDurableObject,
+} from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import { KV_VISIBILITY_MS, RecordNotFoundError } from "@germ-network/atproto-pmr-core"
+import {
+    FIREHOSE_LAGGING_CAP,
+    KV_VISIBILITY_MS,
+    RecordNotFoundError,
+} from "@germ-network/atproto-pmr-core"
 import { intake, settle, type IngestDeps } from "@germ-network/atproto-pmr-monitor"
+import { FIREHOSE_COVERAGE_KEY, kvFirehoseCoverage } from "../src/firehose-coverage-store"
 import { kvSnapshotStore } from "../src/snapshot-store"
 import type { MonitorEnv } from "../src/env"
 import type { MonitorIngest } from "../src/ingest-object"
@@ -322,15 +332,231 @@ describe("owed_since_us (S3)", () => {
     })
 })
 
+const NOW = 1_700_000_000_000
+
+async function published(): Promise<unknown> {
+    return JSON.parse((await testEnv.records.get(FIREHOSE_COVERAGE_KEY)) ?? "null")
+}
+
 describe("publication (S5)", () => {
-    it.todo("the alarm publishes one firehose:coverage value carrying the watermark and lagging list")
-    it.todo("over the cap the published coveredThroughMs is null, replacing any older value")
-    it.todo("kvFirehoseCoverage reads a missing or malformed entry as null")
+    it("the alarm publishes one firehose:coverage value carrying the watermark and lagging list", async () => {
+        const stub = freshStub()
+        const now = Date.now()
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.complete(DID, "3m1", now, VERIFIED)
+            await obj.complete("did:plc:old", "3m1", now, VERIFIED)
+            await obj.intake({ did: "did:plc:old", rev: "3m2" }, String((now - 30 * 60_000) * 1000))
+            await obj.intake({ did: DID, rev: "3m2" }, String((now - 2000) * 1000))
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            const set = (obj as unknown as { setMeta(k: string, v: string): void }).setMeta
+            set.call(obj, "firehose_since", String(now - 3_600_000))
+        })
+        const original = globalThis.fetch
+        globalThis.fetch = (() => Promise.resolve(new Response(null, { status: 200 }))) as typeof fetch
+        try {
+            await runDurableObjectAlarm(stub)
+        } catch {
+            // connect() has no real socket to open here.
+        } finally {
+            globalThis.fetch = original
+        }
+        const value = (await published()) as { coveredThroughMs: number; lagging: string[] }
+        expect(value.lagging).toEqual(["did:plc:old"])
+        expect(value.coveredThroughMs).toBe(now - 2000)
+    })
+
+    it("over the cap the published coveredThroughMs is null, replacing any older value", async () => {
+        const out = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            const sql = (obj as unknown as { db: DurableObjectStorage }).db.sql
+            await obj.intake({ did: DID, rev: "3m1" }, String((NOW - 1000) * 1000))
+            const first = await obj.publishFirehoseCoverage(NOW)
+            for (let i = 0; i <= FIREHOSE_LAGGING_CAP; i++) {
+                const did = `did:plc:lag${i}`
+                sql.exec("INSERT INTO holder_state (did, state) VALUES (?, 'held')", did)
+                sql.exec(
+                    "INSERT INTO pending (did, rev, owed_since_us) VALUES (?, '3m1', 0)",
+                    did
+                )
+            }
+            const second = await obj.publishFirehoseCoverage(NOW)
+            return { first, second }
+        })
+        expect(out.first.coveredThroughMs).toBeNull()
+        const stored = (await published()) as { coveredThroughMs: number | null; lagging: string[] }
+        expect(stored.coveredThroughMs).toBeNull()
+        expect(stored.lagging).toHaveLength(FIREHOSE_LAGGING_CAP + 1)
+    })
+
+    it("publishes a watermark once the cursor passes the run start", async () => {
+        const coverage = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            await obj.publishFirehoseCoverage(NOW)
+            await obj.intake({ did: DID, rev: "3m1" }, String((NOW + 5000) * 1000))
+            return obj.publishFirehoseCoverage(NOW + 6000)
+        })
+        expect(coverage).toEqual({
+            continuousSinceMs: NOW,
+            coveredThroughMs: NOW + 5000,
+            lagging: [],
+        })
+    })
+
+    it("kvFirehoseCoverage reads a missing or malformed entry as null", async () => {
+        const read = kvFirehoseCoverage(testEnv)
+        await testEnv.records.delete(FIREHOSE_COVERAGE_KEY)
+        expect(await read()).toBeNull()
+        for (const bad of [
+            "nope",
+            "[]",
+            '{"continuousSinceMs":"1","coveredThroughMs":2,"lagging":[]}',
+            '{"continuousSinceMs":1,"coveredThroughMs":"2","lagging":[]}',
+            '{"continuousSinceMs":1,"coveredThroughMs":2,"lagging":[1]}',
+            '{"continuousSinceMs":1,"coveredThroughMs":2}',
+        ]) {
+            await testEnv.records.put(FIREHOSE_COVERAGE_KEY, bad)
+            expect(await read()).toBeNull()
+        }
+        await testEnv.records.put(
+            FIREHOSE_COVERAGE_KEY,
+            '{"continuousSinceMs":1,"coveredThroughMs":null,"lagging":["did:plc:a"]}'
+        )
+        expect(await read()).toEqual({
+            continuousSinceMs: 1,
+            coveredThroughMs: null,
+            lagging: ["did:plc:a"],
+        })
+    })
 })
 
+const HOUR = 3_600_000
+
+type Internals = {
+    db: DurableObjectStorage
+    connect(): Promise<void>
+    onFrame(raw: string): Promise<void>
+    metaOf(k: string): string | undefined
+}
+
+/** Connect with the stored cursor, so gap checks run; the upgrade itself fails. */
+async function connectOnce(obj: MonitorIngest): Promise<void> {
+    const original = globalThis.fetch
+    globalThis.fetch = (() => Promise.reject(new Error("no stream"))) as typeof fetch
+    try {
+        await (obj as unknown as Internals).connect()
+    } catch {
+        // No real socket to open here.
+    } finally {
+        globalThis.fetch = original
+    }
+}
+
+async function holdTwo(obj: MonitorIngest, at: number) {
+    await obj.complete(DID, "3m1", at, VERIFIED)
+    await obj.complete("did:plc:bob", "3m1", at, VERIFIED)
+}
+
+const owedStamps = (obj: MonitorIngest) =>
+    (obj as unknown as Internals).db.sql
+        .exec<{ did: string; owed_since_us: number }>(
+            "SELECT did, owed_since_us FROM pending ORDER BY did"
+        )
+        .toArray()
+
 describe("gap and resync (S6)", () => {
-    it.todo("a connect with a cursor past the replay window starts a new run and owes every served declaration DID at the gap instant")
-    it.todo("a resync does not re-owe a reversibly gone DID")
-    it.todo("a resume whose first frame jumps past the tolerance does the same")
-    it.todo("coverage is null until every re-owed DID settles or lags, then resumes from the run start")
+    it("a connect with a cursor past the replay window starts a new run and owes every served declaration DID at the gap instant, on every attempt", async () => {
+        const result = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            const now = Date.now()
+            await holdTwo(obj, now)
+            await obj.intake({ did: "did:plc:cursor", rev: "3m1" }, String((now - 48 * HOUR) * 1000))
+            await obj.clearPending("did:plc:cursor")
+            await connectOnce(obj)
+            const first = owedStamps(obj)
+            await obj.clearPending(DID)
+            await obj.clearPending("did:plc:bob")
+            await connectOnce(obj)
+            return {
+                now,
+                first,
+                since: Number((obj as unknown as Internals).metaOf("firehose_since")),
+                again: owedStamps(obj),
+            }
+        })
+        expect(result.first.map((r) => r.did)).toEqual([DID, "did:plc:bob"])
+        for (const r of result.first) {
+            expect(r.owed_since_us / 1000).toBeGreaterThanOrEqual(result.now - 1)
+            expect(r.owed_since_us / 1000).toBeLessThan(result.since)
+        }
+        expect(result.since).toBeGreaterThanOrEqual(result.now)
+        expect(result.again.map((r) => r.did)).toEqual([DID, "did:plc:bob"])
+    })
+
+    it("a resync does not re-owe a reversibly gone DID", async () => {
+        const owed = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            const now = Date.now()
+            await holdTwo(obj, now)
+            await obj.completeDeletion("did:plc:bob", now, false, false, "repo")
+            await obj.intake({ did: "did:plc:cursor", rev: "3m1" }, String((now - 48 * HOUR) * 1000))
+            await obj.clearPending("did:plc:cursor")
+            await connectOnce(obj)
+            return owedStamps(obj).map((r) => r.did)
+        })
+        expect(owed).toEqual([DID])
+    })
+
+    it("a resume whose first frame jumps past the tolerance does the same", async () => {
+        const out = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            const now = Date.now()
+            await holdTwo(obj, now)
+            const cursorMs = now - 10 * 60_000
+            await obj.intake({ did: "did:plc:cursor", rev: "3m1" }, String(cursorMs * 1000))
+            await obj.clearPending("did:plc:cursor")
+            await connectOnce(obj)
+            const frame = (timeMs: number) =>
+                JSON.stringify({
+                    payload: { $type: "#identity", did: "did:plc:nobody", time_us: timeMs * 1000 },
+                })
+            const o = obj as unknown as Internals
+            await o.onFrame(frame(cursorMs + 30_000))
+            const withinTolerance = owedStamps(obj).length
+            await connectOnce(obj)
+            await o.onFrame(frame(cursorMs + 5 * 60_000))
+            return { withinTolerance, owed: owedStamps(obj).map((r) => r.did), now }
+        })
+        expect(out.withinTolerance).toBe(0)
+        expect(out.owed).toEqual([DID, "did:plc:bob"])
+    })
+
+    it("coverage is null until every re-owed DID settles or lags, then resumes from the run start", async () => {
+        const out = await runInDurableObject(freshStub(), async (obj: MonitorIngest) => {
+            const now = Date.now()
+            await holdTwo(obj, now)
+            await obj.intake({ did: "did:plc:cursor", rev: "3m1" }, String((now - 48 * HOUR) * 1000))
+            await obj.clearPending("did:plc:cursor")
+            await connectOnce(obj)
+            const since = Number((obj as unknown as Internals).metaOf("firehose_since"))
+            const live = async (ms: number) =>
+                (obj as unknown as Internals).db.sql.exec(
+                    "INSERT INTO meta (k, v) VALUES ('cursor', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    String(ms * 1000)
+                )
+            await live(since + 1000)
+            const owedNow = await obj.publishFirehoseCoverage(since + 2000)
+            for (const did of [DID, "did:plc:bob"]) {
+                await obj.complete(did, "3m1", since, VERIFIED, await obj.owedGenOf(did))
+            }
+            const held = await obj.publishFirehoseCoverage(since + 2000)
+            await live(since + 70_000)
+            const settled = await obj.publishFirehoseCoverage(since + 70_000)
+            await live(since + 11 * 60_000)
+            const lagged = await (async () => {
+                for (const did of [DID, "did:plc:bob"]) await obj.owe(did, "3m1", (since - 1) * 1000)
+                return obj.publishFirehoseCoverage(since + 11 * 60_000)
+            })()
+            return { since, owedNow, held, settled, lagged }
+        })
+        expect(out.owedNow.coveredThroughMs).toBeNull()
+        expect(out.held.coveredThroughMs).toBeNull()
+        expect(out.settled.coveredThroughMs).toBe(out.since + 70_000)
+        expect(out.lagged.lagging).toEqual([DID, "did:plc:bob"])
+        expect(out.lagged.coveredThroughMs).toBe(out.since + 11 * 60_000)
+    })
 })

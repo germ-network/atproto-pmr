@@ -84,6 +84,9 @@ import {
     mirrorGraph,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
+    computeFirehoseCoverage,
+    isResumeJump,
+    isStaleCursor,
     streamTimeUs,
     relistStale,
     runListings,
@@ -123,7 +126,10 @@ import {
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
+    FIREHOSE_COVERAGE_MAX_LAG_MS,
+    FIREHOSE_LAGGING_CAP,
     KV_VISIBILITY_MS,
+    type FirehoseCoverage,
     type PlcCoverage,
     type RepoCollectionsExpectation,
     type VerifiedCollections,
@@ -137,6 +143,7 @@ import {
 } from "./did-document-store"
 import { interestPolicy as policyFromEnv, monitorCollections, type MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
+import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
@@ -367,6 +374,8 @@ export class MonitorIngest
     /** What `plc:coverage` last claimed in this run. */
     private plcCoveredThroughMs: number | null = null
     private draining: Promise<void> | null = null
+    /** The cursor this connection resumed from, until its first timed frame has been checked. */
+    private resumeFromUs: number | null = null
     private drainAgain = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
@@ -995,6 +1004,30 @@ export class MonitorIngest
             coveredThroughMs: this.plcCoveredThroughMs,
         }
         await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
+    }
+
+    /**
+     * Publish `firehose:coverage`: the stream cursor held back by what is
+     * still owed, as one value. The run starts when this first runs; a gap
+     * starts a new one.
+     */
+    async publishFirehoseCoverage(nowMs: number = Date.now()): Promise<FirehoseCoverage> {
+        const cursor = this.metaOf("cursor")
+        const cursorUs = cursor === undefined ? 0 : streamTimeUs(cursor)
+        if (this.metaOf("firehose_since") === undefined) {
+            this.setMeta("firehose_since", String(nowMs))
+        }
+        const coverage = computeFirehoseCoverage({
+            cursorUs: cursorUs > 0 ? cursorUs : null,
+            owed: await this.owedStreamEvents(nowMs),
+            continuousSinceMs: Number(this.metaOf("firehose_since")),
+            nowMs,
+            maxLagMs: FIREHOSE_COVERAGE_MAX_LAG_MS,
+            kvVisibilityMs: KV_VISIBILITY_MS,
+            laggingCap: FIREHOSE_LAGGING_CAP,
+        })
+        await this.env.records.put(FIREHOSE_COVERAGE_KEY, JSON.stringify(coverage))
+        return coverage
     }
 
     // ---- MonitorIndex -----------------------------------------------------
@@ -3674,6 +3707,8 @@ export class MonitorIngest
     async connect(): Promise<void> {
         if (this.socket !== null) return
         const cursor = await this.readCursor()
+        this.resumeFromUs = null
+        if (cursor !== null) this.checkStaleCursor(cursor, Date.now())
         const url = new URL(this.env.JETSTREAM_URL)
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
@@ -3690,6 +3725,59 @@ export class MonitorIngest
         ws.addEventListener("close", drop)
         ws.addEventListener("error", drop)
         await this.armWatchdog()
+    }
+
+    /**
+     * A cursor older than the replay window cannot resume without losing
+     * events: start a new coverage run and owe every served declaration. Every
+     * connect attempt with such a cursor does, since a holder fetched while the
+     * stream stays down lost its events too; owing again keeps the earlier
+     * stamps. Otherwise the next frame is checked for a jump past it, which
+     * relies on identity and account events keeping the cursor moving on a
+     * quiet collection.
+     */
+    private checkStaleCursor(cursor: string, nowMs: number): void {
+        const cursorUs = streamTimeUs(cursor)
+        if (cursorUs === 0) return
+        const lookbackMs = this.envInt(this.env.JETSTREAM_LOOKBACK_MS, 129_600_000)
+        if (!isStaleCursor(cursorUs, nowMs, lookbackMs)) {
+            this.resumeFromUs = cursorUs
+            return
+        }
+        this.startFirehoseRun(nowMs)
+    }
+
+    /**
+     * After a resume, a first frame well past the cursor means the stream
+     * skipped events.
+     */
+    private checkResumeFrame(frameMs: number | null): void {
+        if (this.resumeFromUs === null || frameMs === null) return
+        const cursorUs = this.resumeFromUs
+        this.resumeFromUs = null
+        const toleranceMs = this.envInt(this.env.JETSTREAM_RESUME_TOLERANCE_MS, 60_000)
+        if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) this.startFirehoseRun(Date.now())
+    }
+
+    /**
+     * A new unbroken run begins at `nowMs`, and every served declaration is
+     * owed a fetch stamped just before it, so coverage stays null until each
+     * has been fetched or has become lagging. A DID held as gone is not
+     * served and is not owed: re-owing it would fire its deletion again.
+     */
+    private startFirehoseRun(nowMs: number): void {
+        this.ctx.storage.transactionSync(() => {
+            this.setMeta("firehose_since", String(nowMs))
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us) " +
+                    "SELECT did, rev, 0, 0, ?1, ?2 FROM records WHERE collection = ?3 " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0, owed_gen = excluded.owed_gen, " +
+                    KEEP_EARLIER_STAMP,
+                this.nextOweGen(),
+                (nowMs - 1) * 1000,
+                this.env.MONITOR_COLLECTION
+            )
+        })
     }
 
     /**
@@ -3890,6 +3978,7 @@ export class MonitorIngest
     private async onFrame(raw: string): Promise<void> {
         const event = decodeEvent(raw)
         if (event === null) return
+        this.checkResumeFrame(event.timeMs)
         // A frame without a parseable time still carries a DID worth
         // looking at; only the cursor is unknown, so hold the last one
         // rather than discard the event. Replaying a little on resume is
@@ -4087,6 +4176,11 @@ export class MonitorIngest
                 )
             } catch (err) {
                 console.error("monitor: secondary settle failed", err)
+            }
+            try {
+                await this.publishFirehoseCoverage()
+            } catch (err) {
+                console.error("monitor: firehose coverage publish failed", err)
             }
             // After settling (a just-stored snapshot is not yet due) and
             // before sealing (a change it finds lands in a window that has
