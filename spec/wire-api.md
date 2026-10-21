@@ -1496,7 +1496,8 @@ A device verifies a log as the [did:plc specification](https://web.plc.directory
 (a legacy `create` genesis is hashed and verified in its own format); every
 entry's CID is the SHA-256 CID of its operation as served; each live operation's
 `prev` is the CID of the live operation before it, and its signature verifies
-under one of that operation's `rotationKeys` (low-S, canonical base64url, over
+under one of the `rotationKeys` of the operation `prev` names, or of its own
+for the genesis (low-S, canonical base64url, over
 the DAG-CBOR of the operation without `sig`); a `plc_tombstone` ends the log. The
 document the last live operation renders is the DID's document. The did:plc
 specification does not say how a legacy `create` converts to a regular operation;
