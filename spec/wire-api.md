@@ -1341,7 +1341,7 @@ response is a delta against a state the client names by **token**:
 | `b` | `ownBlocks`: the owner's own block list, each `{d: blocked DID, k: rkey of the block record}`, sent whole when it changed and absent (null) when unchanged; a client that reads no `b` keeps the list it holds |
 | `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
 | `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
-| `c` | `verdicts`: the owner's can-message verdict for each contact whose verdict is new or changed, each `{d: contact DID, v: verdict}` with `v` encoded as in the [can-message verdict](#can-message-verdict); the owner is the sender and the contact the recipient |
+| `c` | `verdicts`: the owner's can-message verdict for each contact whose verdict or mutual bit is new or changed, each `{d: contact DID, v: verdict, u: mutual}` with `v` encoded as in the [can-message verdict](#can-message-verdict); the owner is the sender and the contact the recipient. `u` is a boolean, always present: true when the owner follows the contact and the contact follows the owner, as the relay's graph holds it. The owner has no `c` entry |
 | `y` | `droppedVerdicts`: DIDs that had a verdict in the named state and have none now |
 | `m` | `more`: changes remain; read again at once naming this token |
 | `n` | `truncated`: the owner has more contacts than a summary covers |
@@ -1374,6 +1374,12 @@ A client that has never held a `c` list (a build from before it, or a token
 the relay stored for one) MUST read without `since` when it first reads `c`, and
 drop its held tokens, for the same reason.
 
+A client that has never held `u` (a build from before it, or a token the relay
+stored for one) MUST read without `since` when it first reads `u`, and drop its
+held tokens, for the same reason: a relay that stored a state for it counts the
+mutual bits as delivered. A client reading a `c` entry with no `u`, from a
+relay that predates it, holds the contact as not mutual.
+
 A verdict covers a contact only while the contact is covered and the relay
 holds a servable declaration for it; a contact with none has no verdict, and that is not a `no`: a client
 treats a DID in `y`, or one never listed in `c`, as unanswered. A declaration
@@ -1381,7 +1387,8 @@ the relay stored before it kept policies reads `unknown [declaration-unavailable
 here until the account's next repo commit rewrites it. Verdicts are small, so
 every verdict changed since the named state arrives in that response, whatever
 `m` says about records; a later page carries only verdicts that changed after
-it. A change to verdicts alone issues a new token.
+it. A change to verdicts or mutual bits alone issues a new token. A mutual bit travels only on a
+`c` entry: a contact with no verdict is not listed when its mutual bit changes.
 
 The block list is the owner's own: it appears only here, not on any public
 route (no device reads another DID's block list, and serving them would cost),
@@ -1395,6 +1402,38 @@ the owner's `app.bsky.graph.block` records, unrelated to the relay's
 A summary includes a record only if the relay holds it, ingest verified it and
 it passes the same trusted-current-key check as a record read, with the same
 exemption for `did:web`. A record that stops passing is reported in `x`.
+
+##### Summary test vector
+
+A complete non-full response with two `c` entries, a mutual `yes` and a
+non-mutual `no`, and everything else empty or null. Keys are sorted as in
+[deterministic CBOR](#deterministic-cbor) (RFC 8949 §4.2.1): in the response
+`b c f m n r t x y`, in an entry `d u v`.
+
+```
+{
+  "b": null,
+  "c": [
+    {"d": "did:plc:a", "u": true,  "v": {"a": ["bsky-follows"], "v": "yes"}},
+    {"d": "did:plc:b", "u": false, "v": {"r": ["not-admitted"], "v": "no"}}
+  ],
+  "f": false, "m": false, "n": false,
+  "r": [], "t": "abc", "x": [], "y": []
+}
+```
+
+```
+a9 6162 f6
+   6163 82
+      a3 6164 69 6469643a706c633a61  6175 f5
+         6176 a2 6161 81 6c 62736b792d666f6c6c6f7773  6176 63 796573
+      a3 6164 69 6469643a706c633a62  6175 f4
+         6176 a2 6172 81 6c 6e6f742d61646d6974746564  6176 62 6e6f
+   6166 f4  616d f4  616e f4
+   6172 80  6174 63 616263  6178 80  6179 80
+```
+
+Whitespace in the hex is for reading; the body is the bytes concatenated.
 
 #### DID documents
 
