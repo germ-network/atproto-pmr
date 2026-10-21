@@ -1,5 +1,22 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.1.9
+
+### Patch Changes
+
+- [#79](https://github.com/germ-network/atproto-pmr/pull/79) [`8c04eb7`](https://github.com/germ-network/atproto-pmr/commit/8c04eb7e2f128eaa86cea003152ed9b033115c5c) Thanks [@germ-mark](https://github.com/germ-mark)! - Seams for a deployment to extend the relay. With none configured, behaviour and encoding are unchanged.
+
+  - `ingestAuthenticatedPut` stores a put whose sender the caller has already authenticated, exactly as a verified pair put is stored (admission, pool, quota, replay record), and `handlePairPut` now runs through it. `MessageRef.ext` carries deployment fields, emitted beside `sd`/`dc` on every delivery path; `RESERVED_ENTRY_KEYS` lists the keys it may not use.
+  - `OwnerDeps.registrationExtension` parses extra registration-create fields (stored whole on every create, so an omitted key is withdrawn), runs `onCommitted` before the `201`, and adds keys to `GET /pmr/v1/registration` through `readFields`.
+  - `KVDirectory.onRemoved(did, locator)` is raised once per registration removed by replace, retire or deregister.
+  - `IngestDeps.onSettled` (and `InterestDeps.onSettled`, `MonitorIngest.onSettled`) fires after each verified declaration is stored and with `null` when one is disposed.
+  - `kvFirehoseCoverage` is exported from the monitor-cloudflare package.
+
+- [#78](https://github.com/germ-network/atproto-pmr/pull/78) [`51dcfea`](https://github.com/germ-network/atproto-pmr/commit/51dcfea6dc698266dc591698be0ac4bdcad2aeae) Thanks [@germ-mark](https://github.com/germ-mark)! - Request signatures may be made with an ML-DSA-65 key. `parseAkpMlDsa65Key`, `thumbprintAkpMlDsa65`, `parseCosePublicKey` and their encoders handle the AKP COSE_Key (RFC 9964); `verifyRequestSignature` takes a `CosePublicKey` (bare bytes stay Ed25519) and picks the algorithm from the key's type, requiring `alg` to be `ed25519` or `ml-dsa-65` to match; `requestSignatureAlg` exposes that mapping. `signRequest` accepts `key: SigningKey` for an ML-DSA-65 seed (hedged unless `deterministic: true`) alongside the existing `secretKey`. A bare key of the wrong length is now refused as "malformed key". `@noble/*` is pinned to 2.4.0 and `@noble/post-quantum` 0.7.1 is added; the anchor key and its endpoints are unchanged.
+
+- Updated dependencies [[`8c04eb7`](https://github.com/germ-network/atproto-pmr/commit/8c04eb7e2f128eaa86cea003152ed9b033115c5c), [`51dcfea`](https://github.com/germ-network/atproto-pmr/commit/51dcfea6dc698266dc591698be0ac4bdcad2aeae), [`ec0cc5c`](https://github.com/germ-network/atproto-pmr/commit/ec0cc5cffce7c749057b2e4993369cfbc17c31a3), [`dd0fb84`](https://github.com/germ-network/atproto-pmr/commit/dd0fb843c3df0422aca8b34c53710e58186de3f3)]:
+  - @germ-network/atproto-pmr-core@0.1.9
+
 ## 0.1.8
 
 ### Patch Changes

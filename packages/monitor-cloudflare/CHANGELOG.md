@@ -1,5 +1,31 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.1.9
+
+### Patch Changes
+
+- [#79](https://github.com/germ-network/atproto-pmr/pull/79) [`8c04eb7`](https://github.com/germ-network/atproto-pmr/commit/8c04eb7e2f128eaa86cea003152ed9b033115c5c) Thanks [@germ-mark](https://github.com/germ-mark)! - Seams for a deployment to extend the relay. With none configured, behaviour and encoding are unchanged.
+
+  - `ingestAuthenticatedPut` stores a put whose sender the caller has already authenticated, exactly as a verified pair put is stored (admission, pool, quota, replay record), and `handlePairPut` now runs through it. `MessageRef.ext` carries deployment fields, emitted beside `sd`/`dc` on every delivery path; `RESERVED_ENTRY_KEYS` lists the keys it may not use.
+  - `OwnerDeps.registrationExtension` parses extra registration-create fields (stored whole on every create, so an omitted key is withdrawn), runs `onCommitted` before the `201`, and adds keys to `GET /pmr/v1/registration` through `readFields`.
+  - `KVDirectory.onRemoved(did, locator)` is raised once per registration removed by replace, retire or deregister.
+  - `IngestDeps.onSettled` (and `InterestDeps.onSettled`, `MonitorIngest.onSettled`) fires after each verified declaration is stored and with `null` when one is disposed.
+  - `kvFirehoseCoverage` is exported from the monitor-cloudflare package.
+
+- [#78](https://github.com/germ-network/atproto-pmr/pull/78) [`51dcfea`](https://github.com/germ-network/atproto-pmr/commit/51dcfea6dc698266dc591698be0ac4bdcad2aeae) Thanks [@germ-mark](https://github.com/germ-mark)! - Request signatures may be made with an ML-DSA-65 key. `parseAkpMlDsa65Key`, `thumbprintAkpMlDsa65`, `parseCosePublicKey` and their encoders handle the AKP COSE_Key (RFC 9964); `verifyRequestSignature` takes a `CosePublicKey` (bare bytes stay Ed25519) and picks the algorithm from the key's type, requiring `alg` to be `ed25519` or `ml-dsa-65` to match; `requestSignatureAlg` exposes that mapping. `signRequest` accepts `key: SigningKey` for an ML-DSA-65 seed (hedged unless `deterministic: true`) alongside the existing `secretKey`. A bare key of the wrong length is now refused as "malformed key". `@noble/*` is pinned to 2.4.0 and `@noble/post-quantum` 0.7.1 is added; the anchor key and its endpoints are unchanged.
+
+- [#74](https://github.com/germ-network/atproto-pmr/pull/74) [`ec0cc5c`](https://github.com/germ-network/atproto-pmr/commit/ec0cc5cffce7c749057b2e4993369cfbc17c31a3) Thanks [@germ-mark](https://github.com/germ-mark)! - The monitor no longer swallows settle failures. Each deferral is logged as `monitor: settle deferred` with the DID, attempts and reason, and the pending row keeps when it was first owed and its last failure. Retries back off exponentially, capped at the DID's refresh interval (30 days where refresh does not cover it), and a new event for the DID resets the backoff. `MonitorIngest` gains read-only `ingestStatus()` and `pendingDetail(did)` for backfill and pending progress, and a throwing settle no longer skips the rest of the alarm. Non-terminal XRPC errors from the guarded fetches now carry the error name.
+
+- [#72](https://github.com/germ-network/atproto-pmr/pull/72) [`dd0fb84`](https://github.com/germ-network/atproto-pmr/commit/dd0fb843c3df0422aca8b34c53710e58186de3f3) Thanks [@germ-mark](https://github.com/germ-mark)! - The owner's summary carries the monitor's coverage: `w`, the earlier of the firehose and PLC covered-through instants in ms (null when either is missing), and `l`, the summary's contacts the monitor has not caught up on (sorted DIDs). Both appear on every `200`, are per response and not part of a stored state, so old decoders ignore them. `SummaryPageDeps` gains `getFirehoseCoverage` and `getPlcCoverage` (wire `kvFirehoseCoverage(env)` and `kvPlcCoverage(env)`; `PLC_EXPORT_STREAM_URL` must stay set or `w` is always null), and the summary reads coverage before the index and any record.
+
+  The monitor publishes `firehose:coverage` from its alarm: the stream cursor held back by the oldest owed event, including a fetch applied within the last 60 s, with DIDs owed an event over ten minutes old moved to a lagging list. A stream gap (a cursor older than `JETSTREAM_LOOKBACK_MS` at connect, or a first frame past `JETSTREAM_RESUME_TOLERANCE_MS` after a resume) starts a new run and owes every served declaration. `MonitorIndex` gains `owedGenOf`, and `owe` takes an optional stream time; the ingest object migrates `pending` at construction and adds `applied_recent`.
+
+  Fixes a race where an event owed while a fetch was in flight was discharged by that older fetch: every discharge now deletes only the generation the fetch started under.
+
+- Updated dependencies [[`8c04eb7`](https://github.com/germ-network/atproto-pmr/commit/8c04eb7e2f128eaa86cea003152ed9b033115c5c), [`51dcfea`](https://github.com/germ-network/atproto-pmr/commit/51dcfea6dc698266dc591698be0ac4bdcad2aeae), [`ec0cc5c`](https://github.com/germ-network/atproto-pmr/commit/ec0cc5cffce7c749057b2e4993369cfbc17c31a3), [`dd0fb84`](https://github.com/germ-network/atproto-pmr/commit/dd0fb843c3df0422aca8b34c53710e58186de3f3)]:
+  - @germ-network/atproto-pmr-core@0.1.9
+  - @germ-network/atproto-pmr-monitor@0.1.9
+
 ## 0.1.8
 
 ### Patch Changes
