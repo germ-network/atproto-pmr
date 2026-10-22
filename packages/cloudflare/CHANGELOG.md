@@ -1,5 +1,16 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.1.10
+
+### Patch Changes
+
+- [#81](https://github.com/germ-network/atproto-pmr/pull/81) [`6c52b60`](https://github.com/germ-network/atproto-pmr/commit/6c52b606864cc3520b32b63ce82110a6f6d6fab8) Thanks [@germ-mark](https://github.com/germ-mark)! - Replacing, retiring or deregistering a registration now deletes its grant-address rows from the directory instead of leaving them to lapse on their TTL. A sender's put to a removed address is unchanged: still 202 with identical bytes. The deletion is best-effort and never fails the removal.
+
+- [#83](https://github.com/germ-network/atproto-pmr/pull/83) [`f41279d`](https://github.com/germ-network/atproto-pmr/commit/f41279d96a35993788af64596e15e94e617e2e77) Thanks [@germ-mark](https://github.com/germ-mark)! - A secondary record's failed settle is no longer silent: the failure stays on its `rec_pending` row (with when it was first owed), each deferral logs `monitor: secondary settle deferred`, retries back off up to the declaration's retry cap (the DID's refresh interval where it has one), and one failing record no longer ends the batch. `ingestStatus()` gains `secondaryPending` and `gonePermanent` (additive; not a spec surface). `RecordNotFound` is now reversible, since an account can publish the record again; only `RepoNotFound` (and a PLC tombstone) stays permanent, and a reversible answer lifts a DID's deleted mark. A repeated gone answer is recorded quietly, and a DID returning from gone is announced even at an unchanged rev. Every DID marked deleted before the upgrade is asked once more (expect `pending` to spike once after deploy), and a migrated DID answering with a signed exclusion proof can retire its relay registration. `SecondaryIndex.deferSecondary` now takes the failure and answers the stored attempts.
+
+- Updated dependencies [[`f41279d`](https://github.com/germ-network/atproto-pmr/commit/f41279d96a35993788af64596e15e94e617e2e77)]:
+  - @germ-network/atproto-pmr-core@0.1.10
+
 ## 0.1.9
 
 ### Patch Changes
