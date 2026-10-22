@@ -746,6 +746,25 @@ export class MonitorIngest
         return row !== undefined
     }
 
+    /**
+     * `isWatched` without the pending clause: a settle's own pending row is
+     * still present while it decides, and is not a reason to keep a document.
+     */
+    private watchedSansPendingSync(did: string): boolean {
+        return (
+            this.db.sql
+                .exec(
+                    "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM interest WHERE did = ?1 AND member = 1) " +
+                        "OR (?2 = 'registered' AND (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
+                        "OR EXISTS (SELECT 1 FROM records WHERE did = ?1)))) " +
+                        "AND NOT EXISTS (SELECT 1 FROM deleted WHERE did = ?1)",
+                    did,
+                    this.interestPolicy()
+                )
+                .toArray().length > 0
+        )
+    }
+
     /** Replaces any update already owed for `did`, and bumps its version. */
     async oweKeyUpdate(
         did: string,
@@ -1413,8 +1432,9 @@ export class MonitorIngest
 
     /**
      * A refresh found `did` reversibly gone with nothing left to dispose of:
-     * re-assert the state with no digest entry and no push. Stays
-     * gone-permanent for a DID with a `deleted` row.
+     * re-assert the state with no digest entry and no push. A `deleted` row
+     * from an earlier permanent answer is lifted: `deleted` means the last
+     * answer was permanent.
      */
     async markGoneReversible(did: string, cause: GoneCause): Promise<void> {
         this.ctx.storage.transactionSync(() => this.setGoneState(did, false, cause))
@@ -1422,17 +1442,41 @@ export class MonitorIngest
 
     private setGoneState(did: string, permanent: boolean, cause: GoneCause): void {
         const ownedBefore = this.ownsSync(did)
-        // A DID already permanently gone stays so under a reversible answer.
+        const lifted =
+            !permanent &&
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ? RETURNING did", did).toArray()
+                .length > 0
         this.db.sql.exec(
             "INSERT INTO holder_state (did, state, cause) VALUES (?1, ?2, ?3) " +
-                "ON CONFLICT(did) DO UPDATE SET state = CASE " +
-                "WHEN EXISTS (SELECT 1 FROM deleted WHERE did = ?1) THEN 'gone-permanent' " +
-                "ELSE excluded.state END, cause = excluded.cause",
+                "ON CONFLICT(did) DO UPDATE SET state = excluded.state, cause = excluded.cause",
             did,
             permanent ? "gone-permanent" : "gone-reversible",
             cause
         )
         this.reevaluateInterest(did, Date.now(), ownedBefore)
+        if (lifted) this.afterMarkLifted(did)
+    }
+
+    /**
+     * `did` was permanently gone and no longer is. Its stored DID document was
+     * kept current only because it was deleted: an unwatched DID's is now
+     * marked stale, as a leave would. A watched did:plc (registered) is owed
+     * its PLC log again, which the permanent answer dropped.
+     */
+    private afterMarkLifted(did: string): void {
+        const nowMs = Date.now()
+        if (!this.watchedSansPendingSync(did)) {
+            if (this.didDocumentRow(did) !== undefined) this.markDidDocumentStaleSync(did, nowMs)
+            return
+        }
+        if (did.startsWith("did:plc:")) {
+            this.db.sql.exec(
+                "INSERT INTO plc_logs (did, owed_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET owed_at = COALESCE(owed_at, excluded.owed_at)",
+                did,
+                nowMs
+            )
+        }
     }
 
     /**

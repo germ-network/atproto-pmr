@@ -3047,7 +3047,7 @@ describe("record index and holder state", () => {
         expect(await heldAt()).toEqual([{ held_at: 5_000 }])
     })
 
-    it("a seeded held DID that refresh finds gone becomes gone-reversible, quietly; a deleted one stays permanent", async () => {
+    it("a seeded held DID that refresh finds gone becomes gone-reversible, quietly; so does a deleted one, which loses its mark", async () => {
         const stub = freshStub()
         await runInDurableObject(stub, (_obj, state) => {
             state.storage.sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:a', '3m1', 1), ('did:plc:b', '3m1', 1)")
@@ -3065,7 +3065,7 @@ describe("record index and holder state", () => {
                 window: await obj.windowMembers(0),
             }
         })
-        expect(out).toEqual({ a: "gone-reversible", b: "gone-permanent", window: [] })
+        expect(out).toEqual({ a: "gone-reversible", b: "gone-reversible", window: [] })
     })
 
     it("deleting the declaration leaves the DID's other collections' records", async () => {
@@ -3089,7 +3089,7 @@ describe("record index and holder state", () => {
         ).toEqual(["app.bsky.actor.profile"])
     })
 
-    it("a permanent answer for a deleted DID stays gone-permanent", async () => {
+    it("a reversible answer for a deleted DID lifts the mark", async () => {
         const stub = freshStub()
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.complete(DID, "3m1", Date.now(), verified())
@@ -3097,8 +3097,8 @@ describe("record index and holder state", () => {
             await obj.completeDeletion(DID, Date.now(), false)
         })
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
-            "gone-permanent"
+            "gone-reversible"
         )
-        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(true)
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(false)
     })
 })

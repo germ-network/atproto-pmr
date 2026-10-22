@@ -298,7 +298,9 @@ export interface MonitorIndex {
      * still fire, correctly, but the DID must stay open to a future
      * identity/account/sync event rechecking it, since that is the only
      * way a reversal is ever noticed. `true` marking `isDeleted` is what
-     * that suppression is for — see `isDeleted`.
+     * that suppression is for — see `isDeleted`. A reversible answer for a
+     * DID already marked deleted lifts the mark: `isDeleted` is true only
+     * while the last answer was permanent.
      */
     completeDeletion(
         did: string,
@@ -330,7 +332,7 @@ export interface MonitorIndex {
     /**
      * Whether `did`'s declaration is marked *permanently* confirmed-gone
      * — set only by a `completeDeletion(did, _, true)` call, never by a
-     * reversible one.
+     * reversible one, and lifted by a later reversible answer.
      *
      * Exists so `intake`'s reverify path (identity/account/sync events,
      * which arrive for every DID regardless of collection) can stop
@@ -341,7 +343,8 @@ export interface MonitorIndex {
      * but unbounded noise across every later event for that DID. A DID
      * marked deleted only reversibly is deliberately NOT suppressed here,
      * so those events keep flowing and a reversal still gets noticed.
-     * Cleared the moment `complete` runs for the DID again (see there).
+     * Cleared the moment `complete` runs for the DID again (see there), or a
+     * reversible gone answer is recorded for it.
      */
     isDeleted(did: string): Promise<boolean>
 
