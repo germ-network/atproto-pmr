@@ -181,8 +181,10 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         // teardown below degrades to an orphaned-but-intact DO, never to a routing
         // row pointing at a half-wiped DO.
         await this.env.pmrDirectory.delete(did)
+        const stub = this.env.pmrs.get(this.env.pmrs.idFromString(locator))
+        await this.dropGrantRows(did, stub)
         try {
-            await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
+            await stub.destroy()
         } catch (err) {
             // Best-effort reclamation: a failed teardown just leaves the orphan, it
             // must not fail the deregistration/replace.
@@ -194,6 +196,28 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
             console.warn(`KVDirectory: onRemoved failed for ${did}:`, err)
         }
         await this.notifyMonitor("unregister", did)
+    }
+
+    /**
+     * Deletes the global grant-address rows of a registration about to be
+     * destroyed. A deleted row answers a sender like a lapsed one, so this
+     * changes no response. Best-effort: rows left behind lapse on their TTL.
+     */
+    private async dropGrantRows(
+        did: string,
+        stub: { listGrants(): Promise<Array<{ address: string }>> }
+    ): Promise<void> {
+        try {
+            for (const grant of await stub.listGrants()) {
+                try {
+                    await this.deleteGrantAddress(grant.address)
+                } catch (err) {
+                    console.warn(`KVDirectory: grant row delete failed for ${did}:`, err)
+                }
+            }
+        } catch (err) {
+            console.warn(`KVDirectory: grant listing failed for ${did}:`, err)
+        }
     }
 
     async deregister(did: string, anchorThumbprint: Uint8Array): Promise<void> {
