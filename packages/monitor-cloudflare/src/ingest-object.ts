@@ -1483,7 +1483,7 @@ export class MonitorIngest
     /**
      * `did` was permanently gone and no longer is. Its stored DID document was
      * kept current only because it was deleted: an unwatched DID's is now
-     * marked stale, as a leave would. A watched did:plc (registered) is owed
+     * marked stale, as a leave would. A watched did:plc is owed
      * its PLC log again, which the permanent answer dropped.
      */
     private afterMarkLifted(did: string): void {

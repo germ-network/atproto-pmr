@@ -498,7 +498,10 @@ async function settleFetched(
         return "stored"
     }
     // Read before `complete`, which marks the DID held again.
-    const revived = (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
+    const revived =
+        movement !== "advanced" &&
+        !keyRotated &&
+        (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
     await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
     await raiseSettled(deps, did, settled)
 

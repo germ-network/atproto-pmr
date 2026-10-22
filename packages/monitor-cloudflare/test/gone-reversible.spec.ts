@@ -64,6 +64,7 @@ describe("a reversible answer lifts a permanent mark", () => {
             expect(deletedRow(sql)).toEqual([])
             expect(holder(sql)).toMatchObject({ state: "gone-reversible", cause: "repo" })
             expect(await obj.isDeleted(DID)).toBe(false)
+            expect(rows(sql, "SELECT 1 FROM did_documents WHERE did = ?", DID)).toEqual([])
 
             await permanentlyGone(obj, "did:plc:bob")
             await obj.markGoneReversible("did:plc:bob", "record")
