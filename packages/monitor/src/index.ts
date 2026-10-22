@@ -84,6 +84,7 @@ export {
 // The operator's read of ingest progress.
 export {
     PENDING_ATTEMPT_BUCKETS,
+    type FollowFrameFailures,
     type MonitorIngestStatus,
     type MonitorIngestStatusRequest,
     type MonitorPendingDetail,
@@ -109,6 +110,7 @@ export {
     BLOCK_COLLECTION_NSID,
     EDGE_OPS_TABLE,
     FOLLOW_COLLECTION_NSID,
+    followEventListingDid,
     routeFollowEvent,
     type EdgeCollection,
     type EdgeOp,

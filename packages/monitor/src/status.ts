@@ -38,6 +38,20 @@ export interface MonitorIngestStatus {
     heldDeclarations: number
     /** DIDs whose last answer said the repo is gone for good; never re-polled. */
     gonePermanent: number
+    /** Follow-stream frames whose handling threw, since the index was created. */
+    followFrameFailures: FollowFrameFailures
+}
+
+/**
+ * A follow-stream frame that throws is not retried: a later frame still
+ * raises the cursor past it. Counted so an operator can see the loss; the
+ * frame's DID is listed again, which covers follow and block edges only.
+ */
+export interface FollowFrameFailures {
+    count: number
+    lastAtMs: number | null
+    /** The thrown value's `name`, or `typeof` it for a non-Error. */
+    lastErrorName: string | null
 }
 
 export interface PendingRowDetail {
