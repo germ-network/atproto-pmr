@@ -629,7 +629,10 @@ export async function withdrawFetchedDocument(
     } catch {}
 }
 
-/** Drain what is owed. Called by the same clock that watches the socket. */
+/**
+ * Drain what is owed. Called by the same clock that watches the socket. One
+ * DID's failure, or a failure to record it, never costs the rest of the batch.
+ */
 export async function settleDue(
     deps: IngestDeps,
     limit = 32,
@@ -651,12 +654,19 @@ export async function settleDue(
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only
             // thing keeping this DID from being silently dropped.
-            await deferFailure(deps, p.did, now + backoffMs(p.attempts, await retryCapFor(deps, p.did)), {
-                kind: "threw",
-                errorName: err instanceof Error ? err.name : typeof err,
-                message: String(err instanceof Error ? err.message : err),
-                atMs: now,
-            })
+            try {
+                const capMs = await retryCapFor(deps, p.did)
+                await deferFailure(deps, p.did, now + backoffMs(p.attempts, capMs), {
+                    kind: "threw",
+                    errorName: err instanceof Error ? err.name : typeof err,
+                    message: String(err instanceof Error ? err.message : err),
+                    atMs: now,
+                })
+            } catch (deferErr) {
+                // The row keeps its `not_before`, so it is due again next
+                // drain; letting this escape would skip the rest of the batch.
+                console.error("monitor: settle defer failed", { did: p.did, err: deferErr })
+            }
         }
     }
     return settled
