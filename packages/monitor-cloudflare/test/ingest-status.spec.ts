@@ -377,6 +377,11 @@ describe("ingestStatus", () => {
                 await obj.ingestStatus()
             expect(heldDeclarations).toBe(0)
             expect(gonePermanent).toBe(0)
+            expect((await obj.ingestStatus()).followFrameFailures).toEqual({
+                count: 0,
+                lastAtMs: null,
+                lastErrorName: null,
+            })
             expect(secondaryPending).toEqual(pending)
             expect(pending).toEqual({
                 count: 0,

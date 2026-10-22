@@ -223,6 +223,8 @@ const STALE_RELIST_PER_ALARM = 200
 const FOLLOW_TIMEOUTS_BEFORE_PAGED = 3
 /** Consecutive permanent-class failures after which a listing is unlistable. */
 const FOLLOW_UNLISTABLE_AFTER = 5
+/** Characters of a failed follow frame's stack that are logged. */
+const FOLLOW_FRAME_FAILURE_STACK_CHARS = 2_000
 const LISTING_RETRY_BASE_MS = 60_000
 const LISTING_RETRY_MAX_MS = 86_400_000
 
@@ -1751,6 +1753,14 @@ export class MonitorIngest
         return v === undefined
             ? { count: 0, lastAtMs: null, lastErrorName: null }
             : (JSON.parse(v) as FollowFrameFailures)
+    }
+
+    private noteFollowFrameFailureSync(name: string, atMs: number): void {
+        this.ctx.storage.transactionSync(() => {
+            const { count } = this.followFrameFailuresSync()
+            const next: FollowFrameFailures = { count: count + 1, lastAtMs: atMs, lastErrorName: name }
+            this.setMeta("follow_frame_failures", JSON.stringify(next))
+        })
     }
 
     /** What the ingest index holds for one DID, including why it is still owed. */
@@ -4328,9 +4338,32 @@ export class MonitorIngest
         cursor: Cursor | null
     ): Promise<void> {
         try {
-            console.error("monitor: follow frame failed", err)
+            console.error("monitor: follow frame failed", {
+                name: err instanceof Error ? err.name : typeof err,
+                message: err instanceof Error ? err.message : String(err),
+                stack:
+                    err instanceof Error ? err.stack?.slice(0, FOLLOW_FRAME_FAILURE_STACK_CHARS) : undefined,
+                kind: event?.kind ?? null,
+                did: event?.did ?? null,
+                cursor,
+                ...(event?.kind === "commit"
+                    ? { collection: event.collection, operation: event.operation, rkey: event.rkey }
+                    : {}),
+            })
         } catch {
             // Logging must not stop the relisting.
+        }
+        try {
+            this.noteFollowFrameFailureSync(
+                err instanceof Error ? err.name : typeof err,
+                Date.now()
+            )
+        } catch (countErr) {
+            try {
+                console.error("monitor: follow frame failure count failed", countErr)
+            } catch {
+                // Counting must not stop the relisting.
+            }
         }
         if (event === null) return
         const did = followEventListingDid(event)

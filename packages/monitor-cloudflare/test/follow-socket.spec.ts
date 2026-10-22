@@ -457,12 +457,15 @@ describe("a follow frame that throws", () => {
         expect(await queued(stub)).toEqual([])
     })
 
-    it("a throwing secondary commit queues nothing", async () => {
+    it("a throwing secondary commit queues nothing but is counted", async () => {
         const { stub, owner, ws, error } = await ownerOnStream()
         await breakMethod(stub, "oweSecondary")
         await push(stub, ws, commit(owner, PROFILE, "create", "self", 6000))
         await vi.waitFor(() => expect(error).toHaveBeenCalled())
         expect(await queued(stub)).toEqual([])
+        await vi.waitFor(async () =>
+            expect((await inObj(stub, (obj) => obj.ingestStatus())).followFrameFailures.count).toBe(1)
+        )
     })
 
     it("a listing in progress keeps its progress and failure counts, and a fresh listing follows it", async () => {
@@ -521,9 +524,77 @@ describe("a follow frame that throws", () => {
         )
         await vi.waitFor(async () => expect(await meta(stub, "follow_cursor")).toBe("7000"))
     })
-    it.todo("a failed frame is logged with its error and event fields")
-    it.todo("the logged stack is truncated to FOLLOW_FRAME_FAILURE_STACK_CHARS")
-    it.todo("a failed frame by a DID outside interest is logged too")
-    it.todo("each failed frame is counted in ingestStatus().followFrameFailures")
-    it.todo("a failed counter write does not stop the relisting")
+    it("a failed frame is logged with its error and event fields", async () => {
+        const { stub, owner, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        const [message, fields] = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")!
+        expect(message).toBe("monitor: follow frame failed")
+        expect(fields).toMatchObject({
+            name: "Error",
+            message: "logEdgeOp broke",
+            kind: "commit",
+            did: owner,
+            cursor: "6000",
+            collection: BLOCK,
+            operation: "create",
+            rkey: "b1",
+        })
+        expect(typeof fields.stack).toBe("string")
+    })
+
+    it("the logged stack is truncated to FOLLOW_FRAME_FAILURE_STACK_CHARS", async () => {
+        const { stub, owner, ws, error } = await ownerOnStream()
+        await inObj(stub, async (obj) => {
+            ;(obj as unknown as Record<string, unknown>).logEdgeOp = async () => {
+                const err = new Error("deep")
+                err.stack = "x".repeat(5_000)
+                throw err
+            }
+        })
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        const fields = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]
+        expect(fields.stack).toBe("x".repeat(2_000))
+    })
+
+    it("a failed frame by a DID outside interest is logged too", async () => {
+        const { stub, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "isGraphOwner")
+        const stranger = uniqDid()
+        await push(stub, ws, commit(stranger, FOLLOW, "create", "r1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        expect(error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]).toMatchObject({
+            did: stranger,
+            message: "isGraphOwner broke",
+        })
+    })
+
+    it("each failed frame is counted in ingestStatus().followFrameFailures", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        const before = Date.now()
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await push(stub, ws, commit(owner, BLOCK, "delete", "b2", 7000))
+        await vi.waitFor(async () => {
+            const { followFrameFailures } = await inObj(stub, (obj) => obj.ingestStatus())
+            expect(followFrameFailures.count).toBe(2)
+        })
+        const { followFrameFailures } = await inObj(stub, (obj) => obj.ingestStatus())
+        expect(followFrameFailures.lastErrorName).toBe("Error")
+        expect(followFrameFailures.lastAtMs).toBeGreaterThanOrEqual(before)
+    })
+
+    it("a failed counter write does not stop the relisting", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await inObj(stub, async (obj) => {
+            ;(obj as unknown as Record<string, unknown>).noteFollowFrameFailureSync = () => {
+                throw new Error("meta write broke")
+            }
+        })
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(async () => expect(await queued(stub)).toEqual([{ did: owner }]))
+    })
 })
