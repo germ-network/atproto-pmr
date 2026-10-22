@@ -68,10 +68,10 @@ const MAX_RESPONSE_BYTES = 64 * 1024
  * terminal state counts.
  *
  * `permanent` separates two shapes of terminal state a caller may need to
- * treat differently: an outcome with no path back short of the subject
- * republishing from scratch (a deleted record, a fully gone repo), versus
- * a reversible state (an account takedown/suspension/deactivation) that
- * may later resolve on its own. A caller that does not need the
+ * treat differently: an outcome with no path back at that identity (a
+ * repo that no longer exists), versus a state that may later resolve on
+ * its own (an account takedown/suspension/deactivation, or a record the
+ * account can publish again). A caller that does not need the
  * distinction may treat both alike.
  */
 export class RecordNotFoundError extends Error {

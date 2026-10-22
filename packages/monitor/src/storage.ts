@@ -298,7 +298,9 @@ export interface MonitorIndex {
      * still fire, correctly, but the DID must stay open to a future
      * identity/account/sync event rechecking it, since that is the only
      * way a reversal is ever noticed. `true` marking `isDeleted` is what
-     * that suppression is for — see `isDeleted`.
+     * that suppression is for — see `isDeleted`. A reversible answer for a
+     * DID already marked deleted lifts the mark: `isDeleted` is true only
+     * while the last answer was permanent.
      */
     completeDeletion(
         did: string,
@@ -330,7 +332,7 @@ export interface MonitorIndex {
     /**
      * Whether `did`'s declaration is marked *permanently* confirmed-gone
      * — set only by a `completeDeletion(did, _, true)` call, never by a
-     * reversible one.
+     * reversible one, and lifted by a later reversible answer.
      *
      * Exists so `intake`'s reverify path (identity/account/sync events,
      * which arrive for every DID regardless of collection) can stop
@@ -341,7 +343,8 @@ export interface MonitorIndex {
      * but unbounded noise across every later event for that DID. A DID
      * marked deleted only reversibly is deliberately NOT suppressed here,
      * so those events keep flowing and a reversal still gets noticed.
-     * Cleared the moment `complete` runs for the DID again (see there).
+     * Cleared the moment `complete` runs for the DID again (see there), or a
+     * reversible gone answer is recorded for it.
      */
     isDeleted(did: string): Promise<boolean>
 
@@ -707,7 +710,9 @@ export interface SecondaryIntakeIndex {
      * Owe a fetch of one secondary and advance the follow stream's cursor,
      * atomically. The `rec_pending` upsert sets both `rev` and `epoch`, the
      * epoch read in the same step as membership, so a row left from an
-     * earlier epoch is settled at the current one.
+     * earlier epoch is settled at the current one. A new commit also resets the
+     * row's attempts and backoff; a settle that fails concurrently may still
+     * defer the row after the reset.
      * `duplicate` without owing when `rev` is the indexed one; `ignored` for
      * a DID not in interest.
      */
@@ -721,7 +726,15 @@ export interface SecondaryIntakeIndex {
  */
 export interface SecondaryIndex {
     dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
-    deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void>
+    /**
+     * Count an attempt, push `not_before` out and keep `failure` on the row.
+     * Answers the attempts now stored, or null where the row is already gone.
+     */
+    deferSecondary(
+        ref: RecordRef,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null>
     /**
      * Drop the pending row, only while it still owes `owedRev`: a newer
      * commit owed by the live stream during the settle survives.

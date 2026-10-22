@@ -32,8 +32,12 @@ export interface MonitorIngestStatus {
     asOfMs: number
     backfill: BackfillProgress
     pending: PendingSummary
+    /** Owed secondary records (`MONITOR_COLLECTIONS`), one row per record. */
+    secondaryPending: PendingSummary
     /** Declarations currently held. */
     heldDeclarations: number
+    /** DIDs whose last answer said the repo is gone for good; never re-polled. */
+    gonePermanent: number
 }
 
 export interface PendingRowDetail {

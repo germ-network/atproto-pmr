@@ -164,7 +164,8 @@ export function settleRetryBackoffMs(
     return Math.min(2 ** Math.min(attempts, 40) * 1000, capMs)
 }
 
-function truncated(text: string): string {
+/** `text` cut to `PENDING_FAILURE_MESSAGE_MAX`, as kept on a pending row. */
+export function truncated(text: string): string {
     return text.length > PENDING_FAILURE_MESSAGE_MAX ? text.slice(0, PENDING_FAILURE_MESSAGE_MAX) : text
 }
 
@@ -191,7 +192,7 @@ async function deferFailure(
 }
 
 /** `retryCapMs` for `did`, or the default where the deployment gives none. */
-async function retryCapFor(deps: IngestDeps, did: string): Promise<number> {
+export async function retryCapFor(deps: Pick<IngestDeps, "retryCapMs">, did: string): Promise<number> {
     return (await deps.retryCapMs?.(did)) ?? SETTLE_RETRY_CAP_MS
 }
 
@@ -242,9 +243,9 @@ export async function intake(
         // did not change. `owe` rather than `intake` because the dedupe
         // check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
-        // A DID confirmed deleted has no live record to re-verify against
-        // — re-owing here would only rediscover the same deletion and
-        // re-push it, once per identity/account/sync event, forever.
+        // A DID confirmed permanently deleted has no live record to
+        // re-verify against. One that is only reversibly gone is re-asked,
+        // and `settle` records an answer that repeats the deletion quietly.
         const reverify = known !== null && !(await deps.index.isDeleted(event.did))
         if (reverify) await deps.index.owe(event.did, known, streamTimeUs(cursor))
         // The relay's cached key is dropped for every DID whose document the
@@ -306,7 +307,8 @@ export type VerifyOutcome =
  * would: `completeDeletion` is `complete`'s deletion-shaped counterpart.
  * `permanent` decides only whether this ALSO suppresses future reverify
  * events (see `MonitorIndex.isDeleted`) — a reversible state (an account
- * takedown/suspension that may lift) still disposes of the stale snapshot
+ * takedown/suspension that may lift, or a record the account may publish
+ * again) still disposes of the stale snapshot
  * and still pushes, but must stay open to a later event noticing the
  * reversal.
  */
@@ -375,7 +377,11 @@ export async function settle(
             if (repoLevel) await deps.secondaries?.dispose(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, err.permanent, quiet, "repo", gen)
+        // Only a permanent answer for a DID not yet marked deleted is news
+        // for one already gone.
+        const hardens = err.permanent && !(await deps.index.isDeleted(did))
+        const reconfirm = !hardens && (await alreadyGone(deps, did))
+        await settleDeletion(deps, did, err.permanent, quiet || reconfirm, "repo", gen)
         if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
@@ -402,6 +408,18 @@ export async function raiseSettled(
     try {
         await deps.onSettled?.(did, settled)
     } catch {}
+}
+
+/**
+ * The declaration is already gone and recorded so: an answer that merely
+ * repeats it is no new change, and must not reach the window or `onDelete`
+ * again.
+ */
+async function alreadyGone(deps: IngestDeps, did: string): Promise<boolean> {
+    // A snapshot read from KV may be stale; a stale non-null only makes the
+    // repeated answer loud, the safe direction.
+    if ((await deps.snapshot.getRecord(did)) !== null) return false
+    return (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
 }
 
 /** No declaration was ever indexed for `did`, held or gone. */
@@ -440,7 +458,7 @@ async function settleFetched(
             await deps.index.clearPending(did, gen)
             return "deleted"
         }
-        await settleDeletion(deps, did, false, quiet, "record", gen)
+        await settleDeletion(deps, did, false, quiet || (await alreadyGone(deps, did)), "record", gen)
         return "deleted"
     }
 
@@ -479,10 +497,16 @@ async function settleFetched(
         await raiseSettled(deps, did, settled)
         return "stored"
     }
+    // Read before `complete`, which marks the DID held again.
+    const revived =
+        movement !== "advanced" &&
+        !keyRotated &&
+        (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
     await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
     await raiseSettled(deps, did, settled)
 
-    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
+    // A DID back from gone is news at whatever rev it returns.
+    if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
     return "stored"
 }
 

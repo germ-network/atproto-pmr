@@ -44,9 +44,9 @@
  * Object RPC methods, `ingestStatus()` and `pendingDetail(did)` (shapes in
  * `MonitorIngestStatus` and `MonitorPendingDetail` from
  * `@germ-network/atproto-pmr-monitor`). The first is aggregate and names no
- * owed or held DID: whether the baseline backfill finished, how many fetches are owed, how
- * many are due, how long the oldest has waited, and how many held
- * declarations the index has. The second says why one DID is still owed (its
+ * owed or held DID: whether the baseline backfill finished, how many fetches are owed
+ * (declarations, and separately secondary records), how many are due, how long the oldest
+ * has waited, and how many held declarations the index has. The second says why one DID is still owed (its
  * attempts, next try and last failure) or that the monitor never owed or held
  * it. Call them over the binding, or from a route of your own behind
  * authentication; they are not part of the monitor's public surface and must
@@ -55,7 +55,8 @@
  *     const status = await env.ingest.get(env.ingest.idFromName(MONITOR_NAME)).ingestStatus()
  *
  * Every failed settle also logs one `monitor: settle deferred` line carrying
- * the DID, attempts, error or reason, and next try.
+ * the DID, attempts, error or reason, and next try; a failed secondary settle
+ * logs `monitor: secondary settle deferred` with the collection and rkey too.
  *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain

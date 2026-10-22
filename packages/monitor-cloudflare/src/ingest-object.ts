@@ -54,6 +54,7 @@ import {
     type MonitorPendingDetail,
     type OwedKeyUpdate,
     PENDING_ATTEMPT_BUCKETS,
+    type PendingSummary,
     SETTLE_RETRY_CAP_MS,
     type PendingFailure,
     type PendingFetch,
@@ -466,6 +467,8 @@ export class MonitorIngest
                     attempts INTEGER NOT NULL DEFAULT 0,
                     not_before INTEGER NOT NULL DEFAULT 0,
                     epoch INTEGER NOT NULL DEFAULT 0,
+                    owed_at INTEGER,
+                    last_failure TEXT,
                     PRIMARY KEY (did, collection, rkey)
                 );
                 CREATE TABLE IF NOT EXISTS reg_state (
@@ -564,16 +567,18 @@ export class MonitorIngest
             }
             // Rows owed before these columns existed keep NULL: their first
             // owed time and failure are unknown.
-            for (const column of ["owed_at INTEGER", "last_failure TEXT"]) {
-                if (
-                    this.db.sql
-                        .exec(
-                            "SELECT 1 FROM pragma_table_info('pending') WHERE name = ?",
-                            column.split(" ")[0]
-                        )
-                        .toArray().length === 0
-                ) {
-                    this.db.sql.exec(`ALTER TABLE pending ADD COLUMN ${column}`)
+            for (const table of ["pending", "rec_pending"]) {
+                for (const column of ["owed_at INTEGER", "last_failure TEXT"]) {
+                    if (
+                        this.db.sql
+                            .exec(
+                                `SELECT 1 FROM pragma_table_info('${table}') WHERE name = ?`,
+                                column.split(" ")[0]
+                            )
+                            .toArray().length === 0
+                    ) {
+                        this.db.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
+                    }
                 }
             }
             if (
@@ -653,6 +658,29 @@ export class MonitorIngest
             this.seedInterest()
             this.seedListings()
             this.seedPlcLogs()
+            this.seedDeletedReowe()
+        })
+    }
+
+    /**
+     * Once: every DID marked deleted before a reversible answer could lift
+     * the mark is owed a fresh fetch, so one that came back is found. The
+     * mark stays until that settle decides it: a live record, or a reversible
+     * answer, lifts it; a permanent one keeps it. The rows wait out
+     * `not_before` so live owes go first, and are loud: a returning
+     * declaration is announced like any other.
+     */
+    private seedDeletedReowe(): void {
+        if (this.metaOf("deleted_reowed") !== undefined) return
+        this.ctx.storage.transactionSync(() => {
+            const nowMs = Date.now()
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                    "SELECT did, '', 0, ?1, 0, ?1 FROM deleted WHERE true " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0",
+                nowMs
+            )
+            this.setMeta("deleted_reowed", "1")
         })
     }
 
@@ -739,6 +767,25 @@ export class MonitorIngest
             )
             .toArray()[0]
         return row !== undefined
+    }
+
+    /**
+     * `isWatched` without the pending clause: a settle's own pending row is
+     * still present while it decides, and is not a reason to keep a document.
+     */
+    private watchedSansPendingSync(did: string): boolean {
+        return (
+            this.db.sql
+                .exec(
+                    "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM interest WHERE did = ?1 AND member = 1) " +
+                        "OR (?2 = 'registered' AND (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
+                        "OR EXISTS (SELECT 1 FROM records WHERE did = ?1)))) " +
+                        "AND NOT EXISTS (SELECT 1 FROM deleted WHERE did = ?1)",
+                    did,
+                    this.interestPolicy()
+                )
+                .toArray().length > 0
+        )
     }
 
     /** Replaces any update already owed for `did`, and bumps its version. */
@@ -1408,8 +1455,9 @@ export class MonitorIngest
 
     /**
      * A refresh found `did` reversibly gone with nothing left to dispose of:
-     * re-assert the state with no digest entry and no push. Stays
-     * gone-permanent for a DID with a `deleted` row.
+     * re-assert the state with no digest entry and no push. A `deleted` row
+     * from an earlier permanent answer is lifted: `deleted` means the last
+     * answer was permanent.
      */
     async markGoneReversible(did: string, cause: GoneCause): Promise<void> {
         this.ctx.storage.transactionSync(() => this.setGoneState(did, false, cause))
@@ -1417,17 +1465,41 @@ export class MonitorIngest
 
     private setGoneState(did: string, permanent: boolean, cause: GoneCause): void {
         const ownedBefore = this.ownsSync(did)
-        // A DID already permanently gone stays so under a reversible answer.
+        const lifted =
+            !permanent &&
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ? RETURNING did", did).toArray()
+                .length > 0
         this.db.sql.exec(
             "INSERT INTO holder_state (did, state, cause) VALUES (?1, ?2, ?3) " +
-                "ON CONFLICT(did) DO UPDATE SET state = CASE " +
-                "WHEN EXISTS (SELECT 1 FROM deleted WHERE did = ?1) THEN 'gone-permanent' " +
-                "ELSE excluded.state END, cause = excluded.cause",
+                "ON CONFLICT(did) DO UPDATE SET state = excluded.state, cause = excluded.cause",
             did,
             permanent ? "gone-permanent" : "gone-reversible",
             cause
         )
         this.reevaluateInterest(did, Date.now(), ownedBefore)
+        if (lifted) this.afterMarkLifted(did)
+    }
+
+    /**
+     * `did` was permanently gone and no longer is. Its stored DID document was
+     * kept current only because it was deleted: an unwatched DID's is now
+     * marked stale, as a leave would. A watched did:plc is owed
+     * its PLC log again, which the permanent answer dropped.
+     */
+    private afterMarkLifted(did: string): void {
+        const nowMs = Date.now()
+        if (!this.watchedSansPendingSync(did)) {
+            if (this.didDocumentRow(did) !== undefined) this.markDidDocumentStaleSync(did, nowMs)
+            return
+        }
+        if (did.startsWith("did:plc:")) {
+            this.db.sql.exec(
+                "INSERT INTO plc_logs (did, owed_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET owed_at = COALESCE(owed_at, excluded.owed_at)",
+                did,
+                nowMs
+            )
+        }
     }
 
     /**
@@ -1593,9 +1665,8 @@ export class MonitorIngest
         return row?.attempts ?? null
     }
 
-    /** Aggregate ingest progress for an operator; names no owed or held DID. */
-    async ingestStatus(): Promise<MonitorIngestStatus> {
-        const now = Date.now()
+    /** Counts over one owed table; names no DID. */
+    private pendingSummarySync(table: "pending" | "rec_pending", now: number): PendingSummary {
         const bucket =
             "CASE " +
             [...PENDING_ATTEMPT_BUCKETS]
@@ -1620,41 +1691,53 @@ export class MonitorIngest
                     "COALESCE(SUM(owed_at IS NULL), 0) AS unknown, " +
                     "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'threw'), 0) AS threw, " +
                     "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'unverifiable'), 0) AS unverifiable " +
-                    "FROM pending",
+                    `FROM ${table}`,
                 now
             )
             .one()
         const counts = new Map(
             this.db.sql
                 .exec<{ bound: number; n: number }>(
-                    `SELECT ${bucket} AS bound, COUNT(*) AS n FROM pending GROUP BY bound`
+                    `SELECT ${bucket} AS bound, COUNT(*) AS n FROM ${table} GROUP BY bound`
                 )
                 .toArray()
                 .map((r) => [r.bound, r.n])
         )
+        return {
+            count: total.count,
+            due: total.due,
+            maxAttempts: total.max_attempts,
+            attempts: PENDING_ATTEMPT_BUCKETS.map((atLeast) => ({
+                atLeast,
+                count: counts.get(atLeast) ?? 0,
+            })),
+            oldestOwedAtMs: total.oldest,
+            owedAtUnknown: total.unknown,
+            lastFailure: {
+                threw: total.threw,
+                unverifiable: total.unverifiable,
+                none: total.count - total.threw - total.unverifiable,
+            },
+        }
+    }
+
+    /** Aggregate ingest progress for an operator; names no owed or held DID. */
+    async ingestStatus(): Promise<MonitorIngestStatus> {
+        const now = Date.now()
         const held = this.db.sql
             .exec<{ n: number }>("SELECT COUNT(*) AS n FROM holder_state WHERE state = 'held'")
             .one().n
         return {
             asOfMs: now,
             backfill: await this.readBackfillProgress(),
-            pending: {
-                count: total.count,
-                due: total.due,
-                maxAttempts: total.max_attempts,
-                attempts: PENDING_ATTEMPT_BUCKETS.map((atLeast) => ({
-                    atLeast,
-                    count: counts.get(atLeast) ?? 0,
-                })),
-                oldestOwedAtMs: total.oldest,
-                owedAtUnknown: total.unknown,
-                lastFailure: {
-                    threw: total.threw,
-                    unverifiable: total.unverifiable,
-                    none: total.count - total.threw - total.unverifiable,
-                },
-            },
+            pending: this.pendingSummarySync("pending", now),
+            secondaryPending: this.pendingSummarySync("rec_pending", now),
             heldDeclarations: held,
+            gonePermanent: this.db.sql
+                .exec<{ n: number }>(
+                    "SELECT COUNT(*) AS n FROM holder_state WHERE state = 'gone-permanent'"
+                )
+                .one().n,
         }
     }
 
@@ -2337,14 +2420,15 @@ export class MonitorIngest
             }
             for (const r of records) {
                 this.db.sql.exec(
-                    "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) " +
+                    "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
                         "VALUES (?1, ?2, ?3, COALESCE((SELECT rev FROM records " +
-                        "WHERE did = ?1 AND collection = ?2 AND rkey = ?3), ''), ?4) " +
+                        "WHERE did = ?1 AND collection = ?2 AND rkey = ?3), ''), ?4, ?5) " +
                         "ON CONFLICT(did, collection, rkey) DO UPDATE SET epoch = ?4",
                     did,
                     r.collection,
                     r.rkey,
-                    epoch
+                    epoch,
+                    Date.now()
                 )
             }
         })
@@ -2394,15 +2478,23 @@ export class MonitorIngest
             }))
     }
 
-    async deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void> {
-        this.db.sql.exec(
-            "UPDATE rec_pending SET attempts = attempts + 1, not_before = ? " +
-                "WHERE did = ? AND collection = ? AND rkey = ?",
-            notBeforeMs,
-            ref.did,
-            ref.collection,
-            ref.rkey
-        )
+    async deferSecondary(
+        ref: RecordRef,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ attempts: number }>(
+                "UPDATE rec_pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
+                    "WHERE did = ? AND collection = ? AND rkey = ? RETURNING attempts",
+                notBeforeMs,
+                JSON.stringify(failure),
+                ref.did,
+                ref.collection,
+                ref.rkey
+            )
+            .toArray()[0]
+        return row?.attempts ?? null
     }
 
     async clearSecondary(ref: RecordRef, owedRev: string): Promise<void> {
@@ -2526,14 +2618,16 @@ export class MonitorIngest
                 return { outcome: "duplicate" as const }
             }
             this.db.sql.exec(
-                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) VALUES (?, ?, ?, ?, ?) " +
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?) " +
                     "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
-                    "rev = excluded.rev, epoch = excluded.epoch",
+                    "rev = excluded.rev, epoch = excluded.epoch, attempts = 0, not_before = 0",
                 owed.did,
                 owed.collection,
                 owed.rkey,
                 owed.rev,
-                interest.epoch
+                interest.epoch,
+                Date.now()
             )
             this.raiseFollowCursor(cursor)
             return { outcome: "accepted" as const }
@@ -3744,6 +3838,20 @@ export class MonitorIngest
         }
     }
 
+    /**
+     * A pending row takes a DID out of the refresh schedule, so a retry never
+     * waits longer than refresh would have.
+     */
+    private async retryCapMs(did: string): Promise<number> {
+        if ((await this.revOf(did)) !== null) {
+            return this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000)
+        }
+        if (await this.inInterest(did)) {
+            return this.envInt(this.env.REFRESH_NONHOLDER_STALE_AFTER_MS, 86_400_000)
+        }
+        return SETTLE_RETRY_CAP_MS
+    }
+
     private deps(): IngestDeps {
         return {
             index: this,
@@ -3751,17 +3859,7 @@ export class MonitorIngest
             fetchRecord: (did) => this.fetchRecord(did),
             verify: (did, record) => this.verifyRecord(did, record),
             unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
-            // A pending row takes a DID out of the refresh schedule, so a retry
-            // never waits longer than refresh would have.
-            retryCapMs: async (did) => {
-                if ((await this.revOf(did)) !== null) {
-                    return this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000)
-                }
-                if (await this.inInterest(did)) {
-                    return this.envInt(this.env.REFRESH_NONHOLDER_STALE_AFTER_MS, 86_400_000)
-                }
-                return SETTLE_RETRY_CAP_MS
-            },
+            retryCapMs: (did) => this.retryCapMs(did),
             onSettleFailure: ({ did, attempts, failure, notBeforeMs }) =>
                 console.warn("monitor: settle deferred", {
                     did,
@@ -3831,6 +3929,19 @@ export class MonitorIngest
                 await this.owe(did, held)
             },
             didDocuments: this,
+            retryCapMs: (did) => this.retryCapMs(did),
+            onSettleFailure: ({ did, collection, rkey, attempts, failure, notBeforeMs }) =>
+                console.warn("monitor: secondary settle deferred", {
+                    did,
+                    collection,
+                    rkey,
+                    attempts,
+                    kind: failure.kind,
+                    ...(failure.kind === "threw"
+                        ? { error: `${failure.errorName}: ${failure.message}` }
+                        : { reason: failure.reason }),
+                    notBefore: new Date(notBeforeMs).toISOString(),
+                }),
             nowMs: () => Date.now(),
         }
     }

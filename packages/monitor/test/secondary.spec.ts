@@ -5,8 +5,20 @@
  */
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
-import { settle, type FetchedRecord, type IngestDeps, type VerifyOutcome } from "../src/ingest"
-import { settleSecondary, settleSecondaryDue, type SecondaryDeps } from "../src/secondary"
+import {
+    PENDING_FAILURE_MESSAGE_MAX,
+    SETTLE_RETRY_CAP_MS,
+    settle,
+    type FetchedRecord,
+    type IngestDeps,
+    type VerifyOutcome,
+} from "../src/ingest"
+import {
+    settleSecondary,
+    settleSecondaryDue,
+    type SecondaryDeps,
+    type SecondarySettleFailureEvent,
+} from "../src/secondary"
 import type {
     MonitorIndex,
     PendingRecordFetch,
@@ -41,6 +53,7 @@ function harness(
         fetch?: () => Promise<FetchedRecord>
         verify?: VerifyOutcome
         complete?: SecondaryWriteAnswer | "stored"
+        owed?: PendingRecordFetch[]
     } = {}
 ) {
     let stored = opts.stored ?? null
@@ -50,8 +63,11 @@ function harness(
     const owedRevs: string[] = []
     const deps: SecondaryDeps = {
         index: {
-            dueSecondaries: async () => [OWED],
-            deferSecondary: async () => void calls.push("defer"),
+            dueSecondaries: async () => opts.owed ?? [OWED],
+            deferSecondary: async () => {
+                calls.push("defer")
+                return 1
+            },
             clearSecondary: async (_ref, owedRev) => {
                 calls.push("clear")
                 owedRevs.push(owedRev)
@@ -158,7 +174,7 @@ describe("settleSecondary", () => {
             stored: entry("3m3"),
             indexedRev: "3m3",
             fetch: async () => {
-                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+                throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
         })
         expect(await settleSecondary(missing.deps, OWED)).toBe("unverifiable")
@@ -252,9 +268,10 @@ describe("a repo-level answer on the declaration path", () => {
                 completeDeletion,
                 clearPending,
                 owedGenOf: async () => 1,
+                isDeleted: async () => false,
                 isWatched: async () => true,
             } as unknown as MonitorIndex,
-            snapshot: { deleteRecord: async () => {} } as unknown as SnapshotStore,
+            snapshot: { deleteRecord: async () => {}, getRecord: async () => null } as unknown as SnapshotStore,
             fetchRecord: async () => {
                 if (error !== "absent") throw error
                 return { car: new Uint8Array([1]), source: "s", signingKey: KEY }
@@ -278,7 +295,7 @@ describe("a repo-level answer on the declaration path", () => {
             expect(h.dispose).toHaveBeenCalledWith(DID)
             expect(h.onDelete).toHaveBeenCalledWith(DID)
         }
-        const record = declarationDeps(new RecordNotFoundError("no record", true, "RecordNotFound"))
+        const record = declarationDeps(new RecordNotFoundError("no record", false, "RecordNotFound"))
         await settle(record.deps, DID)
         expect(record.dispose).not.toHaveBeenCalled()
     })
@@ -305,5 +322,116 @@ describe("a repo-level answer on the declaration path", () => {
         const loud = declarationDeps("absent", false)
         await settle(loud.deps, DID)
         expect(loud.completeDeletion).toHaveBeenCalled()
+    })
+})
+
+describe("settleSecondaryDue when a settle fails", () => {
+    const SECOND: PendingRecordFetch = { ...OWED, did: "did:plc:bob", attempts: 3 }
+    const boom = async () => {
+        throw new TypeError("pds down")
+    }
+
+    /** `fetch` throws for the first DID only; every deferral is recorded. */
+    function failing(extra: Partial<SecondaryDeps> = {}, owed = [OWED, SECOND]) {
+        const h = harness({ owed })
+        const deferred: { ref: RecordRef; notBeforeMs: number; failure: unknown }[] = []
+        const events: SecondarySettleFailureEvent[] = []
+        h.deps.fetchRecord = async (ref) => {
+            if (ref.did === OWED.did) return boom()
+            return { car: new Uint8Array([9]), source: "https://pds", signingKey: KEY }
+        }
+        h.deps.index.deferSecondary = async (ref, notBeforeMs, failure) => {
+            deferred.push({ ref, notBeforeMs, failure })
+            return (ref as PendingRecordFetch).attempts + 1
+        }
+        h.deps.onSettleFailure = (event) => void events.push(event)
+        Object.assign(h.deps, extra)
+        return { ...h, deferred, events }
+    }
+
+    it("keeps the failure on the row and reports it once through onSettleFailure, with the record named", async () => {
+        const h = failing({}, [OWED])
+        const stored = h.deps.index.deferSecondary
+        h.deps.index.deferSecondary = async (ref, notBeforeMs, failure) => {
+            await stored(ref, notBeforeMs, failure)
+            return 7
+        }
+        expect(await settleSecondaryDue(h.deps)).toBe(0)
+        const failure = { kind: "threw", errorName: "TypeError", message: "pds down", atMs: 1_000 }
+        expect(h.deferred).toEqual([{ ref: OWED, notBeforeMs: 2_000, failure }])
+        expect(h.events).toEqual([
+            {
+                did: DID,
+                collection: COLLECTION,
+                rkey: "self",
+                attempts: 7,
+                failure,
+                notBeforeMs: 2_000,
+            },
+        ])
+    })
+
+    it("truncates a long message to the pending-row limit", async () => {
+        const h = failing({ fetchRecord: async () => { throw new Error("x".repeat(1_000)) } }, [OWED])
+        await settleSecondaryDue(h.deps)
+        expect(h.events[0]!.failure).toMatchObject({ kind: "threw" })
+        expect((h.events[0]!.failure as { message: string }).message).toHaveLength(
+            PENDING_FAILURE_MESSAGE_MAX
+        )
+    })
+
+    it("backs off 2^attempts seconds, capped at the DID's retryCapMs, else SETTLE_RETRY_CAP_MS", async () => {
+        const fifth = { ...OWED, attempts: 5 }
+        const uncapped = failing({}, [fifth])
+        await settleSecondaryDue(uncapped.deps)
+        expect(uncapped.deferred[0]!.notBeforeMs).toBe(1_000 + 32_000)
+
+        const capped = failing({ retryCapMs: async () => 10_000 }, [fifth])
+        await settleSecondaryDue(capped.deps)
+        expect(capped.deferred[0]!.notBeforeMs).toBe(1_000 + 10_000)
+
+        const huge = failing({}, [{ ...OWED, attempts: 60 }])
+        await settleSecondaryDue(huge.deps)
+        expect(huge.deferred[0]!.notBeforeMs).toBe(1_000 + SETTLE_RETRY_CAP_MS)
+    })
+
+    it("settles the rest of the batch after one record throws", async () => {
+        const h = failing()
+        expect(await settleSecondaryDue(h.deps)).toBe(1)
+        expect(h.deferred.map((d) => d.ref.did)).toEqual([DID])
+        expect(h.calls).toContain("complete")
+    })
+
+    it("settles the rest of the batch when recording a failure itself throws", async () => {
+        const h = failing()
+        h.deps.index.deferSecondary = async () => {
+            throw new Error("storage down")
+        }
+        expect(await settleSecondaryDue(h.deps)).toBe(1)
+        expect(h.events).toEqual([])
+
+        const cap = failing({
+            retryCapMs: async () => {
+                throw new Error("cap lookup down")
+            },
+        })
+        expect(await settleSecondaryDue(cap.deps)).toBe(1)
+    })
+
+    it("reports nothing for a row already gone (deferSecondary answers null)", async () => {
+        const h = failing()
+        h.deps.index.deferSecondary = async () => null
+        expect(await settleSecondaryDue(h.deps)).toBe(1)
+        expect(h.events).toEqual([])
+    })
+
+    it("a throwing onSettleFailure costs neither the deferral nor the rest of the batch", async () => {
+        const h = failing({
+            onSettleFailure: () => {
+                throw new Error("hook broke")
+            },
+        })
+        expect(await settleSecondaryDue(h.deps)).toBe(1)
+        expect(h.deferred).toHaveLength(1)
     })
 })

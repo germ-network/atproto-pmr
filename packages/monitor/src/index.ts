@@ -100,6 +100,7 @@ export {
     type SecondaryConfig,
     type SecondaryDeps,
     type SecondaryIntakeDecision,
+    type SecondarySettleFailureEvent,
     type SecondarySettleOutcome,
 } from "./secondary"
 
