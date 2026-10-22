@@ -1,5 +1,17 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.1.11
+
+### Patch Changes
+
+- [#84](https://github.com/germ-network/atproto-pmr/pull/84) [`beac15d`](https://github.com/germ-network/atproto-pmr/commit/beac15d34904127a1e928085976fbd0d05ece083) Thanks [@germ-mark](https://github.com/germ-mark)! - A follow-stream frame whose handling throws no longer loses its edge silently. It is still never retried and never holds the cursor, but its author's follow listing is queued again when the DID is in interest (a follow, block, `#sync` or active `#account` frame; a listing already running keeps its progress and a fresh one follows it), so the lost follow or block edge is usually repaired at the next listing. The failure is logged as `monitor: follow frame failed` with the error's name, message and a truncated stack plus the event's kind, DID, cursor and, for a commit, collection, operation and rkey; a failed relist is logged as `monitor: follow frame relist failed` and a failed counter write as `monitor: follow frame failure count failed`. `ingestStatus()` gains `followFrameFailures` (`count`, `lastAtMs`, `lastErrorName`; additive, not a spec surface). `ListingQueueReason` gains `lost-frame`.
+
+- [#86](https://github.com/germ-network/atproto-pmr/pull/86) [`91e0eb3`](https://github.com/germ-network/atproto-pmr/commit/91e0eb38d8bc2780a49b708b8001afd78bea4d83) Thanks [@germ-mark](https://github.com/germ-mark)! - `settleDue` no longer abandons the rest of its batch when recording one DID's deferral fails (`deferPending` or `retryCapMs` throwing): the failure is logged as `monitor: settle defer failed` with the DID, that row stays due as it was, and the remaining DIDs settle. A live answer for a DID marked deleted by a permanent answer (a commit, refresh or quiet settle through `complete` or `completeQuietly`) now lifts the mark the way a reversible answer does: a watched did:plc is owed its PLC log again at once, rather than only when its interest membership flips.
+
+- Updated dependencies [[`beac15d`](https://github.com/germ-network/atproto-pmr/commit/beac15d34904127a1e928085976fbd0d05ece083), [`91e0eb3`](https://github.com/germ-network/atproto-pmr/commit/91e0eb38d8bc2780a49b708b8001afd78bea4d83)]:
+  - @germ-network/atproto-pmr-core@0.1.11
+  - @germ-network/atproto-pmr-monitor@0.1.11
+
 ## 0.1.10
 
 ### Patch Changes
