@@ -190,7 +190,7 @@ function harness(opts: {
     const secondary: SecondaryDeps = {
         index: {
             dueSecondaries: async () => [],
-            deferSecondary: async () => {},
+            deferSecondary: async () => null,
             clearSecondary: async () => {},
             completeSecondary: async (ref, rev, verified) => {
                 profileRows.set(ref.did, {
@@ -997,4 +997,8 @@ describe("one head check covers every record", () => {
         expect(h.disposed).toEqual([DID])
         expect(h.onDelete).toHaveBeenCalledWith(DID)
     })
+})
+
+describe("a declaration gone by RecordNotFound comes back", () => {
+    it.todo("a held DID answered RecordNotFound, then republished, is held again by refresh with no firehose commit")
 })

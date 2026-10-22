@@ -1071,3 +1071,12 @@ describe("settle verifies at ingest", () => {
         expect(onChange).toHaveBeenCalledWith(DID, "3m1")
     })
 })
+
+describe("settle on a reversible not-found", () => {
+    it.todo("a held DID answered RecordNotFound is gone-reversible, cause repo, and not marked deleted")
+    it.todo("a held DID answered RepoNotFound is still marked deleted")
+    it.todo("an identity event for a DID already gone by RecordNotFound re-asks it with no second window entry and no onDelete")
+    it.todo("a not-found that hardens a reversibly gone DID to permanent is still announced")
+    it.todo("a verified absence for a DID already gone re-confirms it with no window entry and no onDelete")
+    it.todo("a DID stored again after being gone fires onChange even at the rev it was last indexed at")
+})

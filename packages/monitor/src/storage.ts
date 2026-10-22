@@ -707,7 +707,9 @@ export interface SecondaryIntakeIndex {
      * Owe a fetch of one secondary and advance the follow stream's cursor,
      * atomically. The `rec_pending` upsert sets both `rev` and `epoch`, the
      * epoch read in the same step as membership, so a row left from an
-     * earlier epoch is settled at the current one.
+     * earlier epoch is settled at the current one. A new commit also resets the
+     * row's attempts and backoff; a settle that fails concurrently may still
+     * defer the row after the reset.
      * `duplicate` without owing when `rev` is the indexed one; `ignored` for
      * a DID not in interest.
      */
@@ -721,7 +723,15 @@ export interface SecondaryIntakeIndex {
  */
 export interface SecondaryIndex {
     dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
-    deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void>
+    /**
+     * Count an attempt, push `not_before` out and keep `failure` on the row.
+     * Answers the attempts now stored, or null where the row is already gone.
+     */
+    deferSecondary(
+        ref: RecordRef,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null>
     /**
      * Drop the pending row, only while it still owes `owedRev`: a newer
      * commit owed by the live stream during the settle survives.

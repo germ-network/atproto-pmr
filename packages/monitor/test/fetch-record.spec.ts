@@ -368,3 +368,8 @@ describe("fetchRepoCar", () => {
         ).rejects.toMatchObject({ name: "RecordNotFoundError", reason: "RepoDeactivated", permanent: false })
     })
 })
+
+describe("which not-found answers are permanent", () => {
+    it.todo("RecordNotFound is terminal but not permanent: the account may publish the record again")
+    it.todo("RepoNotFound stays permanent")
+})

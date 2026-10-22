@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     settleDue,
+    settleSecondaryDue,
     SETTLE_RETRY_CAP_MS,
     type IngestDeps,
     type PendingFailure,
@@ -356,12 +357,15 @@ describe("ingestStatus", () => {
     it("carries no DID from pending, holder or rev rows, with a DID-shaped backfill cursor in the fixture", async () => {
         await inObj(freshStub(), async (obj, sql) => {
             seedPending(sql, "did:plc:pendingrow", { failure: THREW })
+            sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev) VALUES ('did:plc:recrow', 'c', 'r', '3m1')"
+            )
             sql.exec("INSERT INTO holder_state (did, state) VALUES ('did:plc:holderrow', 'held')")
             sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:revrow', '3m1', 0)")
             await obj.setBackfillProgress({ done: false, cursor: "did:plc:cursor" })
             const text = JSON.stringify(await obj.ingestStatus())
             expect(text).toContain("did:plc:cursor")
-            for (const did of ["did:plc:pendingrow", "did:plc:holderrow", "did:plc:revrow"]) {
+            for (const did of ["did:plc:pendingrow", "did:plc:recrow", "did:plc:holderrow", "did:plc:revrow"]) {
                 expect(text).not.toContain(did)
             }
         })
@@ -369,8 +373,11 @@ describe("ingestStatus", () => {
 
     it("answers zeros and nulls on empty tables", async () => {
         await inObj(freshStub(), async (obj) => {
-            const { pending, heldDeclarations } = await obj.ingestStatus()
+            const { pending, secondaryPending, heldDeclarations, gonePermanent } =
+                await obj.ingestStatus()
             expect(heldDeclarations).toBe(0)
+            expect(gonePermanent).toBe(0)
+            expect(secondaryPending).toEqual(pending)
             expect(pending).toEqual({
                 count: 0,
                 due: 0,
@@ -452,4 +459,183 @@ describe("alarm", () => {
         expect(log).toContain("seal")
         expect(await runInDurableObject(stub, (_o, state) => state.storage.getAlarm())).not.toBeNull()
     })
+})
+
+describe("secondary pending bookkeeping", () => {
+    const COLLECTION = "app.bsky.actor.profile"
+    const RECORD = { collection: COLLECTION, rkey: "self" }
+
+    interface RecRaw {
+        rev: string
+        attempts: number
+        not_before: number
+        owed_at: number | null
+        last_failure: string | null
+    }
+
+    function recRow(sql: SqlStorage, did: string): RecRaw | undefined {
+        return sql
+            .exec<RecRaw>(
+                "SELECT rev, attempts, not_before, owed_at, last_failure FROM rec_pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+    }
+
+    function member(sql: SqlStorage, did: string) {
+        sql.exec("INSERT INTO interest (did, member, epoch) VALUES (?, 1, 1)", did)
+    }
+
+    it("rec_pending gains owed_at and last_failure on an existing object; old rows keep NULL", async () => {
+        const stub = freshStub()
+        await inObj(stub, async (_obj, sql) => {
+            sql.exec("ALTER TABLE rec_pending DROP COLUMN owed_at")
+            sql.exec("ALTER TABLE rec_pending DROP COLUMN last_failure")
+            sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) VALUES (?, ?, 'self', '3m1', 1)",
+                "did:plc:old",
+                COLLECTION
+            )
+        })
+        await evictDurableObject(stub)
+        await inObj(stub, async (obj, sql) => {
+            const row = recRow(sql, "did:plc:old")
+            expect(row?.owed_at).toBeNull()
+            expect(row?.last_failure).toBeNull()
+            expect(
+                await obj.deferSecondary({ did: "did:plc:old", ...RECORD }, 1, THREW)
+            ).toBe(1)
+        })
+    })
+
+    it("oweSecondary and oweJoin stamp owed_at on insert and keep the first stamp on conflict", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            const t0 = Date.now()
+            member(sql, "did:plc:a")
+            member(sql, "did:plc:b")
+            await obj.oweSecondary({ did: "did:plc:a", ...RECORD, rev: "3m1" }, "1")
+            await obj.oweJoin("did:plc:b", [RECORD], 1)
+            for (const did of ["did:plc:a", "did:plc:b"]) {
+                expect(recRow(sql, did)?.owed_at, did).toBeGreaterThanOrEqual(t0)
+            }
+            sql.exec("UPDATE rec_pending SET owed_at = 5")
+            await obj.oweSecondary({ did: "did:plc:a", ...RECORD, rev: "3m2" }, "2")
+            await obj.oweJoin("did:plc:b", [RECORD], 1)
+            expect(recRow(sql, "did:plc:a")?.owed_at).toBe(5)
+            expect(recRow(sql, "did:plc:b")?.owed_at).toBe(5)
+        })
+    })
+
+    it("a new commit on an owed secondary resets attempts and not_before; a join does not", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            member(sql, DID)
+            await obj.oweSecondary({ did: DID, ...RECORD, rev: "3m1" }, "1")
+            const backOff = async () => {
+                await obj.deferSecondary({ did: DID, ...RECORD }, 9_000_000_000_000, THREW)
+                await obj.deferSecondary({ did: DID, ...RECORD }, 9_000_000_000_000, THREW)
+            }
+            await backOff()
+            await obj.oweJoin(DID, [RECORD], 1)
+            expect(recRow(sql, DID)).toMatchObject({ attempts: 2, not_before: 9_000_000_000_000 })
+
+            await obj.oweSecondary({ did: DID, ...RECORD, rev: "3m2" }, "2")
+            const row = recRow(sql, DID)
+            expect(row).toMatchObject({ rev: "3m2", attempts: 0, not_before: 0 })
+            expect(JSON.parse(row?.last_failure ?? "null")).toEqual(THREW)
+        })
+    })
+
+    async function settleFailing(sql: SqlStorage, obj: MonitorIngest, did: string, attempts = 0) {
+        member(sql, did)
+        await obj.oweSecondary({ did, ...RECORD, rev: "3m1" }, "1")
+        sql.exec("UPDATE rec_pending SET attempts = ?", attempts)
+        ;(obj as unknown as Record<string, unknown>).fetchRecordAt = async () => {
+            throw new TypeError("fetch failed")
+        }
+        return settleSecondaryDue(secondaryDepsOf(obj))
+    }
+
+    it("a throwing secondary settle leaves last_failure on the row and logs 'monitor: secondary settle deferred' with did, collection, rkey, attempts, error, notBefore", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            const before = Date.now()
+            await inObj(freshStub(), async (obj, sql) => {
+                expect(await settleFailing(sql, obj, DID, 2)).toBe(0)
+                const row = recRow(sql, DID)
+                expect(row?.attempts).toBe(3)
+                expect(JSON.parse(row?.last_failure ?? "null")).toMatchObject({
+                    kind: "threw",
+                    errorName: "TypeError",
+                    message: "fetch failed",
+                })
+                const lines = warn.mock.calls.filter(
+                    (c) => c[0] === "monitor: secondary settle deferred"
+                )
+                expect(lines).toHaveLength(1)
+                expect(lines[0]?.[1]).toMatchObject({
+                    did: DID,
+                    collection: COLLECTION,
+                    rkey: "self",
+                    attempts: 3,
+                    kind: "threw",
+                    error: "TypeError: fetch failed",
+                })
+                const notBefore = Date.parse(String((lines[0]?.[1] as { notBefore: string }).notBefore))
+                expect(notBefore).toBeGreaterThanOrEqual(before + 4000)
+                expect(notBefore).toBe(row?.not_before)
+            })
+        } finally {
+            warn.mockRestore()
+        }
+    })
+
+    it("a secondary retry waits no longer than the DID's refresh interval", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            await inObj(freshStub(), async (obj, sql) => {
+                sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES (?, '3m0', 0)", DID)
+                const before = Date.now()
+                await settleFailing(sql, obj, DID, 30)
+                const waited = (recRow(sql, DID)?.not_before ?? 0) - before
+                expect(waited).toBeGreaterThan(0)
+                expect(waited).toBeLessThanOrEqual(Number(testEnv.REFRESH_STALE_AFTER_MS ?? 3_600_000) + 1000)
+            })
+        } finally {
+            warn.mockRestore()
+        }
+    })
+})
+
+describe("ingestStatus secondary and gone counts", () => {
+    it("secondaryPending summarises rec_pending in PendingSummary's shape and counts a failed settle as threw", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            await inObj(freshStub(), async (obj, sql) => {
+                sql.exec("INSERT INTO interest (did, member, epoch) VALUES (?, 1, 1)", DID)
+                await obj.oweSecondary(
+                    { did: DID, collection: "app.bsky.actor.profile", rkey: "self", rev: "3m1" },
+                    "1"
+                )
+                sql.exec("UPDATE rec_pending SET owed_at = 77")
+                ;(obj as unknown as Record<string, unknown>).fetchRecordAt = async () => {
+                    throw new TypeError("fetch failed")
+                }
+                await settleSecondaryDue(secondaryDepsOf(obj))
+                const status = await obj.ingestStatus()
+                expect(status.secondaryPending).toMatchObject({
+                    count: 1,
+                    due: 0,
+                    maxAttempts: 1,
+                    oldestOwedAtMs: 77,
+                    owedAtUnknown: 0,
+                    lastFailure: { threw: 1, unverifiable: 0, none: 0 },
+                })
+                expect(status.secondaryPending.attempts.find((b) => b.atLeast === 1)?.count).toBe(1)
+                expect(status.pending.count).toBe(0)
+            })
+        } finally {
+            warn.mockRestore()
+        }
+    })
+    it.todo("gonePermanent counts gone-permanent holders only")
 })
