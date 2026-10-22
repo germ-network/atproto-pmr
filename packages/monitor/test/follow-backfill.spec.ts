@@ -608,7 +608,7 @@ describe("follow listings", () => {
 
         const missingRecord = await causes({
             fetchRepo: async () => {
-                throw new RecordNotFoundError("RecordNotFound", true, "RecordNotFound")
+                throw new RecordNotFoundError("RecordNotFound", false, "RecordNotFound")
             },
         })
         expect(missingRecord.calls.defer[0]!.cause.permanent).toBe(false)

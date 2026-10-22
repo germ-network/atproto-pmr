@@ -8,6 +8,7 @@ import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/re
 import type { IngestDeps, FetchedRecord, VerifyOutcome } from "../src/ingest"
 import { refreshDue, type RefreshDeps, type SnapshotCheck } from "../src/refresh"
 import type { SecondaryDeps } from "../src/secondary"
+import { pdsAnswering } from "./pds-answering"
 import {
     FETCH_AS_OF_SKEW_MS,
     type IndexedRecord,
@@ -126,7 +127,6 @@ function harness(opts: {
             goneCauses.push(`${cause}`)
             windows.push(did)
             if (permanent) deleted.add(did)
-            revs.delete(did)
         },
         clearPending: async () => {},
         markAttempted: async (did: string, at: number) => void attempted.set(did, at),
@@ -916,7 +916,7 @@ describe("one head check covers every record", () => {
             due: [DID],
             head: async () => headAt("3m1"),
             profileFetch: async () => {
-                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+                throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
         })
         const result = await run(h)
@@ -963,7 +963,7 @@ describe("one head check covers every record", () => {
             ...held("3m1"),
             head: async () => headAt("3m2"),
             fetchRecord: async () => {
-                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+                throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
             profile: profileAt("3m1"),
         })
@@ -1000,5 +1000,27 @@ describe("one head check covers every record", () => {
 })
 
 describe("a declaration gone by RecordNotFound comes back", () => {
-    it.todo("a held DID answered RecordNotFound, then republished, is held again by refresh with no firehose commit")
+    it("a held DID answered RecordNotFound, then republished, is held again by refresh with no firehose commit", async () => {
+        let republished = false
+        const h = harness({
+            indexed: { [DID]: "3m1" },
+            stored: { [DID]: fetched("3m1", decl(1)) },
+            head: async () => headAt(republished ? "3m3" : "3m2"),
+            fetchRecord: (did) =>
+                republished
+                    ? Promise.resolve(fetched("3m3", decl(2)))
+                    : pdsAnswering("RecordNotFound", COLLECTION)(did),
+        })
+        await run(h)
+        expect(h.records.has(DID)).toBe(false)
+        expect(h.deleted.has(DID)).toBe(false)
+        expect(h.windows).toEqual([DID])
+
+        republished = true
+        const result = await run(h)
+        expect(result.outcomes.changed).toBe(1)
+        expect(h.records.get(DID)?.rev).toBe("3m3")
+        expect(h.revs.get(DID)).toBe("3m3")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3m3")
+    })
 })

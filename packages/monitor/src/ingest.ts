@@ -307,7 +307,8 @@ export type VerifyOutcome =
  * would: `completeDeletion` is `complete`'s deletion-shaped counterpart.
  * `permanent` decides only whether this ALSO suppresses future reverify
  * events (see `MonitorIndex.isDeleted`) — a reversible state (an account
- * takedown/suspension that may lift) still disposes of the stale snapshot
+ * takedown/suspension that may lift, or a record the account may publish
+ * again) still disposes of the stale snapshot
  * and still pushes, but must stay open to a later event noticing the
  * reversal.
  */

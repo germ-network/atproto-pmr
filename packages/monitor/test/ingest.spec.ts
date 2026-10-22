@@ -11,6 +11,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
+import { pdsAnswering } from "./pds-answering"
 import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
     compareObservations,
@@ -45,6 +46,17 @@ function commit(rev: string, collection = COLLECTION): CommitEvent {
     if (e === null || e.kind !== "commit") throw new Error("fixture is not a commit")
     return e
 }
+
+const storedEntry = (overrides: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
+    rev: "3m1",
+    car: new Uint8Array([1]),
+    observedAtMs: 500_000,
+    source: PDS,
+    signingKey: SIGNING_KEY,
+    verifiedWith: SIGNING_KEY,
+    cid: CID,
+    ...overrides,
+})
 
 /** In-memory stand-ins; the real ones are one DO and one KV namespace. */
 function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
@@ -874,17 +886,6 @@ describe("settle verifies at ingest", () => {
     const unverifiable = async () => ({ kind: "unverifiable" as const })
     const stale = () => vi.fn(async () => {})
     const sink = () => ({ recordDidDocument: vi.fn(async () => {}), markDidDocumentStale: stale() })
-    const storedEntry = (overrides: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
-        rev: "3m1",
-        car: new Uint8Array([1]),
-        observedAtMs: 500_000,
-        source: PDS,
-        signingKey: SIGNING_KEY,
-        verifiedWith: SIGNING_KEY,
-        cid: CID,
-        ...overrides,
-    })
-
     it("verified CAR is stored with the signed commit rev, key and cid", async () => {
         const h = harness({
             rev: "3m5",
@@ -1073,8 +1074,26 @@ describe("settle verifies at ingest", () => {
 })
 
 describe("settle on a reversible not-found", () => {
-    it.todo("a held DID answered RecordNotFound is gone-reversible, cause repo, and not marked deleted")
-    it.todo("a held DID answered RepoNotFound is still marked deleted")
+    const pdsFails = (name: string) => pdsAnswering(name, COLLECTION)
+
+    it("a held DID answered RecordNotFound is gone-reversible, cause repo, and not marked deleted", async () => {
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound") })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(false)
+        expect(h.causes).toEqual(["repo"])
+        expect(h.records.has(DID)).toBe(false)
+    })
+
+    it("a held DID answered RepoNotFound is still marked deleted", async () => {
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound") })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(true)
+    })
+
     it.todo("an identity event for a DID already gone by RecordNotFound re-asks it with no second window entry and no onDelete")
     it.todo("a not-found that hardens a reversibly gone DID to permanent is still announced")
     it.todo("a verified absence for a DID already gone re-confirms it with no window entry and no onDelete")

@@ -72,14 +72,13 @@ const TERMINAL_XRPC_ERRORS = [
  * `RepoDeactivated` are deliberately excluded — atproto's own account
  * lifecycle treats all three as *reversible*, and this monitor's own wake
  * signal for that reversal is a jetstream `#account` event for a DID it
- * already holds. Treating them as permanent would mean a DID that gets
- * suspended and later reinstated, without ever republishing its
- * declaration, has no path back to being served or watched again — a
- * bounded, one-time correctness event turned into a standing bug. Only
- * `RecordNotFound`/`RepoNotFound` earn that treatment: a repo or record
- * atproto itself says will never exist at that identity again.
+ * already holds. `RecordNotFound` is excluded too: the account can write
+ * the record again at the same rkey, and nothing marks that as a different
+ * identity, so a DID that stopped publishing must stay re-askable. Only
+ * `RepoNotFound` earns the treatment: atproto itself says that repo will
+ * never exist at that identity again.
  */
-const PERMANENT_XRPC_ERRORS = ["RecordNotFound", "RepoNotFound"] as const
+const PERMANENT_XRPC_ERRORS = ["RepoNotFound"] as const
 
 /** The repo's head and the `#atproto` key of the document it was resolved through. */
 export interface HeadRev {

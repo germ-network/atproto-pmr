@@ -174,7 +174,7 @@ describe("settleSecondary", () => {
             stored: entry("3m3"),
             indexedRev: "3m3",
             fetch: async () => {
-                throw new RecordNotFoundError("no record", true, "RecordNotFound")
+                throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
         })
         expect(await settleSecondary(missing.deps, OWED)).toBe("unverifiable")
@@ -294,7 +294,7 @@ describe("a repo-level answer on the declaration path", () => {
             expect(h.dispose).toHaveBeenCalledWith(DID)
             expect(h.onDelete).toHaveBeenCalledWith(DID)
         }
-        const record = declarationDeps(new RecordNotFoundError("no record", true, "RecordNotFound"))
+        const record = declarationDeps(new RecordNotFoundError("no record", false, "RecordNotFound"))
         await settle(record.deps, DID)
         expect(record.dispose).not.toHaveBeenCalled()
     })
