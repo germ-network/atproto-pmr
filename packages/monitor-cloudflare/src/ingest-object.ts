@@ -1485,6 +1485,14 @@ export class MonitorIngest
         if (lifted) this.afterMarkLifted(did)
     }
 
+    /** Drops `did`'s `deleted` mark, if it has one, and undoes what the mark kept. */
+    private liftDeletedSync(did: string): void {
+        const lifted =
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ? RETURNING did", did).toArray()
+                .length > 0
+        if (lifted) this.afterMarkLifted(did)
+    }
+
     /**
      * `did` was permanently gone and no longer is. Its stored DID document was
      * kept current only because it was deleted: an unwatched DID's is now
@@ -1536,7 +1544,7 @@ export class MonitorIngest
                 did
             )
             this.dischargePending(did, gen)
-            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+            this.liftDeletedSync(did)
         })
     }
 
@@ -1979,7 +1987,7 @@ export class MonitorIngest
             // A live record again: the join obligation and any deletion mark
             // are spent, but a commit's obligation is still owed.
             this.dischargePending(did, gen, true)
-            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+            this.liftDeletedSync(did)
         })
     }
 

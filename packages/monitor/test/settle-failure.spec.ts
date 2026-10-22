@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import {
     settle,
     settleDue,
@@ -325,5 +325,54 @@ describe("settle failure reporting", () => {
         await expect(settleDue(h.deps)).resolves.toBe(0)
         expect(h.pending.get("did:plc:one")?.attempts).toBe(1)
         expect(h.pending.get("did:plc:two")?.attempts).toBe(1)
+    })
+
+    describe("a failure to record a deferral costs only its own DID", () => {
+        const [A, B, C] = ["did:plc:a", "did:plc:b", "did:plc:c"]
+        const throwingForA: IngestDeps["fetchRecord"] = async (did) => {
+            if (did === A) throw new Error("PDS unreachable")
+            return {
+                car: new Uint8Array([1]),
+                source: "https://pds.example",
+                signingKey: SIGNING_KEY,
+            }
+        }
+
+        async function drain(h: ReturnType<typeof harness>) {
+            h.owe(A)
+            h.owe(B)
+            h.owe(C)
+            const logged = vi.spyOn(console, "error").mockImplementation(() => {})
+            try {
+                await expect(settleDue(h.deps)).resolves.toBe(2)
+                return logged.mock.calls
+            } finally {
+                logged.mockRestore()
+            }
+        }
+
+        it("a throwing deferPending for A still settles B and C, and is logged once with A", async () => {
+            const h = harness({ fetchRecord: throwingForA })
+            h.deps.index.deferPending = async () => {
+                throw new Error("SQLITE_BUSY")
+            }
+            const calls = await drain(h)
+            expect([...h.pending.keys()]).toEqual([A])
+            expect(h.revs.get(B)).toBe("3m2")
+            expect(h.revs.get(C)).toBe("3m2")
+            expect(calls).toEqual([["monitor: settle defer failed", { did: A, err: expect.any(Error) }]])
+        })
+
+        it("a throwing retryCapMs for A still settles B and C, and is logged once with A", async () => {
+            const h = harness({
+                fetchRecord: throwingForA,
+                retryCapMs: async () => {
+                    throw new Error("SQLITE_BUSY")
+                },
+            })
+            const calls = await drain(h)
+            expect([...h.pending.keys()]).toEqual([A])
+            expect(calls).toEqual([["monitor: settle defer failed", { did: A, err: expect.any(Error) }]])
+        })
     })
 })

@@ -139,6 +139,46 @@ describe("a reversible answer lifts a permanent mark", () => {
         })
     })
 
+    const owedAt = (sql: SqlStorage) =>
+        (
+            rows(sql, "SELECT owed_at FROM plc_logs WHERE did = ?", DID)[0] as
+                | { owed_at: number | null }
+                | undefined
+        )?.owed_at ?? null
+
+    for (const path of ["complete", "completeQuietly"] as const) {
+        const revive = (obj: MonitorIngest) => obj[path](DID, "3m2", 3_000, VERIFIED)
+        for (const [policy, stub] of [
+            ["registered", freshRegistered],
+            ["everyone", freshStub],
+        ] as const) {
+            it(`under ${policy}, a registered did:plc revived by ${path} after a permanent answer is owed its plc log again`, async () => {
+                await inObj(stub(), async (obj, sql) => {
+                    await obj.setRegistered(DID, true, 1)
+                    await permanentlyGone(obj)
+                    expect(owedAt(sql)).toBeNull()
+                    await revive(obj)
+                    expect(deletedRow(sql)).toEqual([])
+                    expect(owedAt(sql)).toBeGreaterThan(0)
+                })
+            })
+        }
+
+        it(`under everyone, an unregistered did:plc revived by ${path} still rejoins, and the rejoin keeps the one plc log debt`, async () => {
+            await inObj(freshStub(), async (obj, sql) => {
+                await permanentlyGone(obj)
+                expect(owedAt(sql)).toBeNull()
+                await revive(obj)
+                const owed = owedAt(sql)
+                expect(owed).toBeGreaterThan(0)
+                const [join] = (await obj.dueTransitions(10)).filter((t) => t.did === DID)
+                expect(join?.change).toBe("join")
+                await obj.oweJoin(DID, [], join!.epoch)
+                expect(owedAt(sql)).toBe(owed)
+            })
+        })
+    }
+
     it("a held DID answered RecordNotFound, then republished, is held again through dueRefresh and refresh with no firehose commit", async () => {
         await inObj(freshStub(), async (obj, sql) => {
             await obj.complete(DID, "3m1", 1_000, VERIFIED)
