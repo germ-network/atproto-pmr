@@ -164,7 +164,8 @@ export function settleRetryBackoffMs(
     return Math.min(2 ** Math.min(attempts, 40) * 1000, capMs)
 }
 
-function truncated(text: string): string {
+/** `text` cut to `PENDING_FAILURE_MESSAGE_MAX`, as kept on a pending row. */
+export function truncated(text: string): string {
     return text.length > PENDING_FAILURE_MESSAGE_MAX ? text.slice(0, PENDING_FAILURE_MESSAGE_MAX) : text
 }
 
@@ -191,7 +192,7 @@ async function deferFailure(
 }
 
 /** `retryCapMs` for `did`, or the default where the deployment gives none. */
-async function retryCapFor(deps: IngestDeps, did: string): Promise<number> {
+export async function retryCapFor(deps: Pick<IngestDeps, "retryCapMs">, did: string): Promise<number> {
     return (await deps.retryCapMs?.(did)) ?? SETTLE_RETRY_CAP_MS
 }
 
