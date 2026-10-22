@@ -131,7 +131,8 @@ export interface StartedListing {
  * Why a DID is queued. A listing already in progress is left alone by
  * `join`, `stale` and `upgrade`. `ownership` keeps it running but stamps its
  * queue row past its begin (forward-only, `MAX(now, began + 1, queued_at +
- * 1)`), so its completion keeps the row and the kind is decided again.
+ * 1)`), so its completion keeps the row and the kind is decided again;
+ * `lost-frame` does the same, so a fresh listing follows the running one.
  * `sync`, `gap` and `registration` restart it (progress and staging cleared,
  * a fresh forward-only stamp), since what it already read may predate the
  * cause. No reason resets `attempts` or `not_before` of a row already
@@ -154,6 +155,12 @@ export type ListingQueueReason =
     | "gap"
     /** A followee of a newly served owner: its mutual filter now keeps more. */
     | "registration"
+    /**
+     * A follow-stream frame by the DID threw, so an edge op may be lost. A
+     * running listing keeps its progress and failure counts, so a DID whose
+     * frames keep throwing is not restarted each time.
+     */
+    | "lost-frame"
 
 /**
  * The single writer's listing queue, staging table and per-DID listing

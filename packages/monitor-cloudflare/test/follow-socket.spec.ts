@@ -400,3 +400,201 @@ describe("follow/profile routing", () => {
         expect(await rows(stub, "SELECT seq FROM edge_ops")).toEqual([{ seq: 2 }])
     })
 })
+
+describe("a follow frame that throws", () => {
+    const sync = (did: string, timeUs: number) => frame({ did, time_us: timeUs, kind: "sync", sync: { did } })
+    const queued = (stub: DurableObjectStub<MonitorIngest>) =>
+        rows<{ did: string }>(stub, "SELECT did FROM listing_requeue")
+
+    /** A registered owner on a connected stream, its own listing already cleared from the queue. */
+    async function ownerOnStream() {
+        jet = stubJetstream()
+        const error = vi.spyOn(console, "error").mockImplementation(() => {})
+        const stub = registeredStub()
+        const owner = uniqDid()
+        await inObj(stub, async (obj) => {
+            await obj.connectFollow()
+            await obj.setRegistered(owner, true, 1)
+            obj.ctx.storage.sql.exec("DELETE FROM listing_requeue")
+        })
+        return { stub, owner, ws: jet.followServer().ws, error }
+    }
+
+    /** Make one live method throw, as a bug in the routing would. */
+    const breakMethod = (stub: DurableObjectStub<MonitorIngest>, method: string) =>
+        inObj(stub, async (obj) => {
+            ;(obj as unknown as Record<string, unknown>)[method] = async () => {
+                throw new Error(`${method} broke`)
+            }
+        })
+
+    it("a throwing block create by an interest DID queues its listing", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(async () => expect(await queued(stub)).toEqual([{ did: owner }]))
+    })
+
+    it("a throwing block delete by an interest DID queues its listing", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await push(stub, ws, commit(owner, BLOCK, "delete", "b1", 6000))
+        await vi.waitFor(async () => expect(await queued(stub)).toEqual([{ did: owner }]))
+    })
+
+    it("a throwing #sync of an interest DID still queues its listing", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "requeueListing")
+        await push(stub, ws, sync(owner, 6000))
+        await vi.waitFor(async () => expect(await queued(stub)).toEqual([{ did: owner }]))
+    })
+
+    it("a throwing create by a DID outside interest queues nothing", async () => {
+        const { stub, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "isGraphOwner")
+        await push(stub, ws, commit(uniqDid(), FOLLOW, "create", "r1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        expect(await queued(stub)).toEqual([])
+    })
+
+    it("a throwing secondary commit queues nothing but is counted", async () => {
+        const { stub, owner, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "oweSecondary")
+        await push(stub, ws, commit(owner, PROFILE, "create", "self", 6000))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        expect(await queued(stub)).toEqual([])
+        await vi.waitFor(async () =>
+            expect((await inObj(stub, (obj) => obj.ingestStatus())).followFrameFailures.count).toBe(1)
+        )
+    })
+
+    it("a listing in progress keeps its progress and failure counts, and a fresh listing follows it", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        const began = Date.now() + 60_000
+        await inObj(stub, async (obj) => {
+            const sql = obj.ctx.storage.sql
+            sql.exec("INSERT INTO listing_requeue (did, queued_at, timeouts) VALUES (?, 1000, 2)", owner)
+            sql.exec(
+                "INSERT INTO listings (did, progress_kind, progress_gen, progress_cursor, progress_pages, progress_began_at) " +
+                    "VALUES (?, 'owner', 1, 'abc', 3, ?)",
+                owner,
+                began
+            )
+        })
+        await breakMethod(stub, "logEdgeOp")
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(async () =>
+            expect(
+                (await rows<{ queued_at: number }>(stub, "SELECT queued_at FROM listing_requeue"))[0]!.queued_at
+            ).toBeGreaterThan(began)
+        )
+        expect(await rows(stub, "SELECT progress_cursor, progress_pages, progress_began_at FROM listings")).toEqual([
+            { progress_cursor: "abc", progress_pages: 3, progress_began_at: began },
+        ])
+        expect(await rows(stub, "SELECT timeouts FROM listing_requeue")).toEqual([{ timeouts: 2 }])
+        await inObj(stub, (obj) => obj.completeListing(owner, 1, { beganAtMs: began, nowMs: began + 10, subjects: [] }))
+        expect(await queued(stub)).toEqual([{ did: owner }])
+    })
+
+    it("onFollowFrame resolves when queueListing throws, and logs the relist failure", async () => {
+        const { stub, owner, error } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await breakMethod(stub, "queueListing")
+        await inObj(stub, async (obj) => {
+            const raw = commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" })
+            await expect(
+                (obj as unknown as { onFollowFrame(raw: string): Promise<void> }).onFollowFrame(raw)
+            ).resolves.toBeUndefined()
+        })
+        expect(error).toHaveBeenCalledWith("monitor: follow frame relist failed", {
+            did: owner,
+            name: "Error",
+            message: "queueListing broke",
+        })
+    })
+
+    it("a #sync after a failed frame still raises the follow cursor", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await push(
+            stub,
+            ws,
+            commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }),
+            sync(owner, 7000)
+        )
+        await vi.waitFor(async () => expect(await meta(stub, "follow_cursor")).toBe("7000"))
+    })
+    it("a failed frame is logged with its error and event fields", async () => {
+        const { stub, owner, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        const [message, fields] = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")!
+        expect(message).toBe("monitor: follow frame failed")
+        expect(fields).toMatchObject({
+            name: "Error",
+            message: "logEdgeOp broke",
+            kind: "commit",
+            did: owner,
+            cursor: "6000",
+            collection: BLOCK,
+            operation: "create",
+            rkey: "b1",
+        })
+        expect(typeof fields.stack).toBe("string")
+    })
+
+    it("the logged stack is truncated to FOLLOW_FRAME_FAILURE_STACK_CHARS", async () => {
+        const { stub, owner, ws, error } = await ownerOnStream()
+        await inObj(stub, async (obj) => {
+            ;(obj as unknown as Record<string, unknown>).logEdgeOp = async () => {
+                const err = new Error("deep")
+                err.stack = "x".repeat(5_000)
+                throw err
+            }
+        })
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        const fields = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]
+        expect(fields.stack).toBe("x".repeat(2_000))
+    })
+
+    it("a failed frame by a DID outside interest is logged too", async () => {
+        const { stub, ws, error } = await ownerOnStream()
+        await breakMethod(stub, "isGraphOwner")
+        const stranger = uniqDid()
+        await push(stub, ws, commit(stranger, FOLLOW, "create", "r1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(() => expect(error).toHaveBeenCalled())
+        expect(error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]).toMatchObject({
+            did: stranger,
+            message: "isGraphOwner broke",
+        })
+    })
+
+    it("each failed frame is counted in ingestStatus().followFrameFailures", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        const before = Date.now()
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await push(stub, ws, commit(owner, BLOCK, "delete", "b2", 7000))
+        await vi.waitFor(async () => {
+            const { followFrameFailures } = await inObj(stub, (obj) => obj.ingestStatus())
+            expect(followFrameFailures.count).toBe(2)
+        })
+        const { followFrameFailures } = await inObj(stub, (obj) => obj.ingestStatus())
+        expect(followFrameFailures.lastErrorName).toBe("Error")
+        expect(followFrameFailures.lastAtMs).toBeGreaterThanOrEqual(before)
+    })
+
+    it("a failed counter write does not stop the relisting", async () => {
+        const { stub, owner, ws } = await ownerOnStream()
+        await breakMethod(stub, "logEdgeOp")
+        await inObj(stub, async (obj) => {
+            ;(obj as unknown as Record<string, unknown>).noteFollowFrameFailureSync = () => {
+                throw new Error("meta write broke")
+            }
+        })
+        await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
+        await vi.waitFor(async () => expect(await queued(stub)).toEqual([{ did: owner }]))
+    })
+})

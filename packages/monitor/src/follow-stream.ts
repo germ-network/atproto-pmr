@@ -154,3 +154,23 @@ export async function routeFollowEvent(
     if (decision === "accepted") return "owed"
     return skip(decision === "duplicate" ? "duplicate" : "dropped")
 }
+
+/**
+ * The DID whose follow listing reconciles whatever `event` would have kept,
+ * had routing it not thrown: the author of a follow or block commit, or of a
+ * `#sync` or an `#account` turning active. A listing rebuilds that DID's
+ * follow and block edges from its repo, which usually repairs a lost edge op
+ * without replaying the frame; an older op of the same record still
+ * unflushed when the listing begins is applied after it and can outlive it
+ * until the next listing. Interest is not checked here. `null` for every
+ * other event, a secondary commit included, which a listing does not cover.
+ */
+export function followEventListingDid(event: MonitorEvent): string | null {
+    if (event.kind === "commit") {
+        return event.collection === FOLLOW_COLLECTION_NSID || event.collection === BLOCK_COLLECTION_NSID
+            ? event.did
+            : null
+    }
+    if (event.kind === "sync") return event.did
+    return event.kind === "account" && event.active === true ? event.did : null
+}
