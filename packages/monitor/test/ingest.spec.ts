@@ -1094,8 +1094,58 @@ describe("settle on a reversible not-found", () => {
         expect(h.deleted.has(DID)).toBe(true)
     })
 
-    it.todo("an identity event for a DID already gone by RecordNotFound re-asks it with no second window entry and no onDelete")
-    it.todo("a not-found that hardens a reversibly gone DID to permanent is still announced")
-    it.todo("a verified absence for a DID already gone re-confirms it with no window entry and no onDelete")
+    const windowed = (h: ReturnType<typeof harness>) => [...h.members.values()].flatMap((m) => [...m])
+    const goneReversibly = (h: ReturnType<typeof harness>) => {
+        h.revs.set(DID, "3m1")
+        h.deps.index.holderStateOf = async () => "gone-reversible"
+    }
+
+    it("an identity event for a DID already gone by RecordNotFound re-asks it with no second window entry and no onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        goneReversibly(h)
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe(
+            "reverify"
+        )
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(h.quietDeletions).toEqual([DID])
+    })
+
+    it("a not-found that hardens a reversibly gone DID to permanent is still announced", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound"), onDelete })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(true)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
+    it("a verified absence for a DID already gone re-confirms it with no window entry and no onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onDelete,
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m2" }),
+        })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+    })
+
+    it("the first sighting of a deletion is still a window entry and onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        h.deps.index.holderStateOf = async () => "held"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
     it.todo("a DID stored again after being gone fires onChange even at the rev it was last indexed at")
 })

@@ -268,9 +268,10 @@ describe("a repo-level answer on the declaration path", () => {
                 completeDeletion,
                 clearPending,
                 owedGenOf: async () => 1,
+                isDeleted: async () => false,
                 isWatched: async () => true,
             } as unknown as MonitorIndex,
-            snapshot: { deleteRecord: async () => {} } as unknown as SnapshotStore,
+            snapshot: { deleteRecord: async () => {}, getRecord: async () => null } as unknown as SnapshotStore,
             fetchRecord: async () => {
                 if (error !== "absent") throw error
                 return { car: new Uint8Array([1]), source: "s", signingKey: KEY }

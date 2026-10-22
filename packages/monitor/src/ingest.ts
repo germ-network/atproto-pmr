@@ -243,9 +243,9 @@ export async function intake(
         // did not change. `owe` rather than `intake` because the dedupe
         // check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
-        // A DID confirmed deleted has no live record to re-verify against
-        // — re-owing here would only rediscover the same deletion and
-        // re-push it, once per identity/account/sync event, forever.
+        // A DID confirmed permanently deleted has no live record to
+        // re-verify against. One that is only reversibly gone is re-asked,
+        // and `settle` records an answer that repeats the deletion quietly.
         const reverify = known !== null && !(await deps.index.isDeleted(event.did))
         if (reverify) await deps.index.owe(event.did, known, streamTimeUs(cursor))
         // The relay's cached key is dropped for every DID whose document the
@@ -377,7 +377,11 @@ export async function settle(
             if (repoLevel) await deps.secondaries?.dispose(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, err.permanent, quiet, "repo", gen)
+        // Only a permanent answer for a DID not yet marked deleted is news
+        // for one already gone.
+        const hardens = err.permanent && !(await deps.index.isDeleted(did))
+        const reconfirm = !hardens && (await alreadyGone(deps, did))
+        await settleDeletion(deps, did, err.permanent, quiet || reconfirm, "repo", gen)
         if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
@@ -404,6 +408,16 @@ export async function raiseSettled(
     try {
         await deps.onSettled?.(did, settled)
     } catch {}
+}
+
+/**
+ * The declaration is already gone and recorded so: an answer that merely
+ * repeats it is no new change, and must not reach the window or `onDelete`
+ * again.
+ */
+async function alreadyGone(deps: IngestDeps, did: string): Promise<boolean> {
+    if ((await deps.snapshot.getRecord(did)) !== null) return false
+    return (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
 }
 
 /** No declaration was ever indexed for `did`, held or gone. */
@@ -442,7 +456,7 @@ async function settleFetched(
             await deps.index.clearPending(did, gen)
             return "deleted"
         }
-        await settleDeletion(deps, did, false, quiet, "record", gen)
+        await settleDeletion(deps, did, false, quiet || (await alreadyGone(deps, did)), "record", gen)
         return "deleted"
     }
 
