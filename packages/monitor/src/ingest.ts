@@ -416,6 +416,8 @@ export async function raiseSettled(
  * again.
  */
 async function alreadyGone(deps: IngestDeps, did: string): Promise<boolean> {
+    // A snapshot read from KV may be stale; a stale non-null only makes the
+    // repeated answer loud, the safe direction.
     if ((await deps.snapshot.getRecord(did)) !== null) return false
     return (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
 }
@@ -495,10 +497,13 @@ async function settleFetched(
         await raiseSettled(deps, did, settled)
         return "stored"
     }
+    // Read before `complete`, which marks the DID held again.
+    const revived = (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
     await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
     await raiseSettled(deps, did, settled)
 
-    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
+    // A DID back from gone is news at whatever rev it returns.
+    if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
     return "stored"
 }
 

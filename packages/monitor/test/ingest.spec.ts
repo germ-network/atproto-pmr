@@ -1076,7 +1076,7 @@ describe("settle verifies at ingest", () => {
 describe("settle on a reversible not-found", () => {
     const pdsFails = (name: string) => pdsAnswering(name, COLLECTION)
 
-    it("a held DID answered RecordNotFound is gone-reversible, cause repo, and not marked deleted", async () => {
+    it("a held DID answered RecordNotFound is recorded non-permanent, cause repo, and not marked deleted", async () => {
         const h = harness({ fetchRecord: pdsFails("RecordNotFound") })
         h.revs.set(DID, "3m1")
         h.records.set(DID, storedEntry())
@@ -1100,7 +1100,7 @@ describe("settle on a reversible not-found", () => {
         h.deps.index.holderStateOf = async () => "gone-reversible"
     }
 
-    it("an identity event for a DID already gone by RecordNotFound re-asks it with no second window entry and no onDelete", async () => {
+    it("an identity event for a DID gone reversibly by RecordNotFound re-asks it with no second window entry and no onDelete", async () => {
         const onDelete = vi.fn(async () => {})
         const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
         goneReversibly(h)
@@ -1147,5 +1147,40 @@ describe("settle on a reversible not-found", () => {
         expect(onDelete).toHaveBeenCalledTimes(1)
     })
 
-    it.todo("a DID stored again after being gone fires onChange even at the rev it was last indexed at")
+    it("a repeated permanent answer for a DID already marked deleted stays quiet", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.deleted.add(DID)
+        h.deps.index.holderStateOf = async () => "gone-permanent"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(h.quietDeletions).toEqual([DID])
+    })
+
+    it("a deletion whose earlier recording failed is announced on retry", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.deps.index.holderStateOf = async () => "held"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
+    it("a DID stored again after being gone fires onChange even at the rev it was last indexed at", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({ onChange, rev: "3m1" })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+
+        const quiet = vi.fn(async () => {})
+        const held = harness({ onChange: quiet, rev: "3m1" })
+        held.revs.set(DID, "3m1")
+        held.deps.index.holderStateOf = async () => "held"
+        await settle(held.deps, DID)
+        expect(quiet).not.toHaveBeenCalled()
+    })
 })

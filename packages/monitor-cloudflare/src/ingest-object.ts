@@ -658,6 +658,29 @@ export class MonitorIngest
             this.seedInterest()
             this.seedListings()
             this.seedPlcLogs()
+            this.seedDeletedReowe()
+        })
+    }
+
+    /**
+     * Once: every DID marked deleted before a reversible answer could lift
+     * the mark is owed a fresh fetch, so one that came back is found. The
+     * mark stays until that settle decides it: a live record, or a reversible
+     * answer, lifts it; a permanent one keeps it. The rows wait out
+     * `not_before` so live owes go first, and are loud: a returning
+     * declaration is announced like any other.
+     */
+    private seedDeletedReowe(): void {
+        if (this.metaOf("deleted_reowed") !== undefined) return
+        this.ctx.storage.transactionSync(() => {
+            const nowMs = Date.now()
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                    "SELECT did, '', 0, ?1, 0, ?1 FROM deleted WHERE true " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0",
+                nowMs
+            )
+            this.setMeta("deleted_reowed", "1")
         })
     }
 
@@ -1710,7 +1733,11 @@ export class MonitorIngest
             pending: this.pendingSummarySync("pending", now),
             secondaryPending: this.pendingSummarySync("rec_pending", now),
             heldDeclarations: held,
-            gonePermanent: 0,
+            gonePermanent: this.db.sql
+                .exec<{ n: number }>(
+                    "SELECT COUNT(*) AS n FROM holder_state WHERE state = 'gone-permanent'"
+                )
+                .one().n,
         }
     }
 

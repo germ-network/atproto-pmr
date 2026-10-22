@@ -637,5 +637,19 @@ describe("ingestStatus secondary and gone counts", () => {
             warn.mockRestore()
         }
     })
-    it.todo("gonePermanent counts gone-permanent holders only")
+    it("gonePermanent counts gone-permanent holders only", async () => {
+        await inObj(freshStub(), async (obj, sql) => {
+            for (const [did, state] of [
+                ["did:plc:a", "held"],
+                ["did:plc:b", "gone-reversible"],
+                ["did:plc:c", "gone-permanent"],
+                ["did:plc:d", "gone-permanent"],
+            ]) {
+                sql.exec("INSERT INTO holder_state (did, state) VALUES (?, ?)", did, state)
+            }
+            const status = await obj.ingestStatus()
+            expect(status.gonePermanent).toBe(2)
+            expect(status.heldDeclarations).toBe(1)
+        })
+    })
 })

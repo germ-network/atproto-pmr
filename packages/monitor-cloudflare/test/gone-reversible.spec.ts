@@ -3,8 +3,8 @@
  * (RepoNotFound, a PLC tombstone) does. DIDs marked gone before that rule
  * are asked once more; only a revival is announced.
  */
-import { env, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { env, evictDurableObject, runInDurableObject } from "cloudflare:test"
+import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     refreshDue,
@@ -182,10 +182,136 @@ describe("a reversible answer lifts a permanent mark", () => {
 })
 
 describe("the one-time re-owe of DIDs marked deleted before the upgrade", () => {
-    it.todo("every deleted DID is owed once, behind live owes, and the seed never runs twice across evictions")
-    it.todo("a deleted DID with a live record at its indexed rev is held again, announced with a window entry and onChange, and its deleted row is gone")
-    it.todo("a deleted DID answering RecordNotFound becomes gone-reversible with no window entry and no onDelete")
-    it.todo("a deleted DID answering with a signed exclusion proof becomes gone-reversible, cause record, and verifiedAnchorOf answers absent")
-    it.todo("a deleted DID answering RepoNotFound stays deleted and gone-permanent")
-    it.todo("an existing pending row for a deleted DID keeps its rev and backoff but is made non-quiet")
+    const BOB = "did:plc:bob"
+    const PENDING = "SELECT rev, attempts, not_before, quiet FROM pending WHERE did = ?"
+
+    /** Leaves `dids` marked deleted with no pending row and no seed flag, then reopens. */
+    async function upgraded(stub: DurableObjectStub<MonitorIngest>, dids: string[], extra?: (sql: SqlStorage) => void) {
+        for (const did of dids) await kvSnapshotStore(testEnv).deleteRecord(did)
+        await inObj(stub, async (obj, sql) => {
+            for (const did of dids) await permanentlyGone(obj, did)
+            sql.exec("DELETE FROM pending")
+            sql.exec("DELETE FROM window_members")
+            sql.exec("DELETE FROM meta WHERE k = 'deleted_reowed'")
+            extra?.(sql)
+        })
+        await evictDurableObject(stub)
+    }
+
+    /** Settles whatever is owed against a PDS answering `answer`, with the hooks spied. */
+    async function settleWith(
+        obj: MonitorIngest,
+        answer: "gone-record" | "gone-repo" | "live" | "excluded"
+    ) {
+        const o = privately<Record<string, unknown>>(obj)
+        const car = buildRepoCar({
+            did: DID,
+            records: { [`${testEnv.MONITOR_COLLECTION}/self`]: { $type: testEnv.MONITOR_COLLECTION, n: 1 } },
+        }).car
+        o.fetchRecord = async () => {
+            if (answer === "gone-record") {
+                throw new RecordNotFoundError("RecordNotFound", false, "RecordNotFound")
+            }
+            if (answer === "gone-repo") {
+                throw new RecordNotFoundError("RepoNotFound", true, "RepoNotFound")
+            }
+            return { car, source: "https://pds", signingKey: KEY }
+        }
+        o.verifyRecord = async () =>
+            answer === "excluded"
+                ? { kind: "verified-absent", key: KEY, rev: "3m2" }
+                : { kind: "verified", key: KEY, rev: "3m1", cid: "bafyreinew" }
+        const onChange = vi.fn(async () => {})
+        const onDelete = vi.fn(async () => {})
+        await settleDue({ ...depsOf(obj), onChange, onDelete })
+        return { onChange, onDelete }
+    }
+    const windowed = (sql: SqlStorage) => rows(sql, "SELECT did FROM window_members")
+
+    it("every deleted DID is owed once, behind live owes, and the seed never runs twice across evictions", async () => {
+        const stub = freshStub()
+        const t0 = Date.now()
+        await upgraded(stub, [DID, BOB])
+        await inObj(stub, async (obj, sql) => {
+            await obj.owe("did:plc:live", "3m9")
+            for (const did of [DID, BOB]) {
+                expect(rows(sql, PENDING, did)[0]).toMatchObject({ rev: "", attempts: 0, quiet: 0 })
+                expect(rows(sql, PENDING, did)[0]?.not_before).toBeGreaterThanOrEqual(t0)
+            }
+            const due = await obj.duePending(Date.now() + 1_000, 10)
+            expect(due[0]?.did).toBe("did:plc:live")
+            expect(due.map((d) => d.did).sort()).toEqual(["did:plc:live", BOB, DID].sort())
+            await obj.clearPending(DID)
+        })
+        await evictDurableObject(stub)
+        await inObj(stub, async (_obj, sql) => {
+            expect(rows(sql, PENDING, DID)).toEqual([])
+            expect(rows(sql, PENDING, BOB)).toHaveLength(1)
+        })
+    })
+
+    it("a deleted DID with a live record at its indexed rev is held again, announced with a window entry and onChange, and its deleted row is gone", async () => {
+        const stub = freshStub()
+        await upgraded(stub, [DID])
+        await inObj(stub, async (obj, sql) => {
+            const { onChange } = await settleWith(obj, "live")
+            expect(deletedRow(sql)).toEqual([])
+            expect(holder(sql)).toMatchObject({ state: "held" })
+            expect(windowed(sql)).toEqual([{ did: DID }])
+            expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+        })
+    })
+
+    it("a deleted DID answering RecordNotFound becomes gone-reversible with no window entry and no onDelete", async () => {
+        const stub = freshStub()
+        await upgraded(stub, [DID])
+        await inObj(stub, async (obj, sql) => {
+            const { onDelete } = await settleWith(obj, "gone-record")
+            expect(deletedRow(sql)).toEqual([])
+            expect(holder(sql)).toMatchObject({ state: "gone-reversible" })
+            expect(windowed(sql)).toEqual([])
+            expect(onDelete).not.toHaveBeenCalled()
+        })
+    })
+
+    it("a deleted DID answering with a signed exclusion proof becomes gone-reversible, cause record, and verifiedAnchorOf answers absent", async () => {
+        const stub = freshStub()
+        await upgraded(stub, [DID])
+        await inObj(stub, async (obj, sql) => {
+            await settleWith(obj, "excluded")
+            expect(deletedRow(sql)).toEqual([])
+            expect(holder(sql)).toMatchObject({ state: "gone-reversible", cause: "record" })
+            expect(await obj.verifiedAnchorOf(DID)).toEqual({ state: "absent" })
+        })
+    })
+
+    it("a deleted DID answering RepoNotFound stays deleted and gone-permanent", async () => {
+        const stub = freshStub()
+        await upgraded(stub, [DID])
+        await inObj(stub, async (obj, sql) => {
+            const { onDelete } = await settleWith(obj, "gone-repo")
+            expect(deletedRow(sql)).toHaveLength(1)
+            expect(holder(sql)).toMatchObject({ state: "gone-permanent" })
+            expect(windowed(sql)).toEqual([])
+            expect(onDelete).not.toHaveBeenCalled()
+        })
+    })
+
+    it("an existing pending row for a deleted DID keeps its rev and backoff but is made non-quiet", async () => {
+        const stub = freshStub()
+        await upgraded(stub, [DID], (sql) =>
+            sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) VALUES (?, '3m5', 2, 9000000000000, 1, 5)",
+                DID
+            )
+        )
+        await inObj(stub, async (_obj, sql) => {
+            expect(rows(sql, PENDING, DID)[0]).toEqual({
+                rev: "3m5",
+                attempts: 2,
+                not_before: 9_000_000_000_000,
+                quiet: 0,
+            })
+        })
+    })
 })
