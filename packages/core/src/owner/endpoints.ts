@@ -351,9 +351,10 @@ export async function handleRegistrationCreate(
     // only DoS (fresh empty registration), never takeover of the prior contents, is
     // reachable by whoever controls the declaration. The continuity path that KEEPS
     // the registration is gated on GER-2447. `directory.delete` now tears down the
-    // prior registration's DO storage too (deregistration and replace alike) — only
-    // its global grant-address routing rows are left, lapsing on their own KV TTL;
-    // until then an old grant address routes dead 202 mail to the now-torn-down DO.
+    // prior registration's DO storage too (deregistration and replace alike), and
+    // drops its global grant-address routing rows best-effort; a row it misses
+    // lapses on its own KV TTL, and until then routes dead 202 mail to the
+    // now-torn-down DO.
     // Same-key re-registration stays an idempotent in-place refresh (below). Brief
     // non-atomicity is acceptable: between the delete and create's re-put the DID
     // resolves to null, so a concurrent owner

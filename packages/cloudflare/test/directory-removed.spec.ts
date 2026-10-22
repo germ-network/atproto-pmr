@@ -127,3 +127,73 @@ describe("KVDirectory.onRemoved", () => {
         warn.mockRestore()
     })
 })
+
+describe("grant-address rows on teardown", () => {
+    async function withGrant(directory: KVDirectory, did: string, key: Uint8Array) {
+        await register(did, key, directory)
+        const locator = (await directory.resolve(did))!
+        const address = `addr-teardown-${Math.random().toString(36).slice(2)}`
+        await pmrStore(locator, testEnv).issueGrant(address, new Uint8Array(32), T0 + 3600)
+        await directory.createGrantAddress(locator, address, new Uint8Array(32), T0 + 3600)
+        expect(await directory.resolveAddress(address)).not.toBeNull()
+        return { locator, address }
+    }
+
+    it("deregister drops the row", async () => {
+        const directory = new KVDirectory(testEnv)
+        const did = freshDID()
+        const key = ed25519.utils.randomSecretKey()
+        const { address } = await withGrant(directory, did, key)
+        await directory.deregister(did, thumb(key))
+        expect(await directory.resolveAddress(address)).toBeNull()
+    })
+
+    it("replace drops the row", async () => {
+        const directory = new KVDirectory(testEnv)
+        const did = freshDID()
+        const { address } = await withGrant(directory, did, ed25519.utils.randomSecretKey())
+        await register(did, ed25519.utils.randomSecretKey(), directory)
+        expect(await directory.resolveAddress(address)).toBeNull()
+    })
+
+    it("retire drops the row", async () => {
+        const directory = new KVDirectory(testEnv)
+        const did = freshDID()
+        const { locator, address } = await withGrant(
+            directory,
+            did,
+            ed25519.utils.randomSecretKey()
+        )
+        await directory.retire(did, locator)
+        expect(await directory.resolveAddress(address)).toBeNull()
+    })
+
+    it("a throwing listGrants does not block teardown", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const directory = new KVDirectory(testEnv)
+        const did = freshDID()
+        const key = ed25519.utils.randomSecretKey()
+        const { address } = await withGrant(directory, did, key)
+        const original = testEnv.pmrs.get.bind(testEnv.pmrs)
+        const spy = vi.spyOn(testEnv.pmrs, "get").mockImplementation((id) => {
+            const stub = original(id)
+            return new Proxy(stub, {
+                get: (t, p) =>
+                    p === "listGrants"
+                        ? async () => {
+                              throw new Error("list down")
+                          }
+                        : (t as any)[p],
+            })
+        })
+        try {
+            await expect(directory.deregister(did, thumb(key))).resolves.toBeUndefined()
+        } finally {
+            spy.mockRestore()
+        }
+        expect(await directory.resolve(did)).toBeNull()
+        expect(await directory.resolveAddress(address)).not.toBeNull()
+        expect(warn.mock.calls.some((c) => String(c[0]).includes("grant listing"))).toBe(true)
+        warn.mockRestore()
+    })
+})
