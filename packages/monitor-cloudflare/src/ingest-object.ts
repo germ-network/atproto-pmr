@@ -24,8 +24,11 @@ import {
     settleDue,
     settleSecondaryDue,
     sweepBackfill,
+    sweepEvidenceRefresh,
+    retainSnapshotEvidence,
     windowOf,
     type BackfillProgress,
+    type EvidenceBackfillProgress,
     type DidDocumentSink,
     type Cursor,
     type MonitorEvent,
@@ -116,10 +119,13 @@ import {
     appendPlcLogEntry,
     fetchDidDocument,
     fetchPlcAuditLog,
+    guardedFetchJSON,
+    parsePlcAuditLog,
     pdsResolutionFromDocument,
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyPlcLog,
+    verifyPlcCurrentKeyOperation,
     verifyRecordProofOutcome,
     verifyRepoCollections,
     type BlockEdge,
@@ -137,6 +143,7 @@ import {
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
+    didWebDocumentURL,
     FIREHOSE_COVERAGE_MAX_LAG_MS,
     FIREHOSE_LAGGING_CAP,
     KV_VISIBILITY_MS,
@@ -185,6 +192,7 @@ const CONNECT_TIMEOUT_MS = 5_000
 /** KV puts one alarm may spend on stored DID documents. */
 const DID_DOCUMENT_PUBLISH_BATCH = 64
 const PLC_LOG_PUBLISH_BATCH = 64
+const EVIDENCE_FRESHNESS_MS = 30_000
 
 type PublishRow = {
     did: string
@@ -450,6 +458,10 @@ export class MonitorIngest
                     cid TEXT NOT NULL,
                     verified_with TEXT NOT NULL,
                     PRIMARY KEY (did, collection, rkey)
+                );
+                CREATE TABLE IF NOT EXISTS evidence_anchors (
+                    identity TEXT PRIMARY KEY,
+                    first_observed_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS holder_state (
                     did TEXT PRIMARY KEY,
@@ -1638,6 +1650,78 @@ export class MonitorIngest
     async setBackfillProgress(progress: BackfillProgress): Promise<void> {
         this.db.sql.exec(
             "INSERT INTO meta (k, v) VALUES ('backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
+    async getEvidenceAnchor(identity: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ first_observed_at: number }>(
+                "SELECT first_observed_at FROM evidence_anchors WHERE identity = ?",
+                identity
+            )
+            .toArray()[0]
+        return row?.first_observed_at ?? null
+    }
+
+    async retainEvidenceAnchor(identity: string, observedAtMs: number): Promise<number> {
+        return this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT OR IGNORE INTO evidence_anchors (identity, first_observed_at) VALUES (?, ?)",
+                identity,
+                observedAtMs
+            )
+            const row = this.db.sql
+                .exec<{ first_observed_at: number }>(
+                    "SELECT first_observed_at FROM evidence_anchors WHERE identity = ?",
+                    identity
+                )
+                .toArray()[0]
+            return row?.first_observed_at ?? observedAtMs
+        })
+    }
+
+    async evidenceBackfillPage(afterDid: string | null, limit: number): Promise<IndexedRecord[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>(
+                "SELECT did, collection, rkey, rev, cid, verified_with FROM records " +
+                    "WHERE collection = ? AND rkey = 'self' AND (? IS NULL OR did > ?) " +
+                    "ORDER BY did LIMIT ?",
+                this.env.MONITOR_COLLECTION,
+                afterDid,
+                afterDid,
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async readEvidenceBackfillProgress(): Promise<EvidenceBackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'evidence_backfill'")
+            .toArray()[0]
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as EvidenceBackfillProgress
+    }
+
+    async setEvidenceBackfillProgress(progress: EvidenceBackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('evidence_backfill', ?) " +
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             JSON.stringify(progress)
         )
@@ -3663,9 +3747,9 @@ export class MonitorIngest
         return this.verifyAt({ did, collection: this.env.MONITOR_COLLECTION, rkey: "self" }, record)
     }
 
-    private verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
+    private async verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
         if (record.signingKey === null) {
-            return Promise.resolve({ kind: "unverifiable", reason: "no #atproto signing key" })
+            return { kind: "unverifiable", reason: "no #atproto signing key" }
         }
         try {
             const outcome = verifyRecordProofOutcome(record.car, {
@@ -3674,17 +3758,92 @@ export class MonitorIngest
                 collection: ref.collection,
                 rkey: ref.rkey,
             })
-            return Promise.resolve(
-                outcome.kind === "present"
-                    ? { kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid }
-                    : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
-            )
+            if (outcome.kind === "absent") {
+                return { kind: "verified-absent", key: record.signingKey, rev: outcome.rev, commitCid: outcome.commitCid }
+            }
+            const base: VerifyOutcome = {
+                kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
+                commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
+            }
+            if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
+            const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)
+            // Evidence enrichment is optional. A valid PDS proof remains a
+            // servable declaration when external corroboration or monitor
+            // provenance is unavailable; the summary then reports evidence
+            // as explicitly unavailable.
+            if (!monitor) return base
+            const evidence = await this.declarationEvidence(ref.did, record, outcome.commitCid, monitor)
+            return evidence ? { ...base, ...evidence, monitor } : base
         } catch (err) {
             if (err instanceof RepoProofError) {
-                return Promise.resolve({ kind: "unverifiable", reason: err.message })
+                return { kind: "unverifiable", reason: err.message }
             }
-            throw err
+            return { kind: "unverifiable", reason: err instanceof Error ? err.message : "evidence verification failed" }
         }
+    }
+
+    private async declarationEvidence(
+        did: string,
+        record: FetchedRecord,
+        commitCid: string,
+        monitor: string
+    ): Promise<{ authority: import("@germ-network/atproto-pmr-core").EvidenceAuthorityIdentity; assurance: import("@germ-network/atproto-pmr-core").EvidenceAssurance } | null> {
+        if (record.signingKey === null) return null
+        const started = record.attemptStartedAtMs
+        const doc = record.didDocument
+        if (started === undefined || !doc || doc.document.id !== did || doc.fetchedAtMs < started - EVIDENCE_FRESHNESS_MS) return null
+        const now = Date.now()
+        if (now < started || now - started > EVIDENCE_FRESHNESS_MS || now - doc.fetchedAtMs > EVIDENCE_FRESHNESS_MS) return null
+        let plcEntries: PlcLogEntry[] | null = null
+        if (did.startsWith("did:plc:")) {
+            try {
+                const body = await fetchPlcAuditLog(did, fetch)
+                const entries = parsePlcAuditLog(did, body)
+                if (entries) {
+                    plcEntries = entries
+                    const plcDocument = verifyPlcLog(did, entries)
+                    const current = [...entries].reverse().find((entry) => !entry.nullified)
+                    const methods = current?.operation.verificationMethods
+                    const key = methods && typeof methods === "object"
+                        ? (methods as Record<string, unknown>).atproto : undefined
+                    if (plcDocument && key === record.signingKey &&
+                        extractSigningMethodId(doc.document, did, record.signingKey) !== null &&
+                        Date.now() - started <= EVIDENCE_FRESHNESS_MS) {
+                        return { assurance: "custody-chain", authority: { method: "plc", operationCid: current!.cid } }
+                    }
+                }
+            } catch { /* A failed full-chain proof may use the separately checked current-key seed. */ }
+        }
+        if (!(await this.appViewConfirms(did, record, commitCid)) || Date.now() - started > EVIDENCE_FRESHNESS_MS) return null
+        if (did.startsWith("did:plc:")) {
+            // PLC current-key evidence names the verified fresh operation when available.
+            try {
+                const entries = plcEntries ?? parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
+                if (!entries) return null
+                const operationCid = verifyPlcCurrentKeyOperation(entries, record.signingKey)
+                if (!operationCid || extractSigningMethodId(doc.document, did, record.signingKey) === null ||
+                    Date.now() - started > EVIDENCE_FRESHNESS_MS) return null
+                return { assurance: "current-key-cross-check", authority: { method: "plc", operationCid } }
+            } catch { return null }
+        }
+        if (did.startsWith("did:web:")) {
+            const authority = await didWebAuthority(did, doc.document, record.signingKey)
+            return authority ? { assurance: "current-key-cross-check", authority } : null
+        }
+        return null
+    }
+
+    private async appViewConfirms(did: string, record: FetchedRecord, commitCid: string): Promise<boolean> {
+        const parsed = readRecordFromCar(record.car, this.env.MONITOR_COLLECTION, "self")
+        if (!parsed || parsed.did !== did || parsed.commitCid !== commitCid) return false
+        const origin = (this.env.APP_VIEW_URL || "https://public.api.bsky.app").replace(/\/$/, "")
+        const url = new URL(`${origin}/xrpc/com.atproto.repo.getRecord`)
+        if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false
+        url.searchParams.set("repo", did)
+        url.searchParams.set("collection", this.env.MONITOR_COLLECTION)
+        url.searchParams.set("rkey", "self")
+        const value = await guardedFetchJSON(url.href, fetch, { maxBytes: 64 * 1024, cache: "no-store" }) as { uri?: unknown; cid?: unknown }
+        return value.uri === `at://${did}/${this.env.MONITOR_COLLECTION}/self` && value.cid === parsed.cid
     }
 
     /**
@@ -4506,6 +4665,10 @@ export class MonitorIngest
                                 secondaries: monitorCollections(this.env),
                                 didDocuments: this,
                                 nowMs: () => Date.now(),
+                                archiveEvidence: async (did) => {
+                                    const entry = await kvSnapshotStore(this.env).getRecord(did)
+                                    if (entry?.evidence) await retainSnapshotEvidence(this, entry.evidence)
+                                },
                                 onSettled: (did, settled) => this.onSettled(did, settled),
                             },
                             this.envInt(this.env.INTEREST_BATCH, 64)
@@ -4538,6 +4701,14 @@ export class MonitorIngest
                 } catch (err) {
                     console.error("monitor: backfill sweep failed", err)
                 }
+            }
+            try {
+                await sweepEvidenceRefresh({
+                    index: this,
+                    limit: this.envInt(this.env.SETTLE_BATCH, 32),
+                })
+            } catch (err) {
+                console.error("monitor: evidence refresh sweep failed", err)
             }
             const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
             try {
@@ -4611,4 +4782,35 @@ export class MonitorIngest
             }
         }
     }
+}
+
+function normalizeMonitorHostname(value: string | undefined): string | null {
+    if (!value || value.includes(":") || value.includes("/") || value.includes("@")) return null
+    try {
+        const parsed = new URL(`https://${value}`)
+        if (parsed.port || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") return null
+        const hostname = parsed.hostname.replace(/\.$/, "").toLowerCase()
+        return hostname.length > 0 ? hostname : null
+    } catch { return null }
+}
+
+function extractSigningMethodId(document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] }, did: string, key: string): string | null {
+    const method = document.verificationMethod?.find((item) =>
+        (item.id === "#atproto" || item.id === `${did}#atproto`) && item.publicKeyMultibase === key
+    )
+    return method?.id ?? null
+}
+
+async function didWebAuthority(
+    did: string,
+    document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] },
+    key: string
+): Promise<import("@germ-network/atproto-pmr-core").EvidenceAuthorityIdentity | null> {
+    if (!did.startsWith("did:web:")) return null
+    const verificationMethodId = extractSigningMethodId(document, did, key)
+    if (!verificationMethodId) return null
+    const method = document.verificationMethod!.find((item) => item.id === verificationMethodId)!
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(method.publicKeyMultibase!))
+    const fingerprint = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+    return { method: "web", documentUrl: new URL(didWebDocumentURL(did)).href, verificationMethodId, keyFingerprint: `sha256:${fingerprint}` }
 }

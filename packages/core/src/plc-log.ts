@@ -182,6 +182,41 @@ export function verifyPlcLog(did: string, entries: readonly PlcLogEntry[]): DidD
 }
 
 /**
+ * Verify only the latest live operation's link to its immediately preceding
+ * operation and that it authorizes `signingKey`. This deliberately omits the
+ * genesis-to-head custody proof and is suitable only for the labelled
+ * current-key cross-check assurance mode.
+ */
+export function verifyPlcCurrentKeyOperation(
+    entries: readonly PlcLogEntry[],
+    signingKey: string
+): string | null {
+    let currentIndex = -1
+    for (let i = entries.length - 1; i >= 0; i--) {
+        if (!entries[i]!.nullified) { currentIndex = i; break }
+    }
+    if (currentIndex <= 0) return null
+    const current = entries[currentIndex]!
+    let priorIndex = currentIndex - 1
+    while (priorIndex >= 0 && entries[priorIndex]!.nullified) priorIndex--
+    if (priorIndex < 0) return null
+    const prior = entries[priorIndex]!
+    if (current.operation.type !== "plc_operation" ||
+        current.operation.prev !== prior.cid ||
+        operationCid(prior.operation) !== prior.cid ||
+        operationCid(current.operation) !== current.cid) return null
+    const methods = current.operation.verificationMethods
+    const atproto = isRecord(methods) ? methods.atproto : null
+    if (atproto !== `${DID_KEY_PREFIX}${signingKey}`) return null
+    try {
+        verifySignedBy(current, rotationKeysOf(prior.operation))
+        return current.cid
+    } catch {
+        return null
+    }
+}
+
+/**
  * `broken`: the log is not a valid chain (a trust violation). `unrenderable`:
  * it verifies, but its last operation is a state this module does not render
  * as a DID document, which says nothing against the log.

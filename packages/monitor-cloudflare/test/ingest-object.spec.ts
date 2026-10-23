@@ -2890,6 +2890,9 @@ describe("verifying a fetched record", () => {
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
             cid: repo.recordCids[`${COLLECTION}/self`],
+            commitCid: expect.any(String),
+            collection: COLLECTION,
+            rkey: "self",
         })
     })
 
@@ -2899,6 +2902,7 @@ describe("verifying a fetched record", () => {
             kind: "verified-absent",
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
+            commitCid: expect.any(String),
         })
     })
 

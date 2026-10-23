@@ -275,6 +275,7 @@ export {
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
+    didWebDocumentURL,
     fetchPlcAuditLog,
     pdsResolutionFromDocument,
     extractSigningKey,
@@ -438,6 +439,7 @@ export {
     appendPlcLogEntry,
     parsePlcAuditLog,
     PlcLogError,
+    verifyPlcCurrentKeyOperation,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,
@@ -482,6 +484,13 @@ export {
     type SummaryRecord,
     type SummaryRecordRef,
 } from "./summary"
+export type {
+    DeclarationEvidenceIdentity,
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
+    SummaryEvidence,
+} from "./summary-evidence-contract"
 export {
     CAN_MESSAGE_KEYS,
     canMessageFromCose,

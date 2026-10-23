@@ -17,7 +17,7 @@
  */
 
 import type { ListReposPage } from "./list-repos"
-import type { BackfillProgress, MonitorIndex } from "./storage"
+import type { BackfillProgress, EvidenceBackfillProgress, MonitorIndex } from "./storage"
 
 export interface BackfillDeps {
     index: MonitorIndex
@@ -65,4 +65,28 @@ export async function sweepBackfill(deps: BackfillDeps): Promise<SweepBackfillRe
     await deps.index.setBackfillProgress(next)
 
     return { discovered, done: next.done }
+}
+
+/** Force a fresh fetch/verification for each already-indexed declaration once. */
+export async function sweepEvidenceRefresh(deps: {
+    index: MonitorIndex
+    limit: number
+}): Promise<SweepBackfillResult> {
+    const { evidenceBackfillPage, readEvidenceBackfillProgress, setEvidenceBackfillProgress } =
+        deps.index
+    if (!evidenceBackfillPage || !readEvidenceBackfillProgress || !setEvidenceBackfillProgress) {
+        return { discovered: 0, done: true }
+    }
+    const progress: EvidenceBackfillProgress = await readEvidenceBackfillProgress()
+    if (progress.done) return { discovered: 0, done: true }
+
+    const page = await evidenceBackfillPage(progress.cursor, Math.max(1, deps.limit))
+    for (const record of page) await deps.index.owe(record.did, record.rev)
+
+    const next: EvidenceBackfillProgress =
+        page.length < Math.max(1, deps.limit)
+            ? { done: true }
+            : { done: false, cursor: page.at(-1)!.did }
+    await setEvidenceBackfillProgress(next)
+    return { discovered: page.length, done: next.done }
 }

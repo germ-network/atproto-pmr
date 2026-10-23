@@ -16,6 +16,7 @@ const index = (ownBlocks: SummaryIndex["ownBlocks"]): SummaryIndex => ({
     ownBlocks,
     records: [],
     verdicts: [],
+    evidenceSchema: 1,
 })
 const block = (did: string, rkey: string) => ({ did, rkey })
 const deps = {

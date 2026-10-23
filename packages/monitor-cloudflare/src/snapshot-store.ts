@@ -13,6 +13,7 @@ import type {
     SecondarySnapshotStore,
     SnapshotCheck,
     SnapshotEntry,
+    SnapshotEvidence,
     SnapshotStore,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
@@ -74,6 +75,7 @@ async function readEntry(
     if (value === null || metadata === null) return null
     return {
         rev: metadata.rev,
+        commitCid: metadata.commitCid ?? null,
         car: new Uint8Array(value),
         observedAtMs: metadata.observedAtMs,
         source: metadata.source,
@@ -81,6 +83,7 @@ async function readEntry(
         verifiedWith: metadata.verifiedWith ?? null,
         cid: metadata.cid ?? null,
         seenKey: metadata.seenKey ?? null,
+        evidence: metadata.evidence ?? null,
     }
 }
 
@@ -95,12 +98,14 @@ async function writeEntry(
     await env.records.put(key, entry.car, {
         metadata: {
             rev: entry.rev,
+            commitCid: entry.commitCid ?? null,
             observedAtMs: entry.observedAtMs,
             source: entry.source,
             signingKey: entry.signingKey,
             verifiedWith: entry.verifiedWith,
             cid: entry.cid,
             seenKey: entry.seenKey ?? null,
+            evidence: entry.evidence ?? null,
             ...(policies ? { policies } : {}),
         } satisfies StoredMeta,
     })
@@ -116,12 +121,14 @@ export const DIGEST_MARKER_KEY = "digest:marker"
 /** Stored beside the bytes so a reader knows what it holds without the index. */
 interface StoredMeta {
     rev: string
+    commitCid?: string | null
     observedAtMs: number
     source: string
     signingKey: string | null
     verifiedWith: string | null
     cid: string | null
     seenKey: string | null
+    evidence?: SnapshotEvidence | null
     /**
      * The declaration's decoded policies; absent on entries stored before
      * they were kept and on any entry ingest did not verify.
@@ -281,6 +288,8 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 // An entry stored before ingest verified carries an unsigned rev.
                 rev: verifiedWith === null ? null : metadata.rev,
                 cid: verifiedWith === null ? null : (metadata.cid ?? null),
+                commitCid: verifiedWith === null ? null : (metadata.commitCid ?? null),
+                evidence: metadata.evidence ?? null,
                 ...(metadata.policies ? { policies: metadata.policies } : {}),
             }
         },
@@ -328,7 +337,10 @@ export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorInge
                     ...ref,
                     cid,
                     verifiedWith,
+                    commitCid: metadata.commitCid ?? null,
+                    rev: metadata.rev ?? null,
                     freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+                    evidenceState: metadata.evidence ?? null,
                     ...(metadata.policies ? { policies: metadata.policies } : {}),
                 }
             })

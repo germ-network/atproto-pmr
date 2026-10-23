@@ -50,6 +50,8 @@ export interface VerifiedRecord {
     record: unknown
     /** The signed commit's `rev`. */
     rev: string
+    /** CID of the signed repository commit that contains this record. */
+    commitCid: string
 }
 
 /**
@@ -58,7 +60,7 @@ export interface VerifiedRecord {
  */
 export type RecordProofOutcome =
     | ({ kind: "present" } & VerifiedRecord)
-    | { kind: "absent"; rev: string }
+    | { kind: "absent"; rev: string; commitCid: string }
 
 /**
  * Like `verifyRecordProof`, but a valid absence is a result carrying the
@@ -72,8 +74,14 @@ export function verifyRecordProofOutcome(
     const parsed = parseProof(car, expected.did)
     verifyCommitSignature(parsed.commit, expected.signingKey)
     const found = findRecord(parsed, expected.collection, expected.rkey)
-    if (!found) return { kind: "absent", rev: parsed.commit.rev }
-    return { kind: "present", cid: found.cid, record: found.record, rev: parsed.commit.rev }
+    if (!found) return { kind: "absent", rev: parsed.commit.rev, commitCid: parsed.commitCid }
+    return {
+        kind: "present",
+        cid: found.cid,
+        record: found.record,
+        rev: parsed.commit.rev,
+        commitCid: parsed.commitCid,
+    }
 }
 
 /**
@@ -88,7 +96,7 @@ export function verifyRecordProof(
     verifyCommitSignature(parsed.commit, expect.signingKey)
     const found = findRecord(parsed, expect.collection, expect.rkey)
     if (!found) throw new RepoProofError("record-absent", "no record at path")
-    return { cid: found.cid, record: found.record, rev: parsed.commit.rev }
+    return { cid: found.cid, record: found.record, rev: parsed.commit.rev, commitCid: parsed.commitCid }
 }
 
 export interface CarRecord {
@@ -97,6 +105,8 @@ export interface CarRecord {
     rev: string
     /** The commit's `did` field. */
     did: string
+    /** CID of the signed repository commit that contains this record. */
+    commitCid: string
 }
 
 /**
@@ -121,6 +131,7 @@ export function readRecordFromCar(
         record: found.record,
         rev: parsed.commit.rev,
         did: parsed.commit.did,
+        commitCid: parsed.commitCid,
     }
 }
 
@@ -253,6 +264,7 @@ export interface Commit {
 interface ParsedProof {
     blocks: Map<string, Uint8Array>
     commit: Commit
+    commitCid: string
 }
 
 function parseProof(car: Uint8Array, expectedDID: string | null): ParsedProof {
@@ -313,7 +325,7 @@ function parseProof(car: Uint8Array, expectedDID: string | null): ParsedProof {
     if (expectedDID !== null && commit.did !== expectedDID) {
         throw new RepoProofError("did-mismatch", "commit is for a different DID")
     }
-    return { blocks, commit }
+    return { blocks, commit, commitCid: cidToString(root.bytes) }
 }
 
 export function parseCommit(bytes: Uint8Array): Commit {

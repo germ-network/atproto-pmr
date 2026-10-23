@@ -84,6 +84,7 @@ const STORAGE_BATCH = 128
 interface SummaryHeader {
     owner: string
     more?: boolean
+    evidenceSchema?: number
     parts: number
 }
 
@@ -475,6 +476,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                     {
                         owner: index.owner,
                         ...(index.more ? { more: true } : {}),
+                        ...(index.evidenceSchema === undefined ? {} : { evidenceSchema: index.evidenceSchema }),
                         parts: parts.length,
                     } satisfies SummaryHeader,
                 ],
@@ -507,6 +509,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             records: [],
             verdicts: [],
             ...(header.more ? { more: true } : {}),
+            ...(header.evidenceSchema === undefined ? {} : { evidenceSchema: header.evidenceSchema }),
         }
         const keys = summaryPartKeys(token, 0, header.parts)
         for (const batch of chunk(keys, STORAGE_BATCH)) {

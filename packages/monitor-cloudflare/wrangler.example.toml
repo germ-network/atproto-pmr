@@ -19,6 +19,10 @@ new_sqlite_classes = ["MonitorIngest"]
 [vars]
 # The collection carrying the published key.
 MONITOR_COLLECTION = "com.germnetwork.declaration"
+# Stable logical identity used in evidence records. Lowercase IDNA hostname, without a port.
+MONITOR_HOSTNAME = "monitor.example.org"
+# AppView used to independently confirm a PDS-fetched declaration CID.
+APP_VIEW_URL = "https://public.api.bsky.app"
 
 # Who the monitor keeps records for. `registered` (the default) is registered
 # users plus the DIDs they follow, and needs the `pmrDirectory` binding below;

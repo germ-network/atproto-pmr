@@ -228,12 +228,16 @@ const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey")
     ...refOf(did, rkey),
     cid,
     verifiedWith,
+    commitCid: null,
+    rev: null,
+    evidenceState: null,
 })
 const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): SummaryIndex => ({
     owner: OWNER,
     ownBlocks: [],
     records,
     verdicts: [],
+    evidenceSchema: 1,
     ...(more ? { more } : {}),
 })
 

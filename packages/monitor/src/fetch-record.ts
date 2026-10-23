@@ -133,6 +133,7 @@ export async function fetchRecordCar(
     options: FetchRecordOptions
 ): Promise<FetchedRecord> {
     const fetchImpl = options.fetchImpl ?? fetch
+    const attemptStartedAtMs = (options.nowMs ?? Date.now)()
     const fetchedAtMs = (options.nowMs ?? Date.now)()
     const document = await fetchDidDocument(did, fetchImpl)
     const { endpoint: pds, signingKey } = pdsResolutionFromDocument(document)
@@ -151,6 +152,7 @@ export async function fetchRecordCar(
         source: pds,
         signingKey,
         didDocument: { document: document as unknown as DidDocument, fetchedAtMs },
+        attemptStartedAtMs,
     }
 }
 

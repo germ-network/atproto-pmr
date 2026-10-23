@@ -11,7 +11,7 @@ import { DECLARATION_COLLECTION_NSID } from "../../src/declaration"
 import type { RecipientGraphFacts, StoredPolicies } from "../../src/can-message"
 import type { PlcCoverage } from "../../src/did-document"
 import type { FirehoseCoverage } from "../../src/firehose-coverage"
-import { buildRepoCar, makeKey } from "./repo-car"
+import { buildRepoCar, cidString, makeKey } from "./repo-car"
 
 /** An in-memory owner summary endpoint: stores, a monitor and a signed-request client. */
 export const COLLECTION = "app.example.thing"
@@ -113,6 +113,7 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
                 freshAtMs: 0,
                 verifiedWith: key.multikey,
                 rev: "3kaaaaaaaaaaa",
+                commitCid: cidString(repo.root),
                 cid: repo.recordCids[`${collection}/${rkey}`]!,
             }
         },
@@ -144,6 +145,9 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
                           ...r,
                           cid: repo.recordCids[`${r.collection}/${r.rkey}`]!,
                           verifiedWith: key.multikey,
+                          commitCid: cidString(repo.root),
+                          rev: "3kaaaaaaaaaaa",
+                          evidenceState: null,
                           freshAtMs: T0 * 1000,
                           ...(r.collection === DECLARATION_COLLECTION_NSID && declared.has(r.did)
                               ? { policies: declared.get(r.did)! }

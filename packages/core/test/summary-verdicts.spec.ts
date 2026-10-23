@@ -114,7 +114,7 @@ describe("summary verdicts", () => {
             { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
         ])
 
-        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: false }] }
+        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: false }], evidenceSchema: 1 }
         // Same verdict, fields in another order: equal on the wire.
         const same = { ...held, verdicts: [{ did: PEER, verdict: { via: ["open"], verdict: "yes" } as const, mutual: false }] }
         const { page } = await readSummaryPage(held, same, w.deps, 10)

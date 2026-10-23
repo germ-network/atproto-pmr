@@ -26,6 +26,7 @@ import { indexPolicySource, SUMMARY_VERDICT_KEYS, type SummaryVerdict } from "./
 import type { StoredPolicies } from "./policy.js"
 import type { SummaryCoverageDeps } from "./firehose-coverage.js"
 import type { WatchedRecord } from "./watched.js"
+import type { SnapshotEvidence, SummaryEvidence } from "./summary-evidence-contract.js"
 
 export interface SummaryRecordRef {
     did: string
@@ -41,6 +42,11 @@ export interface SummaryIndexEntry extends SummaryRecordRef {
      * under a rotated key keeps its CID but must still reach the device.
      */
     verifiedWith: string
+    /** Signed repository commit CID/rev paired with this declaration record. */
+    commitCid?: string | null
+    rev?: string | null
+    /** Stable stored evidence state used for token diffs; never emitted as an absolute time. */
+    evidenceState?: SnapshotEvidence | null
 }
 
 /** Enough of a summary to diff against: the owner, their blocks and each record's state. */
@@ -59,13 +65,23 @@ export interface SummaryIndex {
      * mutual bits has no `mutual`, and is re-sent once.
      */
     verdicts: SummaryVerdict[]
+    /** Missing on old token baselines, which forces a fresh full read. */
+    evidenceSchema?: number
     /** Delivered by a page that left more: a client holding it is mid-sync. */
     more?: boolean
 }
 
-export interface SummaryRecord extends SummaryIndexEntry {
+export interface SummaryRecord extends Omit<SummaryIndexEntry, "evidenceState" | "commitCid" | "rev"> {
     /** The held proof CAR, byte for byte. */
     car: Uint8Array
+    /** Render-time age/TTL durations only; explicit null means unavailable. */
+    evidence: SummaryEvidence | null
+}
+
+type ReadSummaryRecord = SummaryRecord & {
+    commitCid?: string | null
+    rev?: string | null
+    evidenceState?: SnapshotEvidence | null
 }
 
 export interface SummaryDelta {
@@ -138,6 +154,7 @@ export const SUMMARY_PAGE_RECORDS = 300
 /** A held, ingest-verified record's index entry, read without its CAR. */
 export interface SummaryHeldEntry extends SummaryIndexEntry {
     freshAtMs: number
+    evidenceState?: SnapshotEvidence | null
     /**
      * A declaration's stored policies; absent on other records and on a
      * declaration stored before they were kept. Dropped before an entry
@@ -182,7 +199,26 @@ export interface SummaryPageDeps extends SummaryCoverageDeps {
      * over a day behind, an operational alarm. Never a re-check request.
      */
     onLapse: (did: string) => void
+    /** Requests an immediate source recheck when this process detects a wall-clock jump. */
+    onClockDiscontinuity?: (did: string) => void
     nowMs: () => number
+}
+
+let lastClockSample: { wallMs: number; monotonicMs: number } | null = null
+let wallClockSuspect = false
+const CLOCK_DISCONTINUITY_THRESHOLD_MS = 5_000
+
+function observeWallClock(wallMs: number): boolean {
+    const monotonicMs = performance.now()
+    if (lastClockSample !== null) {
+        const wallElapsed = wallMs - lastClockSample.wallMs
+        const monotonicElapsed = monotonicMs - lastClockSample.monotonicMs
+        if (Math.abs(wallElapsed - monotonicElapsed) > CLOCK_DISCONTINUITY_THRESHOLD_MS) {
+            wallClockSuspect = true
+        }
+    }
+    lastClockSample = { wallMs, monotonicMs }
+    return !wallClockSuspect
 }
 
 /**
@@ -260,6 +296,7 @@ export async function buildSummaryIndex(
     const heldDids = [...new Set(held.flatMap((e) => (e === null ? [] : [e.did])))]
     const keys = heldDids.length === 0 ? new Map() : await deps.signingKeys.keysFor(heldDids)
     const now = deps.nowMs()
+    const clockReliable = observeWallClock(now)
     const lapsed = new Set<string>()
     const records: SummaryIndexEntry[] = []
     const servable: SummaryHeldEntry[] = []
@@ -275,6 +312,9 @@ export async function buildSummaryIndex(
             lapsed.add(entry.did)
         }
         servable.push(entry)
+        if (!clockReliable && entry.collection === DECLARATION_COLLECTION_NSID && entry.rkey === "self") {
+            deps.onClockDiscontinuity?.(entry.did)
+        }
         const { freshAtMs: _freshAtMs, policies: _policies, ...indexed } = entry
         records.push(indexed)
     }
@@ -295,7 +335,7 @@ export async function buildSummaryIndex(
     }
     const behind = new Set(laggingDids)
     const lagging = dids.filter((d) => d !== did && behind.has(d)).sort(compareStrings)
-    return { index: { owner: did, ownBlocks, records, verdicts }, truncated, lagging }
+    return { index: { owner: did, ownBlocks, records, verdicts, evidenceSchema: 1 }, truncated, lagging }
 }
 
 /**
@@ -311,7 +351,7 @@ export async function buildSummaryIndex(
 export async function readSummaryPage(
     base: SummaryIndex | null,
     current: SummaryIndex,
-    deps: Pick<SummaryPageDeps, "records" | "signingKeys">,
+    deps: Pick<SummaryPageDeps, "records" | "signingKeys"> & Partial<Pick<SummaryPageDeps, "nowMs">>,
     limit: number
 ): Promise<{
     delivered: SummaryIndex
@@ -332,10 +372,11 @@ export async function readSummaryPage(
             : await deps.signingKeys.keysFor([...new Set(batch.map((e) => e.did))])
     const reads = await Promise.all(
         batch.map((entry) =>
-            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" })
+            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" }, deps.nowMs?.() ?? Date.now())
         )
     )
-    const records = reads.filter((r): r is SummaryRecord => r !== null)
+    const readRecords = reads.filter((r): r is ReadSummaryRecord => r !== null)
+    const records = readRecords.map(({ evidenceState: _evidenceState, commitCid: _commitCid, rev: _rev, ...record }) => record)
     const dropped = batch
         .filter((_, i) => reads[i] === null)
         .map(({ did, collection, rkey }) => ({ did, collection, rkey }))
@@ -345,12 +386,13 @@ export async function readSummaryPage(
     // A drop is a removal only for a record the client holds.
     const removed = [...diff.removed, ...dropped.filter((r) => kept.has(refKey(r)))]
     for (const gone of removed) kept.delete(refKey(gone))
-    for (const { car: _car, ...entry } of records) kept.set(refKey(entry), entry)
+    for (const { car: _car, evidence: _evidence, ...entry } of readRecords) kept.set(refKey(entry), entry)
     const delivered: SummaryIndex = {
         owner: current.owner,
         ownBlocks: current.ownBlocks,
         records: [...kept.values()].sort(compareRefs),
         verdicts: current.verdicts,
+        evidenceSchema: 1,
         ...(more ? { more: true } : {}),
     }
     return {
@@ -375,30 +417,60 @@ export async function readSummaryPage(
  * without its verified `rev` and `cid`.
  */
 async function readSummaryRecord(
-    ref: SummaryRecordRef,
+    ref: SummaryIndexEntry,
     store: RecordSnapshotStore,
-    key: ReadSigningKey
-): Promise<SummaryRecord | null> {
+    key: ReadSigningKey,
+    now: number
+): Promise<ReadSummaryRecord | null> {
     const snapshot = await store.get(ref.did, ref.collection, ref.rkey)
     if (!snapshot || snapshot.verifiedWith === null) return null
     if (!servableUnderRotation(snapshot.verifiedWith, key)) return null
-    let cid = snapshot.rev !== null ? snapshot.cid : null
-    if (cid === null) {
-        let parsed
+    const state = ref.collection === DECLARATION_COLLECTION_NSID && ref.rkey === "self"
+        ? snapshot.evidence ?? null
+        : null
+    let parsed: ReturnType<typeof readRecordFromCar> | null = null
+    // A persisted evidence binding must be checked against the exact CAR. For
+    // legacy/unavailable evidence, preserve the established fast path: ingest
+    // already verified the held snapshot and its indexed CID/rev.
+    if (state !== null || snapshot.cid === null || snapshot.rev === null) {
         try {
             parsed = readRecordFromCar(snapshot.car, ref.collection, ref.rkey)
         } catch {
             return null
         }
         if (!parsed || parsed.did !== ref.did) return null
-        cid = parsed.cid
     }
+    const cid = snapshot.cid ?? parsed!.cid
+    if (parsed && (cid !== parsed.cid || (snapshot.rev !== null && snapshot.rev !== parsed.rev))) return null
+    const validState = state && state.did === ref.did && state.collection === ref.collection &&
+        parsed !== null && state.rkey === ref.rkey && state.recordCid === cid && state.commitCid === parsed.commitCid &&
+        state.rev === parsed.rev && state.verifiedWith === snapshot.verifiedWith &&
+        state.commitCid === (snapshot.commitCid ?? null) ? state : null
+    const clockReliable = observeWallClock(now)
+    const age = (anchor: number): number | null => {
+        const elapsed = now - anchor
+        return clockReliable && Number.isSafeInteger(anchor) && Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : null
+    }
+    const evidence: SummaryEvidence | null = validState ? {
+        commitCid: validState.commitCid,
+        rev: validState.rev,
+        authority: validState.authority,
+        assurance: validState.assurance,
+        monitor: validState.monitor,
+        commitAgeMs: age(validState.commitFirstObservedAtMs),
+        anchorAgeMs: age(validState.anchorFirstObservedAtMs),
+        remainingTtlMs: age(snapshot.freshAtMs) === null ? null : Math.max(0, SNAPSHOT_MAX_AGE_MS - age(snapshot.freshAtMs)!),
+    } : null
     return {
         did: ref.did,
         collection: ref.collection,
         rkey: ref.rkey,
         cid,
         verifiedWith: snapshot.verifiedWith,
+        commitCid: validState ? validState.commitCid : ref.commitCid,
+        rev: validState ? validState.rev : ref.rev,
+        evidenceState: validState,
+        evidence,
         car: snapshot.car,
     }
 }
@@ -435,7 +507,7 @@ export function diffSummaryIndex(
     verdicts: SummaryVerdict[]
     droppedVerdicts: string[]
 } {
-    if (!base) {
+    if (!base || base.evidenceSchema !== 1) {
         return {
             full: true,
             blocksChanged: true,
@@ -466,7 +538,10 @@ export function diffSummaryIndex(
             ),
         changed: current.records.filter((e) => {
             const prior = before.get(refKey(e))
-            return !prior || prior.cid !== e.cid || prior.verifiedWith !== e.verifiedWith
+            return !prior || prior.cid !== e.cid || prior.verifiedWith !== e.verifiedWith ||
+                JSON.stringify(prior.evidenceState ?? null) !== JSON.stringify(e.evidenceState ?? null) ||
+                (prior.commitCid ?? null) !== (e.commitCid ?? null) ||
+                (prior.rev ?? null) !== (e.rev ?? null)
         }),
         removed: base.records
             .filter((e) => !after.has(refKey(e)))
@@ -494,6 +569,44 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 type FieldsOf<T> = T extends unknown ? keyof T : never
 type WireKeys<T> = { readonly [K in FieldsOf<T>]: string }
 
+function decodeSummaryEvidence(value: CoseValue | undefined): SummaryEvidence | null {
+    if (value === undefined || value === null) return null
+    if (!(value instanceof Map)) throw new Error("summary: malformed evidence")
+    const get = (key: string) => value.get(key)
+    const str = (key: string): string => {
+        const item = get(key)
+        if (typeof item !== "string") throw new Error("summary: malformed evidence")
+        return item
+    }
+    const duration = (key: string): number | null => {
+        const item = get(key)
+        if (item === null) return null
+        if (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0) throw new Error("summary: malformed evidence duration")
+        return item
+    }
+    const rawAuthority = get(SUMMARY_EVIDENCE_KEYS.authority)
+    if (!(rawAuthority instanceof Map)) throw new Error("summary: malformed authority")
+    const method = rawAuthority.get("m")
+    const authority = method === "p"
+        ? { method: "plc" as const, operationCid: String(rawAuthority.get("o") ?? "") }
+        : method === "w"
+            ? { method: "web" as const, documentUrl: String(rawAuthority.get("u") ?? ""), verificationMethodId: String(rawAuthority.get("i") ?? ""), keyFingerprint: String(rawAuthority.get("f") ?? "") }
+            : null
+    if (!authority || Object.values(authority).some((item) => item.length === 0)) throw new Error("summary: malformed authority")
+    const assurance = str(SUMMARY_EVIDENCE_KEYS.assurance)
+    if (assurance !== "custody-chain" && assurance !== "current-key-cross-check") throw new Error("summary: malformed assurance")
+    return {
+        commitCid: str(SUMMARY_EVIDENCE_KEYS.commitCid),
+        rev: str(SUMMARY_EVIDENCE_KEYS.rev),
+        authority,
+        assurance,
+        monitor: str(SUMMARY_EVIDENCE_KEYS.monitor),
+        commitAgeMs: duration(SUMMARY_EVIDENCE_KEYS.commitAgeMs),
+        anchorAgeMs: duration(SUMMARY_EVIDENCE_KEYS.anchorAgeMs),
+        remainingTtlMs: duration(SUMMARY_EVIDENCE_KEYS.remainingTtlMs),
+    }
+}
+
 export const SUMMARY_DELTA_KEYS = {
     token: "t",
     full: "f",
@@ -515,7 +628,10 @@ export const SUMMARY_RECORD_KEYS = {
     cid: "i",
     verifiedWith: "v",
     car: "b",
+    evidence: "e",
 } as const satisfies WireKeys<SummaryRecord>
+
+const SUMMARY_EVIDENCE_KEYS = { commitCid: "c", rev: "r", authority: "a", assurance: "s", monitor: "m", commitAgeMs: "g", anchorAgeMs: "h", remainingTtlMs: "t" } as const
 
 export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
     const R = SUMMARY_RECORD_KEYS
@@ -548,6 +664,18 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
                     m.set(R.cid, r.cid)
                     m.set(R.verifiedWith, r.verifiedWith)
                     m.set(R.car, r.car)
+                    m.set(R.evidence, r.evidence == null ? null : new Map<string, CoseValue>([
+                        [SUMMARY_EVIDENCE_KEYS.commitCid, r.evidence.commitCid],
+                        [SUMMARY_EVIDENCE_KEYS.rev, r.evidence.rev],
+                        [SUMMARY_EVIDENCE_KEYS.authority, r.evidence.authority.method === "plc"
+                            ? new Map<string, CoseValue>([["m", "p"], ["o", r.evidence.authority.operationCid]])
+                            : new Map<string, CoseValue>([["m", "w"], ["u", r.evidence.authority.documentUrl], ["i", r.evidence.authority.verificationMethodId], ["f", r.evidence.authority.keyFingerprint]])],
+                        [SUMMARY_EVIDENCE_KEYS.assurance, r.evidence.assurance],
+                        [SUMMARY_EVIDENCE_KEYS.monitor, r.evidence.monitor],
+                        [SUMMARY_EVIDENCE_KEYS.commitAgeMs, r.evidence.commitAgeMs],
+                        [SUMMARY_EVIDENCE_KEYS.anchorAgeMs, r.evidence.anchorAgeMs],
+                        [SUMMARY_EVIDENCE_KEYS.remainingTtlMs, r.evidence.remainingTtlMs],
+                    ]))
                     return m
                 }),
             ],
@@ -641,6 +769,7 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
                 cid: str(m, R.cid),
                 verifiedWith: str(m, R.verifiedWith),
                 car,
+                evidence: decodeSummaryEvidence(m.get(R.evidence)),
             }
         }),
         removed: items(D.removed).map(refOf),
