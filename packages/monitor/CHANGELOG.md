@@ -1,8 +1,8 @@
 # @germ-network/atproto-pmr-monitor
 
-## 0.1.12
+## 0.2.0
 
-### Patch Changes
+### Minor Changes
 
 - [#87](https://github.com/germ-network/atproto-pmr/pull/87) [`4433633`](https://github.com/germ-network/atproto-pmr/commit/44336337b57fd4c6a760767158aca33880029c35) Thanks [@germ-mark](https://github.com/germ-mark)! - Add monitor evidence for declaration summaries. Evidence binds retained observation ages and a remaining recheck TTL to the exact declaration record, signed repository commit, verified key authority, assurance mode, and monitor hostname. Full custody-chain evidence is preferred; a fresh current-key/AppView/PDS cross-check is an explicitly weaker seed path. Summary records use compact CBOR durations, and legacy or unprovable evidence is explicitly unavailable.
 
