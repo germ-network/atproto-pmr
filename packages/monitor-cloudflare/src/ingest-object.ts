@@ -25,9 +25,9 @@ import {
     settleSecondaryDue,
     sweepBackfill,
     sweepEvidenceRefresh,
-    retainSnapshotEvidence,
     windowOf,
     type BackfillProgress,
+    type EvidenceAnchorRow,
     type EvidenceBackfillProgress,
     type DidDocumentSink,
     type Cursor,
@@ -122,6 +122,7 @@ import {
     guardedFetchJSON,
     parsePlcAuditLog,
     pdsResolutionFromDocument,
+    PlcLogError,
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyPlcLog,
@@ -130,6 +131,8 @@ import {
     verifyRepoCollections,
     type BlockEdge,
     type DidDocument,
+    type EvidenceAssurance,
+    type EvidenceAuthorityIdentity,
     type InterestPolicy,
     type MonitorRegistrationNotify,
     type MonitorOwnBlocksRequest,
@@ -193,6 +196,8 @@ const CONNECT_TIMEOUT_MS = 5_000
 const DID_DOCUMENT_PUBLISH_BATCH = 64
 const PLC_LOG_PUBLISH_BATCH = 64
 const EVIDENCE_FRESHNESS_MS = 30_000
+/** Distinct authority-and-key anchors kept per DID for reuse when one reappears. */
+const EVIDENCE_ANCHOR_HISTORY = 16
 
 type PublishRow = {
     did: string
@@ -399,6 +404,8 @@ export class MonitorIngest
     /** The cursor this connection resumed from, until its first timed frame has been checked. */
     private resumeFromUs: number | null = null
     private drainAgain = false
+    /** The evidence sweep finished, so later alarms skip even its progress read. */
+    private evidenceRefreshDone = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -461,6 +468,8 @@ export class MonitorIngest
                 );
                 CREATE TABLE IF NOT EXISTS evidence_anchors (
                     identity TEXT PRIMARY KEY,
+                    did TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')),
                     first_observed_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS holder_state (
@@ -649,6 +658,45 @@ export class MonitorIngest
             ) {
                 this.db.sql.exec("ALTER TABLE edge_ops ADD COLUMN collection TEXT NOT NULL DEFAULT 'follow'")
             }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('evidence_anchors') WHERE name = 'did'")
+                    .toArray().length === 0
+            ) {
+                // Rows from before anchors were kept per DID carry their DID
+                // and kind in the identity JSON (`["commit", {did, ...}]` or
+                // `["anchor", did, key, authority]`), so they move across in
+                // place: a held snapshot's evidence keeps its rows, which
+                // the unchanged skip in `retainSnapshotEvidence` relies on.
+                // Each DID's superseded commit rows go as the store would
+                // have pruned them; its anchor rows are pruned on its next
+                // retain. No await separates these writes.
+                this.db.sql.exec("ALTER TABLE evidence_anchors RENAME TO evidence_anchors_unkeyed")
+                this.db.sql.exec(
+                    "CREATE TABLE evidence_anchors (identity TEXT PRIMARY KEY, did TEXT NOT NULL, " +
+                        "kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')), first_observed_at INTEGER NOT NULL)"
+                )
+                this.db.sql.exec(
+                    "INSERT INTO evidence_anchors (identity, did, kind, first_observed_at) " +
+                        "SELECT identity, did, kind, first_observed_at FROM (" +
+                        "SELECT identity, first_observed_at, json_extract(identity, '$[0]') AS kind, " +
+                        "CASE json_extract(identity, '$[0]') " +
+                        "WHEN 'commit' THEN json_extract(identity, '$[1].did') " +
+                        "ELSE json_extract(identity, '$[1]') END AS did " +
+                        "FROM evidence_anchors_unkeyed WHERE json_valid(identity)) " +
+                        "WHERE kind IN ('commit', 'anchor') AND typeof(did) = 'text'"
+                )
+                this.db.sql.exec("DROP TABLE evidence_anchors_unkeyed")
+                this.db.sql.exec(
+                    "DELETE FROM evidence_anchors WHERE kind = 'commit' AND identity NOT IN (" +
+                        "SELECT identity FROM (SELECT identity, ROW_NUMBER() OVER (" +
+                        "PARTITION BY did ORDER BY first_observed_at DESC, identity) AS n " +
+                        "FROM evidence_anchors WHERE kind = 'commit') WHERE n = 1)"
+                )
+            }
+            this.db.sql.exec(
+                "CREATE INDEX IF NOT EXISTS evidence_anchors_by_did ON evidence_anchors (did, kind, first_observed_at)"
+            )
             for (const column of [
                 "attempts",
                 "not_before",
@@ -1665,20 +1713,41 @@ export class MonitorIngest
         return row?.first_observed_at ?? null
     }
 
-    async retainEvidenceAnchor(identity: string, observedAtMs: number): Promise<number> {
-        return this.ctx.storage.transactionSync(() => {
-            this.db.sql.exec(
-                "INSERT OR IGNORE INTO evidence_anchors (identity, first_observed_at) VALUES (?, ?)",
-                identity,
-                observedAtMs
-            )
-            const row = this.db.sql
-                .exec<{ first_observed_at: number }>(
-                    "SELECT first_observed_at FROM evidence_anchors WHERE identity = ?",
-                    identity
+    /**
+     * The DID's other commit rows go: only the newest commit can reappear.
+     * Anchor rows stay, since an authority and key can come back (a PLC
+     * fork restoring an operation, a did:web key rotated back), but only the
+     * newest `EVIDENCE_ANCHOR_HISTORY` of them; one dropped only reads
+     * younger.
+     */
+    async retainEvidenceAnchors(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            for (const row of rows) {
+                this.db.sql.exec(
+                    "INSERT OR IGNORE INTO evidence_anchors (identity, did, kind, first_observed_at) VALUES (?, ?, ?, ?)",
+                    row.identity,
+                    did,
+                    row.kind,
+                    row.firstObservedAtMs
                 )
-                .toArray()[0]
-            return row?.first_observed_at ?? observedAtMs
+            }
+            const commit = rows.find((row) => row.kind === "commit")
+            if (commit !== undefined) {
+                this.db.sql.exec(
+                    "DELETE FROM evidence_anchors WHERE did = ? AND kind = 'commit' AND identity <> ?",
+                    did,
+                    commit.identity
+                )
+            }
+            const anchor = rows.find((row) => row.kind === "anchor")
+            this.db.sql.exec(
+                "DELETE FROM evidence_anchors WHERE did = ?1 AND kind = 'anchor' AND identity IS NOT ?2 " +
+                    "AND identity NOT IN (SELECT identity FROM evidence_anchors WHERE did = ?1 " +
+                    "AND kind = 'anchor' ORDER BY (identity = ?2) DESC, first_observed_at DESC, identity LIMIT ?3)",
+                did,
+                anchor?.identity ?? null,
+                EVIDENCE_ANCHOR_HISTORY
+            )
         })
     }
 
@@ -1724,6 +1793,18 @@ export class MonitorIngest
             "INSERT INTO meta (k, v) VALUES ('evidence_backfill', ?) " +
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             JSON.stringify(progress)
+        )
+    }
+
+    /** `owe` for the evidence sweep, where a row already owed is left as it is. */
+    async oweEvidenceRefresh(did: string, rev: string): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
+                "VALUES (?, ?, 0, 0, ?, NULL, ?) ON CONFLICT(did) DO NOTHING",
+            did,
+            rev,
+            this.nextOweGen(),
+            Date.now()
         )
     }
 
@@ -2550,7 +2631,7 @@ export class MonitorIngest
 
     async forgetLeft(did: string): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            for (const table of ["records", "rec_pending", "checks", "refresh_requests"]) {
+            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
             this.dropPlcLogSync(did)
@@ -3751,99 +3832,121 @@ export class MonitorIngest
         if (record.signingKey === null) {
             return { kind: "unverifiable", reason: "no #atproto signing key" }
         }
+        let outcome: ReturnType<typeof verifyRecordProofOutcome>
         try {
-            const outcome = verifyRecordProofOutcome(record.car, {
+            outcome = verifyRecordProofOutcome(record.car, {
                 did: ref.did,
                 signingKey: record.signingKey,
                 collection: ref.collection,
                 rkey: ref.rkey,
             })
-            if (outcome.kind === "absent") {
-                return { kind: "verified-absent", key: record.signingKey, rev: outcome.rev, commitCid: outcome.commitCid }
-            }
-            const base: VerifyOutcome = {
-                kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
-                commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
-            }
-            if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
-            const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)
-            // Evidence enrichment is optional. A valid PDS proof remains a
-            // servable declaration when external corroboration or monitor
-            // provenance is unavailable; the summary then reports evidence
-            // as explicitly unavailable.
-            if (!monitor) return base
-            const evidence = await this.declarationEvidence(ref.did, record, outcome.commitCid, monitor)
-            return evidence ? { ...base, ...evidence, monitor } : base
         } catch (err) {
             if (err instanceof RepoProofError) {
                 return { kind: "unverifiable", reason: err.message }
             }
-            return { kind: "unverifiable", reason: err instanceof Error ? err.message : "evidence verification failed" }
+            throw err
         }
+        if (outcome.kind === "absent") {
+            return { kind: "verified-absent", key: record.signingKey, rev: outcome.rev, commitCid: outcome.commitCid }
+        }
+        const base: VerifyOutcome = {
+            kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
+            commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
+        }
+        if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
+        const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)
+        // Evidence enrichment is optional. A valid PDS proof remains a
+        // servable declaration when external corroboration or monitor
+        // provenance is unavailable, whatever the reason, so nothing here
+        // may turn it unverifiable; the summary then reports evidence as
+        // explicitly unavailable.
+        if (!monitor) return base
+        let evidence: DeclarationEvidence
+        try {
+            evidence = await this.declarationEvidence(ref.did, record, record.signingKey, outcome.commitCid)
+        } catch (err) {
+            evidence = { kind: "unavailable", reason: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }
+        }
+        if (evidence.kind === "unavailable") {
+            console.warn("monitor: declaration evidence unavailable", { did: ref.did, reason: evidence.reason })
+            return base
+        }
+        return { ...base, assurance: evidence.assurance, authority: evidence.authority, monitor }
     }
 
     private async declarationEvidence(
         did: string,
         record: FetchedRecord,
-        commitCid: string,
-        monitor: string
-    ): Promise<{ authority: import("@germ-network/atproto-pmr-core").EvidenceAuthorityIdentity; assurance: import("@germ-network/atproto-pmr-core").EvidenceAssurance } | null> {
-        if (record.signingKey === null) return null
+        signingKey: string,
+        commitCid: string
+    ): Promise<DeclarationEvidence> {
         const started = record.attemptStartedAtMs
         const doc = record.didDocument
-        if (started === undefined || !doc || doc.document.id !== did || doc.fetchedAtMs < started - EVIDENCE_FRESHNESS_MS) return null
+        if (started === undefined) return unavailable("no fetch attempt start")
+        if (!doc) return unavailable("no fetched DID document")
+        if (doc.document.id !== did) return unavailable("DID document for another DID")
         const now = Date.now()
-        if (now < started || now - started > EVIDENCE_FRESHNESS_MS || now - doc.fetchedAtMs > EVIDENCE_FRESHNESS_MS) return null
+        if (doc.fetchedAtMs < started - EVIDENCE_FRESHNESS_MS || now - doc.fetchedAtMs > EVIDENCE_FRESHNESS_MS) {
+            return unavailable("stale DID document")
+        }
+        if (now < started || now - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
         let plcEntries: PlcLogEntry[] | null = null
         if (did.startsWith("did:plc:")) {
             try {
-                const body = await fetchPlcAuditLog(did, fetch)
-                const entries = parsePlcAuditLog(did, body)
+                const entries = parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
                 if (entries) {
                     plcEntries = entries
-                    const plcDocument = verifyPlcLog(did, entries)
-                    const current = [...entries].reverse().find((entry) => !entry.nullified)
-                    const methods = current?.operation.verificationMethods
-                    const key = methods && typeof methods === "object"
-                        ? (methods as Record<string, unknown>).atproto : undefined
-                    if (plcDocument && key === record.signingKey &&
-                        extractSigningMethodId(doc.document, did, record.signingKey) !== null &&
-                        Date.now() - started <= EVIDENCE_FRESHNESS_MS) {
-                        return { assurance: "custody-chain", authority: { method: "plc", operationCid: current!.cid } }
+                    const current = [...entries].reverse().find((entry) => !entry.nullified)!
+                    if (plcCustodyAuthorizes(did, entries, signingKey) &&
+                        extractSigningMethodId(doc.document, did, signingKey) !== null) {
+                        if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+                        return { kind: "available", assurance: "custody-chain", authority: { method: "plc", operationCid: current.cid } }
                     }
                 }
             } catch { /* A failed full-chain proof may use the separately checked current-key seed. */ }
         }
-        if (!(await this.appViewConfirms(did, record, commitCid)) || Date.now() - started > EVIDENCE_FRESHNESS_MS) return null
+        const confirmed = await this.appViewConfirms(did, record, commitCid)
+        if (confirmed !== true) return unavailable(confirmed)
+        if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
         if (did.startsWith("did:plc:")) {
             // PLC current-key evidence names the verified fresh operation when available.
-            try {
-                const entries = plcEntries ?? parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
-                if (!entries) return null
-                const operationCid = verifyPlcCurrentKeyOperation(entries, record.signingKey)
-                if (!operationCid || extractSigningMethodId(doc.document, did, record.signingKey) === null ||
-                    Date.now() - started > EVIDENCE_FRESHNESS_MS) return null
-                return { assurance: "current-key-cross-check", authority: { method: "plc", operationCid } }
-            } catch { return null }
+            const entries = plcEntries ?? parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
+            const operationCid = entries ? verifyPlcCurrentKeyOperation(did, entries, signingKey) : null
+            if (!operationCid || extractSigningMethodId(doc.document, did, signingKey) === null) {
+                return unavailable("PLC current-key operation unverified")
+            }
+            if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+            return { kind: "available", assurance: "current-key-cross-check", authority: { method: "plc", operationCid } }
         }
         if (did.startsWith("did:web:")) {
-            const authority = await didWebAuthority(did, doc.document, record.signingKey)
-            return authority ? { assurance: "current-key-cross-check", authority } : null
+            const authority = await didWebAuthority(did, doc.document, signingKey)
+            return authority
+                ? { kind: "available", assurance: "current-key-cross-check", authority }
+                : unavailable("did:web authority unavailable")
         }
-        return null
+        return unavailable("unsupported DID method")
     }
 
-    private async appViewConfirms(did: string, record: FetchedRecord, commitCid: string): Promise<boolean> {
-        const parsed = readRecordFromCar(record.car, this.env.MONITOR_COLLECTION, "self")
-        if (!parsed || parsed.did !== did || parsed.commitCid !== commitCid) return false
-        const origin = (this.env.APP_VIEW_URL || "https://public.api.bsky.app").replace(/\/$/, "")
-        const url = new URL(`${origin}/xrpc/com.atproto.repo.getRecord`)
-        if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return false
-        url.searchParams.set("repo", did)
-        url.searchParams.set("collection", this.env.MONITOR_COLLECTION)
-        url.searchParams.set("rkey", "self")
-        const value = await guardedFetchJSON(url.href, fetch, { maxBytes: 64 * 1024, cache: "no-store" }) as { uri?: unknown; cid?: unknown }
-        return value.uri === `at://${did}/${this.env.MONITOR_COLLECTION}/self` && value.cid === parsed.cid
+    /** `true` when the AppView serves this exact record, else why not. Never throws. */
+    private async appViewConfirms(did: string, record: FetchedRecord, commitCid: string): Promise<true | string> {
+        try {
+            const parsed = readRecordFromCar(record.car, this.env.MONITOR_COLLECTION, "self")
+            if (!parsed || parsed.did !== did || parsed.commitCid !== commitCid) return "AppView did not confirm"
+            const origin = (this.env.APP_VIEW_URL || "https://public.api.bsky.app").replace(/\/$/, "")
+            const url = new URL(`${origin}/xrpc/com.atproto.repo.getRecord`)
+            if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+                return "AppView URL unusable"
+            }
+            url.searchParams.set("repo", did)
+            url.searchParams.set("collection", this.env.MONITOR_COLLECTION)
+            url.searchParams.set("rkey", "self")
+            const value = await guardedFetchJSON(url.href, fetch, { maxBytes: 64 * 1024, cache: "no-store" }) as { uri?: unknown; cid?: unknown }
+            return value.uri === `at://${did}/${this.env.MONITOR_COLLECTION}/self` && value.cid === parsed.cid
+                ? true
+                : "AppView did not confirm"
+        } catch (err) {
+            return `AppView unreachable: ${err instanceof Error ? err.message : String(err)}`
+        }
     }
 
     /**
@@ -4045,7 +4148,15 @@ export class MonitorIngest
         return {
             index: this,
             snapshot: kvSnapshotStore(this.env),
-            fetchRecord: (did) => this.fetchRecord(did),
+            // A deployment's `fetchRecord` need not stamp its attempt start;
+            // evidence needs one, so a start taken before the whole call
+            // (its own DID and PDS reads included) stands in — earlier than
+            // the true start, so it can only make evidence less fresh.
+            fetchRecord: async (did) => {
+                const attemptStartedAtMs = Date.now()
+                const record = await this.fetchRecord(did)
+                return record.attemptStartedAtMs === undefined ? { ...record, attemptStartedAtMs } : record
+            },
             verify: (did, record) => this.verifyRecord(did, record),
             unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
             retryCapMs: (did) => this.retryCapMs(did),
@@ -4588,6 +4699,21 @@ export class MonitorIngest
     }
 
     /**
+     * One page of the one-time evidence sweep, which owes a fresh fetch for
+     * every held declaration so it gains summary evidence. Only with
+     * `MONITOR_HOSTNAME` set, since without it no fetch could produce
+     * evidence: the sweep then starts once it is set.
+     */
+    private async sweepEvidenceRefreshIfConfigured(): Promise<void> {
+        if (this.evidenceRefreshDone || normalizeMonitorHostname(this.env.MONITOR_HOSTNAME) === null) return
+        const { done } = await sweepEvidenceRefresh({
+            index: this,
+            limit: this.envInt(this.env.SETTLE_BATCH, 32),
+        })
+        this.evidenceRefreshDone = done
+    }
+
+    /**
      * Watchdog, backfill, and retry queue. Reconnects a dropped stream,
      * discovers anything the live tail could never see on its own, then
      * settles what is owed — the only thing standing between a PDS outage
@@ -4665,10 +4791,6 @@ export class MonitorIngest
                                 secondaries: monitorCollections(this.env),
                                 didDocuments: this,
                                 nowMs: () => Date.now(),
-                                archiveEvidence: async (did) => {
-                                    const entry = await kvSnapshotStore(this.env).getRecord(did)
-                                    if (entry?.evidence) await retainSnapshotEvidence(this, entry.evidence)
-                                },
                                 onSettled: (did, settled) => this.onSettled(did, settled),
                             },
                             this.envInt(this.env.INTEREST_BATCH, 64)
@@ -4703,10 +4825,7 @@ export class MonitorIngest
                 }
             }
             try {
-                await sweepEvidenceRefresh({
-                    index: this,
-                    limit: this.envInt(this.env.SETTLE_BATCH, 32),
-                })
+                await this.sweepEvidenceRefreshIfConfigured()
             } catch (err) {
                 console.error("monitor: evidence refresh sweep failed", err)
             }
@@ -4784,6 +4903,13 @@ export class MonitorIngest
     }
 }
 
+/** What a declaration's evidence enrichment found: evidence, or why there is none. */
+type DeclarationEvidence =
+    | { kind: "available"; authority: EvidenceAuthorityIdentity; assurance: EvidenceAssurance }
+    | { kind: "unavailable"; reason: string }
+
+const unavailable = (reason: string): DeclarationEvidence => ({ kind: "unavailable", reason })
+
 function normalizeMonitorHostname(value: string | undefined): string | null {
     if (!value || value.includes(":") || value.includes("/") || value.includes("@")) return null
     try {
@@ -4792,6 +4918,25 @@ function normalizeMonitorHostname(value: string | undefined): string | null {
         const hostname = parsed.hostname.replace(/\.$/, "").toLowerCase()
         return hostname.length > 0 ? hostname : null
     } catch { return null }
+}
+
+/**
+ * Whether `did`'s log verifies from genesis to head and the head authorizes
+ * `signingKey`. A head that verifies but renders no document this module
+ * supports (an extra verification method or service) still proves custody,
+ * so its own `atproto` method is checked instead. The rendered document
+ * carries the key as bare multibase, as the fetched one does; the
+ * operation's own `did:key:` form never equals it. Never throws.
+ */
+function plcCustodyAuthorizes(did: string, entries: readonly PlcLogEntry[], signingKey: string): boolean {
+    let rendered: DidDocument | null
+    try {
+        rendered = verifyPlcLog(did, entries)
+    } catch (err) {
+        return err instanceof PlcLogError && err.kind === "unrenderable" &&
+            verifyPlcCurrentKeyOperation(did, entries, signingKey) !== null
+    }
+    return rendered !== null && extractSigningMethodId(rendered, did, signingKey) !== null
 }
 
 function extractSigningMethodId(document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] }, did: string, key: string): string | null {
@@ -4805,7 +4950,7 @@ async function didWebAuthority(
     did: string,
     document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] },
     key: string
-): Promise<import("@germ-network/atproto-pmr-core").EvidenceAuthorityIdentity | null> {
+): Promise<EvidenceAuthorityIdentity | null> {
     if (!did.startsWith("did:web:")) return null
     const verificationMethodId = extractSigningMethodId(document, did, key)
     if (!verificationMethodId) return null

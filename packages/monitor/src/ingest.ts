@@ -33,6 +33,7 @@ import {
     type KeyUpdateIndex,
     type MonitorIndex,
     type PendingFailure,
+    type SnapshotEntry,
     type SnapshotEvidence,
     type SnapshotStore,
 } from "./storage"
@@ -50,7 +51,12 @@ export interface FetchedRecord {
      * Absent from a deployment fetch that does not; then nothing is stored.
      */
     didDocument?: FetchedDidDocument
-    /** Start of the bounded DID-document/PDS read attempt; absent for custom fetches. */
+    /**
+     * Start of the bounded DID-document/PDS read attempt, which declaration
+     * evidence is bounded by. A fetch that omits it may have one stamped
+     * around the call by its caller (monitor-cloudflare does); with none,
+     * the declaration is stored without evidence.
+     */
     attemptStartedAtMs?: number
 }
 
@@ -336,8 +342,6 @@ export async function settleDeletion(
     cause: GoneCause,
     gen?: number | null
 ): Promise<void> {
-    const previous = await deps.snapshot.getRecord(did)
-    if (previous?.evidence) await retainSnapshotEvidence(deps.index, previous.evidence)
     await deps.snapshot.deleteRecord(did)
     await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause, gen)
     await raiseSettled(deps, did, null)
@@ -490,18 +494,31 @@ async function settleFetched(
     // Only checked on "unchanged" — an "advanced" movement already fires
     // `onChange` below regardless, so resolving the full previous record
     // (a KV round trip carrying the whole CAR) would be wasted work on
-    // every ordinary, non-rotation settle.
-    const previous = await deps.snapshot.getRecord(did)
-    const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-    const keyRotated = previousKey !== null && previousKey !== verified.key
+    // every ordinary, non-rotation settle. Evidence needs no previous read
+    // on an advance either: the anchors it carries forward were retained in
+    // the index when the previous snapshot was stored.
+    let previous: SnapshotEntry | null = null
+    let keyRotated = false
+    if (movement === "unchanged") {
+        previous = await deps.snapshot.getRecord(did)
+        const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
+        keyRotated = previousKey !== null && previousKey !== verified.key
+    }
+
     const observedAtMs = deps.nowMs()
+    const previousEvidence = previous?.evidence ?? null
     const evidence = await prepareSnapshotEvidence(
         deps.index,
         did,
         verified,
-        previous?.evidence ?? null,
+        previousEvidence,
         observedAtMs
     )
+    // Retained before the put, so a snapshot carrying evidence never exists
+    // without its anchors: a put that then fails leaves only rows the retry
+    // reuses, and `retainSnapshotEvidence`'s unchanged skip can trust that
+    // the evidence a stored snapshot carries is already in the index.
+    if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence, previousEvidence)
     await deps.snapshot.putRecord(did, {
         rev: verified.rev,
         commitCid: verified.commitCid ?? null,
@@ -513,7 +530,6 @@ async function settleFetched(
         cid: verified.cid,
         evidence,
     })
-    if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence)
     const written = { cid: verified.cid, verifiedWith: verified.key }
     const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
     if (quiet) {
@@ -534,7 +550,12 @@ async function settleFetched(
     return "stored"
 }
 
-/** Construct stable evidence identity and reuse the first anchor for a reappearing identity. */
+/**
+ * Construct stable evidence identity and reuse the first anchor for a
+ * reappearing identity. `previous` is the evidence the stored snapshot
+ * carries, where the caller has it; without it, both anchors come from the
+ * index, which every evidence-bearing put has already retained them in.
+ */
 export async function prepareSnapshotEvidence(
     index: MonitorIndex,
     did: string,
@@ -552,8 +573,6 @@ export async function prepareSnapshotEvidence(
     ) {
         return null
     }
-    // Archive the prior active identity before replacing its atomic snapshot entry.
-    if (previous !== null) await retainSnapshotEvidence(index, previous)
     const declaration = {
         did,
         collection: verified.collection,
@@ -564,31 +583,16 @@ export async function prepareSnapshotEvidence(
         verifiedWith: verified.key,
         authority: verified.authority,
     }
-    const commitHistoryId = JSON.stringify(["commit", declaration])
-    const anchorHistoryId = JSON.stringify([
-        "anchor",
-        did,
-        verified.key,
-        verified.authority,
-    ])
-    const sameCommit =
-        previous !== null &&
-        previous.recordCid === declaration.recordCid &&
-        previous.commitCid === declaration.commitCid &&
-        previous.rev === declaration.rev &&
-        previous.verifiedWith === declaration.verifiedWith &&
-        JSON.stringify(previous.authority) === JSON.stringify(declaration.authority)
-    const sameAnchor =
-        previous !== null &&
-        previous.did === did &&
-        previous.verifiedWith === verified.key &&
-        JSON.stringify(previous.authority) === JSON.stringify(verified.authority)
+    const commitId = commitHistoryId(declaration)
+    const anchorId = anchorHistoryId(declaration)
+    const sameCommit = previous !== null && commitHistoryId(previous) === commitId
+    const sameAnchor = previous !== null && anchorHistoryId(previous) === anchorId
     const commitFirstObservedAtMs = sameCommit
         ? previous!.commitFirstObservedAtMs
-        : ((await index.getEvidenceAnchor?.(commitHistoryId)) ?? nowMs)
+        : ((await index.getEvidenceAnchor?.(commitId)) ?? nowMs)
     const anchorFirstObservedAtMs = sameAnchor
         ? previous!.anchorFirstObservedAtMs
-        : ((await index.getEvidenceAnchor?.(anchorHistoryId)) ?? nowMs)
+        : ((await index.getEvidenceAnchor?.(anchorId)) ?? nowMs)
     return {
         ...declaration,
         assurance: verified.assurance,
@@ -598,32 +602,66 @@ export async function prepareSnapshotEvidence(
     }
 }
 
-/** Preserve active anchors before a later identity replaces or deletes their snapshot. */
+/**
+ * Retain the anchors a snapshot about to be stored carries, so a later
+ * identity that replaces or deletes it can still reuse them. Nothing is
+ * written when `previous` (what the replaced snapshot carried) already held
+ * the same identities at the same first observations — an assurance
+ * upgrade changes no anchor.
+ */
 export async function retainSnapshotEvidence(
     index: MonitorIndex,
-    evidence: SnapshotEvidence
+    evidence: SnapshotEvidence,
+    previous: SnapshotEvidence | null = null
 ): Promise<void> {
-    const commitHistoryId = JSON.stringify([
+    const commit = commitHistoryId(evidence)
+    const anchor = anchorHistoryId(evidence)
+    if (
+        previous !== null &&
+        commitHistoryId(previous) === commit &&
+        anchorHistoryId(previous) === anchor &&
+        previous.commitFirstObservedAtMs === evidence.commitFirstObservedAtMs &&
+        previous.anchorFirstObservedAtMs === evidence.anchorFirstObservedAtMs
+    ) {
+        return
+    }
+    await index.retainEvidenceAnchors?.(evidence.did, [
+        { kind: "commit", identity: commit, firstObservedAtMs: evidence.commitFirstObservedAtMs },
+        { kind: "anchor", identity: anchor, firstObservedAtMs: evidence.anchorFirstObservedAtMs },
+    ])
+}
+
+/** The fields a commit's first observation is keyed by. */
+type CommitIdentity = Pick<
+    SnapshotEvidence,
+    | "did"
+    | "collection"
+    | "rkey"
+    | "recordCid"
+    | "commitCid"
+    | "rev"
+    | "verifiedWith"
+    | "authority"
+>
+
+function commitHistoryId(e: CommitIdentity): string {
+    return JSON.stringify([
         "commit",
         {
-            did: evidence.did,
-            collection: evidence.collection,
-            rkey: evidence.rkey,
-            recordCid: evidence.recordCid,
-            commitCid: evidence.commitCid,
-            rev: evidence.rev,
-            verifiedWith: evidence.verifiedWith,
-            authority: evidence.authority,
+            did: e.did,
+            collection: e.collection,
+            rkey: e.rkey,
+            recordCid: e.recordCid,
+            commitCid: e.commitCid,
+            rev: e.rev,
+            verifiedWith: e.verifiedWith,
+            authority: e.authority,
         },
     ])
-    const anchorHistoryId = JSON.stringify([
-        "anchor",
-        evidence.did,
-        evidence.verifiedWith,
-        evidence.authority,
-    ])
-    await index.retainEvidenceAnchor?.(commitHistoryId, evidence.commitFirstObservedAtMs)
-    await index.retainEvidenceAnchor?.(anchorHistoryId, evidence.anchorFirstObservedAtMs)
+}
+
+function anchorHistoryId(e: Pick<SnapshotEvidence, "did" | "verifiedWith" | "authority">): string {
+    return JSON.stringify(["anchor", e.did, e.verifiedWith, e.authority])
 }
 
 /**

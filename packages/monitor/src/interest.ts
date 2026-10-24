@@ -22,7 +22,6 @@ export interface InterestDeps {
     secondaries: readonly WatchedRecord[]
     didDocuments?: DidDocumentSink
     nowMs(): number
-    archiveEvidence?(did: string): Promise<void>
     /** Raised with `null` once a leave has disposed of the DID; see `IngestDeps.onSettled`. */
     onSettled?: IngestDeps["onSettled"]
 }
@@ -68,7 +67,6 @@ async function dispose(deps: InterestDeps, did: string): Promise<void> {
         refs.set(`${r.collection}/${r.rkey}`, r)
     }
     for (const r of deps.secondaries) refs.set(`${r.collection}/${r.rkey}`, r)
-    await deps.archiveEvidence?.(did)
     await deps.snapshot.deleteRecord(did)
     for (const r of refs.values()) {
         await deps.snapshot.deleteSecondary({ did, collection: r.collection, rkey: r.rkey })

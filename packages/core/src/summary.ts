@@ -26,7 +26,7 @@ import { indexPolicySource, SUMMARY_VERDICT_KEYS, type SummaryVerdict } from "./
 import type { StoredPolicies } from "./policy.js"
 import type { SummaryCoverageDeps } from "./firehose-coverage.js"
 import type { WatchedRecord } from "./watched.js"
-import type { SnapshotEvidence, SummaryEvidence } from "./summary-evidence-contract.js"
+import type { EvidenceAuthorityIdentity, SnapshotEvidence, SummaryEvidence } from "./summary-evidence-contract.js"
 
 export interface SummaryRecordRef {
     did: string
@@ -199,27 +199,63 @@ export interface SummaryPageDeps extends SummaryCoverageDeps {
      * over a day behind, an operational alarm. Never a re-check request.
      */
     onLapse: (did: string) => void
-    /** Requests an immediate source recheck when this process detects a wall-clock jump. */
+    /**
+     * Requests an immediate source recheck for each held declaration a build
+     * indexes while this process holds the wall clock suspect.
+     */
     onClockDiscontinuity?: (did: string) => void
+    /** The process's wall-clock discontinuity detector; the system clocks' by default. */
+    wallClock?: WallClockMonitor
     nowMs: () => number
 }
 
-let lastClockSample: { wallMs: number; monotonicMs: number } | null = null
-let wallClockSuspect = false
-const CLOCK_DISCONTINUITY_THRESHOLD_MS = 5_000
+/** A wall-clock change this far from the monotonic change between two samples is a jump. */
+export const CLOCK_DISCONTINUITY_THRESHOLD_MS = 5_000
 
-function observeWallClock(wallMs: number): boolean {
-    const monotonicMs = performance.now()
-    if (lastClockSample !== null) {
-        const wallElapsed = wallMs - lastClockSample.wallMs
-        const monotonicElapsed = monotonicMs - lastClockSample.monotonicMs
-        if (Math.abs(wallElapsed - monotonicElapsed) > CLOCK_DISCONTINUITY_THRESHOLD_MS) {
-            wallClockSuspect = true
-        }
-    }
-    lastClockSample = { wallMs, monotonicMs }
-    return !wallClockSuspect
+/** How long after a detected jump ages and TTLs stay unavailable. */
+export const CLOCK_DISCONTINUITY_HOLD_MS = 600_000
+
+export interface WallClockMonitor {
+    /**
+     * Samples both clocks against the previous sample; false while within
+     * the hold window after a detected jump.
+     */
+    observe(): boolean
 }
+
+/**
+ * Detects observable wall-clock jumps by comparing wall-clock and monotonic
+ * elapsed time between samples. Every sample is the next baseline, so a jump
+ * is reported for `holdMs` of monotonic time after it, not for the life of
+ * the process.
+ */
+export function wallClockMonitor(options: {
+    wallMs?: () => number
+    monotonicMs?: () => number
+    thresholdMs?: number
+    holdMs?: number
+} = {}): WallClockMonitor {
+    const wallMs = options.wallMs ?? (() => Date.now())
+    const monotonicMs = options.monotonicMs ?? (() => performance.now())
+    const thresholdMs = options.thresholdMs ?? CLOCK_DISCONTINUITY_THRESHOLD_MS
+    const holdMs = options.holdMs ?? CLOCK_DISCONTINUITY_HOLD_MS
+    let last: { wall: number; mono: number } | null = null
+    let suspectUntil = -Infinity
+    return {
+        observe() {
+            const wall = wallMs()
+            const mono = monotonicMs()
+            if (last !== null && Math.abs((wall - last.wall) - (mono - last.mono)) > thresholdMs) {
+                suspectUntil = mono + holdMs
+            }
+            last = { wall, mono }
+            return mono >= suspectUntil
+        },
+    }
+}
+
+/** Samples the system clocks, never an injected `nowMs`, so a fixed test time cannot trip it. */
+const defaultWallClock = wallClockMonitor()
 
 /**
  * The owner's graph, their blocks or their contacts' graph facts could not
@@ -296,7 +332,7 @@ export async function buildSummaryIndex(
     const heldDids = [...new Set(held.flatMap((e) => (e === null ? [] : [e.did])))]
     const keys = heldDids.length === 0 ? new Map() : await deps.signingKeys.keysFor(heldDids)
     const now = deps.nowMs()
-    const clockReliable = observeWallClock(now)
+    const clockReliable = (deps.wallClock ?? defaultWallClock).observe()
     const lapsed = new Set<string>()
     const records: SummaryIndexEntry[] = []
     const servable: SummaryHeldEntry[] = []
@@ -316,7 +352,7 @@ export async function buildSummaryIndex(
             deps.onClockDiscontinuity?.(entry.did)
         }
         const { freshAtMs: _freshAtMs, policies: _policies, ...indexed } = entry
-        records.push(indexed)
+        records.push({ ...indexed, evidenceState: boundEvidence(entry, entry, entry.evidenceState) })
     }
     for (const lapse of lapsed) deps.onLapse(lapse)
     records.sort(compareRefs)
@@ -351,7 +387,7 @@ export async function buildSummaryIndex(
 export async function readSummaryPage(
     base: SummaryIndex | null,
     current: SummaryIndex,
-    deps: Pick<SummaryPageDeps, "records" | "signingKeys"> & Partial<Pick<SummaryPageDeps, "nowMs">>,
+    deps: Pick<SummaryPageDeps, "records" | "signingKeys"> & Partial<Pick<SummaryPageDeps, "nowMs" | "wallClock">>,
     limit: number
 ): Promise<{
     delivered: SummaryIndex
@@ -370,9 +406,11 @@ export async function readSummaryPage(
         batch.length === 0
             ? new Map<string, ReadSigningKey>()
             : await deps.signingKeys.keysFor([...new Set(batch.map((e) => e.did))])
+    const now = deps.nowMs?.() ?? Date.now()
+    const clockReliable = (deps.wallClock ?? defaultWallClock).observe()
     const reads = await Promise.all(
         batch.map((entry) =>
-            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" }, deps.nowMs?.() ?? Date.now())
+            readSummaryRecord(entry, deps.records, keys.get(entry.did) ?? { kind: "unknown" }, now, clockReliable)
         )
     )
     const readRecords = reads.filter((r): r is ReadSummaryRecord => r !== null)
@@ -414,52 +452,53 @@ export async function readSummaryPage(
  * read, so the CAR served matches the index stored under the token. Null when
  * nothing verified is held, it fails to parse, or it is no longer servable
  * under the DID's current key. The parse only runs for an entry stored
- * without its verified `rev` and `cid`.
+ * without its verified `rev` and `cid`. Its evidence is bound against the
+ * same stored `cid`, `rev` and `commitCid` the index reads, which ingest
+ * verified and wrote with the CAR.
  */
 async function readSummaryRecord(
     ref: SummaryIndexEntry,
     store: RecordSnapshotStore,
     key: ReadSigningKey,
-    now: number
+    now: number,
+    clockReliable: boolean
 ): Promise<ReadSummaryRecord | null> {
     const snapshot = await store.get(ref.did, ref.collection, ref.rkey)
     if (!snapshot || snapshot.verifiedWith === null) return null
     if (!servableUnderRotation(snapshot.verifiedWith, key)) return null
-    const state = ref.collection === DECLARATION_COLLECTION_NSID && ref.rkey === "self"
-        ? snapshot.evidence ?? null
-        : null
-    let parsed: ReturnType<typeof readRecordFromCar> | null = null
-    // A persisted evidence binding must be checked against the exact CAR. For
-    // legacy/unavailable evidence, preserve the established fast path: ingest
-    // already verified the held snapshot and its indexed CID/rev.
-    if (state !== null || snapshot.cid === null || snapshot.rev === null) {
+    let cid = snapshot.rev !== null ? snapshot.cid : null
+    if (cid === null) {
+        let parsed
         try {
             parsed = readRecordFromCar(snapshot.car, ref.collection, ref.rkey)
         } catch {
             return null
         }
         if (!parsed || parsed.did !== ref.did) return null
+        if (snapshot.cid !== null && parsed.cid !== snapshot.cid) return null
+        if (snapshot.rev !== null && parsed.rev !== snapshot.rev) return null
+        cid = parsed.cid
     }
-    const cid = snapshot.cid ?? parsed!.cid
-    if (parsed && (cid !== parsed.cid || (snapshot.rev !== null && snapshot.rev !== parsed.rev))) return null
-    const validState = state && state.did === ref.did && state.collection === ref.collection &&
-        parsed !== null && state.rkey === ref.rkey && state.recordCid === cid && state.commitCid === parsed.commitCid &&
-        state.rev === parsed.rev && state.verifiedWith === snapshot.verifiedWith &&
-        state.commitCid === (snapshot.commitCid ?? null) ? state : null
-    const clockReliable = observeWallClock(now)
+    const commitCid = snapshot.commitCid ?? null
+    const evidenceState = boundEvidence(
+        ref,
+        { cid, rev: snapshot.rev, commitCid, verifiedWith: snapshot.verifiedWith },
+        snapshot.evidence
+    )
     const age = (anchor: number): number | null => {
         const elapsed = now - anchor
         return clockReliable && Number.isSafeInteger(anchor) && Number.isSafeInteger(elapsed) && elapsed >= 0 ? elapsed : null
     }
-    const evidence: SummaryEvidence | null = validState ? {
-        commitCid: validState.commitCid,
-        rev: validState.rev,
-        authority: validState.authority,
-        assurance: validState.assurance,
-        monitor: validState.monitor,
-        commitAgeMs: age(validState.commitFirstObservedAtMs),
-        anchorAgeMs: age(validState.anchorFirstObservedAtMs),
-        remainingTtlMs: age(snapshot.freshAtMs) === null ? null : Math.max(0, SNAPSHOT_MAX_AGE_MS - age(snapshot.freshAtMs)!),
+    const ttlAge = age(snapshot.freshAtMs)
+    const evidence: SummaryEvidence | null = evidenceState ? {
+        commitCid: evidenceState.commitCid,
+        rev: evidenceState.rev,
+        authority: evidenceState.authority,
+        assurance: evidenceState.assurance,
+        monitor: evidenceState.monitor,
+        commitAgeMs: age(evidenceState.commitFirstObservedAtMs),
+        anchorAgeMs: age(evidenceState.anchorFirstObservedAtMs),
+        remainingTtlMs: ttlAge === null ? null : Math.max(0, SNAPSHOT_MAX_AGE_MS - ttlAge),
     } : null
     return {
         did: ref.did,
@@ -467,12 +506,74 @@ async function readSummaryRecord(
         rkey: ref.rkey,
         cid,
         verifiedWith: snapshot.verifiedWith,
-        commitCid: validState ? validState.commitCid : ref.commitCid,
-        rev: validState ? validState.rev : ref.rev,
-        evidenceState: validState,
+        commitCid: evidenceState ? evidenceState.commitCid : ref.commitCid,
+        rev: evidenceState ? evidenceState.rev : ref.rev,
+        evidenceState,
         evidence,
         car: snapshot.car,
     }
+}
+
+/**
+ * `evidence` when it names exactly this declaration's path, record CID,
+ * commit, `rev` and verifying key, as a fresh object in a fixed key order;
+ * otherwise null (unavailable). Both sides of a summary diff take their
+ * evidence through this, so evidence that fails to bind compares as null on
+ * each and settles instead of being re-sent.
+ */
+function boundEvidence(
+    ref: SummaryRecordRef,
+    held: { cid: string | null; rev?: string | null; commitCid?: string | null; verifiedWith: string | null },
+    evidence: SnapshotEvidence | null | undefined
+): SnapshotEvidence | null {
+    if (!evidence || ref.collection !== DECLARATION_COLLECTION_NSID || ref.rkey !== "self") return null
+    const commitCid = held.commitCid ?? null
+    const rev = held.rev ?? null
+    if (
+        evidence.did !== ref.did || evidence.collection !== ref.collection || evidence.rkey !== ref.rkey ||
+        held.cid === null || evidence.recordCid !== held.cid ||
+        commitCid === null || evidence.commitCid !== commitCid ||
+        rev === null || evidence.rev !== rev ||
+        held.verifiedWith === null || evidence.verifiedWith !== held.verifiedWith
+    ) return null
+    if (evidence.assurance !== "custody-chain" && evidence.assurance !== "current-key-cross-check") return null
+    if (typeof evidence.monitor !== "string" || evidence.monitor === "") return null
+    if (!Number.isSafeInteger(evidence.commitFirstObservedAtMs) ||
+        !Number.isSafeInteger(evidence.anchorFirstObservedAtMs)) return null
+    const authority = boundAuthority(evidence.authority)
+    if (authority === null) return null
+    return {
+        did: ref.did,
+        collection: ref.collection,
+        rkey: ref.rkey,
+        recordCid: held.cid,
+        commitCid,
+        rev,
+        verifiedWith: held.verifiedWith,
+        authority,
+        assurance: evidence.assurance,
+        monitor: evidence.monitor,
+        commitFirstObservedAtMs: evidence.commitFirstObservedAtMs,
+        anchorFirstObservedAtMs: evidence.anchorFirstObservedAtMs,
+    }
+}
+
+function boundAuthority(value: unknown): EvidenceAuthorityIdentity | null {
+    if (typeof value !== "object" || value === null) return null
+    const a = value as Record<string, unknown>
+    if (a.method === "plc") {
+        return typeof a.operationCid === "string" ? { method: "plc", operationCid: a.operationCid } : null
+    }
+    if (a.method === "web" && typeof a.documentUrl === "string" &&
+        typeof a.verificationMethodId === "string" && typeof a.keyFingerprint === "string") {
+        return {
+            method: "web",
+            documentUrl: a.documentUrl,
+            verificationMethodId: a.verificationMethodId,
+            keyFingerprint: a.keyFingerprint,
+        }
+    }
+    return null
 }
 
 function compareStrings(a: string, b: string): number {

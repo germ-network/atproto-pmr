@@ -182,12 +182,15 @@ export function verifyPlcLog(did: string, entries: readonly PlcLogEntry[]): DidD
 }
 
 /**
- * Verify only the latest live operation's link to its immediately preceding
- * operation and that it authorizes `signingKey`. This deliberately omits the
+ * Verify only the latest live operation of `did`'s log and that it
+ * authorizes `signingKey`: a genesis by its CID naming `did` and its own
+ * rotation keys, any later operation by its link to the immediately
+ * preceding one and that one's rotation keys. This deliberately omits the
  * genesis-to-head custody proof and is suitable only for the labelled
  * current-key cross-check assurance mode.
  */
 export function verifyPlcCurrentKeyOperation(
+    did: string,
     entries: readonly PlcLogEntry[],
     signingKey: string
 ): string | null {
@@ -195,21 +198,28 @@ export function verifyPlcCurrentKeyOperation(
     for (let i = entries.length - 1; i >= 0; i--) {
         if (!entries[i]!.nullified) { currentIndex = i; break }
     }
-    if (currentIndex <= 0) return null
+    if (currentIndex < 0) return null
     const current = entries[currentIndex]!
-    let priorIndex = currentIndex - 1
-    while (priorIndex >= 0 && entries[priorIndex]!.nullified) priorIndex--
-    if (priorIndex < 0) return null
-    const prior = entries[priorIndex]!
-    if (current.operation.type !== "plc_operation" ||
-        current.operation.prev !== prior.cid ||
-        operationCid(prior.operation) !== prior.cid ||
-        operationCid(current.operation) !== current.cid) return null
-    const methods = current.operation.verificationMethods
+    if (operationCid(current.operation) !== current.cid) return null
+    let signers: string[]
+    if (currentIndex === 0) {
+        if (current.operation.prev !== null || didOfGenesis(current.operation) !== did) return null
+        signers = rotationKeysOf(current.operation)
+    } else {
+        let priorIndex = currentIndex - 1
+        while (priorIndex >= 0 && entries[priorIndex]!.nullified) priorIndex--
+        if (priorIndex < 0) return null
+        const prior = entries[priorIndex]!
+        if (current.operation.type !== "plc_operation" ||
+            current.operation.prev !== prior.cid ||
+            operationCid(prior.operation) !== prior.cid) return null
+        signers = rotationKeysOf(prior.operation)
+    }
+    const methods = normalisedOperation(current.operation).verificationMethods
     const atproto = isRecord(methods) ? methods.atproto : null
     if (atproto !== `${DID_KEY_PREFIX}${signingKey}`) return null
     try {
-        verifySignedBy(current, rotationKeysOf(prior.operation))
+        verifySignedBy(current, signers)
         return current.cid
     } catch {
         return null

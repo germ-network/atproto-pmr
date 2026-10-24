@@ -44,6 +44,7 @@ export {
     FETCH_AS_OF_SKEW_MS,
     type DidDocumentSink,
     type DigestMarker,
+    type EvidenceAnchorRow,
     type EvidenceBackfillProgress,
     type EvidenceAssurance,
     type EvidenceAuthorityIdentity,

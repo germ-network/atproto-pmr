@@ -4,9 +4,14 @@
  * connection opened and untouched since.
  */
 import { describe, expect, it } from "vitest"
-import { sweepBackfill, type BackfillDeps } from "../src/backfill"
+import { sweepBackfill, sweepEvidenceRefresh, type BackfillDeps } from "../src/backfill"
 import type { ListReposPage } from "../src/list-repos"
-import type { BackfillProgress, MonitorIndex } from "../src/storage"
+import type {
+    BackfillProgress,
+    EvidenceBackfillProgress,
+    IndexedRecord,
+    MonitorIndex,
+} from "../src/storage"
 
 /** A minimal MonitorIndex — only the members sweepBackfill actually touches. */
 function fakeIndex(overrides: Partial<MonitorIndex> = {}): {
@@ -122,5 +127,72 @@ describe("sweepBackfill", () => {
             listRepos: pages({ dids: [], nextCursor: null }),
         }
         expect(await sweepBackfill(deps)).toEqual({ discovered: 0, done: true })
+    })
+})
+
+describe("sweepEvidenceRefresh", () => {
+    const held = (did: string): IndexedRecord => ({
+        did,
+        collection: "com.example.declaration",
+        rkey: "self",
+        rev: `rev-${did}`,
+        cid: "bafyreic",
+        verifiedWith: "zKey",
+    })
+
+    /** Held declarations, paged by DID, with the sweep's members as methods needing `this`. */
+    function evidenceIndex(dids: string[], withOwe = true) {
+        const refreshed: string[] = []
+        const pageCursors: (string | null)[] = []
+        const members = {
+            progress: { done: false, cursor: null } as EvidenceBackfillProgress,
+            refreshed,
+            pageCursors,
+            async evidenceBackfillPage(afterDid: string | null, limit: number) {
+                this.pageCursors.push(afterDid)
+                return dids
+                    .filter((did) => afterDid === null || did > afterDid)
+                    .slice(0, limit)
+                    .map(held)
+            },
+            async readEvidenceBackfillProgress() {
+                return this.progress
+            },
+            async setEvidenceBackfillProgress(p: EvidenceBackfillProgress) {
+                this.progress = p
+            },
+            async oweEvidenceRefresh(did: string, rev: string) {
+                this.refreshed.push(`${did}@${rev}`)
+            },
+        }
+        const h = fakeIndex(members)
+        if (!withOwe) delete (h.index as Partial<MonitorIndex>).oweEvidenceRefresh
+        // The members are copied onto the index, which is their `this`.
+        return { ...h, state: h.index as unknown as typeof members }
+    }
+
+    it("owes each held declaration through oweEvidenceRefresh, never owe, a page per call", async () => {
+        const h = evidenceIndex(["did:a", "did:b", "did:c"])
+        expect(await sweepEvidenceRefresh({ index: h.index, limit: 2 })).toEqual({ discovered: 2, done: false })
+        expect(await sweepEvidenceRefresh({ index: h.index, limit: 2 })).toEqual({ discovered: 1, done: true })
+        expect(h.state.pageCursors).toEqual([null, "did:b"])
+        expect(h.state.refreshed).toEqual(["did:a@rev-did:a", "did:b@rev-did:b", "did:c@rev-did:c"])
+        expect(h.owed).toEqual([])
+    })
+
+    it("pages nothing once done", async () => {
+        const h = evidenceIndex(["did:a"])
+        await sweepEvidenceRefresh({ index: h.index, limit: 4 })
+        expect(h.state.progress).toEqual({ done: true })
+        expect(await sweepEvidenceRefresh({ index: h.index, limit: 4 })).toEqual({ discovered: 0, done: true })
+        expect(h.state.pageCursors).toEqual([null])
+    })
+
+    it("an index without oweEvidenceRefresh is done at once and owes nothing", async () => {
+        const h = evidenceIndex(["did:a"], false)
+        expect(await sweepEvidenceRefresh({ index: h.index, limit: 4 })).toEqual({ discovered: 0, done: true })
+        expect(h.state.pageCursors).toEqual([])
+        expect(h.owed).toEqual([])
+        expect(h.state.progress).toEqual({ done: false, cursor: null })
     })
 })

@@ -343,6 +343,61 @@ describe("settle", () => {
         expect(onChange).not.toHaveBeenCalled()
     })
 
+    it("reads the previous snapshot only when the rev is unchanged", async () => {
+        // The previous entry is a KV read carrying the whole CAR; an advance
+        // fires onChange anyway and its evidence anchors come from the index.
+        const advancing = harness()
+        advancing.revs.set(DID, "3m1")
+        advancing.records.set(DID, storedEntry())
+        const advanceRead = vi.spyOn(advancing.deps.snapshot, "getRecord")
+        expect(await settle(advancing.deps, DID)).toBe("stored")
+        expect(advanceRead).not.toHaveBeenCalled()
+
+        const unchanged = harness()
+        unchanged.revs.set(DID, "3m2")
+        unchanged.records.set(DID, storedEntry({ rev: "3m2" }))
+        const unchangedRead = vi.spyOn(unchanged.deps.snapshot, "getRecord")
+        expect(await settle(unchanged.deps, DID)).toBe("stored")
+        expect(unchangedRead).toHaveBeenCalledTimes(1)
+    })
+
+    it("retains evidence anchors once on an advance and not again on an unchanged settle", async () => {
+        const h = harness({
+            verify: async (_did, record) => ({
+                kind: "verified",
+                key: record.signingKey!,
+                rev: "3m2",
+                cid: CID,
+                collection: COLLECTION,
+                rkey: "self",
+                commitCid: "bafCommit",
+                authority: { method: "plc", operationCid: "bafOperation" },
+                assurance: "custody-chain",
+                monitor: "monitor.example.org",
+            }),
+        })
+        const anchors = new Map<string, number>()
+        const getEvidenceAnchor = vi.fn(async (identity: string) => anchors.get(identity) ?? null)
+        const retainEvidenceAnchors = vi.fn(async (_did: string, rows: readonly { identity: string; firstObservedAtMs: number }[]) => {
+            for (const row of rows) if (!anchors.has(row.identity)) anchors.set(row.identity, row.firstObservedAtMs)
+        })
+        Object.assign(h.deps.index, { getEvidenceAnchor, retainEvidenceAnchors })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(retainEvidenceAnchors).toHaveBeenCalledTimes(1)
+        const stored = h.records.get(DID)!.evidence
+        expect(stored).toMatchObject({ rev: "3m2", commitFirstObservedAtMs: 1_000_000 })
+
+        getEvidenceAnchor.mockClear()
+        retainEvidenceAnchors.mockClear()
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(getEvidenceAnchor).not.toHaveBeenCalled()
+        expect(retainEvidenceAnchors).not.toHaveBeenCalled()
+        expect(h.records.get(DID)!.evidence).toEqual(stored)
+    })
+
     it("does not treat an unresolved signing key as a rotation", async () => {
         // Mirrors `compareObservations`' own documented blind spot: a
         // `null` key on either side means rotation cannot be asserted, not

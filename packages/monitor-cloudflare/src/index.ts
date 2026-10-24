@@ -57,6 +57,9 @@
  * Every failed settle also logs one `monitor: settle deferred` line carrying
  * the DID, attempts, error or reason, and next try; a failed secondary settle
  * logs `monitor: secondary settle deferred` with the collection and rkey too.
+ * With `MONITOR_HOSTNAME` set, a declaration stored without summary evidence
+ * logs `monitor: declaration evidence unavailable` with the DID and reason
+ * (for a deployment `fetchRecord`, most often a missing `didDocument`).
  *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain

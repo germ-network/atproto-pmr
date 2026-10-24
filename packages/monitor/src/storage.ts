@@ -93,6 +93,13 @@ export type HolderState = "held" | "gone-reversible" | "gone-permanent"
  */
 export type GoneCause = "record" | "repo"
 
+/** One first observation a snapshot's evidence carries; see `MonitorIndex.retainEvidenceAnchors`. */
+export interface EvidenceAnchorRow {
+    kind: "commit" | "anchor"
+    identity: string
+    firstObservedAtMs: number
+}
+
 /** What a completion records about the bytes it just stored. */
 export interface VerifiedWrite {
     /** The record's CID, as verified. */
@@ -414,12 +421,22 @@ export interface MonitorIndex {
 
     /** First-observation anchor history survives replacing or deleting a snapshot. */
     getEvidenceAnchor?(identity: string): Promise<number | null>
-    /** Insert only when absent and return the retained first-observation time. */
-    retainEvidenceAnchor?(identity: string, observedAtMs: number): Promise<number>
+    /**
+     * Insert each row only when its identity is absent, in one write. The
+     * DID's other commit rows are superseded: a regression is never stored,
+     * so only the newest commit's first observation can be reused.
+     */
+    retainEvidenceAnchors?(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void>
     /** Indexed declaration pages for the evidence bootstrap sweep. */
     evidenceBackfillPage?(afterDid: string | null, limit: number): Promise<IndexedRecord[]>
     readEvidenceBackfillProgress?(): Promise<EvidenceBackfillProgress>
     setEvidenceBackfillProgress?(progress: EvidenceBackfillProgress): Promise<void>
+    /**
+     * The evidence sweep's owe: a fetch at `rev` only when none is owed. A
+     * row already owed keeps its attempts, backoff, quiet flag and
+     * generation, unlike `owe`, where news ends backoff.
+     */
+    oweEvidenceRefresh?(did: string, rev: string): Promise<void>
 }
 
 /**

@@ -67,26 +67,36 @@ export async function sweepBackfill(deps: BackfillDeps): Promise<SweepBackfillRe
     return { discovered, done: next.done }
 }
 
-/** Force a fresh fetch/verification for each already-indexed declaration once. */
+/**
+ * Force a fresh fetch/verification for each already-indexed declaration
+ * once, a page per call. A declaration already owed keeps its backoff:
+ * the fetch it is owed will carry the evidence.
+ */
 export async function sweepEvidenceRefresh(deps: {
     index: MonitorIndex
     limit: number
 }): Promise<SweepBackfillResult> {
-    const { evidenceBackfillPage, readEvidenceBackfillProgress, setEvidenceBackfillProgress } =
-        deps.index
-    if (!evidenceBackfillPage || !readEvidenceBackfillProgress || !setEvidenceBackfillProgress) {
+    // Called through `index`, not destructured: an implementation's
+    // methods may need their `this`.
+    const index = deps.index
+    if (
+        !index.evidenceBackfillPage ||
+        !index.readEvidenceBackfillProgress ||
+        !index.setEvidenceBackfillProgress ||
+        !index.oweEvidenceRefresh
+    ) {
         return { discovered: 0, done: true }
     }
-    const progress: EvidenceBackfillProgress = await readEvidenceBackfillProgress()
+    const progress: EvidenceBackfillProgress = await index.readEvidenceBackfillProgress()
     if (progress.done) return { discovered: 0, done: true }
 
-    const page = await evidenceBackfillPage(progress.cursor, Math.max(1, deps.limit))
-    for (const record of page) await deps.index.owe(record.did, record.rev)
+    const page = await index.evidenceBackfillPage(progress.cursor, Math.max(1, deps.limit))
+    for (const record of page) await index.oweEvidenceRefresh(record.did, record.rev)
 
     const next: EvidenceBackfillProgress =
         page.length < Math.max(1, deps.limit)
             ? { done: true }
             : { done: false, cursor: page.at(-1)!.did }
-    await setEvidenceBackfillProgress(next)
+    await index.setEvidenceBackfillProgress(next)
     return { discovered: page.length, done: next.done }
 }

@@ -285,14 +285,16 @@ async function refreshDeclaration(
         return { outcome: "changed", repoGone: false }
     }
 
+    const previousEvidence = previous?.evidence ?? null
     const evidence = await prepareSnapshotEvidence(
         ingest.index,
         did,
         verified,
-        previous?.evidence ?? null,
+        previousEvidence,
         nowMs
     )
 
+    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence, previousEvidence)
     await ingest.snapshot.putRecord(did, {
         rev: verified.rev,
         commitCid: verified.commitCid ?? null,
@@ -304,7 +306,6 @@ async function refreshDeclaration(
         cid: verified.cid,
         evidence,
     })
-    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence)
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
         cid: verified.cid,
         verifiedWith: verified.key,
