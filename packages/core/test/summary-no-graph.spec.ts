@@ -64,7 +64,7 @@ describe("summary without a graph", () => {
 
     it("a summary index holds the owner, the owner's blocks and record entries, and no edges", async () => {
         const index = await build(graphOf(["did:plc:a"], ["did:plc:b"]), [OWNER, "did:plc:a"])
-        expect(Object.keys(index).sort()).toEqual(["ownBlocks", "owner", "records", "verdicts"])
+        expect(Object.keys(index).sort()).toEqual(["evidenceSchema", "ownBlocks", "owner", "records", "verdicts"])
         expect(index.owner).toBe(OWNER)
         expect(index.ownBlocks).toEqual([{ did: "did:plc:blocked", rkey: "b1" }])
         expect(index.records.map((r) => r.did)).toEqual(["did:plc:a", OWNER])

@@ -299,6 +299,7 @@ describe("verifyRecordProofOutcome", () => {
         expect(verifyRecordProofOutcome(repo.car, expectation(repo.key.multikey))).toEqual({
             kind: "absent",
             rev: "3kaaaaaaaaaaa",
+            commitCid: expect.any(String),
         })
     })
 

@@ -275,6 +275,7 @@ export {
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
+    didWebDocumentURL,
     fetchPlcAuditLog,
     pdsResolutionFromDocument,
     extractSigningKey,
@@ -438,6 +439,7 @@ export {
     appendPlcLogEntry,
     parsePlcAuditLog,
     PlcLogError,
+    verifyPlcCurrentKeyOperation,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,
@@ -467,6 +469,10 @@ export {
     SummaryOwnerReadError,
     SUMMARY_MAX_RECORDS,
     SUMMARY_PAGE_RECORDS,
+    CLOCK_DISCONTINUITY_HOLD_MS,
+    CLOCK_DISCONTINUITY_THRESHOLD_MS,
+    wallClockMonitor,
+    type WallClockMonitor,
     type SummaryHeldEntry,
     type SummaryIndexReader,
     type SummaryPageDeps,
@@ -482,6 +488,13 @@ export {
     type SummaryRecord,
     type SummaryRecordRef,
 } from "./summary"
+export type {
+    DeclarationEvidenceIdentity,
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
+    SummaryEvidence,
+} from "./summary-evidence-contract"
 export {
     CAN_MESSAGE_KEYS,
     canMessageFromCose,

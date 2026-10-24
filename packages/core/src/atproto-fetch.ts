@@ -162,6 +162,8 @@ export async function guardedFetchJSON(
         permanentErrorNames?: readonly string[]
         /** Body cap in bytes; the default suits a DID document. */
         maxBytes?: number
+        /** Request cache mode for freshness-sensitive callers. */
+        cache?: "no-store"
     } = {}
 ): Promise<unknown> {
     let parsed: URL
@@ -191,6 +193,7 @@ export async function guardedFetchJSON(
             // injects a mock fetchImpl that never validates the option at
             // all. The refusal happens explicitly below instead.
             redirect: "manual",
+            ...(options.cache ? { cache: options.cache } : {}),
             headers: { accept: "application/did+ld+json,application/json" },
         })
         if (isRedirect(response)) {
@@ -769,7 +772,7 @@ export function cachedSigningKeyResolver(deps: {
  *     Guessing either way means fetching the wrong URL, so this refuses
  *     rather than resolve a DID differently from the rest of the network.
  */
-function didWebDocumentURL(did: string): string {
+export function didWebDocumentURL(did: string): string {
     const parts = did.slice("did:web:".length).split(":").map(decodeURIComponent)
     if (parts.length !== 1 || parts[0].length === 0) {
         throw new Error(`unsupported did:web form: ${did}`)

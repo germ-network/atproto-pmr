@@ -20,6 +20,8 @@ import {
     settle,
     raiseSettled,
     settleDeletion,
+    prepareSnapshotEvidence,
+    retainSnapshotEvidence,
     type IngestDeps,
 } from "./ingest"
 import type { HeadRev } from "./fetch-record"
@@ -283,14 +285,26 @@ async function refreshDeclaration(
         return { outcome: "changed", repoGone: false }
     }
 
+    const previousEvidence = previous?.evidence ?? null
+    const evidence = await prepareSnapshotEvidence(
+        ingest.index,
+        did,
+        verified,
+        previousEvidence,
+        nowMs
+    )
+
+    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence, previousEvidence)
     await ingest.snapshot.putRecord(did, {
         rev: verified.rev,
+        commitCid: verified.commitCid ?? null,
         car: fetched.car,
         observedAtMs: nowMs,
         source: fetched.source,
         signingKey: verified.key,
         verifiedWith: verified.key,
         cid: verified.cid,
+        evidence,
     })
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
         cid: verified.cid,

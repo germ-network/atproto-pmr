@@ -130,8 +130,8 @@ describe("kvSummaryIndexReader", () => {
             { did: uniq(), collection: PROFILE, rkey: "self" },
         ]
         expect(await kvSummaryIndexReader(testEnv).entries(refs)).toEqual([
-            { ...refs[0], cid: "cid-b", verifiedWith: "zOther", freshAtMs: 1_000 },
-            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", freshAtMs: 1_000, policies: { found: false, code: "undecodable" } },
+            { ...refs[0], cid: "cid-b", verifiedWith: "zOther", commitCid: null, rev: "3m2", evidenceState: null, freshAtMs: 1_000 },
+            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", commitCid: null, rev: "3m1", evidenceState: null, freshAtMs: 1_000, policies: { found: false, code: "undecodable" } },
             null,
         ])
     })

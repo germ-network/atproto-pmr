@@ -18,8 +18,10 @@ import {
     binaryToBase64URL,
     RecordNotFoundError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
+    verifyPlcLog,
     type CachedDidDocument,
     type DidDocument,
+    type PlcLogEntry,
 } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
@@ -27,14 +29,17 @@ import {
     mightHaveChanged,
     sealDueWindows,
     intakePlcEvent,
+    settle,
     settleDue,
     sweepBackfill,
     FETCH_AS_OF_SKEW_MS,
     type FetchedRecord,
     type IngestDeps,
     type PlcExportEvent,
+    type VerifyOutcome,
 } from "@germ-network/atproto-pmr-monitor"
-import { buildRepoCar, makeKey } from "../../core/test/fixtures/repo-car"
+import { logEntry, signedOperation, syntheticPlcChain } from "../../core/test/fixtures/plc-chain"
+import { buildRepoCar, makeKey, type TestKey } from "../../core/test/fixtures/repo-car"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
 import { canonicalDidDocumentJson, kvDidDocuments, kvPlcCoverage } from "../src/did-document-store"
@@ -2890,6 +2895,9 @@ describe("verifying a fetched record", () => {
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
             cid: repo.recordCids[`${COLLECTION}/self`],
+            commitCid: expect.any(String),
+            collection: COLLECTION,
+            rkey: "self",
         })
     })
 
@@ -2899,6 +2907,7 @@ describe("verifying a fetched record", () => {
             kind: "verified-absent",
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
+            commitCid: expect.any(String),
         })
     })
 
@@ -2930,6 +2939,543 @@ describe("verifying a fetched record", () => {
             cid: "bafyreimeta",
             seenKey: "zQ3shSeen",
         })
+    })
+})
+
+describe("declaration evidence", () => {
+    const COLLECTION = testEnv.MONITOR_COLLECTION
+    const HOSTNAME = "monitor.example.org"
+    const APP_VIEW_PATH = "/xrpc/com.atproto.repo.getRecord"
+    const didKey = (key: TestKey) => `did:key:${key.multikey}`
+
+    /** A did:plc whose genesis renders the document the PDS was resolved through. */
+    function custodyWorld(rev?: string) {
+        const chain = syntheticPlcChain()
+        const repo = buildRepoCar({
+            did: chain.did,
+            key: chain.signing,
+            rev,
+            records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+        })
+        return {
+            chain,
+            did: chain.did,
+            repo,
+            recordCid: repo.recordCids[`${COLLECTION}/self`]!,
+            document: verifyPlcLog(chain.did, [chain.g])!,
+            entries: [chain.g] as PlcLogEntry[],
+        }
+    }
+
+    /**
+     * The same, with a validly signed head that renders no document (two
+     * verification methods): the chain still proves custody of it.
+     */
+    function unrenderableWorld() {
+        const w = custodyWorld()
+        const head = logEntry(
+            signedOperation(w.chain.rotation, {
+                type: "plc_operation",
+                rotationKeys: [didKey(w.chain.rotation)],
+                verificationMethods: { atproto: didKey(w.chain.signing), other: didKey(makeKey()) },
+                alsoKnownAs: ["at://b.test"],
+                services: {
+                    atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://b.example" },
+                },
+                prev: w.chain.g.cid,
+            })
+        )
+        return { ...w, head, entries: [w.chain.g, head] }
+    }
+
+    /**
+     * The same, with a middle operation no rotation key of the genesis
+     * signed, so the full chain fails, under a head its predecessor's keys
+     * did sign: only the current-key cross-check can name it.
+     */
+    function currentKeyWorld() {
+        const w = custodyWorld()
+        const mid = logEntry(
+            signedOperation(makeKey(), {
+                type: "plc_operation",
+                rotationKeys: [didKey(w.chain.rotation)],
+                verificationMethods: { atproto: didKey(w.chain.signing) },
+                alsoKnownAs: ["at://b.test"],
+                services: {
+                    atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://b.example" },
+                },
+                prev: w.chain.g.cid,
+            })
+        )
+        const head = w.chain.next(mid.cid, "c")
+        return { ...w, head, entries: [w.chain.g, mid, head] }
+    }
+
+    type World = ReturnType<typeof custodyWorld>
+
+    const auditLog = (w: World) =>
+        Response.json(
+            w.entries.map((e) => ({
+                did: w.did,
+                cid: e.cid,
+                operation: e.operation,
+                nullified: e.nullified,
+                createdAt: new Date(e.createdAtMs).toISOString(),
+            }))
+        )
+
+    const fetched = (w: World, extra: Partial<FetchedRecord> = {}): FetchedRecord => ({
+        car: w.repo.car,
+        source: PDS,
+        signingKey: w.chain.signing.multikey,
+        didDocument: { document: w.document, fetchedAtMs: Date.now() },
+        attemptStartedAtMs: Date.now(),
+        ...extra,
+    })
+
+    const base = (w: World): VerifyOutcome => ({
+        kind: "verified",
+        key: w.chain.signing.multikey,
+        rev: "3kaaaaaaaaaaa",
+        cid: w.recordCid,
+        commitCid: expect.any(String),
+        collection: COLLECTION,
+        rkey: "self",
+    })
+
+    const appViewServes = (w: World, cid = w.recordCid) => () =>
+        Response.json({ uri: `at://${w.did}/${COLLECTION}/self`, cid })
+
+    /**
+     * Run `fn` in a fresh object with `MONITOR_HOSTNAME` set (unless
+     * `hostname` is null), the PLC directory serving `w`'s log (unless
+     * `plc` says otherwise), and the AppView answering `appView`; every
+     * requested URL is recorded.
+     */
+    async function inEvidenceObj<R>(
+        w: World,
+        options: {
+            appView?: () => Response | Promise<Response>
+            plc?: () => Response | Promise<Response>
+            hostname?: string | null
+            stub?: DurableObjectStub<MonitorIngest>
+        },
+        fn: (obj: MonitorIngest, state: DurableObjectState, requested: string[]) => Promise<R>
+    ): Promise<R> {
+        const requested: string[] = []
+        const original = globalThis.fetch
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = new URL(input instanceof Request ? input.url : input.toString())
+            requested.push(url.href)
+            if (url.hostname === "plc.directory") return (options.plc ?? (() => auditLog(w)))()
+            if (url.pathname === APP_VIEW_PATH && options.appView) return options.appView()
+            return new Response(null, { status: 404 })
+        }) as typeof fetch
+        try {
+            return await runInDurableObject(options.stub ?? freshStub(), async (obj: MonitorIngest, state) => {
+                const o = obj as unknown as { env: MonitorEnv }
+                const hostname = options.hostname === undefined ? HOSTNAME : options.hostname
+                o.env = { ...o.env, MONITOR_HOSTNAME: hostname ?? undefined }
+                return fn(obj, state, requested)
+            })
+        } finally {
+            globalThis.fetch = original
+        }
+    }
+
+    const verify = (obj: MonitorIngest, did: string, record: FetchedRecord) =>
+        (
+            obj as unknown as {
+                verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+            }
+        ).verifyRecord(did, record)
+
+    afterEach(() => {
+        vi.restoreAllMocks()
+    })
+
+    it("a verified PLC log rendering the fetched key is custody-chain evidence, with no AppView read", async () => {
+        const w = custodyWorld()
+        const { outcome, requested } = await inEvidenceObj(w, {}, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "custody-chain",
+            authority: { method: "plc", operationCid: w.chain.g.cid },
+            monitor: HOSTNAME,
+        })
+        expect(requested.some((u) => new URL(u).pathname === APP_VIEW_PATH)).toBe(false)
+    })
+
+    it("a log rendering another key is no custody evidence", async () => {
+        const w = custodyWorld()
+        const other = makeKey()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const outcome = await inEvidenceObj(w, { appView: appViewServes(w) }, (obj) =>
+            verify(obj, w.did, {
+                ...fetched(w),
+                car: buildRepoCar({
+                    did: w.did,
+                    key: other,
+                    records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+                }).car,
+                signingKey: other.multikey,
+            })
+        )
+        expect(outcome).toEqual({ ...base(w), key: other.multikey })
+        expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+            did: w.did,
+            reason: "PLC current-key operation unverified",
+        })
+    })
+
+    it("a verified chain whose head renders no document is custody-chain evidence, with no AppView read", async () => {
+        const w = unrenderableWorld()
+        const { outcome, requested } = await inEvidenceObj(w, {}, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "custody-chain",
+            authority: { method: "plc", operationCid: w.head.cid },
+            monitor: HOSTNAME,
+        })
+        expect(requested.some((url) => url.includes(APP_VIEW_PATH))).toBe(false)
+    })
+
+    it("a head whose chain fails the full proof, confirmed by the AppView, is current-key cross-check evidence naming it", async () => {
+        const w = currentKeyWorld()
+        const outcome = await inEvidenceObj(w, { appView: appViewServes(w) }, (obj) =>
+            verify(obj, w.did, fetched(w))
+        )
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "current-key-cross-check",
+            authority: { method: "plc", operationCid: w.head.cid },
+            monitor: HOSTNAME,
+        })
+    })
+
+    it("an AppView 5xx, a failed AppView fetch, or a CID mismatch leaves the declaration verified without evidence", async () => {
+        const w = currentKeyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (const appView of [
+            () => new Response("unavailable", { status: 503 }),
+            () => Promise.reject(new Error("down")),
+            appViewServes(w, "bafyreiother"),
+        ]) {
+            const outcome = await inEvidenceObj(w, { appView }, (obj) => verify(obj, w.did, fetched(w)))
+            expect(outcome).toEqual(base(w))
+        }
+        const reasons = warn.mock.calls.map((call) => (call[1] as { reason: string }).reason)
+        expect(reasons).toEqual([
+            expect.stringMatching(/^AppView unreachable: /),
+            expect.stringMatching(/^AppView unreachable: .*down/),
+            "AppView did not confirm",
+        ])
+    })
+
+    it("an unreachable PLC directory leaves the declaration verified without evidence", async () => {
+        const w = currentKeyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const outcome = await inEvidenceObj(
+            w,
+            { appView: appViewServes(w), plc: () => new Response(null, { status: 502 }) },
+            (obj) => verify(obj, w.did, fetched(w))
+        )
+        expect(outcome).toEqual(base(w))
+        expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+            did: w.did,
+            reason: expect.any(String),
+        })
+    })
+
+    it("a stale fetched document or a fetch with no attempt start is no evidence", async () => {
+        const w = custodyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (const extra of [
+            { didDocument: { document: w.document, fetchedAtMs: Date.now() - 60_000 } },
+            { attemptStartedAtMs: undefined },
+            { didDocument: undefined },
+        ]) {
+            expect(await inEvidenceObj(w, {}, (obj) => verify(obj, w.did, fetched(w, extra)))).toEqual(base(w))
+        }
+        expect(warn.mock.calls.map((call) => (call[1] as { reason: string }).reason)).toEqual([
+            "stale DID document",
+            "no fetch attempt start",
+            "no fetched DID document",
+        ])
+    })
+
+    it("without MONITOR_HOSTNAME nothing is fetched and nothing is logged", async () => {
+        const w = custodyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const { outcome, requested } = await inEvidenceObj(w, { hostname: null }, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toEqual(base(w))
+        expect(requested).toEqual([])
+        expect(warn).not.toHaveBeenCalled()
+    })
+
+    describe("through deps() with a deployment fetchRecord", () => {
+        const override = (obj: MonitorIngest, record: () => FetchedRecord) => {
+            ;(obj as unknown as { fetchRecord: (did: string) => Promise<FetchedRecord> }).fetchRecord =
+                async () => record()
+        }
+        const depsOf = (obj: MonitorIngest) => (obj as unknown as { deps(): IngestDeps }).deps()
+        const anchorRows = (state: DurableObjectState, did: string) =>
+            state.storage.sql
+                .exec<{ kind: string }>("SELECT kind FROM evidence_anchors WHERE did = ? ORDER BY kind", did)
+                .toArray()
+                .map((r) => r.kind)
+
+        it("stores evidence for a fetch that stamps no attempt start, and keeps one commit row per DID", async () => {
+            const w = custodyWorld()
+            const stub = freshStub()
+            const { first, rows } = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                return {
+                    first: (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence,
+                    rows: anchorRows(state, w.did),
+                }
+            })
+            expect(first).toMatchObject({
+                did: w.did,
+                recordCid: w.recordCid,
+                commitCid: expect.any(String),
+                assurance: "custody-chain",
+                monitor: HOSTNAME,
+            })
+            expect(rows).toEqual(["anchor", "commit"])
+
+            // A later commit supersedes the first commit's row; the anchor is the same one.
+            const advanced = buildRepoCar({
+                did: w.did,
+                key: w.chain.signing,
+                rev: "3kaaaaaaaaaab",
+                records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 2 } },
+            })
+            const { second, after } = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { car: advanced.car, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaab" }, "c2")
+                await settle(depsOf(obj), w.did)
+                return {
+                    second: (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence,
+                    after: anchorRows(state, w.did),
+                }
+            })
+            expect(second).toMatchObject({ rev: "3kaaaaaaaaaab", anchorFirstObservedAtMs: first!.anchorFirstObservedAtMs })
+            expect(second!.commitCid).not.toBe(first!.commitCid)
+            expect(after).toEqual(["anchor", "commit"])
+        })
+
+        it("a fetch with no DID document logs why and stores the declaration without evidence", async () => {
+            const w = custodyWorld()
+            const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+            const stored = await inEvidenceObj(w, {}, async (obj) => {
+                override(obj, () => fetched(w, { didDocument: undefined, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                return kvSnapshotStore(testEnv).getRecord(w.did)
+            })
+            expect(stored).toMatchObject({ rev: "3kaaaaaaaaaaa", cid: w.recordCid, evidence: null })
+            expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+                did: w.did,
+                reason: "no fetched DID document",
+            })
+        })
+
+        it("anchors kept before rows were keyed by DID migrate in place and survive an unchanged settle", async () => {
+            const w = custodyWorld()
+            const stub = freshStub()
+            const stale = JSON.stringify(["commit", { did: w.did, commitCid: "bafStale" }])
+            const first = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                // Rewrite the table in its earlier shape: identity and time only.
+                const held = state.storage.sql
+                    .exec<{ identity: string; first_observed_at: number }>(
+                        "SELECT identity, first_observed_at FROM evidence_anchors"
+                    )
+                    .toArray()
+                state.storage.sql.exec("DROP TABLE evidence_anchors")
+                state.storage.sql.exec(
+                    "CREATE TABLE evidence_anchors (identity TEXT PRIMARY KEY, first_observed_at INTEGER NOT NULL)"
+                )
+                for (const row of [...held, { identity: stale, first_observed_at: 1 }, { identity: "not json", first_observed_at: 1 }]) {
+                    state.storage.sql.exec(
+                        "INSERT INTO evidence_anchors (identity, first_observed_at) VALUES (?, ?)",
+                        row.identity,
+                        row.first_observed_at
+                    )
+                }
+                await obj.setEvidenceBackfillProgress({ done: true, cursor: null })
+                return (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence!
+            })
+            await evictDurableObject(stub)
+
+            const migrated = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                const rows = anchorRows(state, w.did)
+                const progress = await obj.readEvidenceBackfillProgress()
+                // A sweep-style refetch at the indexed rev: an unchanged settle.
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.oweEvidenceRefresh(w.did, "3kaaaaaaaaaaa")
+                await settle(depsOf(obj), w.did)
+                return { rows, progress, after: anchorRows(state, w.did) }
+            })
+            expect(migrated.rows).toEqual(["anchor", "commit"])
+            expect(migrated.progress).toEqual({ done: true, cursor: null })
+            expect(migrated.after).toEqual(["anchor", "commit"])
+
+            await new Promise((resolve) => setTimeout(resolve, 5))
+            const advanced = buildRepoCar({
+                did: w.did,
+                key: w.chain.signing,
+                rev: "3kaaaaaaaaaab",
+                records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 2 } },
+            })
+            const second = await inEvidenceObj(w, { stub }, async (obj) => {
+                override(obj, () => fetched(w, { car: advanced.car, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaab" }, "c2")
+                await settle(depsOf(obj), w.did)
+                return (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence!
+            })
+            expect(second.rev).toBe("3kaaaaaaaaaab")
+            expect(second.anchorFirstObservedAtMs).toBe(first.anchorFirstObservedAtMs)
+        })
+    })
+})
+
+describe("evidence anchors and the evidence sweep", () => {
+    const anchorRows = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<{ identity: string; kind: string }>(
+                    "SELECT identity, kind FROM evidence_anchors WHERE did = ? ORDER BY kind, identity",
+                    did
+                )
+                .toArray()
+                .map((r) => `${r.kind}:${r.identity}`)
+        )
+    const retain = (stub: DurableObjectStub<MonitorIngest>, did: string, commit: string, anchor: string, at = 1) =>
+        runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.retainEvidenceAnchors(did, [
+                { kind: "commit", identity: `${did}/${commit}`, firstObservedAtMs: at },
+                { kind: "anchor", identity: `${did}/${anchor}`, firstObservedAtMs: at },
+            ])
+        )
+
+    it("a new commit supersedes the DID's commit row and leaves other DIDs alone", async () => {
+        const stub = freshStub()
+        await retain(stub, "did:plc:other", "c1", "a1")
+        await retain(stub, DID, "c1", "a1")
+        await retain(stub, DID, "c2", "a1", 2)
+        expect(await anchorRows(stub, DID)).toEqual([`anchor:${DID}/a1`, `commit:${DID}/c2`])
+        expect(await anchorRows(stub, "did:plc:other")).toEqual([
+            "anchor:did:plc:other/a1",
+            "commit:did:plc:other/c1",
+        ])
+        // Reused, not rewritten.
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getEvidenceAnchor(`${DID}/a1`))).toBe(1)
+    })
+
+    it("keeps the newest 16 anchors per DID, and a reappearing one keeps its first observation", async () => {
+        const stub = freshStub()
+        for (let i = 0; i < 17; i++) await retain(stub, DID, `c${i}`, `a${i}`, 100 + i)
+        let anchors = (await anchorRows(stub, DID)).filter((r) => r.startsWith("anchor:"))
+        expect(anchors).toHaveLength(16)
+        expect(anchors).not.toContain(`anchor:${DID}/a0`)
+        expect(anchors).toContain(`anchor:${DID}/a16`)
+        // The oldest kept anchor comes back as current.
+        await retain(stub, DID, "c17", "a1", 200)
+        anchors = (await anchorRows(stub, DID)).filter((r) => r.startsWith("anchor:"))
+        expect(anchors).toHaveLength(16)
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getEvidenceAnchor(`${DID}/a1`))).toBe(101)
+    })
+
+    it("a leave forgets the DID's anchors", async () => {
+        const stub = freshStub()
+        await retain(stub, DID, "c1", "a1")
+        await retain(stub, "did:plc:other", "c1", "a1")
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.forgetLeft(DID))
+        expect(await anchorRows(stub, DID)).toEqual([])
+        expect(await anchorRows(stub, "did:plc:other")).toHaveLength(2)
+    })
+
+    const pendingRow = (state: DurableObjectState, did: string) =>
+        state.storage.sql
+            .exec<{ rev: string; attempts: number; not_before: number; quiet: number; owed_gen: number }>(
+                "SELECT rev, attempts, not_before, quiet, owed_gen FROM pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+
+    it("oweEvidenceRefresh owes an un-owed DID and leaves an owed row's backoff, quiet flag and generation", async () => {
+        const stub = freshStub()
+        const rows = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            await obj.owe("did:plc:backoff", "3m1")
+            await obj.deferPending("did:plc:backoff", Date.now() + 60_000, {
+                kind: "threw",
+                errorName: "Error",
+                message: "down",
+                atMs: Date.now(),
+            })
+            state.storage.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) VALUES (?, '', 0, 0, 1, ?)",
+                "did:plc:quiet",
+                Date.now()
+            )
+            const before = [pendingRow(state, "did:plc:backoff"), pendingRow(state, "did:plc:quiet")]
+            await obj.oweEvidenceRefresh("did:plc:backoff", "3m2")
+            await obj.oweEvidenceRefresh("did:plc:quiet", "3m2")
+            await obj.oweEvidenceRefresh("did:plc:fresh", "3m2")
+            return {
+                before,
+                after: [pendingRow(state, "did:plc:backoff"), pendingRow(state, "did:plc:quiet")],
+                fresh: pendingRow(state, "did:plc:fresh"),
+            }
+        })
+        expect(rows.before[0]).toMatchObject({ attempts: 1, quiet: 0 })
+        expect(rows.before[1]).toMatchObject({ quiet: 1 })
+        expect(rows.after).toEqual(rows.before)
+        expect(rows.fresh).toMatchObject({ rev: "3m2", attempts: 0, not_before: 0, quiet: 0 })
+    })
+
+    const sweep = (obj: MonitorIngest) =>
+        (obj as unknown as { sweepEvidenceRefreshIfConfigured(): Promise<void> }).sweepEvidenceRefreshIfConfigured()
+    const metaOf = (state: DurableObjectState, k: string) =>
+        state.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
+
+    it("the evidence sweep waits for MONITOR_HOSTNAME, then owes each held declaration once", async () => {
+        const stub = freshStub()
+        const did = "did:plc:held-before-evidence"
+        const unset = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            await obj.complete(did, "3m1", Date.now(), STUB_VERIFIED)
+            await sweep(obj)
+            return { meta: metaOf(state, "evidence_backfill"), pending: pendingRow(state, did) }
+        })
+        expect(unset).toEqual({ meta: undefined, pending: undefined })
+
+        const set = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            const o = obj as unknown as { env: MonitorEnv }
+            o.env = { ...o.env, MONITOR_HOSTNAME: "monitor.example.org" }
+            await sweep(obj)
+            const first = { meta: metaOf(state, "evidence_backfill"), pending: pendingRow(state, did) }
+            await obj.clearPending(did)
+            await sweep(obj)
+            return { first, again: pendingRow(state, did) }
+        })
+        expect(set.first.pending).toMatchObject({ rev: "3m1", attempts: 0 })
+        expect(JSON.parse(set.first.meta!)).toEqual({ done: true })
+        expect(set.again).toBeUndefined()
     })
 })
 

@@ -44,6 +44,11 @@ export {
     FETCH_AS_OF_SKEW_MS,
     type DidDocumentSink,
     type DigestMarker,
+    type EvidenceAnchorRow,
+    type EvidenceBackfillProgress,
+    type EvidenceAssurance,
+    type EvidenceAuthorityIdentity,
+    type SnapshotEvidence,
     type IntakeOutcome,
     type KeyUpdateIndex,
     type MonitorIndex,
@@ -234,6 +239,8 @@ export {
     settleDeletion,
     settleDue,
     settleRetryBackoffMs,
+    prepareSnapshotEvidence,
+    retainSnapshotEvidence,
     SETTLE_RETRY_CAP_MS,
     PENDING_FAILURE_MESSAGE_MAX,
     type SettleFailureEvent,
@@ -265,7 +272,12 @@ export {
 
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
-export { sweepBackfill, type BackfillDeps, type SweepBackfillResult } from "./backfill"
+export {
+    sweepBackfill,
+    sweepEvidenceRefresh,
+    type BackfillDeps,
+    type SweepBackfillResult,
+} from "./backfill"
 export {
     refreshDue,
     type RefreshDeps,

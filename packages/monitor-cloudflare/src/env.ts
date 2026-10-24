@@ -37,6 +37,11 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     /** The collection carrying the published key. */
     MONITOR_COLLECTION: string
 
+    /** Stable public hostname identifying this evidence monitor (lowercase IDNA, no port). */
+    MONITOR_HOSTNAME?: string
+    /** AppView XRPC origin used by current-key cross-check evidence. */
+    APP_VIEW_URL?: string
+
     /**
      * The singleton records kept beside the declaration for every DID in
      * interest, as comma-separated `<nsid>/<rkey>` (core

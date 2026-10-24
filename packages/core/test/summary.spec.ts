@@ -38,12 +38,16 @@ describe("diffSummaryIndex", () => {
         rkey: "self",
         cid,
         verifiedWith,
+        commitCid: null,
+        rev: null,
+        evidenceState: null,
     })
     const idx = (records: ReturnType<typeof entry>[]): SummaryIndex => ({
         owner: "did:plc:me",
         ownBlocks: [],
         records,
         verdicts: [],
+        evidenceSchema: 1,
     })
 
     it("with no base, everything changed and full is set", () => {
@@ -523,6 +527,7 @@ describe("summary codec", () => {
                 cid: "bafy",
                 verifiedWith: "zKey",
                 car: Uint8Array.of(1, 2, 3),
+                evidence: null,
             },
         ],
         removed: [{ did: "did:plc:b", collection: "app.example.thing", rkey: "self" }],
@@ -534,6 +539,31 @@ describe("summary codec", () => {
         expect(decodeSummaryDelta(encodeSummaryDelta(delta))).toEqual(delta)
         const unchanged = { ...delta, ownBlocks: null, records: [], removed: [] }
         expect(decodeSummaryDelta(encodeSummaryDelta(unchanged))).toEqual(unchanged)
+    })
+
+    it("round-trips bound evidence with integer durations and explicit unavailable values", () => {
+        const withEvidence = {
+            ...delta,
+            records: [{
+                ...delta.records[0]!,
+                evidence: {
+                    commitCid: "bafCommit",
+                    rev: "3m1",
+                    authority: {
+                        method: "web" as const,
+                        documentUrl: "https://example.org/did.json",
+                        verificationMethodId: "did:web:example.org#atproto",
+                        keyFingerprint: "sha256:abcd",
+                    },
+                    assurance: "current-key-cross-check" as const,
+                    monitor: "monitor.example.org",
+                    commitAgeMs: 12_345,
+                    anchorAgeMs: null,
+                    remainingTtlMs: 500,
+                },
+            }],
+        }
+        expect(decodeSummaryDelta(encodeSummaryDelta(withEvidence))).toEqual(withEvidence)
     })
 
     it("decode ignores unknown keys", () => {

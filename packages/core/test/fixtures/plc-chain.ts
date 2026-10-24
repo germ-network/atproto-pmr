@@ -28,7 +28,10 @@ export function logEntry(operation: Record<string, unknown>): PlcLogEntry {
     return { cid: operationCid(operation), operation, createdAtMs: clock, nullified: false }
 }
 
-/** A DID with a signed genesis, and builders for what follows it. */
+/**
+ * A DID with a signed genesis, its rotation and signing keys, and builders
+ * for what follows it.
+ */
 export function syntheticPlcChain() {
     const rotation = makeKey()
     const signing = makeKey()
@@ -47,6 +50,8 @@ export function syntheticPlcChain() {
     const g = logEntry(genesisOp)
     return {
         did,
+        rotation,
+        signing,
         g,
         next: (prev: string, tag: string) => logEntry(signedOperation(rotation, body(prev, tag))),
         log: (entries: PlcLogEntry[], asOfMs = Date.now()): PlcLog => ({ did, entries, asOfMs }),

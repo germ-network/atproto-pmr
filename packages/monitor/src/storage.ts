@@ -28,9 +28,18 @@
 import type {
     BlockEdge,
     DidDocument,
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
     FollowEdge,
     InterestPolicy,
     WatchedRecord,
+} from "@germ-network/atproto-pmr-core"
+
+export type {
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
 } from "@germ-network/atproto-pmr-core"
 import type { SigningKeyUpdate } from "./plc-export"
 import type { SnapshotCheck } from "./refresh"
@@ -45,6 +54,8 @@ export type Cursor = string
 /** What the monitor serves for one DID: the verified bytes and their rev. */
 export interface SnapshotEntry {
     rev: string
+    /** CID of the signed commit that contains this snapshot's record. */
+    commitCid?: string | null
     /** The record as CAR — never a parsed form; the client verifies it. */
     car: Uint8Array
     observedAtMs: number
@@ -66,6 +77,8 @@ export interface SnapshotEntry {
     cid: string | null
     /** The newest signing key a rotation push has been sent for. */
     seenKey?: string | null
+    /** Absent/null on legacy snapshots and entries whose evidence was not provable. */
+    evidence?: SnapshotEvidence | null
 }
 
 /** Whether a DID's declaration is held, and if not, whether that can reverse. */
@@ -79,6 +92,13 @@ export type HolderState = "held" | "gone-reversible" | "gone-permanent"
  * only pauses it.
  */
 export type GoneCause = "record" | "repo"
+
+/** One first observation a snapshot's evidence carries; see `MonitorIndex.retainEvidenceAnchors`. */
+export interface EvidenceAnchorRow {
+    kind: "commit" | "anchor"
+    identity: string
+    firstObservedAtMs: number
+}
 
 /** What a completion records about the bytes it just stored. */
 export interface VerifiedWrite {
@@ -398,6 +418,25 @@ export interface MonitorIndex {
      */
     readBackfillProgress(): Promise<BackfillProgress>
     setBackfillProgress(progress: BackfillProgress): Promise<void>
+
+    /** First-observation anchor history survives replacing or deleting a snapshot. */
+    getEvidenceAnchor?(identity: string): Promise<number | null>
+    /**
+     * Insert each row only when its identity is absent, in one write. The
+     * DID's other commit rows are superseded: a regression is never stored,
+     * so only the newest commit's first observation can be reused.
+     */
+    retainEvidenceAnchors?(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void>
+    /** Indexed declaration pages for the evidence bootstrap sweep. */
+    evidenceBackfillPage?(afterDid: string | null, limit: number): Promise<IndexedRecord[]>
+    readEvidenceBackfillProgress?(): Promise<EvidenceBackfillProgress>
+    setEvidenceBackfillProgress?(progress: EvidenceBackfillProgress): Promise<void>
+    /**
+     * The evidence sweep's owe: a fetch at `rev` only when none is owed. A
+     * row already owed keeps its attempts, backoff, quiet flag and
+     * generation, unlike `owe`, where news ends backoff.
+     */
+    oweEvidenceRefresh?(did: string, rev: string): Promise<void>
 }
 
 /**
@@ -409,6 +448,11 @@ export interface MonitorIndex {
  * DID from one pass, is a separate sweep, not implemented by this baseline-build pass.)
  */
 export type BackfillProgress =
+    | { done: false; cursor: string | null }
+    | { done: true }
+
+/** Separate resumable cursor; the baseline backfill only discovers missing DIDs. */
+export type EvidenceBackfillProgress =
     | { done: false; cursor: string | null }
     | { done: true }
 
