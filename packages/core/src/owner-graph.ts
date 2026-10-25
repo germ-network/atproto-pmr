@@ -13,6 +13,10 @@ export interface OwnerGraphEdge {
     did: string
     /** The other party also has the reverse edge. */
     mutual: boolean
+    /** Private ordering hint from the owner's follow record rkey. */
+    ownerFollowsContactAtMs?: number | null
+    /** Private ordering hint from the contact's follow record rkey. */
+    contactFollowsOwnerAtMs?: number | null
 }
 
 export interface OwnerGraph {
@@ -33,6 +37,19 @@ export interface OwnerGraph {
  */
 export interface MonitorOwnGraphRequest {
     ownGraph(did: string): Promise<OwnerGraph | null>
+    /** Batched ordering hints for the same owner/contact set, where available. */
+    permissionRecencyForRecipients?(
+        did: string,
+        recipients: readonly string[]
+    ): Promise<Map<string, number | null>>
+}
+
+/** Public can-message's batched, optional recency read from the monitor singleton. */
+export interface MonitorPermissionRecencyRequest {
+    permissionRecencyForRecipients(
+        did: string,
+        recipients: readonly string[]
+    ): Promise<Map<string, number | null>>
 }
 
 /**
@@ -48,13 +65,54 @@ export function ownerGraph(
 ): OwnerGraph {
     const followingDids = new Set(following.map((e) => e.subject))
     const followerDids = new Set(followers.map((e) => e.follower))
-    const edges = (others: Set<string>, reverse: Set<string>): OwnerGraphEdge[] =>
+    const timestamps = (rows: FollowEdge[], otherOf: (e: FollowEdge) => string) => {
+        const out = new Map<string, number | null>()
+        for (const edge of rows) {
+            const did = otherOf(edge)
+            const atMs = followRkeyAtMs(edge.rkey)
+            const prior = out.get(did)
+            if (prior === undefined) {
+                out.set(did, atMs)
+            } else if (prior === null || atMs === null) {
+                out.set(did, null)
+            } else {
+                out.set(did, Math.max(prior, atMs))
+            }
+        }
+        return out
+    }
+    const followingAt = timestamps(following, (e) => e.subject)
+    const followersAt = timestamps(followers, (e) => e.follower)
+    const edges = (
+        others: Set<string>,
+        reverse: Set<string>,
+        ownTimes: Map<string, number | null>,
+        reverseTimes: Map<string, number | null>
+    ): OwnerGraphEdge[] =>
         [...others]
             .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-            .map((other) => ({ did: other, mutual: reverse.has(other) }))
+            .map((other) => ({
+                did: other,
+                mutual: reverse.has(other),
+                ownerFollowsContactAtMs: ownTimes.get(other) ?? null,
+                contactFollowsOwnerAtMs: reverseTimes.get(other) ?? null,
+            }))
     return {
         did,
-        following: edges(followingDids, followerDids),
-        followers: edges(followerDids, followingDids),
+        following: edges(followingDids, followerDids, followingAt, followersAt),
+        followers: edges(followerDids, followingDids, followingAt, followersAt),
     }
+}
+
+/** AT Protocol TID timestamp: 53-bit Unix microseconds followed by 10 clock-ID bits. */
+export function followRkeyAtMs(rkey: string): number | null {
+    if (!/^[234567abcdefghijklmnopqrstuvwxyz]{13}$/.test(rkey)) return null
+    let value = 0n
+    for (const char of rkey) {
+        const digit = "234567abcdefghijklmnopqrstuvwxyz".indexOf(char)
+        if (digit < 0) return null
+        value = (value << 5n) | BigInt(digit)
+    }
+    const milliseconds = Number((value >> 10n) / 1000n)
+    return Number.isSafeInteger(milliseconds) && milliseconds >= 0 ? milliseconds : null
 }

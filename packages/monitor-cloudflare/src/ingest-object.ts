@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers"
+import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
     compareRev,
@@ -28,6 +29,7 @@ import {
     windowOf,
     type BackfillProgress,
     type EvidenceAnchorRow,
+    type MessagingKeyHistoryRow,
     type EvidenceBackfillProgress,
     type DidDocumentSink,
     type Cursor,
@@ -167,7 +169,7 @@ import { monitorWebPushSender } from "./push-sender"
 import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
-import { kvSnapshotStore } from "./snapshot-store"
+import { kvMessagingKeyFirstSeenMany, kvSnapshotStore } from "./snapshot-store"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
@@ -471,6 +473,16 @@ export class MonitorIngest
                     did TEXT NOT NULL,
                     kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')),
                     first_observed_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messaging_key_history (
+                    did TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    first_seen_at INTEGER,
+                    record_cid TEXT,
+                    commit_cid TEXT,
+                    rev TEXT,
+                    verified_with TEXT,
+                    PRIMARY KEY (did, fingerprint)
                 );
                 CREATE TABLE IF NOT EXISTS holder_state (
                     did TEXT PRIMARY KEY,
@@ -1751,6 +1763,55 @@ export class MonitorIngest
         })
     }
 
+    async getMessagingKeyHistory(
+        did: string,
+        fingerprint: string
+    ): Promise<MessagingKeyHistoryRow | null> {
+        const row = this.db.sql
+            .exec<{
+                fingerprint: string
+                first_seen_at: number | null
+                record_cid: string | null
+                commit_cid: string | null
+                rev: string | null
+                verified_with: string | null
+            }>(
+                "SELECT fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with " +
+                    "FROM messaging_key_history WHERE did = ? AND fingerprint = ?",
+                did,
+                fingerprint
+            )
+            .toArray()[0]
+        return row === undefined
+            ? null
+            : {
+                  fingerprint: row.fingerprint,
+                  firstSeenAtMs: row.first_seen_at,
+                  recordCid: row.record_cid,
+                  commitCid: row.commit_cid,
+                  rev: row.rev,
+                  verifiedWith: row.verified_with,
+              }
+    }
+
+    async retainMessagingKeyFirstSeen(
+        did: string,
+        row: MessagingKeyHistoryRow
+    ): Promise<void> {
+        this.db.sql.exec(
+            "INSERT OR IGNORE INTO messaging_key_history " +
+                "(did, fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            did,
+            row.fingerprint,
+            row.firstSeenAtMs,
+            row.recordCid,
+            row.commitCid,
+            row.rev,
+            row.verifiedWith
+        )
+    }
+
     async evidenceBackfillPage(afterDid: string | null, limit: number): Promise<IndexedRecord[]> {
         return this.db.sql
             .exec<{
@@ -2065,6 +2126,36 @@ export class MonitorIngest
     async ownGraph(did: string): Promise<OwnerGraph | null> {
         const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
         return edges === null ? null : ownerGraph(did, edges.following, edges.followers)
+    }
+
+    /** Public pair ordering hints from one graph batch and one batched snapshot metadata read. */
+    async permissionRecencyForRecipients(
+        did: string,
+        recipients: readonly string[]
+    ): Promise<Map<string, number | null>> {
+        const result = new Map<string, number | null>(recipients.map((recipient) => [recipient, null] as const))
+        const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
+        if (edges === null) return result
+        const graph = ownerGraph(did, edges.following, edges.followers)
+        const byDid = new Map(
+            [...graph.following, ...graph.followers].map((edge) => [edge.did, edge] as const)
+        )
+        const keyTimes = await kvMessagingKeyFirstSeenMany(this.env, recipients)
+        for (const recipient of recipients) {
+            const edge = byDid.get(recipient)
+            const values = [
+                keyTimes.get(recipient) ?? null,
+                edge?.ownerFollowsContactAtMs ?? null,
+                edge?.contactFollowsOwnerAtMs ?? null,
+            ]
+            if (
+                edge?.mutual &&
+                values.every((value) => value !== null && Number.isSafeInteger(value) && value >= 0)
+            ) {
+                result.set(recipient, Math.max(...(values as number[])))
+            }
+        }
+        return result
     }
 
     /**
@@ -3852,6 +3943,14 @@ export class MonitorIngest
         const base: VerifyOutcome = {
             kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
             commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
+            ...(ref.collection === DECLARATION_COLLECTION_NSID && ref.rkey === "self"
+                ? (() => {
+                      const currentKey = declarationAnchorKeyOf(outcome.record)
+                      return currentKey === null
+                          ? { messagingKeyFingerprint: null }
+                          : { messagingKeyFingerprint: [...currentKey].map((b) => b.toString(16).padStart(2, "0")).join("") }
+                  })()
+                : {}),
         }
         if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
         const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)

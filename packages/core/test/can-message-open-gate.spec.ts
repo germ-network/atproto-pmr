@@ -56,7 +56,8 @@ describe("open gate", () => {
         const wire = (await read(await (await owner(w, OWNER))())).verdicts.find((v) => v.did === PEER)!.verdict
 
         const many = (await computeCanMessageMany(OWNER, [PEER], deps)).get(PEER)!
-        expect(viaRoute).toEqual(GATED)
+        expect(viaRoute).toMatchObject(GATED)
+        expect(viaRoute.permissionRecencyAtMs).toBeNull()
         expect(viaSummary).toEqual(GATED)
         expect(wire).toEqual(GATED)
         expect(admissionOf(many)).toEqual({ verdict: "unknown", why: ["policy-not-enabled"] })

@@ -396,10 +396,23 @@ export {
 } from "./block-edges"
 export {
     ownerGraph,
+    followRkeyAtMs,
     type MonitorOwnGraphRequest,
+    type MonitorPermissionRecencyRequest,
     type OwnerGraph,
     type OwnerGraphEdge,
 } from "./owner-graph"
+export {
+    permissionRecencyAtMs,
+    PERMISSION_RECENCY_CBOR_KEY,
+    type PermissionRecencyAtMs,
+    type PermissionRecencyInputs,
+    type CanMessageRecencyResult,
+    type HeldSummaryRecencyVerdict,
+    type OwnerGraphRecencyEdge,
+    type OwnerGraphWithRecency,
+    type HeldOwnerRecencySummary,
+} from "./permission-recency"
 export {
     type InterestReader,
 } from "./graph"

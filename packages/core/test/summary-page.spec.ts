@@ -244,6 +244,7 @@ const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): Summary
     records,
     verdicts: [],
     evidenceSchema: 1,
+    permissionRecencySchema: 1,
     ...(more ? { more } : {}),
 })
 

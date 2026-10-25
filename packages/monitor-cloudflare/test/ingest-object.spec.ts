@@ -2898,6 +2898,7 @@ describe("verifying a fetched record", () => {
             commitCid: expect.any(String),
             collection: COLLECTION,
             rkey: "self",
+            messagingKeyFingerprint: null,
         })
     })
 
@@ -3041,6 +3042,7 @@ describe("declaration evidence", () => {
         commitCid: expect.any(String),
         collection: COLLECTION,
         rkey: "self",
+        messagingKeyFingerprint: null,
     })
 
     const appViewServes = (w: World, cid = w.recordCid) => () =>

@@ -22,12 +22,12 @@ describe("MonitorIngest.ownGraph", () => {
         expect(await inObj(registeredStub("graph"), (obj) => obj.ownGraph("did:o"))).toEqual({
             did: "did:o",
             following: [
-                { did: "did:a", mutual: true },
-                { did: "did:b", mutual: false },
+                { did: "did:a", mutual: true, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null },
+                { did: "did:b", mutual: false, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null },
             ],
             followers: [
-                { did: "did:a", mutual: true },
-                { did: "did:c", mutual: false },
+                { did: "did:a", mutual: true, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null },
+                { did: "did:c", mutual: false, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null },
             ],
         })
     })
@@ -38,7 +38,7 @@ describe("MonitorIngest.ownGraph", () => {
         await put("did:o", "1", "did:a")
         expect(await registeredStub("graph").ownGraph("did:o")).toEqual({
             did: "did:o",
-            following: [{ did: "did:a", mutual: false }],
+            following: [{ did: "did:a", mutual: false, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null }],
             followers: [],
         })
     })
@@ -51,7 +51,7 @@ describe("MonitorIngest.ownGraph", () => {
         await put("did:nodecl", "3", "did:o")
         expect(await inObj(registeredStub("graph"), (obj) => obj.ownGraph("did:o"))).toEqual({
             did: "did:o",
-            following: [{ did: "did:a", mutual: false }],
+            following: [{ did: "did:a", mutual: false, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null }],
             followers: [],
         })
     })
@@ -79,8 +79,8 @@ describe("MonitorIngest.ownGraph", () => {
         await put("did:a", "3", "did:o")
         expect(await inObj(registeredStub("graph"), (obj) => obj.ownGraph("did:o"))).toEqual({
             did: "did:o",
-            following: [{ did: "did:a", mutual: true }],
-            followers: [{ did: "did:a", mutual: true }],
+            following: [{ did: "did:a", mutual: true, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null }],
+            followers: [{ did: "did:a", mutual: true, ownerFollowsContactAtMs: null, contactFollowsOwnerAtMs: null }],
         })
     })
 

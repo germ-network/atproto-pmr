@@ -84,6 +84,8 @@ async function readEntry(
         cid: metadata.cid ?? null,
         seenKey: metadata.seenKey ?? null,
         evidence: metadata.evidence ?? null,
+        messagingKeyFingerprint: metadata.messagingKeyFingerprint ?? null,
+        messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
     }
 }
 
@@ -106,6 +108,12 @@ async function writeEntry(
             cid: entry.cid,
             seenKey: entry.seenKey ?? null,
             evidence: entry.evidence ?? null,
+            ...(entry.messagingKeyFingerprint == null
+                ? {}
+                : { messagingKeyFingerprint: entry.messagingKeyFingerprint }),
+            ...(entry.messagingKeyFirstSeenAtMs == null
+                ? {}
+                : { messagingKeyFirstSeenAtMs: entry.messagingKeyFirstSeenAtMs }),
             ...(policies ? { policies } : {}),
         } satisfies StoredMeta,
     })
@@ -129,6 +137,9 @@ interface StoredMeta {
     cid: string | null
     seenKey: string | null
     evidence?: SnapshotEvidence | null
+    /** Internal currentKey history metadata; absent on legacy snapshots. */
+    messagingKeyFingerprint?: string | null
+    messagingKeyFirstSeenAtMs?: number | null
     /**
      * The declaration's decoded policies; absent on entries stored before
      * they were kept and on any entry ingest did not verify.
@@ -341,11 +352,32 @@ export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorInge
                     rev: metadata.rev ?? null,
                     freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
                     evidenceState: metadata.evidence ?? null,
+                    messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
                     ...(metadata.policies ? { policies: metadata.policies } : {}),
                 }
             })
         },
     }
+}
+
+/** Batched private read of messaging-key first-seen metadata for public pair ranking. */
+export async function kvMessagingKeyFirstSeenMany(
+    env: { records: KVNamespace },
+    dids: readonly string[]
+): Promise<Map<string, number | null>> {
+    const distinct = [...new Set(dids)]
+    const out = new Map<string, number | null>()
+    for (let i = 0; i < distinct.length; i += KV_BULK_READ_MAX) {
+        const chunk = distinct.slice(i, i + KV_BULK_READ_MAX)
+        const keys = chunk.map((did) => snapshotKeys(did, DECLARATION_COLLECTION_NSID, "self").record)
+        const rows = await env.records.getWithMetadata<StoredMeta>(keys, "text")
+        for (const did of chunk) {
+            const key = snapshotKeys(did, DECLARATION_COLLECTION_NSID, "self").record
+            const metadata = rows.get(key)?.metadata
+            out.set(did, metadata?.messagingKeyFirstSeenAtMs ?? null)
+        }
+    }
+    return out
 }
 
 /** Keys one KV bulk read accepts. */

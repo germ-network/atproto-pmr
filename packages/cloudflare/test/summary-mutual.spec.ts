@@ -16,6 +16,7 @@ const index: SummaryIndex = {
         { did: "did:plc:b", verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
     ],
     evidenceSchema: 1,
+    permissionRecencySchema: 1,
 }
 
 describe("stored summary mutual bits", () => {

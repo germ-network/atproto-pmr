@@ -79,6 +79,10 @@ export interface SnapshotEntry {
     seenKey?: string | null
     /** Absent/null on legacy snapshots and entries whose evidence was not provable. */
     evidence?: SnapshotEvidence | null
+    /** Internal fingerprint of the declaration's validated currentKey. */
+    messagingKeyFingerprint?: string | null
+    /** First observed only after a verified key rotation; null for legacy keys. */
+    messagingKeyFirstSeenAtMs?: number | null
 }
 
 /** Whether a DID's declaration is held, and if not, whether that can reverse. */
@@ -98,6 +102,16 @@ export interface EvidenceAnchorRow {
     kind: "commit" | "anchor"
     identity: string
     firstObservedAtMs: number
+}
+
+/** Provenance for the first verified observation of a declaration currentKey. */
+export interface MessagingKeyHistoryRow {
+    fingerprint: string
+    firstSeenAtMs: number | null
+    recordCid: string | null
+    commitCid: string | null
+    rev: string | null
+    verifiedWith: string | null
 }
 
 /** What a completion records about the bytes it just stored. */
@@ -427,6 +441,9 @@ export interface MonitorIndex {
      * so only the newest commit's first observation can be reused.
      */
     retainEvidenceAnchors?(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void>
+    /** Read/retain currentKey history, separate from repo-signer evidence anchors. */
+    getMessagingKeyHistory?(did: string, fingerprint: string): Promise<MessagingKeyHistoryRow | null>
+    retainMessagingKeyFirstSeen?(did: string, row: MessagingKeyHistoryRow): Promise<void>
     /** Indexed declaration pages for the evidence bootstrap sweep. */
     evidenceBackfillPage?(afterDid: string | null, limit: number): Promise<IndexedRecord[]>
     readEvidenceBackfillProgress?(): Promise<EvidenceBackfillProgress>

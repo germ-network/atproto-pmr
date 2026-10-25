@@ -18,12 +18,15 @@ export interface SummaryVerdict {
      * reads an entry from a relay that predates it as not mutual.
      */
     mutual: boolean
+    /** Absolute Unix epoch milliseconds, null when the full mutual tuple is unavailable. */
+    permissionRecencyAtMs?: number | null
 }
 
 export const SUMMARY_VERDICT_KEYS = {
     did: "d",
     verdict: "v",
     mutual: "u",
+    permissionRecencyAtMs: "t",
 } as const satisfies { readonly [K in keyof SummaryVerdict]: string }
 
 /**

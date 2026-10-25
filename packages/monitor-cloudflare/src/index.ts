@@ -84,6 +84,7 @@ export {
     kvDeclarationSnapshots,
     kvRecordSnapshots,
     kvSummaryIndexReader,
+    kvMessagingKeyFirstSeenMany,
 } from "./snapshot-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
