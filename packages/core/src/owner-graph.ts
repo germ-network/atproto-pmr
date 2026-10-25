@@ -91,15 +91,19 @@ export function ownerGraph(
     }
 }
 
-/** AT Protocol TID timestamp: 53-bit Unix microseconds followed by 10 clock-ID bits. */
+/** AT Protocol TID: zero top bit, 53-bit Unix microseconds, then 10 clock-ID bits. */
 export function followRkeyAtMs(rkey: string): number | null {
-    if (!/^[234567abcdefghijklmnopqrstuvwxyz]{13}$/.test(rkey)) return null
+    // https://atproto.com/specs/tid: syntax alone allows a 64-bit value,
+    // but a timestamp must fit the 53-bit field beneath the zero top bit.
+    if (rkey.length !== 13 || !/^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$/.test(rkey)) return null
     let value = 0n
     for (const char of rkey) {
         const digit = "234567abcdefghijklmnopqrstuvwxyz".indexOf(char)
         if (digit < 0) return null
         value = (value << 5n) | BigInt(digit)
     }
-    const milliseconds = Number((value >> 10n) / 1000n)
+    const microseconds = value >> 10n
+    if (microseconds > (1n << 53n) - 1n) return null
+    const milliseconds = Number(microseconds / 1000n)
     return Number.isSafeInteger(milliseconds) && milliseconds >= 0 ? milliseconds : null
 }

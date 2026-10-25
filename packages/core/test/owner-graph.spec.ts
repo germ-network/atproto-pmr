@@ -73,3 +73,41 @@ describe("owner graph", () => {
         })
     })
 })
+
+
+describe("follow rkey TID validation", () => {
+    it("accepts the zero and maximum 53-bit timestamps regardless of clock ID", () => {
+        expect(followRkeyAtMs("2222222222222")).toBe(0)
+        expect(followRkeyAtMs("bzzzzzzzzzzzz")).toBe(Number(((1n << 53n) - 1n) / 1000n))
+        expect(followRkeyAtMs(tidAtMs(1_700_000_000_000, 1023))).toBe(1_700_000_000_000)
+    })
+
+    it.each([
+        "zzzzzzzzzzzzz", // outside the first-character syntax
+        "kjzfcijpj2z2a",
+        "c222222222222", // syntax-valid, but the 53-bit timestamp overflows
+        "jzzzzzzzzzzzz",
+        "3jzfcijpj2z21", // not base32-sortable
+        "3JZFCIJPJ2Z2A", // uppercase
+        "3jzfcijpj2z2aa", // too long
+        "3jzfcijpj2z2", // too short
+        "3jzf-cij-pj2z-2a", // obsolete hyphen syntax
+        "3jzfcijpj2z2a\n",
+    ])("rejects an invalid TID: %j", (rkey) => {
+        expect(followRkeyAtMs(rkey)).toBeNull()
+    })
+
+    it.each(["zzzzzzzzzzzzz", "kjzfcijpj2z2a", "c222222222222", "jzzzzzzzzzzzz"])(
+        "makes a direction unknown when an active duplicate has invalid prefix/range: %s", (invalid) => {
+            const valid = edge(ME, A, tidAtMs(1_700_000_000_000))
+            const malformed = edge(ME, A, invalid)
+            for (const following of [[valid, malformed], [malformed, valid]]) {
+                const graph = ownerGraph(ME, following, [edge(A, ME, tidAtMs(1_700_000_000_100))])
+                expect(graph.following).toEqual([{
+                    did: A, mutual: true, ownerFollowsContactAtMs: null,
+                    contactFollowsOwnerAtMs: 1_700_000_000_100,
+                }])
+            }
+        }
+    )
+})
