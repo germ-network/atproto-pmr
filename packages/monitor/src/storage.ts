@@ -441,9 +441,14 @@ export interface MonitorIndex {
      * so only the newest commit's first observation can be reused.
      */
     retainEvidenceAnchors?(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void>
-    /** Read/retain currentKey history, separate from repo-signer evidence anchors. */
-    getMessagingKeyHistory?(did: string, fingerprint: string): Promise<MessagingKeyHistoryRow | null>
-    retainMessagingKeyFirstSeen?(did: string, row: MessagingKeyHistoryRow): Promise<void>
+    /**
+     * Read/retain currentKey history, separate from repo-signer evidence.
+     * Stores reconcile prior raw-hex identities with the canonical digest,
+     * keeping null sentinels and the earliest observation's provenance.
+     * The optional raw alias preserves history across writer rollback.
+     */
+    getMessagingKeyHistory?(did: string, fingerprint: string, legacyFingerprint?: string): Promise<MessagingKeyHistoryRow | null>
+    retainMessagingKeyFirstSeen?(did: string, row: MessagingKeyHistoryRow, legacyFingerprint?: string): Promise<void>
     /** Indexed declaration pages for the evidence bootstrap sweep. */
     evidenceBackfillPage?(afterDid: string | null, limit: number): Promise<IndexedRecord[]>
     readEvidenceBackfillProgress?(): Promise<EvidenceBackfillProgress>

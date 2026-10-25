@@ -256,6 +256,7 @@ export {
     DECLARATION_COLLECTION_NSID,
     declarationAnchorKeyOf,
     messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,

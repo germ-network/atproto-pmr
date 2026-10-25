@@ -129,6 +129,17 @@ export function messagingKeyFingerprint(key: Uint8Array): string {
     return [...sha256(key)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
+/** Normalize the prior monitor revision's raw COSE_Key hex identity. */
+export function normalizeMessagingKeyFingerprint(fingerprint: string): string {
+    if (fingerprint.length <= 64 || !/^(?:[0-9a-f]{2})+$/i.test(fingerprint)) return fingerprint
+    try {
+        const key = Uint8Array.from(fingerprint.match(/../g)!, (byte) => parseInt(byte, 16))
+        return messagingKeyFingerprint(encodeOkpEd25519Key(parseOkpEd25519Key(key)))
+    } catch {
+        return fingerprint
+    }
+}
+
 /**
  * The germ declaration's anchor-key field: NOT COSE. One field —
  * an algorithm identifier byte followed by the raw key bytes — because this
