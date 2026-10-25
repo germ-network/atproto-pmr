@@ -1,5 +1,11 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.3.0
+
+### Minor Changes
+
+- [#89](https://github.com/germ-network/atproto-pmr/pull/89) [`1a9278d`](https://github.com/germ-network/atproto-pmr/commit/1a9278d92ebb06604c0c01f6d0d70bf9d69bfb04) Thanks [@germ-mark](https://github.com/germ-mark)! - Add nullable permission recency to public can-message results and held summary verdicts for display ranking. Track declaration messaging-key first-seen history separately from repository-signer evidence, preserve unknown legacy observations, and use active follow-record TID hints. Read public recency in batched request-side D1 and KV operations, including non-owner sender holders.
+
 ## 0.2.0
 
 ### Minor Changes
