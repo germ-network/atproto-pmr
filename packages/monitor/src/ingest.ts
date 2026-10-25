@@ -18,11 +18,11 @@ import {
     RecordNotFoundError,
     DECLARATION_COLLECTION_NSID,
     declarationAnchorKeyOf,
+    messagingKeyFingerprint,
     readRecordFromCar,
     type DidDocument,
     type InterestPolicy,
 } from "@germ-network/atproto-pmr-core"
-import { sha256 } from "@noble/hashes/sha2.js"
 import { streamTimeUs } from "./firehose-coverage"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
@@ -540,7 +540,7 @@ async function settleFetched(
         try {
             const record = readRecordFromCar(previous.car, DECLARATION_COLLECTION_NSID, "self")?.record
             const key = declarationAnchorKeyOf(record)
-            if (key) previousMessagingKeyFingerprint = fingerprintKey(key)
+            if (key) previousMessagingKeyFingerprint = messagingKeyFingerprint(key)
         } catch {
             // An unreadable legacy snapshot cannot establish a prior key.
         }
@@ -622,12 +622,6 @@ async function settleFetched(
     // A DID back from gone is news at whatever rev it returns.
     if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
     return "stored"
-}
-
-function fingerprintKey(key: Uint8Array): string {
-    // A digest keeps snapshot KV metadata below Cloudflare's 1 KiB limit;
-    // this value is an internal stable identity, not exposed key material.
-    return [...sha256(key)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
 /**

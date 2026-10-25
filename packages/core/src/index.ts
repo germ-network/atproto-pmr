@@ -255,6 +255,7 @@ export {
 export {
     DECLARATION_COLLECTION_NSID,
     declarationAnchorKeyOf,
+    messagingKeyFingerprint,
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,
@@ -398,7 +399,6 @@ export {
     ownerGraph,
     followRkeyAtMs,
     type MonitorOwnGraphRequest,
-    type MonitorPermissionRecencyRequest,
     type OwnerGraph,
     type OwnerGraphEdge,
 } from "./owner-graph"

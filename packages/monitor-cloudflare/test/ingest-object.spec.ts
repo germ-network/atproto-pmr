@@ -3650,3 +3650,70 @@ describe("record index and holder state", () => {
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(false)
     })
 })
+
+describe("messaging_key_history with verified declaration CARs", () => {
+    async function lifecycle(legacy: boolean) {
+        const stub = freshStub()
+        const did = `did:web:messaging-history-${n}.example`
+        const signer = makeKey()
+        const keys = [1, 2].map((value) => Uint8Array.of(3, ...new Uint8Array(32).fill(value)))
+        const repos = [0, 0, 1, 0, 1].map((key, i) => buildRepoCar({
+            did, key: signer, rev: `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`,
+            records: { "com.germnetwork.declaration/self": { currentKey: keys[key] } },
+        }))
+        const snapshots = kvSnapshotStore(testEnv)
+        if (legacy) {
+            // Real pre-tracker KV snapshot: no fingerprint or first-seen metadata.
+            await snapshots.putRecord(did, {
+                car: repos[0]!.car, rev: "3kaaaaaaaaaaa", observedAtMs: 100,
+                source: PDS, signingKey: signer.multikey, verifiedWith: signer.multikey,
+                cid: repos[0]!.recordCids["com.germnetwork.declaration/self"]!,
+            })
+        }
+        const seen: Array<number | null | undefined> = []
+        for (let i = legacy ? 1 : 0; i < repos.length; i++) {
+            const repo = repos[i]!
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const deps: IngestDeps = {
+                    index: obj, snapshot: snapshots,
+                    fetchRecord: async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey }),
+                    // Exercise the actual verifier: a raw-hex fingerprint here
+                    // must fail the legacy same-key assertion below.
+                    verify: (did, record) => (obj as unknown as {
+                        verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+                    }).verifyRecord(did, record),
+                    interest: { inInterest: async () => true, interestEpoch: async () => 0 },
+                    nowMs: () => (i + 1) * 1000,
+                }
+                await obj.owe(did, `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`)
+                expect(await settle(deps, did)).toBe("stored")
+            })
+            seen.push((await snapshots.getRecord(did))!.messagingKeyFirstSeenAtMs)
+        }
+        expect(seen).toEqual(legacy ? [null, 3000, null, 3000] : [null, null, 3000, null, 3000])
+        const rows = await runInDurableObject(stub, (_obj, state) => state.storage.sql.exec<{
+            fingerprint: string; first_seen_at: number | null; record_cid: string; commit_cid: string; rev: string; verified_with: string
+        }>("SELECT * FROM messaging_key_history WHERE did = ? ORDER BY first_seen_at", did).toArray())
+        expect(rows).toHaveLength(2)
+        expect(rows.map((row) => row.fingerprint.length)).toEqual([64, 64])
+        expect(rows.map((row) => row.first_seen_at)).toEqual([null, 3000])
+        expect(rows[1]).toMatchObject({
+            record_cid: repos[2]!.recordCids["com.germnetwork.declaration/self"],
+            rev: "3kaaaaaaaaaac", verified_with: signer.multikey,
+        })
+        expect(rows[1]!.commit_cid).toBeTruthy()
+        // Forget only this DID, alongside evidence, under the full-interest policy.
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.retainMessagingKeyFirstSeen("did:web:other-history.example", {
+                fingerprint: "other", firstSeenAtMs: null, recordCid: null, commitCid: null, rev: null, verifiedWith: null,
+            })
+            await obj.forgetLeft(did)
+            expect(await obj.getMessagingKeyHistory(did, rows[0]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory(did, rows[1]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory("did:web:other-history.example", "other")).not.toBeNull()
+        })
+    }
+
+    it("preserves the first unknown sentinel and the original observed rotation time", async () => lifecycle(false))
+    it("keeps an unrotated legacy key unknown and remembers it when it returns", async () => lifecycle(true))
+})

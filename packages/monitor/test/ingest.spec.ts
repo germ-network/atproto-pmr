@@ -1239,3 +1239,44 @@ describe("settle on a reversible not-found", () => {
         expect(quiet).not.toHaveBeenCalled()
     })
 })
+
+describe("declaration messaging-key history", () => {
+    it("retains first unknown and tracked rotation observations when keys return", async () => {
+        const { messagingKeyFingerprint, declarationAnchorKeyOf } = await import("@germ-network/atproto-pmr-core")
+        const { buildRepoCar, makeKey } = await import("../../core/test/fixtures/repo-car")
+        const history = new Map<string, import("../src/storage").MessagingKeyHistoryRow>()
+        const h = harness()
+        h.deps.index.getMessagingKeyHistory = async (_did, fingerprint) => history.get(fingerprint) ?? null
+        h.deps.index.retainMessagingKeyFirstSeen = async (_did, row) => {
+            if (!history.has(row.fingerprint)) history.set(row.fingerprint, row)
+        }
+        const signer = makeKey()
+        const key = (value: number) => Uint8Array.of(3, ...new Uint8Array(32).fill(value))
+        const fingerprint = (value: number) => messagingKeyFingerprint(declarationAnchorKeyOf({ currentKey: key(value) })!)
+        let step = 0
+        const observe = async (value: number) => {
+            step++
+            const rev = `3kaaaaaaaaaa${String.fromCharCode(96 + step)}`
+            const repo = buildRepoCar({ did: DID, key: signer, rev,
+                records: { [`${COLLECTION}/self`]: { currentKey: key(value) } } })
+            h.deps.fetchRecord = async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey })
+            h.deps.verify = async () => ({ kind: "verified", rev, key: signer.multikey,
+                cid: repo.recordCids[`${COLLECTION}/self`]!, collection: COLLECTION, rkey: "self",
+                commitCid: `commit-${step}`, messagingKeyFingerprint: fingerprint(value) })
+            h.deps.nowMs = () => step * 1000
+            await h.deps.index.owe(DID, rev)
+            expect(await settle(h.deps, DID)).toBe("stored")
+            return h.records.get(DID)!
+        }
+        expect((await observe(1)).messagingKeyFirstSeenAtMs).toBeNull()
+        expect(history.get(fingerprint(1))?.firstSeenAtMs).toBeNull()
+        const rotated = await observe(2)
+        expect(rotated.messagingKeyFirstSeenAtMs).toBe(2000)
+        expect(history.get(fingerprint(2))).toEqual({ fingerprint: fingerprint(2), firstSeenAtMs: 2000,
+            recordCid: rotated.cid, commitCid: "commit-2", rev: rotated.rev, verifiedWith: signer.multikey })
+        expect(history.get(fingerprint(1))?.firstSeenAtMs).toBeNull()
+        expect((await observe(1)).messagingKeyFirstSeenAtMs).toBeNull()
+        expect((await observe(2)).messagingKeyFirstSeenAtMs).toBe(2000)
+        expect(history.size).toBe(2)
+    })
+})

@@ -85,4 +85,6 @@ Required dependency sequence: `atproto-pmr` backend API + held-summary delta/tok
 
 ## Validation status
 
-The implementation and ordinary Core/Cloudflare fixtures are in the worktree. `git diff --check` passes. The normal Core typecheck was attempted but cannot start because this checkout has no `node_modules` and `tsc` is unavailable. No dependencies were installed, and tests remain unrun; the package toolchain must be available for final verification.
+Validated locally on 2026-10-25 with Node v24.14.1 and pnpm 10.33.0. `pnpm typecheck` passes across all four packages. Full package suites pass: Core 874 tests, monitor 429 tests, monitor-cloudflare 614 tests, and cloudflare 218 tests (2,135 total). `git diff --check` passes. Regression coverage exercises the real declaration verifier and KV/SQLite history lifecycle (unknown first observation, unrotated legacy snapshot, verified rotation, return to unknown/tracked keys, and forgetting), plus request-side batched D1/KV reads for a non-owner sender holder. Cloudflare tests require loopback access for the local test runtime.
+
+Public can-message recency uses `d1PermissionRecencyReader` with the request's D1 session and batched KV snapshot metadata; it does not read through MonitorIngest. The held-summary path retains its existing batched backend graph/metadata reads. The wrapper integration must use this source commit until a reviewed package release is available; no release or deployment is implied by local validation.

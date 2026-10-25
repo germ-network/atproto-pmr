@@ -145,6 +145,7 @@ import {
     type MonitorVerifiedAnchorRequest,
     type VerifiedAnchorObservation,
     declarationAnchorKeyOf,
+    messagingKeyFingerprint,
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
@@ -169,7 +170,7 @@ import { monitorWebPushSender } from "./push-sender"
 import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
-import { kvMessagingKeyFirstSeenMany, kvSnapshotStore } from "./snapshot-store"
+import { kvSnapshotStore } from "./snapshot-store"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
@@ -2128,36 +2129,6 @@ export class MonitorIngest
         return edges === null ? null : ownerGraph(did, edges.following, edges.followers)
     }
 
-    /** Public pair ordering hints from one graph batch and one batched snapshot metadata read. */
-    async permissionRecencyForRecipients(
-        did: string,
-        recipients: readonly string[]
-    ): Promise<Map<string, number | null>> {
-        const result = new Map<string, number | null>(recipients.map((recipient) => [recipient, null] as const))
-        const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
-        if (edges === null) return result
-        const graph = ownerGraph(did, edges.following, edges.followers)
-        const byDid = new Map(
-            [...graph.following, ...graph.followers].map((edge) => [edge.did, edge] as const)
-        )
-        const keyTimes = await kvMessagingKeyFirstSeenMany(this.env, recipients)
-        for (const recipient of recipients) {
-            const edge = byDid.get(recipient)
-            const values = [
-                keyTimes.get(recipient) ?? null,
-                edge?.ownerFollowsContactAtMs ?? null,
-                edge?.contactFollowsOwnerAtMs ?? null,
-            ]
-            if (
-                edge?.mutual &&
-                values.every((value) => value !== null && Number.isSafeInteger(value) && value >= 0)
-            ) {
-                result.set(recipient, Math.max(...(values as number[])))
-            }
-        }
-        return result
-    }
-
     /**
      * The anchor the stored, verified declaration names. Only an exclusion
      * proof from a live repo is `absent`; a repo-level reversible state
@@ -2722,7 +2693,7 @@ export class MonitorIngest
 
     async forgetLeft(did: string): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors"]) {
+            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors", "messaging_key_history"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
             this.dropPlcLogSync(did)
@@ -3948,7 +3919,7 @@ export class MonitorIngest
                       const currentKey = declarationAnchorKeyOf(outcome.record)
                       return currentKey === null
                           ? { messagingKeyFingerprint: null }
-                          : { messagingKeyFingerprint: [...currentKey].map((b) => b.toString(16).padStart(2, "0")).join("") }
+                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey) }
                   })()
                 : {}),
         }

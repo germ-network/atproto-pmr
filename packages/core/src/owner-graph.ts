@@ -37,19 +37,6 @@ export interface OwnerGraph {
  */
 export interface MonitorOwnGraphRequest {
     ownGraph(did: string): Promise<OwnerGraph | null>
-    /** Batched ordering hints for the same owner/contact set, where available. */
-    permissionRecencyForRecipients?(
-        did: string,
-        recipients: readonly string[]
-    ): Promise<Map<string, number | null>>
-}
-
-/** Public can-message's batched, optional recency read from the monitor singleton. */
-export interface MonitorPermissionRecencyRequest {
-    permissionRecencyForRecipients(
-        did: string,
-        recipients: readonly string[]
-    ): Promise<Map<string, number | null>>
 }
 
 /**
