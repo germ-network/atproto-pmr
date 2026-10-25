@@ -1,3 +1,4 @@
+import { sha256 } from "@noble/hashes/sha2.js"
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
 import { snapshotRecordReader, type RecordSnapshot } from "./snapshot-read"
 
@@ -119,6 +120,23 @@ export function declarationAnchorKeyOf(record: unknown): Uint8Array | null {
         return encodeOkpEd25519Key(parseFrozenAnchorKeyField(currentKey))
     } catch {
         return null
+    }
+}
+
+/** Stable internal identity of the canonical encoded declaration messaging key. */
+export function messagingKeyFingerprint(key: Uint8Array): string {
+    // Digest the canonical COSE_Key to keep snapshot metadata below 1 KiB.
+    return [...sha256(key)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+/** Normalize the prior monitor revision's raw COSE_Key hex identity. */
+export function normalizeMessagingKeyFingerprint(fingerprint: string): string {
+    if (fingerprint.length <= 64 || !/^(?:[0-9a-f]{2})+$/i.test(fingerprint)) return fingerprint
+    try {
+        const key = Uint8Array.from(fingerprint.match(/../g)!, (byte) => parseInt(byte, 16))
+        return messagingKeyFingerprint(encodeOkpEd25519Key(parseOkpEd25519Key(key)))
+    } catch {
+        return fingerprint
     }
 }
 

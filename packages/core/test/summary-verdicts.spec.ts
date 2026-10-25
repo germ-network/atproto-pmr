@@ -6,6 +6,7 @@ import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
 import {
     buildSummaryIndex,
     decodeSummaryDelta,
+    diffSummaryIndex,
     encodeSummaryDelta,
     readSummaryPage,
     SUMMARY_DELTA_KEYS,
@@ -111,16 +112,51 @@ describe("summary verdicts", () => {
         w.senderFacts.set(`${OWNER}|${PEER}`, { blocks: "yes", follows: "no" })
         const second = await read(await get(first.token))
         expect(second.verdicts).toEqual([
-            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
+            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false, permissionRecencyAtMs: null },
         ])
 
-        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: false }], evidenceSchema: 1 }
+        const held: SummaryIndex = { owner: OWNER, ownBlocks: [], records: [], verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: false }], evidenceSchema: 1, permissionRecencySchema: 1 }
         // Same verdict, fields in another order: equal on the wire.
         const same = { ...held, verdicts: [{ did: PEER, verdict: { via: ["open"], verdict: "yes" } as const, mutual: false }] }
         const { page } = await readSummaryPage(held, same, w.deps, 10)
         expect(page.verdicts).toEqual([])
         const other = { ...held, verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open", "bsky-follows"] }, mutual: false }] }
         expect((await readSummaryPage(held, other, w.deps, 10)).page.verdicts).toHaveLength(1)
+    })
+
+    it("a recency-only change is a verdict delta", () => {
+        const before: SummaryIndex = {
+            owner: OWNER,
+            ownBlocks: [],
+            records: [],
+            verdicts: [{ did: PEER, verdict: { verdict: "yes", via: ["open"] }, mutual: true, permissionRecencyAtMs: 100 }],
+            evidenceSchema: 1,
+            permissionRecencySchema: 1,
+        }
+        const after: SummaryIndex = {
+            ...before,
+            verdicts: [{
+                did: PEER,
+                verdict: { verdict: "yes", via: ["open"] },
+                mutual: true,
+                permissionRecencyAtMs: 101,
+            }],
+        }
+        expect(diffSummaryIndex(before, after).verdicts).toEqual(after.verdicts)
+    })
+
+    it("builds recency from the contact key history and both directional rkey hints", async () => {
+        const w = world()
+        const edge = {
+            did: PEER,
+            mutual: true,
+            ownerFollowsContactAtMs: 20,
+            contactFollowsOwnerAtMs: 30,
+        }
+        w.ownGraphs.set(OWNER, { did: OWNER, following: [edge], followers: [edge] })
+        w.messagingKeyFirstSeen.set(PEER, 10)
+        const built = await buildSummaryIndex(OWNER, w.deps)
+        expect(built?.index.verdicts[0]?.permissionRecencyAtMs).toBe(30)
     })
 
     it("a contact no longer covered, or whose verdict disappeared, is listed in y", async () => {
@@ -201,7 +237,7 @@ describe("summary verdicts", () => {
         w.senderFacts.set(`${OWNER}|${PEER}`, { blocks: "yes", follows: "no" })
         const built = await buildSummaryIndex(OWNER, w.deps)
         expect(built!.index.verdicts).toEqual([
-            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false },
+            { did: PEER, verdict: { verdict: "no", why: ["blocked"] }, mutual: false, permissionRecencyAtMs: null },
         ])
     })
 
@@ -315,7 +351,7 @@ describe("summary verdicts", () => {
         expect(page.droppedVerdicts).toEqual([])
     })
 
-    it("encodes c as a list of {d, u, v} with v the canMessageToCose map, and y as a list of DIDs", () => {
+    it("encodes c as a list of {d, u, v, t} and y as a list of DIDs", () => {
         const verdict = { verdict: "yes", via: ["open"] } as const
         const delta = {
             token: "t",
@@ -323,7 +359,7 @@ describe("summary verdicts", () => {
             ownBlocks: null,
             records: [],
             removed: [],
-            verdicts: [{ did: PEER, verdict, mutual: true }],
+            verdicts: [{ did: PEER, verdict, mutual: true, permissionRecencyAtMs: 123 }],
             droppedVerdicts: [THIRD],
             more: false,
             truncated: false,
@@ -338,6 +374,7 @@ describe("summary verdicts", () => {
                 ["d", PEER],
                 ["u", true],
                 ["v", canMessageToCose(verdict)],
+                ["t", 123],
             ]),
         ])
         expect(wire.get("y")).toEqual([THIRD])

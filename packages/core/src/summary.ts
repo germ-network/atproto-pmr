@@ -23,6 +23,7 @@ import {
     type SenderGraphReader,
 } from "./can-message.js"
 import { indexPolicySource, SUMMARY_VERDICT_KEYS, type SummaryVerdict } from "./summary-verdicts.js"
+import { permissionRecencyAtMs } from "./permission-recency.js"
 import type { StoredPolicies } from "./policy.js"
 import type { SummaryCoverageDeps } from "./firehose-coverage.js"
 import type { WatchedRecord } from "./watched.js"
@@ -67,6 +68,8 @@ export interface SummaryIndex {
     verdicts: SummaryVerdict[]
     /** Missing on old token baselines, which forces a fresh full read. */
     evidenceSchema?: number
+    /** Distinct held-value schema marker; old token baselines force a full read. */
+    permissionRecencySchema?: number
     /** Delivered by a page that left more: a client holding it is mid-sync. */
     more?: boolean
 }
@@ -161,6 +164,8 @@ export interface SummaryHeldEntry extends SummaryIndexEntry {
      * joins a {@link SummaryIndex}.
      */
     policies?: StoredPolicies
+    /** Internal monitor metadata; never serialized as a summary record field. */
+    messagingKeyFirstSeenAtMs?: number | null
 }
 
 export interface SummaryIndexReader {
@@ -351,7 +356,12 @@ export async function buildSummaryIndex(
         if (!clockReliable && entry.collection === DECLARATION_COLLECTION_NSID && entry.rkey === "self") {
             deps.onClockDiscontinuity?.(entry.did)
         }
-        const { freshAtMs: _freshAtMs, policies: _policies, ...indexed } = entry
+        const {
+            freshAtMs: _freshAtMs,
+            policies: _policies,
+            messagingKeyFirstSeenAtMs: _messagingKeyFirstSeenAtMs,
+            ...indexed
+        } = entry
         records.push({ ...indexed, evidenceState: boundEvidence(entry, entry, entry.evidenceState) })
     }
     for (const lapse of lapsed) deps.onLapse(lapse)
@@ -363,15 +373,39 @@ export async function buildSummaryIndex(
             dids.filter((d) => d !== did),
             { policies: indexPolicySource(servable), graph: deps.senderGraph }
         )
+        const graphEdges = new Map(
+            [...graph.following, ...graph.followers].map((edge) => [edge.did, edge] as const)
+        )
+        const currentKeyFirstSeen = new Map(
+            servable
+                .filter((entry) => entry.collection === DECLARATION_COLLECTION_NSID && entry.rkey === "self")
+                .map((entry) => [entry.did, entry.messagingKeyFirstSeenAtMs ?? null] as const)
+        )
         verdicts = [...computed]
-            .map(([contact, verdict]) => ({ did: contact, verdict, mutual: mutuals.has(contact) }))
+            .map(([contact, verdict]) => {
+                const edge = graphEdges.get(contact)
+                const keyAt = currentKeyFirstSeen.get(contact) ?? null
+                const recency = mutuals.has(contact)
+                    ? permissionRecencyAtMs({
+                          messagingKeyFirstSeenAtMs: keyAt,
+                          aFollowedBAtMs: edge?.ownerFollowsContactAtMs ?? null,
+                          bFollowedAAtMs: edge?.contactFollowsOwnerAtMs ?? null,
+                      })
+                    : null
+                return {
+                    did: contact,
+                    verdict,
+                    mutual: mutuals.has(contact),
+                    permissionRecencyAtMs: recency,
+                }
+            })
             .sort((a, b) => compareStrings(a.did, b.did))
     } catch (error) {
         throw new SummaryOwnerReadError(error)
     }
     const behind = new Set(laggingDids)
     const lagging = dids.filter((d) => d !== did && behind.has(d)).sort(compareStrings)
-    return { index: { owner: did, ownBlocks, records, verdicts, evidenceSchema: 1 }, truncated, lagging }
+    return { index: { owner: did, ownBlocks, records, verdicts, evidenceSchema: 1, permissionRecencySchema: 1 }, truncated, lagging }
 }
 
 /**
@@ -431,6 +465,7 @@ export async function readSummaryPage(
         records: [...kept.values()].sort(compareRefs),
         verdicts: current.verdicts,
         evidenceSchema: 1,
+        permissionRecencySchema: 1,
         ...(more ? { more: true } : {}),
     }
     return {
@@ -608,7 +643,7 @@ export function diffSummaryIndex(
     verdicts: SummaryVerdict[]
     droppedVerdicts: string[]
 } {
-    if (!base || base.evidenceSchema !== 1) {
+    if (!base || base.evidenceSchema !== 1 || base.permissionRecencySchema !== 1) {
         return {
             full: true,
             blocksChanged: true,
@@ -623,7 +658,7 @@ export function diffSummaryIndex(
             (v) =>
                 [
                     v.did,
-                    { bytes: encodeCanMessageVerdict(v.verdict), mutual: v.mutual as boolean | undefined },
+                    { bytes: encodeCanMessageVerdict(v.verdict), mutual: v.mutual as boolean | undefined, recency: v.permissionRecencyAtMs },
                 ] as const
         )
     )
@@ -652,6 +687,7 @@ export function diffSummaryIndex(
             return (
                 prior === undefined ||
                 prior.mutual !== v.mutual ||
+                prior.recency !== v.permissionRecencyAtMs ||
                 !bytesEqual(prior.bytes, encodeCanMessageVerdict(v.verdict))
             )
         }),
@@ -784,12 +820,17 @@ export function encodeSummaryDelta(delta: SummaryDelta): Uint8Array {
             [
                 SUMMARY_DELTA_KEYS.verdicts,
                 delta.verdicts.map(
-                    (v) =>
-                        new Map<string, CoseValue>([
+                    (v) => {
+                        const map = new Map<string, CoseValue>([
                             [SUMMARY_VERDICT_KEYS.did, v.did],
                             [SUMMARY_VERDICT_KEYS.verdict, canMessageToCose(v.verdict)],
                             [SUMMARY_VERDICT_KEYS.mutual, v.mutual],
                         ])
+                        if (v.permissionRecencyAtMs !== undefined) {
+                            map.set(SUMMARY_VERDICT_KEYS.permissionRecencyAtMs, v.permissionRecencyAtMs)
+                        }
+                        return map
+                    }
                 ),
             ],
             [SUMMARY_DELTA_KEYS.droppedVerdicts, delta.droppedVerdicts],
@@ -879,10 +920,19 @@ export function decodeSummaryDelta(bytes: Uint8Array): SummaryDelta {
             if (!(verdict instanceof Map)) throw new Error("summary: missing or malformed verdict")
             const mutual = m.get(SUMMARY_VERDICT_KEYS.mutual)
             if (mutual !== undefined && typeof mutual !== "boolean") throw new Error("summary: malformed mutual")
+            const rawRecency = m.get(SUMMARY_VERDICT_KEYS.permissionRecencyAtMs)
+            const permissionRecencyAtMs =
+                typeof rawRecency === "number" && Number.isSafeInteger(rawRecency) && rawRecency >= 0
+                    ? rawRecency
+                    : null
+            const recencyField = m.has(SUMMARY_VERDICT_KEYS.permissionRecencyAtMs)
+                ? { permissionRecencyAtMs }
+                : {}
             return {
                 did: str(m, SUMMARY_VERDICT_KEYS.did),
                 verdict: canMessageFromCose(verdict),
                 mutual: mutual === true,
+                ...recencyField,
             }
         }),
         droppedVerdicts: dropped,

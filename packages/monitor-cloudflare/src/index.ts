@@ -84,6 +84,7 @@ export {
     kvDeclarationSnapshots,
     kvRecordSnapshots,
     kvSummaryIndexReader,
+    kvMessagingKeyFirstSeenMany,
 } from "./snapshot-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
@@ -95,3 +96,5 @@ export { d1AdmissionSource } from "./admission-source"
 export type { D1Reader } from "./block-edge-store"
 export { d1InterestReader } from "./interest-reader"
 export type { MonitorEnv } from "./env"
+
+export { d1PermissionRecencyReader } from "./permission-recency-reader"

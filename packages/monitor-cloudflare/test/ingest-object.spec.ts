@@ -16,6 +16,8 @@ import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
     binaryToBase64URL,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
     RecordNotFoundError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyPlcLog,
@@ -2898,6 +2900,7 @@ describe("verifying a fetched record", () => {
             commitCid: expect.any(String),
             collection: COLLECTION,
             rkey: "self",
+            messagingKeyFingerprint: null,
         })
     })
 
@@ -3041,6 +3044,7 @@ describe("declaration evidence", () => {
         commitCid: expect.any(String),
         collection: COLLECTION,
         rkey: "self",
+        messagingKeyFingerprint: null,
     })
 
     const appViewServes = (w: World, cid = w.recordCid) => () =>
@@ -3646,5 +3650,174 @@ describe("record index and holder state", () => {
             "gone-reversible"
         )
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(false)
+    })
+})
+
+describe("messaging_key_history with verified declaration CARs", () => {
+    async function lifecycle(legacy: boolean) {
+        const stub = freshStub()
+        const did = `did:web:messaging-history-${n}.example`
+        const signer = makeKey()
+        const keys = [1, 2].map((value) => Uint8Array.of(3, ...new Uint8Array(32).fill(value)))
+        const repos = [0, 0, 1, 0, 1].map((key, i) => buildRepoCar({
+            did, key: signer, rev: `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`,
+            records: { "com.germnetwork.declaration/self": { currentKey: keys[key] } },
+        }))
+        const snapshots = kvSnapshotStore(testEnv)
+        if (legacy) {
+            // Real pre-tracker KV snapshot: no fingerprint or first-seen metadata.
+            await snapshots.putRecord(did, {
+                car: repos[0]!.car, rev: "3kaaaaaaaaaaa", observedAtMs: 100,
+                source: PDS, signingKey: signer.multikey, verifiedWith: signer.multikey,
+                cid: repos[0]!.recordCids["com.germnetwork.declaration/self"]!,
+            })
+        }
+        const seen: Array<number | null | undefined> = []
+        for (let i = legacy ? 1 : 0; i < repos.length; i++) {
+            const repo = repos[i]!
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const deps: IngestDeps = {
+                    index: obj, snapshot: snapshots,
+                    fetchRecord: async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey }),
+                    // Exercise the actual verifier: a raw-hex fingerprint here
+                    // must fail the legacy same-key assertion below.
+                    verify: (did, record) => (obj as unknown as {
+                        verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+                    }).verifyRecord(did, record),
+                    interest: { inInterest: async () => true, interestEpoch: async () => 0 },
+                    nowMs: () => (i + 1) * 1000,
+                }
+                await obj.owe(did, `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`)
+                expect(await settle(deps, did)).toBe("stored")
+            })
+            seen.push((await snapshots.getRecord(did))!.messagingKeyFirstSeenAtMs)
+        }
+        expect(seen).toEqual(legacy ? [null, 3000, null, 3000] : [null, null, 3000, null, 3000])
+        const rows = await runInDurableObject(stub, (_obj, state) => state.storage.sql.exec<{
+            fingerprint: string; first_seen_at: number | null; record_cid: string; commit_cid: string; rev: string; verified_with: string
+        }>("SELECT * FROM messaging_key_history WHERE did = ? AND length(fingerprint) = 64 ORDER BY first_seen_at", did).toArray())
+        expect(rows).toHaveLength(2)
+        expect(rows.map((row) => row.fingerprint.length)).toEqual([64, 64])
+        expect(rows.map((row) => row.first_seen_at)).toEqual([null, 3000])
+        expect(rows[1]).toMatchObject({
+            record_cid: repos[2]!.recordCids["com.germnetwork.declaration/self"],
+            rev: "3kaaaaaaaaaac", verified_with: signer.multikey,
+        })
+        expect(rows[1]!.commit_cid).toBeTruthy()
+        // Forget only this DID, alongside evidence, under the full-interest policy.
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.retainMessagingKeyFirstSeen("did:web:other-history.example", {
+                fingerprint: "other", firstSeenAtMs: null, recordCid: null, commitCid: null, rev: null, verifiedWith: null,
+            })
+            await obj.forgetLeft(did)
+            expect(await obj.getMessagingKeyHistory(did, rows[0]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory(did, rows[1]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory("did:web:other-history.example", "other")).not.toBeNull()
+        })
+    }
+
+    it("preserves the first unknown sentinel and the original observed rotation time", async () => lifecycle(false))
+    it("keeps an unrotated legacy key unknown and remembers it when it returns", async () => lifecycle(true))
+})
+
+
+describe("messaging-key fingerprint upgrade and rollback aliases", () => {
+    const identity = (value: number) => {
+        const currentKey = Uint8Array.of(3, ...new Uint8Array(32).fill(value))
+        const key = declarationAnchorKeyOf({ currentKey })!
+        return {
+            currentKey, canonical: messagingKeyFingerprint(key),
+            raw: [...key].map((b) => b.toString(16).padStart(2, "0")).join(""),
+        }
+    }
+
+    it.each([null, 1234])("preserves prior raw-hex history and provenance (%s) through forward/rollback/forward", async (firstSeenAtMs) => {
+        const stub = freshStub()
+        const did = `did:web:history-upgrade-${n}.example`
+        const signer = makeKey()
+        const snapshots = kvSnapshotStore(testEnv)
+        const a = identity(10)
+        const b = identity(11)
+        const c = identity(12)
+        const provenance = { recordCid: "original-record", commitCid: "original-commit", rev: "original-rev", verifiedWith: "original-signer" }
+        const seedOldWriter = async (key: ReturnType<typeof identity>, time: number | null, rev: string) => {
+            const repo = buildRepoCar({ did, key: signer, rev,
+                records: { "com.germnetwork.declaration/self": { currentKey: key.currentKey } } })
+            await snapshots.putRecord(did, { car: repo.car, rev, observedAtMs: 9999,
+                source: PDS, signingKey: signer.multikey, verifiedWith: signer.multikey,
+                cid: repo.recordCids["com.germnetwork.declaration/self"]!,
+                messagingKeyFingerprint: key.raw, messagingKeyFirstSeenAtMs: time })
+            // Seed the exact prior revision's format, bypassing new migration helpers.
+            await runInDurableObject(stub, (_obj, state) => {
+                state.storage.sql.exec(
+                    "INSERT INTO messaging_key_history VALUES (?, ?, ?, ?, ?, ?, ?)", did, key.raw, time,
+                    provenance.recordCid, provenance.commitCid, provenance.rev, provenance.verifiedWith)
+            })
+        }
+        const observe = async (key: ReturnType<typeof identity>, rev: string, now: number) => {
+            const repo = buildRepoCar({ did, key: signer, rev,
+                records: { "com.germnetwork.declaration/self": { currentKey: key.currentKey } } })
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                await obj.owe(did, rev)
+                expect(await settle({ index: obj, snapshot: snapshots,
+                    fetchRecord: async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey }),
+                    verify: (did, record) => (obj as unknown as {
+                        verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+                    }).verifyRecord(did, record),
+                    interest: { inInterest: async () => true, interestEpoch: async () => 0 }, nowMs: () => now,
+                }, did)).toBe("stored")
+            })
+            return (await snapshots.getRecord(did))!
+        }
+        await seedOldWriter(a, firstSeenAtMs, "3kaaaaaaaaaaa")
+        const upgraded = await observe(a, "3kaaaaaaaaaab", 20000)
+        expect(upgraded.messagingKeyFirstSeenAtMs).toBe(firstSeenAtMs)
+        expect(upgraded.messagingKeyFingerprint).toBe(a.canonical)
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getMessagingKeyHistory(did, a.canonical)))
+            .toEqual({ fingerprint: a.canonical, firstSeenAtMs, ...provenance })
+        // New rotations also retain raw aliases, so the prior writer can find
+        // them after rollback despite the newer snapshot's canonical metadata.
+        expect((await observe(b, "3kaaaaaaaaaac", 30000)).messagingKeyFirstSeenAtMs).toBe(30000)
+        expect(await runInDurableObject(stub, (_obj, state) => state.storage.sql.exec<{ first_seen_at: number }>(
+            "SELECT first_seen_at FROM messaging_key_history WHERE did = ? AND fingerprint = ?", did, b.raw
+        ).toArray()[0]?.first_seen_at)).toBe(30000)
+        // A rolled-back writer can add another raw-only history/snapshot;
+        // the next forward settle must preserve its observation and provenance.
+        await seedOldWriter(c, 40000, "3kaaaaaaaaaad")
+        expect((await observe(c, "3kaaaaaaaaaae", 50000)).messagingKeyFirstSeenAtMs).toBe(40000)
+        expect((await observe(a, "3kaaaaaaaaaaf", 60000)).messagingKeyFirstSeenAtMs).toBe(firstSeenAtMs)
+        expect((await observe(b, "3kaaaaaaaaaag", 70000)).messagingKeyFirstSeenAtMs).toBe(30000)
+    })
+
+    it("keeps an unknown sentinel over a conflicting timestamp with its original provenance", async () => {
+        const stub = freshStub()
+        const a = identity(13)
+        const did = "did:web:history-conflict.example"
+        await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            // The original bug could leave SHA unknown plus raw timestamp rows.
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, NULL, 'unknown-record', 'unknown-commit', 'unknown-rev', 'unknown-signer')", did, a.canonical)
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 9999, 'false-record', 'false-commit', 'false-rev', 'false-signer')", did, a.raw)
+            const expected = { fingerprint: a.canonical, firstSeenAtMs: null,
+                recordCid: "unknown-record", commitCid: "unknown-commit", rev: "unknown-rev", verifiedWith: "unknown-signer" }
+            expect(await obj.getMessagingKeyHistory(did, a.canonical)).toEqual(expected)
+            expect(await obj.getMessagingKeyHistory(did, a.raw)).toEqual(expected)
+            expect(state.storage.sql.exec<{ first_seen_at: number | null }>(
+                "SELECT first_seen_at FROM messaging_key_history WHERE did = ?", did
+            ).toArray().map((row) => row.first_seen_at)).toEqual([null, null])
+        })
+    })
+
+    it("keeps the earliest tracked observation and its provenance when aliases disagree", async () => {
+        const stub = freshStub()
+        const a = identity(14)
+        await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            const did = "did:web:history-earliest.example"
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 100, 'earliest-record', 'earliest-commit', 'earliest-rev', 'earliest-signer')", did, a.raw)
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 200, 'later-record', 'later-commit', 'later-rev', 'later-signer')", did, a.canonical)
+            expect(await obj.getMessagingKeyHistory(did, a.canonical)).toEqual({
+                fingerprint: a.canonical, firstSeenAtMs: 100, recordCid: "earliest-record",
+                commitCid: "earliest-commit", rev: "earliest-rev", verifiedWith: "earliest-signer",
+            })
+        })
     })
 })

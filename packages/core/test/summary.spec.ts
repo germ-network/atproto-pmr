@@ -48,6 +48,7 @@ describe("diffSummaryIndex", () => {
         records,
         verdicts: [],
         evidenceSchema: 1,
+        permissionRecencySchema: 1,
     })
 
     it("with no base, everything changed and full is set", () => {

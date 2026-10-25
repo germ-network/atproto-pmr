@@ -412,6 +412,23 @@ describe("handleCanMessageRead", () => {
             verdict: "unknown",
             pending: ["open"],
             why: ["policy-not-enabled"],
+            permissionRecencyAtMs: null,
+        })
+    })
+
+    it("includes the nullable aggregate from one batched backend source", async () => {
+        const response = await handleCanMessageRead(
+            new Request(`https://relay.test/pmr/v1/can-message/${DID_A}/${DID_B}`),
+            {
+                ...deps,
+                permissionRecencyForRecipients: async (_sender, recipients) =>
+                    new Map(
+                        recipients.map((recipient) => [recipient, recipient === DID_B ? 1_700_000_000_000 : null] as const)
+                    ),
+            }
+        )
+        expect(decodeCanMessageVerdict(new Uint8Array(await response.arrayBuffer()))).toMatchObject({
+            permissionRecencyAtMs: 1_700_000_000_000,
         })
     })
 

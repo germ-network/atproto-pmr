@@ -16,6 +16,11 @@
 
 import {
     RecordNotFoundError,
+    DECLARATION_COLLECTION_NSID,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
+    readRecordFromCar,
     type DidDocument,
     type InterestPolicy,
 } from "@germ-network/atproto-pmr-core"
@@ -317,6 +322,8 @@ export type VerifyOutcome =
           authority?: EvidenceAuthorityIdentity
           assurance?: EvidenceAssurance
           monitor?: string
+          /** Canonical hex fingerprint of the validated declaration currentKey, when present. */
+          messagingKeyFingerprint?: string | null
       }
     | { kind: "verified-absent"; key: string; rev: string; commitCid?: string }
     /** `reason` says what failed to verify, where the verifier knows. */
@@ -504,6 +511,16 @@ async function settleFetched(
         const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
         keyRotated = previousKey !== null && previousKey !== verified.key
     }
+    if (
+        previous === null &&
+        verified.collection === DECLARATION_COLLECTION_NSID &&
+        verified.rkey === "self"
+    ) {
+        // Key-history tracking needs the prior declaration to distinguish a
+        // newly observed rotation from a legacy key whose first-seen date is
+        // unknowable. Other records keep the existing no-read fast path.
+        previous = await deps.snapshot.getRecord(did)
+    }
 
     const observedAtMs = deps.nowMs()
     const previousEvidence = previous?.evidence ?? null
@@ -519,6 +536,57 @@ async function settleFetched(
     // reuses, and `retainSnapshotEvidence`'s unchanged skip can trust that
     // the evidence a stored snapshot carries is already in the index.
     if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence, previousEvidence)
+    const previousKey = previous === null ? null : messagingKeyIdentity(previous.car, previous.messagingKeyFingerprint)
+    const previousMessagingKeyFingerprint = previousKey?.fingerprint ?? null
+    const currentKey = verified.messagingKeyFingerprint
+        ? messagingKeyIdentity(record.car, verified.messagingKeyFingerprint)
+        : null
+    let messagingKeyFirstSeenAtMs: number | null = null
+    if (currentKey?.fingerprint) {
+        const history = await deps.index.getMessagingKeyHistory?.(did, currentKey.fingerprint, currentKey.legacyFingerprint)
+        if (history !== null && history !== undefined) {
+            messagingKeyFirstSeenAtMs = history.firstSeenAtMs
+        } else if (
+            previousMessagingKeyFingerprint !== null &&
+            previousMessagingKeyFingerprint !== currentKey.fingerprint
+        ) {
+            // Preserve the legacy key as explicitly unknown so a later
+            // reappearance cannot be mistaken for a new first observation.
+            if ((await deps.index.getMessagingKeyHistory?.(did, previousMessagingKeyFingerprint, previousKey?.legacyFingerprint)) == null) {
+                await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                    fingerprint: previousMessagingKeyFingerprint,
+                    firstSeenAtMs: null,
+                    recordCid: previous?.cid ?? null,
+                    commitCid: previous?.commitCid ?? null,
+                    rev: previous?.rev ?? null,
+                    verifiedWith: previous?.verifiedWith ?? previous?.signingKey ?? null,
+                }, previousKey?.legacyFingerprint)
+            }
+            // A verified transition is the first trustworthy observation
+            // after tracking started, unless this key already has an
+            // unknown sentinel from a pre-tracker appearance.
+            messagingKeyFirstSeenAtMs = observedAtMs
+            await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                fingerprint: currentKey.fingerprint,
+                firstSeenAtMs: observedAtMs,
+                recordCid: verified.cid,
+                commitCid: verified.commitCid ?? null,
+                rev: verified.rev,
+                verifiedWith: verified.key,
+            }, currentKey.legacyFingerprint)
+        } else {
+            // First observation may be a legacy key. Keep a durable unknown
+            // sentinel so it stays unranked if it later disappears/returns.
+            await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                fingerprint: currentKey.fingerprint,
+                firstSeenAtMs: null,
+                recordCid: verified.cid,
+                commitCid: verified.commitCid ?? null,
+                rev: verified.rev,
+                verifiedWith: verified.key,
+            }, currentKey.legacyFingerprint)
+        }
+    }
     await deps.snapshot.putRecord(did, {
         rev: verified.rev,
         commitCid: verified.commitCid ?? null,
@@ -529,6 +597,8 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
+        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
+        messagingKeyFirstSeenAtMs,
     })
     const written = { cid: verified.cid, verifiedWith: verified.key }
     const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
@@ -548,6 +618,30 @@ async function settleFetched(
     // A DID back from gone is news at whatever rev it returns.
     if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
     return "stored"
+}
+
+/** Recover a compatibility alias only from the same accepted declaration key. */
+function messagingKeyIdentity(car: Uint8Array, fingerprint?: string | null): {
+    fingerprint: string | null
+    legacyFingerprint?: string
+} {
+    const normalized = fingerprint == null ? null : normalizeMessagingKeyFingerprint(fingerprint)
+    try {
+        const record = readRecordFromCar(car, DECLARATION_COLLECTION_NSID, "self")?.record
+        const key = declarationAnchorKeyOf(record)
+        if (key !== null) {
+            const canonical = messagingKeyFingerprint(key)
+            if (normalized === null || normalized === canonical) {
+                return {
+                    fingerprint: canonical,
+                    legacyFingerprint: [...key].map((b) => b.toString(16).padStart(2, "0")).join(""),
+                }
+            }
+        }
+    } catch {
+        // Unreadable legacy bytes cannot establish a different key or alias.
+    }
+    return { fingerprint: normalized }
 }
 
 /**

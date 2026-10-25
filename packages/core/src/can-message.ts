@@ -49,10 +49,13 @@ export type CanMessageUnknownReason =
     | typeof POLICY_NOT_ENABLED
     | (string & {})
 
+/** Nullable absolute Unix epoch milliseconds; optional only for in-process legacy constructors. */
 export type CanMessageVerdict =
-    | { verdict: "yes"; via: AllowPolicy[] }
-    | { verdict: "no"; why: CanMessageNoReason[] }
-    | { verdict: "unknown"; pending: AllowPolicy[]; why: CanMessageUnknownReason[] }
+    | ({ verdict: "yes"; via: AllowPolicy[] } & { permissionRecencyAtMs?: number | null })
+    | ({ verdict: "no"; why: CanMessageNoReason[] } & { permissionRecencyAtMs?: number | null })
+    | ({ verdict: "unknown"; pending: AllowPolicy[]; why: CanMessageUnknownReason[] } & {
+          permissionRecencyAtMs?: number | null
+      })
 
 /**
  * A graph fact for one ordered pair. `unknown` when the relay's keep rules
@@ -159,6 +162,11 @@ export function evaluateCanMessage(facts: CanMessageFacts): CanMessageVerdict {
 export interface CanMessageDeps {
     policies: PolicySource
     graph: SenderGraphReader
+    /** One backend batch for the same sender/recipient set; no device graph reads. */
+    permissionRecencyForRecipients?: (
+        sender: string,
+        recipients: readonly string[]
+    ) => Promise<Map<string, number | null>>
 }
 
 /**
@@ -194,16 +202,24 @@ export async function computeCanMessageMany(
     const verdicts = new Map<string, CanMessageVerdict>()
     if (held.size === 0) return verdicts
 
-    const facts = await deps.graph.forSender(sender, [...held.keys()])
+    const recipientsWithDeclarations = [...held.keys()]
+    const facts = await deps.graph.forSender(sender, recipientsWithDeclarations)
+    const recency = await deps.permissionRecencyForRecipients?.(sender, recipientsWithDeclarations)
     for (const [recipient, declared] of held) {
         const graph = facts.get(recipient)
+        const value = recency?.get(recipient)
+        const permissionRecencyAtMs =
+            typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null
         verdicts.set(
             recipient,
-            evaluateCanMessage({
-                declared,
-                blocked: graph?.blocks ?? "unknown",
-                followed: graph?.follows ?? "unknown",
-            })
+            {
+                ...evaluateCanMessage({
+                    declared,
+                    blocked: graph?.blocks ?? "unknown",
+                    followed: graph?.follows ?? "unknown",
+                }),
+                ...(deps.permissionRecencyForRecipients ? { permissionRecencyAtMs } : {}),
+            }
         )
     }
     return verdicts
@@ -240,10 +256,18 @@ export async function handleCanMessageRead(
     if (!pair) return new Response("Malformed path", { status: 400, headers })
     const verdict = await computeCanMessage(pair.sender, pair.recipient, deps)
     if (!verdict) return new Response("Not found", { status: 404, headers })
-    return new Response(toResponseBody(encodeCanMessageVerdict(verdict)), {
-        status: 200,
-        headers: { ...headers, "content-type": "application/cbor" },
-    })
+    return new Response(
+        toResponseBody(
+            encodeCanMessageVerdict({
+                ...verdict,
+                permissionRecencyAtMs: verdict.permissionRecencyAtMs ?? null,
+            })
+        ),
+        {
+            status: 200,
+            headers: { ...headers, "content-type": "application/cbor" },
+        }
+    )
 }
 
 type FieldsOf<T> = T extends unknown ? keyof T : never
@@ -254,22 +278,30 @@ export const CAN_MESSAGE_KEYS = {
     via: "a",
     pending: "p",
     why: "r",
+    permissionRecencyAtMs: "t",
 } as const satisfies WireKeys<CanMessageVerdict>
 
 /** The verdict as a CBOR map under {@link CAN_MESSAGE_KEYS}, for embedding in another body. */
 export function canMessageToCose(verdict: CanMessageVerdict): Map<string, CoseValue> {
     const K = CAN_MESSAGE_KEYS
+    const map = new Map<string, CoseValue>()
+    if (verdict.permissionRecencyAtMs !== undefined) {
+        map.set(K.permissionRecencyAtMs, verdict.permissionRecencyAtMs)
+    }
     switch (verdict.verdict) {
         case "yes":
-            return new Map<string, CoseValue>([[K.verdict, "yes"], [K.via, [...verdict.via]]])
+            map.set(K.verdict, "yes")
+            map.set(K.via, [...verdict.via])
+            return map
         case "no":
-            return new Map<string, CoseValue>([[K.verdict, "no"], [K.why, [...verdict.why]]])
+            map.set(K.verdict, "no")
+            map.set(K.why, [...verdict.why])
+            return map
         case "unknown":
-            return new Map<string, CoseValue>([
-                [K.verdict, "unknown"],
-                [K.pending, [...verdict.pending]],
-                [K.why, [...verdict.why]],
-            ])
+            map.set(K.verdict, "unknown")
+            map.set(K.pending, [...verdict.pending])
+            map.set(K.why, [...verdict.why])
+            return map
     }
 }
 
@@ -284,13 +316,22 @@ export function canMessageFromCose(map: Map<number | string, CoseValue>): CanMes
         return v as string[]
     }
     const verdict = map.get(K.verdict)
+    const rawRecency = map.get(K.permissionRecencyAtMs)
+    const recencyField = map.has(K.permissionRecencyAtMs)
+        ? {
+              permissionRecencyAtMs:
+                  typeof rawRecency === "number" && Number.isSafeInteger(rawRecency) && rawRecency >= 0
+                      ? rawRecency
+                      : null,
+          }
+        : {}
     switch (verdict) {
         case "yes":
-            return { verdict, via: strings(K.via) }
+            return { verdict, via: strings(K.via), ...recencyField }
         case "no":
-            return { verdict, why: strings(K.why) }
+            return { verdict, why: strings(K.why), ...recencyField }
         case "unknown":
-            return { verdict, pending: strings(K.pending), why: strings(K.why) }
+            return { verdict, pending: strings(K.pending), why: strings(K.why), ...recencyField }
         default:
             throw new Error("can-message: unrecognized verdict")
     }

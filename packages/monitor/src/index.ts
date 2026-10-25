@@ -45,6 +45,7 @@ export {
     type DidDocumentSink,
     type DigestMarker,
     type EvidenceAnchorRow,
+    type MessagingKeyHistoryRow,
     type EvidenceBackfillProgress,
     type EvidenceAssurance,
     type EvidenceAuthorityIdentity,

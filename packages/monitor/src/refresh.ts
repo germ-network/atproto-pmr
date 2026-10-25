@@ -305,6 +305,21 @@ async function refreshDeclaration(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
+        messagingKeyFingerprint:
+            verified.messagingKeyFingerprint === undefined
+                ? (previous?.messagingKeyFingerprint ?? null)
+                : verified.messagingKeyFingerprint,
+        messagingKeyFirstSeenAtMs: await (async () => {
+            if (verified.messagingKeyFingerprint === undefined) {
+                return previous?.messagingKeyFirstSeenAtMs ?? null
+            }
+            if (verified.messagingKeyFingerprint === null) return null
+            const history = await ingest.index.getMessagingKeyHistory?.(did, verified.messagingKeyFingerprint)
+            if (history !== null && history !== undefined) return history.firstSeenAtMs
+            return previous?.messagingKeyFingerprint === verified.messagingKeyFingerprint
+                ? (previous.messagingKeyFirstSeenAtMs ?? null)
+                : null
+        })(),
     })
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
         cid: verified.cid,

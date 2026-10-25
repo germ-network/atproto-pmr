@@ -120,6 +120,7 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
     }
     // The declarations the index holds with stored policies, and the owner -> contact facts the sender graph answers.
     const declared = new Map<string, StoredPolicies>()
+    const messagingKeyFirstSeen = new Map<string, number | null>()
     const senderFacts = new Map<string, RecipientGraphFacts>()
     const senderAsked: { sender: string; recipients: string[] }[] = []
     const senderFail = new Set<string>()
@@ -149,6 +150,10 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
                           rev: "3kaaaaaaaaaaa",
                           evidenceState: null,
                           freshAtMs: T0 * 1000,
+                          messagingKeyFirstSeenAtMs:
+                              r.collection === DECLARATION_COLLECTION_NSID && r.rkey === "self"
+                                  ? (messagingKeyFirstSeen.get(r.did) ?? null)
+                                  : null,
                           ...(r.collection === DECLARATION_COLLECTION_NSID && declared.has(r.did)
                               ? { policies: declared.get(r.did)! }
                               : {}),
@@ -225,6 +230,7 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
         order,
         unreadable,
         declared,
+        messagingKeyFirstSeen,
         senderFacts,
         senderAsked,
         senderFail,

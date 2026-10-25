@@ -87,7 +87,7 @@ describe("summary mutual bit", () => {
         setMutual(w, PEER, true)
         const second = await read(await get(first.token))
         expect(second.token).not.toBe(first.token)
-        expect(second.verdicts).toEqual([{ did: PEER, verdict: first.verdicts[0]!.verdict, mutual: true }])
+        expect(second.verdicts).toEqual([{ did: PEER, verdict: first.verdicts[0]!.verdict, mutual: true, permissionRecencyAtMs: null }])
         expect(second).toMatchObject({ ownBlocks: null, records: [], removed: [], droppedVerdicts: [] })
     })
 

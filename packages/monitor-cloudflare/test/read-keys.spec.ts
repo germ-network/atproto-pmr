@@ -122,7 +122,11 @@ describe("kvSummaryIndexReader", () => {
     it("returns each ref's cid, verifiedWith and freshAtMs from metadata, in ref order", async () => {
         const [a, b] = [uniq(), uniq()]
         const store = kvSnapshotStore(testEnv)
-        await store.putRecord(a, entry("3m1", { cid: "cid-a" }))
+        await store.putRecord(a, {
+            ...entry("3m1", { cid: "cid-a" }),
+            messagingKeyFingerprint: "canonical-key-fingerprint",
+            messagingKeyFirstSeenAtMs: 1_700_000_000_000,
+        })
         await store.putSecondary({ did: b, collection: PROFILE, rkey: "self" }, entry("3m2", { cid: "cid-b", verifiedWith: "zOther" }))
         const refs = [
             { did: b, collection: PROFILE, rkey: "self" },
@@ -130,8 +134,8 @@ describe("kvSummaryIndexReader", () => {
             { did: uniq(), collection: PROFILE, rkey: "self" },
         ]
         expect(await kvSummaryIndexReader(testEnv).entries(refs)).toEqual([
-            { ...refs[0], cid: "cid-b", verifiedWith: "zOther", commitCid: null, rev: "3m2", evidenceState: null, freshAtMs: 1_000 },
-            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", commitCid: null, rev: "3m1", evidenceState: null, freshAtMs: 1_000, policies: { found: false, code: "undecodable" } },
+            { ...refs[0], cid: "cid-b", verifiedWith: "zOther", commitCid: null, rev: "3m2", evidenceState: null, messagingKeyFirstSeenAtMs: null, freshAtMs: 1_000 },
+            { ...refs[1], cid: "cid-a", verifiedWith: "zKey", commitCid: null, rev: "3m1", evidenceState: null, messagingKeyFirstSeenAtMs: 1_700_000_000_000, freshAtMs: 1_000, policies: { found: false, code: "undecodable" } },
             null,
         ])
     })

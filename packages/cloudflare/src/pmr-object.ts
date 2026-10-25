@@ -85,6 +85,7 @@ interface SummaryHeader {
     owner: string
     more?: boolean
     evidenceSchema?: number
+    permissionRecencySchema?: number
     parts: number
 }
 
@@ -477,6 +478,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         owner: index.owner,
                         ...(index.more ? { more: true } : {}),
                         ...(index.evidenceSchema === undefined ? {} : { evidenceSchema: index.evidenceSchema }),
+                        ...(index.permissionRecencySchema === undefined
+                            ? {}
+                            : { permissionRecencySchema: index.permissionRecencySchema }),
                         parts: parts.length,
                     } satisfies SummaryHeader,
                 ],
@@ -510,6 +514,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             verdicts: [],
             ...(header.more ? { more: true } : {}),
             ...(header.evidenceSchema === undefined ? {} : { evidenceSchema: header.evidenceSchema }),
+            ...(header.permissionRecencySchema === undefined
+                ? {}
+                : { permissionRecencySchema: header.permissionRecencySchema }),
         }
         const keys = summaryPartKeys(token, 0, header.parts)
         for (const batch of chunk(keys, STORAGE_BATCH)) {

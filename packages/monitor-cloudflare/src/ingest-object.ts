@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers"
+import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
     compareRev,
@@ -28,6 +29,7 @@ import {
     windowOf,
     type BackfillProgress,
     type EvidenceAnchorRow,
+    type MessagingKeyHistoryRow,
     type EvidenceBackfillProgress,
     type DidDocumentSink,
     type Cursor,
@@ -143,6 +145,8 @@ import {
     type MonitorVerifiedAnchorRequest,
     type VerifiedAnchorObservation,
     declarationAnchorKeyOf,
+    messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
     readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
@@ -471,6 +475,16 @@ export class MonitorIngest
                     did TEXT NOT NULL,
                     kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')),
                     first_observed_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messaging_key_history (
+                    did TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    first_seen_at INTEGER,
+                    record_cid TEXT,
+                    commit_cid TEXT,
+                    rev TEXT,
+                    verified_with TEXT,
+                    PRIMARY KEY (did, fingerprint)
                 );
                 CREATE TABLE IF NOT EXISTS holder_state (
                     did TEXT PRIMARY KEY,
@@ -1751,6 +1765,80 @@ export class MonitorIngest
         })
     }
 
+    async getMessagingKeyHistory(
+        did: string,
+        fingerprint: string,
+        legacyFingerprint?: string
+    ): Promise<MessagingKeyHistoryRow | null> {
+        return this.reconcileMessagingKeyHistory(did, fingerprint, legacyFingerprint)
+    }
+
+    async retainMessagingKeyFirstSeen(
+        did: string,
+        row: MessagingKeyHistoryRow,
+        legacyFingerprint?: string
+    ): Promise<void> {
+        this.reconcileMessagingKeyHistory(did, row.fingerprint, legacyFingerprint, row)
+    }
+
+    /**
+     * Lazy, atomic migration of the prior raw-COSE hex identity. Keep aliases
+     * for older writers: rollback must find both unknown and tracked keys.
+     * An unknown sentinel wins a conflict; otherwise retain the earliest
+     * observation together with that observation's complete provenance.
+     */
+    private reconcileMessagingKeyHistory(
+        did: string,
+        fingerprint: string,
+        legacyFingerprint?: string,
+        incoming?: MessagingKeyHistoryRow
+    ): MessagingKeyHistoryRow | null {
+        const canonical = normalizeMessagingKeyFingerprint(fingerprint)
+        return this.ctx.storage.transactionSync(() => {
+            const candidates = this.db.sql.exec<{
+                fingerprint: string; first_seen_at: number | null; record_cid: string | null
+                commit_cid: string | null; rev: string | null; verified_with: string | null
+            }>(
+                "SELECT fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with " +
+                "FROM messaging_key_history WHERE did = ? AND (fingerprint = ? OR length(fingerprint) > 64) " +
+                "ORDER BY fingerprint",
+                did, canonical
+            ).toArray().filter((row) => normalizeMessagingKeyFingerprint(row.fingerprint) === canonical)
+            const aliases = new Set([canonical, ...candidates.map((row) => row.fingerprint)])
+            for (const alias of [fingerprint, legacyFingerprint]) {
+                if (alias !== undefined && normalizeMessagingKeyFingerprint(alias) === canonical) aliases.add(alias)
+            }
+            const rows: MessagingKeyHistoryRow[] = candidates.map((row) => ({
+                fingerprint: canonical, firstSeenAtMs: row.first_seen_at,
+                recordCid: row.record_cid, commitCid: row.commit_cid,
+                rev: row.rev, verifiedWith: row.verified_with,
+            }))
+            if (incoming !== undefined) rows.push({ ...incoming, fingerprint: canonical })
+            const first = rows.reduce<MessagingKeyHistoryRow | null>((prior, row) => {
+                if (prior === null) return row
+                if (prior.firstSeenAtMs === null) return prior
+                if (row.firstSeenAtMs === null || row.firstSeenAtMs < prior.firstSeenAtMs) return row
+                return prior
+            }, null)
+            if (first === null) return null
+            for (const alias of aliases) {
+                const prior = candidates.find((row) => row.fingerprint === alias)
+                if (prior !== undefined && prior.first_seen_at === first.firstSeenAtMs &&
+                    prior.record_cid === first.recordCid && prior.commit_cid === first.commitCid &&
+                    prior.rev === first.rev && prior.verified_with === first.verifiedWith) continue
+                this.db.sql.exec(
+                    "INSERT INTO messaging_key_history " +
+                    "(did, fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(did, fingerprint) DO UPDATE SET " +
+                    "first_seen_at = excluded.first_seen_at, record_cid = excluded.record_cid, " +
+                    "commit_cid = excluded.commit_cid, rev = excluded.rev, verified_with = excluded.verified_with",
+                    did, alias, first.firstSeenAtMs, first.recordCid, first.commitCid, first.rev, first.verifiedWith
+                )
+            }
+            return first
+        })
+    }
+
     async evidenceBackfillPage(afterDid: string | null, limit: number): Promise<IndexedRecord[]> {
         return this.db.sql
             .exec<{
@@ -2631,7 +2719,7 @@ export class MonitorIngest
 
     async forgetLeft(did: string): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors"]) {
+            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors", "messaging_key_history"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
             this.dropPlcLogSync(did)
@@ -3852,6 +3940,14 @@ export class MonitorIngest
         const base: VerifyOutcome = {
             kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
             commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
+            ...(ref.collection === DECLARATION_COLLECTION_NSID && ref.rkey === "self"
+                ? (() => {
+                      const currentKey = declarationAnchorKeyOf(outcome.record)
+                      return currentKey === null
+                          ? { messagingKeyFingerprint: null }
+                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey) }
+                  })()
+                : {}),
         }
         if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
         const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)
