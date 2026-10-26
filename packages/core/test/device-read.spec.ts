@@ -18,6 +18,7 @@ import {
     type RecordReadResponse,
 } from "../src/read-api"
 import { SNAPSHOT_MAX_AGE_MS, type StoredRecordSnapshot } from "../src/snapshot-read"
+import { verifyRecordProof } from "../src/repo-proof"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
 
 const DID = "did:plc:alice1234567890123456789012"
@@ -44,13 +45,15 @@ function setup(
         serves?: boolean
         watched?: RecordReadDeps["watched"]
         declaration?: boolean
+        /** The record's path, when not the default `COLLECTION/RKEY`. */
+        at?: { collection: string; rkey: string }
         commitDid?: string
         /** Ingest's rev/cid metadata; null models an entry stored without it. */
         metadata?: null
     } = {}
 ) {
-    const collection = options.declaration ? DECLARATION_COLLECTION_NSID : COLLECTION
-    const rkey = options.declaration ? "self" : RKEY
+    const collection = options.at?.collection ?? (options.declaration ? DECLARATION_COLLECTION_NSID : COLLECTION)
+    const rkey = options.at?.rkey ?? (options.declaration ? "self" : RKEY)
     const key = makeKey()
     const repo = buildRepoCar({
         did: DID,
@@ -456,5 +459,96 @@ describe("record read codec", () => {
         expect(() => decodeRecordReadResponse(encodeCose(unknownCode))).toThrow()
         const withoutCode = new Map<string, CoseValue>([[RECORD_READ_KEYS.found, false]])
         expect(() => decodeRecordReadResponse(encodeCose(withoutCode))).toThrow()
+    })
+})
+
+describe("handleRecordRead — a registered owner's own block records", () => {
+    const BLOCK = "app.bsky.graph.block"
+    const BLOCK_RKEY = "3kblockrkeyaa"
+    const BLOCK_PATH = `${BLOCK}/${BLOCK_RKEY}`
+    const BLOCKED = "did:plc:bob12345678901234567890123"
+    const BLOCK_URL = `/pmr/v1/records/${DID}/${BLOCK}/${BLOCK_RKEY}`
+
+    function blockSetup(
+        options: {
+            records?: Record<string, unknown>
+            snapshot?: null
+            metadata?: null
+            servesOwnBlocks?: RecordReadDeps["servesOwnBlocks"] | null
+        } = {}
+    ) {
+        const s = setup({
+            records: options.records ?? {
+                [BLOCK_PATH]: { $type: BLOCK, subject: BLOCKED, createdAt: "2026-01-01T00:00:00.000Z" },
+            },
+            snapshot: options.snapshot,
+            metadata: options.metadata,
+            at: { collection: BLOCK, rkey: BLOCK_RKEY },
+            watched: [],
+        })
+        if (options.servesOwnBlocks !== null) {
+            s.deps.servesOwnBlocks = options.servesOwnBlocks ?? (async () => true)
+        }
+        const original = s.deps.records.get
+        s.deps.records.get = async (did, c, r) =>
+            c === BLOCK ? await original(did, c, r) : null
+        return s
+    }
+
+    it("serves a registered owner's held block record as found with its proof CAR", async () => {
+        const { deps, repo } = blockSetup()
+        const res = await handleRecordRead(get(BLOCK_URL), deps)
+        const body = decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer()))
+        expect(body).toMatchObject({
+            found: true,
+            car: repo.car,
+            cid: repo.recordCids[BLOCK_PATH],
+        })
+    })
+
+    it("the served CAR verifies against the owner's signing key and names the blocked DID as subject", async () => {
+        const { deps, repo } = blockSetup()
+        const res = await handleRecordRead(get(BLOCK_URL), deps)
+        const body = decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer()))
+        if (!body.found) throw new Error("expected found")
+        const verified = verifyRecordProof(body.car, {
+            did: DID,
+            signingKey: repo.key.multikey,
+            collection: BLOCK,
+            rkey: BLOCK_RKEY,
+        })
+        expect((verified.record as { subject: string }).subject).toBe(BLOCKED)
+    })
+
+    it("a block record of a DID that is served but not a registered owner reads not-watched", async () => {
+        const { deps } = blockSetup({ servesOwnBlocks: async () => false })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-watched" })
+    })
+
+    it("every block read is not-watched when the deployment does not wire servesOwnBlocks", async () => {
+        const { deps } = blockSetup({ servesOwnBlocks: null })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-watched" })
+    })
+
+    it("a block proof held under a rotated-away key reads unverifiable", async () => {
+        const { deps } = blockSetup()
+        deps.signingKeys = {
+            keysFor: async (dids) =>
+                new Map(dids.map((d) => [d, { kind: "trusted", key: makeKey().multikey } as const])),
+        }
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "unverifiable" })
+    })
+
+    it("a block rkey with nothing held reads not-held", async () => {
+        const { deps } = blockSetup({ snapshot: null })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-held" })
+    })
+
+    it("a held CAR proving a block absent reads not-held", async () => {
+        const { deps } = blockSetup({
+            records: { [`${BLOCK}/other`]: { $type: BLOCK, subject: BLOCKED } },
+            metadata: null,
+        })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-held" })
     })
 })

@@ -14,6 +14,7 @@ import {
     type VerifyOutcome,
 } from "../src/ingest"
 import {
+    disposeStrayOwnBlockProofs,
     settleSecondary,
     settleSecondaryDue,
     type SecondaryDeps,
@@ -85,6 +86,8 @@ function harness(
                 indexedRev = null
                 return "disposed"
             },
+            strayOwnBlockProofs: async () => [],
+            forgetStrayOwnBlockProof: async () => {},
             secondaryRevOf: async () => indexedRev,
             forgetSecondaries: async () => {},
         },
@@ -433,5 +436,53 @@ describe("settleSecondaryDue when a settle fails", () => {
         })
         expect(await settleSecondaryDue(h.deps)).toBe(1)
         expect(h.deferred).toHaveLength(1)
+    })
+})
+
+describe("own-block proofs", () => {
+    it("settleSecondaryDue drains only the lane it is given, records by default", async () => {
+        const h = harness()
+        const lanes: unknown[] = []
+        h.deps.index.dueSecondaries = async (_now, _limit, lane) => {
+            lanes.push(lane)
+            return []
+        }
+        await settleSecondaryDue(h.deps)
+        await settleSecondaryDue(h.deps, 4, undefined, "own-blocks")
+        expect(lanes).toEqual(["records", "own-blocks"])
+    })
+
+    const BLOCK_REFS: RecordRef[] = [
+        { did: DID, collection: "app.bsky.graph.block", rkey: "a" },
+        { did: DID, collection: "app.bsky.graph.block", rkey: "b" },
+    ]
+
+    function disposer(refs: RecordRef[] = BLOCK_REFS) {
+        const h = harness()
+        const calls: string[] = []
+        h.deps.index.strayOwnBlockProofs = async (limit) => {
+            calls.push(`stray:${limit}`)
+            return refs
+        }
+        h.deps.index.forgetStrayOwnBlockProof = async (ref) => void calls.push(`forget:${ref.rkey}`)
+        h.deps.snapshot.deleteSecondary = async (ref) => void calls.push(`delete:${ref.rkey}`)
+        return { h, calls }
+    }
+
+    it("disposeStrayOwnBlockProofs deletes each store entry before its index row", async () => {
+        const { h, calls } = disposer()
+        expect(await disposeStrayOwnBlockProofs(h.deps, 5)).toBe(2)
+        expect(calls).toEqual(["stray:5", "delete:a", "forget:a", "delete:b", "forget:b"])
+    })
+
+    it("disposeStrayOwnBlockProofs carries on past one proof's failure", async () => {
+        const { h, calls } = disposer()
+        const del = h.deps.snapshot.deleteSecondary
+        h.deps.snapshot.deleteSecondary = async (ref) => {
+            if (ref.rkey === "a") throw new Error("kv down")
+            await del(ref)
+        }
+        expect(await disposeStrayOwnBlockProofs(h.deps, 5)).toBe(1)
+        expect(calls).toEqual(["stray:5", "delete:b", "forget:b"])
     })
 })

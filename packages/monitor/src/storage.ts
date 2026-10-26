@@ -759,6 +759,13 @@ export interface PendingRecordFetch extends OwedRecord {
     epoch: number
 }
 
+/**
+ * Which owed secondaries a drain reads: `records` are the configured
+ * singletons (`MONITOR_COLLECTIONS`); `own-blocks` are registered owners'
+ * `app.bsky.graph.block` records, by rkey.
+ */
+export type SecondaryLane = "records" | "own-blocks"
+
 /** Why a secondary index write was refused: a newer rev is indexed, or the DID left interest. */
 export type SecondaryWriteAnswer = "older" | "left"
 
@@ -791,7 +798,16 @@ export interface SecondaryIntakeIndex {
  * their rev authority is the `records` row alone.
  */
 export interface SecondaryIndex {
-    dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
+    /**
+     * Owed fetches due by `nowMs`, from one lane only: `records` (the
+     * configured secondaries) by default, or `own-blocks` (registered owners'
+     * block proofs), so a large owner never starves the other lane.
+     */
+    dueSecondaries(
+        nowMs: number,
+        limit: number,
+        lane?: SecondaryLane
+    ): Promise<PendingRecordFetch[]>
     /**
      * Count an attempt, push `not_before` out and keep `failure` on the row.
      * Answers the attempts now stored, or null where the row is already gone.
@@ -823,6 +839,20 @@ export interface SecondaryIndex {
         epoch: number,
         owedRev: string
     ): Promise<SecondaryWriteAnswer | "stored">
+    /**
+     * Own-block proofs of DIDs no longer registered, held (`records`) or
+     * still owed (`rec_pending`), at most `limit`.
+     */
+    strayOwnBlockProofs(limit: number): Promise<RecordRef[]>
+    /**
+     * After a stray own-block proof's snapshot is deleted: drop its `records`
+     * and `rec_pending` rows, re-checking in the same step that the DID is
+     * still not registered. If it registered again meanwhile, its `records`
+     * row is dropped all the same and a fetch is owed at rev `""` under the
+     * DID's current epoch, so the deleted bytes are fetched again rather than
+     * indexed as held.
+     */
+    forgetStrayOwnBlockProof(ref: RecordRef): Promise<void>
     /** Drop a secondary verified absent at `rev`, under the same rules. */
     disposeSecondary(
         ref: RecordRef,

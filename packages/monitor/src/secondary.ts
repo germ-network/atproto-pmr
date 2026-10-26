@@ -26,6 +26,7 @@ import {
     type RecordRef,
     type SecondaryIndex,
     type SecondaryIntakeIndex,
+    type SecondaryLane,
     type SecondarySnapshotStore,
 } from "./storage"
 
@@ -217,10 +218,11 @@ export async function settleSecondaryDue(
     deps: SecondaryDeps,
     limit = 32,
     /** Given the cap `retryCapMs` answered for the DID. */
-    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs,
+    lane: SecondaryLane = "records"
 ): Promise<number> {
     const now = deps.nowMs()
-    const due = await deps.index.dueSecondaries(now, limit)
+    const due = await deps.index.dueSecondaries(now, limit, lane)
     let settled = 0
     for (const owed of due) {
         try {
@@ -237,4 +239,27 @@ export async function settleSecondaryDue(
         }
     }
     return settled
+}
+
+/** Per-alarm budget of the `own-blocks` lane (`OWN_BLOCK_SETTLE_BATCH`). */
+export const OWN_BLOCK_SETTLE_BATCH = 16
+
+/**
+ * Deletes the held block proofs of owners no longer registered, store first
+ * and index second, at most `limit`. One proof's failure never costs the
+ * rest. Returns how many were disposed.
+ */
+export async function disposeStrayOwnBlockProofs(
+    deps: Pick<SecondaryDeps, "index" | "snapshot">,
+    limit: number
+): Promise<number> {
+    let disposed = 0
+    for (const ref of await deps.index.strayOwnBlockProofs(limit)) {
+        try {
+            await deps.snapshot.deleteSecondary(ref)
+            await deps.index.forgetStrayOwnBlockProof(ref)
+            disposed++
+        } catch {}
+    }
+    return disposed
 }

@@ -183,6 +183,13 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     SETTLE_BATCH: string
 
     /**
+     * How many registered owners' block-record proofs to settle per wake, on
+     * their own budget so a large backfill never delays `SETTLE_BATCH`.
+     * Unset: 16.
+     */
+    OWN_BLOCK_SETTLE_BATCH?: string
+
+    /**
      * Bytes of filter a digest response carries before deferring the rest
      * to the next page. A **byte** budget rather than a window count, so
      * it does not go stale as the population grows: fatter windows simply

@@ -72,6 +72,7 @@ export {
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryIndex,
+    type SecondaryLane,
     type SecondaryIntakeIndex,
     type SecondaryIntakeOutcome,
     type SecondarySnapshotStore,
@@ -101,7 +102,9 @@ export {
 // The allow list and the secondary records it keeps.
 export { applyInterestTransitions, type InterestDeps } from "./interest"
 export {
+    disposeStrayOwnBlockProofs,
     intakeSecondary,
+    OWN_BLOCK_SETTLE_BATCH,
     settleSecondary,
     settleSecondaryDue,
     type SecondaryConfig,

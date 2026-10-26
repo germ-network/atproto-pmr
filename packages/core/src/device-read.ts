@@ -5,6 +5,7 @@
  * asked. It never reaches a PDS on the response path.
  */
 
+import { BLOCK_COLLECTION_NSID } from "./block-edges.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "./cose/cbor.js"
 import { DECLARATION_COLLECTION_NSID } from "./declaration.js"
 import {
@@ -29,6 +30,12 @@ export interface RecordReadDeps {
     serves: (did: string) => Promise<boolean>
     /** Every singleton this PMR snapshots, the declaration included. */
     watched: WatchedRecord[]
+    /**
+     * Whether `did` is an owner registered with this deployment, whose own
+     * `app.bsky.graph.block` records the monitor holds by rkey. Absent: no
+     * block record is served, and every block read is `not-watched`.
+     */
+    servesOwnBlocks?: (did: string) => Promise<boolean>
     /**
      * The DID's current key: a snapshot ingest verified under any other key,
      * or with no trusted current key for a `did:plc` DID, reads `unverifiable`.
@@ -100,8 +107,10 @@ export async function handleRecordRead(
     const { did, collection, rkey } = target
 
     const watched =
-        isDeclaration(collection, rkey) ||
-        deps.watched.some((w) => w.collection === collection && w.rkey === rkey)
+        collection === BLOCK_COLLECTION_NSID
+            ? (await deps.servesOwnBlocks?.(did)) === true
+            : isDeclaration(collection, rkey) ||
+              deps.watched.some((w) => w.collection === collection && w.rkey === rkey)
     if (!watched || !(await deps.serves(did))) {
         return recordResponse({ found: false, code: "not-watched", reason: "not watched" })
     }
