@@ -23,6 +23,8 @@ import {
     refreshDue,
     sealDueWindows,
     settleDue,
+    disposeStrayOwnBlockProofs,
+    OWN_BLOCK_SETTLE_BATCH,
     settleSecondaryDue,
     sweepBackfill,
     sweepEvidenceRefresh,
@@ -51,6 +53,7 @@ import {
     type RecordRef,
     type SecondaryDeps,
     type SecondaryIndex,
+    type SecondaryLane,
     type SecondaryIntakeIndex,
     type SecondaryIntakeOutcome,
     type SecondaryWriteAnswer,
@@ -470,6 +473,7 @@ export class MonitorIngest
                     verified_with TEXT NOT NULL,
                     PRIMARY KEY (did, collection, rkey)
                 );
+                CREATE INDEX IF NOT EXISTS records_by_collection ON records (collection, did);
                 CREATE TABLE IF NOT EXISTS evidence_anchors (
                     identity TEXT PRIMARY KEY,
                     did TEXT NOT NULL,
@@ -511,6 +515,7 @@ export class MonitorIngest
                     last_failure TEXT,
                     PRIMARY KEY (did, collection, rkey)
                 );
+                CREATE INDEX IF NOT EXISTS rec_pending_by_collection ON rec_pending (collection, did);
                 CREATE TABLE IF NOT EXISTS reg_state (
                     did TEXT PRIMARY KEY,
                     registered_at INTEGER NOT NULL DEFAULT 0,
@@ -2634,6 +2639,7 @@ export class MonitorIngest
 
     private setRegisteredSync(did: string, registered: boolean, atMs: number): void {
         const ownedBefore = this.ownsSync(did)
+        const registeredBefore = this.registeredSync(did)
         this.db.sql.exec(
             "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
                 "ON CONFLICT(did) DO UPDATE SET registered = ?2",
@@ -2641,6 +2647,11 @@ export class MonitorIngest
             registered ? 1 : 0
         )
         this.reevaluateInterest(did, atMs, ownedBefore)
+        // Under `everyone` a registration does not change who owns a graph,
+        // so the owner's block records still need their listing.
+        if (registered && !registeredBefore && this.ownsSync(did)) {
+            this.queueListingSync(did, atMs, "ownership")
+        }
     }
 
     async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
@@ -2733,7 +2744,11 @@ export class MonitorIngest
 
     // ---- SecondaryIndex ---------------------------------------------------
 
-    async dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]> {
+    async dueSecondaries(
+        nowMs: number,
+        limit: number,
+        lane: SecondaryLane = "records"
+    ): Promise<PendingRecordFetch[]> {
         return this.db.sql
             .exec<{
                 did: string
@@ -2745,8 +2760,10 @@ export class MonitorIngest
                 epoch: number
             }>(
                 "SELECT did, collection, rkey, rev, attempts, not_before, epoch FROM rec_pending " +
-                    "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
+                    `WHERE not_before <= ? AND collection ${lane === "records" ? "!=" : "="} ? ` +
+                    "ORDER BY not_before LIMIT ?",
                 nowMs,
+                BLOCK_COLLECTION_NSID,
                 limit
             )
             .toArray()
@@ -2793,7 +2810,7 @@ export class MonitorIngest
     ): Promise<SecondaryWriteAnswer | "stored"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
-            if (refusal !== null) return refusal
+            if (refusal !== null) return this.refuseSecondary(ref, refusal, owedRev)
             this.db.sql.exec(
                 "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
                     "VALUES (?, ?, ?, ?, ?, ?) " +
@@ -2819,7 +2836,7 @@ export class MonitorIngest
     ): Promise<SecondaryWriteAnswer | "disposed"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
-            if (refusal !== null) return refusal
+            if (refusal !== null) return this.refuseSecondary(ref, refusal, owedRev)
             this.db.sql.exec(
                 "DELETE FROM records WHERE did = ? AND collection = ? AND rkey = ?",
                 ref.did,
@@ -2831,7 +2848,64 @@ export class MonitorIngest
         })
     }
 
-    /** `left` if the DID is out of the interest epoch it was owed under; `older` if a newer rev is indexed. */
+    async strayOwnBlockProofs(limit: number): Promise<RecordRef[]> {
+        return this.db.sql
+            .exec<{ did: string; collection: string; rkey: string }>(
+                "SELECT did, collection, rkey FROM (" +
+                    "SELECT did, collection, rkey FROM records WHERE collection = ?1 " +
+                    "UNION SELECT did, collection, rkey FROM rec_pending WHERE collection = ?1" +
+                    ") b WHERE NOT EXISTS (SELECT 1 FROM interest i WHERE i.did = b.did AND i.registered = 1) " +
+                    "LIMIT ?2",
+                BLOCK_COLLECTION_NSID,
+                limit
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, collection: r.collection, rkey: r.rkey }))
+    }
+
+    async forgetStrayOwnBlockProof(ref: RecordRef): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "DELETE FROM records WHERE did = ? AND collection = ? AND rkey = ?",
+                ref.did,
+                ref.collection,
+                ref.rkey
+            )
+            const interest = this.db.sql
+                .exec<{ epoch: number }>(
+                    "SELECT epoch FROM interest WHERE did = ? AND registered = 1",
+                    ref.did
+                )
+                .toArray()[0]
+            if (interest === undefined) {
+                this.db.sql.exec(
+                    "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
+                    ref.did,
+                    ref.collection,
+                    ref.rkey
+                )
+                return
+            }
+            this.oweSecondarySync({ ...ref, rev: "" }, interest.epoch)
+        })
+    }
+
+    /**
+     * A block proof of an owner no longer registered is not retried: the DID
+     * may still be a member, so no leave would sweep its row.
+     */
+    private refuseSecondary(
+        ref: RecordRef,
+        refusal: SecondaryWriteAnswer,
+        owedRev: string
+    ): SecondaryWriteAnswer {
+        if (refusal === "left" && ref.collection === BLOCK_COLLECTION_NSID) {
+            this.clearSecondarySync(ref, owedRev)
+        }
+        return refusal
+    }
+
+    /** `left` if the DID is out of the interest epoch it was owed under, or a block ref of a DID no longer registered; `older` if a newer rev is indexed. */
     private secondaryRefusal(ref: RecordRef, rev: string, epoch: number): SecondaryWriteAnswer | null {
         const interest = this.db.sql
             .exec<{ member: number; epoch: number }>(
@@ -2840,6 +2914,7 @@ export class MonitorIngest
             )
             .toArray()[0]
         if (interest === undefined || interest.member !== 1 || interest.epoch !== epoch) return "left"
+        if (ref.collection === BLOCK_COLLECTION_NSID && !this.registeredSync(ref.did)) return "left"
         const indexed = this.secondaryRevSync(ref)
         if (indexed !== null && compareRev(indexed, rev) === "regressed") return "older"
         return null
@@ -2900,21 +2975,25 @@ export class MonitorIngest
             if (this.secondaryRevSync(owed) === owed.rev) {
                 return { outcome: "duplicate" as const }
             }
-            this.db.sql.exec(
-                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
-                    "VALUES (?, ?, ?, ?, ?, ?) " +
-                    "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
-                    "rev = excluded.rev, epoch = excluded.epoch, attempts = 0, not_before = 0",
-                owed.did,
-                owed.collection,
-                owed.rkey,
-                owed.rev,
-                interest.epoch,
-                Date.now()
-            )
+            this.oweSecondarySync(owed, interest.epoch)
             this.raiseFollowCursor(cursor)
             return { outcome: "accepted" as const }
         })
+    }
+
+    private oweSecondarySync(owed: OwedRecord, epoch: number): void {
+        this.db.sql.exec(
+            "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
+                "rev = excluded.rev, epoch = excluded.epoch, attempts = 0, not_before = 0",
+            owed.did,
+            owed.collection,
+            owed.rkey,
+            owed.rev,
+            epoch,
+            Date.now()
+        )
     }
 
     // ---- FollowStreamIndex ------------------------------------------------
@@ -2935,7 +3014,7 @@ export class MonitorIngest
     }
 
     /** Logged only: nothing reads `edge_ops` until the edge index exists. */
-    async logEdgeOp(op: NewEdgeOp, cursor: Cursor): Promise<void> {
+    async logEdgeOp(op: NewEdgeOp, cursor: Cursor, ownBlockProof?: OwedRecord): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
                 "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor, collection) " +
@@ -2948,6 +3027,15 @@ export class MonitorIngest
                 op.cursor,
                 op.collection
             )
+            if (ownBlockProof) {
+                const interest = this.db.sql
+                    .exec<{ epoch: number }>(
+                        "SELECT epoch FROM interest WHERE did = ? AND member = 1",
+                        ownBlockProof.did
+                    )
+                    .toArray()[0]
+                if (interest) this.oweSecondarySync(ownBlockProof, interest.epoch)
+            }
             this.raiseFollowCursor(cursor)
         })
     }
@@ -3275,10 +3363,36 @@ export class MonitorIngest
                     done.beganAtMs
                 )
             }
+            if (ownerKind && this.registeredSync(did)) this.oweOwnBlockProofsSync(did)
             this.clearProgressSync(did)
             this.queueRecountSync(done.subjects, done.nowMs)
             return true
         })
+    }
+
+    /**
+     * Owes a proof fetch of every block the finished listing staged that is
+     * not held, and of every held block it no longer lists. A block the
+     * stream already touched may be owed again; the fetch is idempotent.
+     */
+    private oweOwnBlockProofsSync(did: string): void {
+        const epoch = this.db.sql
+            .exec<{ epoch: number }>("SELECT epoch FROM interest WHERE did = ?", did)
+            .toArray()[0]?.epoch
+        if (epoch === undefined) return
+        const rkeys = this.db.sql
+            .exec<{ rkey: string }>(
+                "SELECT rkey FROM listing_stage WHERE did = ?1 AND collection = 'block' " +
+                    "AND rkey NOT IN (SELECT rkey FROM records WHERE did = ?1 AND collection = ?2) " +
+                    "UNION SELECT rkey FROM records WHERE did = ?1 AND collection = ?2 " +
+                    "AND rkey NOT IN (SELECT rkey FROM listing_stage WHERE did = ?1 AND collection = 'block')",
+                did,
+                BLOCK_COLLECTION_NSID
+            )
+            .toArray()
+        for (const { rkey } of rkeys) {
+            this.oweSecondarySync({ did, collection: BLOCK_COLLECTION_NSID, rkey, rev: "" }, epoch)
+        }
     }
 
     private registeredSync(did: string): boolean {
@@ -4938,6 +5052,24 @@ export class MonitorIngest
                 )
             } catch (err) {
                 console.error("monitor: secondary settle failed", err)
+            }
+            try {
+                await settleSecondaryDue(
+                    this.secondaryDeps(),
+                    this.envInt(this.env.OWN_BLOCK_SETTLE_BATCH, OWN_BLOCK_SETTLE_BATCH),
+                    undefined,
+                    "own-blocks"
+                )
+            } catch (err) {
+                console.error("monitor: own-block settle failed", err)
+            }
+            try {
+                await disposeStrayOwnBlockProofs(
+                    this.secondaryDeps(),
+                    Number.isFinite(batch) ? batch : 32
+                )
+            } catch (err) {
+                console.error("monitor: own-block disposal failed", err)
             }
             try {
                 await this.publishFirehoseCoverage()

@@ -191,6 +191,8 @@ function harness(opts: {
         index: {
             dueSecondaries: async () => [],
             deferSecondary: async () => null,
+            strayOwnBlockProofs: async () => [],
+            forgetStrayOwnBlockProof: async () => {},
             clearSecondary: async () => {},
             completeSecondary: async (ref, rev, verified) => {
                 profileRows.set(ref.did, {

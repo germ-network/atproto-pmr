@@ -8,7 +8,7 @@
 import type { WatchedRecord } from "@germ-network/atproto-pmr-core"
 import type { MonitorEvent } from "./jetstream"
 import { intakeSecondary } from "./secondary"
-import type { Cursor, InterestIndex, SecondaryIntakeIndex } from "./storage"
+import type { Cursor, InterestIndex, OwedRecord, SecondaryIntakeIndex } from "./storage"
 
 import { BLOCK_COLLECTION_NSID, FOLLOW_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 
@@ -63,8 +63,12 @@ export interface FollowStreamIndex {
      * once per `FOLLOW_CURSOR_PERSIST_MS`.
      */
     skipFollowEvent(cursor: Cursor): Promise<void>
-    /** Log a follow or block change and persist the cursor, atomically. */
-    logEdgeOp(op: NewEdgeOp, cursor: Cursor): Promise<void>
+    /**
+     * Log a follow or block change and persist the cursor, atomically. With
+     * `ownBlockProof`, a registered owner's block change, also owe a fetch of
+     * that block record's proof in the same step, as `oweSecondary` would.
+     */
+    logEdgeOp(op: NewEdgeOp, cursor: Cursor, ownBlockProof?: OwedRecord): Promise<void>
     /** Queue `did`'s follow listing to run again, and persist the cursor, atomically. */
     requeueListing(did: string, cursor: Cursor): Promise<void>
 }
@@ -92,6 +96,8 @@ export type FollowRoute =
  *   collection; an update with a subject is routed as a create (it replaces
  *   the edge of `(follower, rkey)`), a create or update without one is
  *   dropped;
+ * - a block commit by a registered owner also owes a fetch of that block
+ *   record's proof, whether or not the edge is kept;
  * - a secondary commit for a DID in interest: owed, unless at the indexed rev;
  * - `#sync`, or `#account` turning active, for a DID in interest: its
  *   listing re-queued;
@@ -124,11 +130,16 @@ export async function routeFollowEvent(
               : null
     if (collection !== null) {
         const follower = event.did
+        const owed: OwedRecord | undefined =
+            collection === "block" && (await index.isRegistered(follower))
+                ? { did: follower, collection: event.collection, rkey: event.rkey, rev: event.rev }
+                : undefined
         if (event.operation === "delete") {
             if (!(await index.inInterest(follower))) return skip("dropped")
             await index.logEdgeOp(
                 { collection, kind: "delete", follower, rkey: event.rkey, rev: event.rev, cursor },
-                cursor
+                cursor,
+                owed
             )
             return "edge-op"
         }
@@ -137,10 +148,16 @@ export async function routeFollowEvent(
         const kept =
             (await index.isGraphOwner(follower)) ||
             ((await index.inInterest(follower)) && (await index.isRegistered(subject)))
-        if (!kept) return skip("dropped")
+        if (!kept) {
+            if (!owed) return skip("dropped")
+            const result = await index.oweSecondary(owed, cursor)
+            if (result.outcome === "accepted") return "owed"
+            return result.outcome === "duplicate" ? "duplicate" : skip("dropped")
+        }
         await index.logEdgeOp(
             { collection, kind: "create", follower, rkey: event.rkey, subject, rev: event.rev, cursor },
-            cursor
+            cursor,
+            owed
         )
         return "edge-op"
     }

@@ -216,6 +216,19 @@ device looks at. That privacy is the whole of the trust: records stay CAR, a
 device verifies each against the DID document itself, and it never takes the
 relay's word for content or a key.
 
+### Registered owners' block records
+
+A registered owner's own `app.bsky.graph.block` records are held by rkey, like
+any other secondary record, but fetched under a separate per-wake budget so a
+large owner's backfill never delays declarations or the other secondary records. A block commit by a registered
+owner owes a fetch of that record's proof, together with the stream cursor;
+completing the owner's listing owes every listed block not yet held and every
+held block it no longer lists. Only presence is held: a proof that shows the
+record absent deletes the held proof. Deregistering an owner deletes their held
+and owed block proofs whether or not they remain in interest, and one who
+registers again meanwhile is fetched again. The wire behavior is described in
+[wire-api](wire-api.md#block-records).
+
 ### Freshness comes from coverage, not polling
 
 A monitor is sized for every declaration holder on the network, not for a

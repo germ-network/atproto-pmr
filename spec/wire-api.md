@@ -1303,8 +1303,8 @@ re-derives from the CAR.
 
 | code | meaning |
 |---|---|
-| `not-watched` | the relay does not serve that DID or does not snapshot that collection and rkey |
-| `not-held` | nothing is held for the DID |
+| `not-watched` | the relay does not serve that DID or does not snapshot that collection and rkey, or the collection is `app.bsky.graph.block` and the DID is not registered with the relay ([below](#block-records)) |
+| `not-held` | nothing is held for the DID, or for that rkey |
 | `unverifiable` | a snapshot is held but is not served (below) |
 
 A relay serves a snapshot only if ingest verified it against the DID
@@ -1326,6 +1326,28 @@ restart of the monitor's PLC stream without a usable cursor resets its
 continuous coverage, which leaves `did:plc` snapshots `unverifiable` until
 the monitor's resync confirms them again. A declaration that fails this check
 does not move the resync forward.
+
+##### Block records
+
+`app.bsky.graph.block` records are served by rkey, and only for a DID
+**registered** with the relay: it is that owner's own record, a CAR from the
+owner's repo signed under the owner's key, which a device verifies like any
+other record and checks names the blocked DID as its `subject`. The same route
+answers `not-watched` for any other DID, so a relay never serves one DID's
+blocks to learn about another. The summary's `b` list names the rkeys.
+
+The relay serves **presence only**, and is never the authority for absence. An
+rkey with no held proof reads `not-held`, whether the block was lifted, never
+existed or has not been fetched yet. A newly registered owner's blocks arrive
+over time, so an unheld rkey is not evidence of anything. A device MUST treat
+any answer other than a verified record as unverifiable, and confirm a lifted
+block with the owner's own PDS.
+
+Held blocks follow the owner's block commits and are reconciled against the
+owner's listing, so a block deleted while the relay missed the event stays
+served until that owner's next listing. After an `#atproto` key rotation the
+held proofs read `unverifiable` until each block record changes or the owner
+is listed again. Deregistering an owner removes their held blocks.
 
 The response never waits on the PDS. A declaration whose freshness is past 24 hours is served as
 held and moved forward in the monitor's resync ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
@@ -1487,12 +1509,14 @@ every verdict changed since the named state arrives in that response, whatever
 it. A change to verdicts or mutual bits alone issues a new token. A mutual bit travels only on a
 `c` entry: a contact with no verdict is not listed when its mutual bit changes.
 
-The block list is the owner's own: it appears only here, not on any public
-route (no device reads another DID's block list, and serving them would cost),
+The block list is the owner's own: it appears only here, as a list (no
+device reads another DID's block list, and serving them would cost),
 and is diffed independently of the records, so a change to blocks alone
 issues a new token. Each entry names the block record's
 rkey in the owner's repo, so a device can verify it against the signed record
-before relying on it; a block is a hint until then. These are
+before relying on it; a block is a hint until then. A relay serves the
+owner's own block record by that rkey on the [record route](#block-records).
+These are
 the owner's `app.bsky.graph.block` records, unrelated to the relay's
 [blocked senders](#blocked-senders).
 
