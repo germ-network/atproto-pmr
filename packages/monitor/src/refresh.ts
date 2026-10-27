@@ -161,8 +161,9 @@ export async function refreshDue(
         let outcome: RefreshOutcome
         try {
             outcome = await refreshOne(deps, did, opts.nowMs)
-        } catch {
+        } catch (err) {
             outcome = "failed"
+            console.warn("monitor: refresh did failed", { did, error: String(err) })
             await deps.refreshIndex.markAttempted(did, opts.nowMs).catch(() => {})
         }
         outcomes[outcome] += 1

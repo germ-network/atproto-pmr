@@ -449,6 +449,26 @@ describe("refreshDue", () => {
         expect(half.checks.size).toBe(0)
     })
 
+    it("a DID that fails logs its DID and the error", async () => {
+        const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            const down = harness({
+                indexed: { [DID]: "3m1" },
+                stored: { [DID]: fetched("3m1", decl(1)) },
+                head: async () => {
+                    throw new Error("pds down")
+                },
+            })
+            expect((await run(down)).outcomes.failed).toBe(1)
+            expect(warned).toHaveBeenCalledWith("monitor: refresh did failed", {
+                did: DID,
+                error: "Error: pds down",
+            })
+        } finally {
+            warned.mockRestore()
+        }
+    })
+
     it("processes at most limit DIDs, least recently checked first", async () => {
         const dids = ["did:plc:a", "did:plc:b", "did:plc:c"]
         const h = harness({

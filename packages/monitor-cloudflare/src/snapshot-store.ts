@@ -1,6 +1,7 @@
 import {
     DECLARATION_COLLECTION_NSID,
     declaredPoliciesOf,
+    didWebDocumentURL,
     readRecordFromCar,
     type StoredPolicies,
     type RecordSnapshotStore,
@@ -66,10 +67,10 @@ export function snapshotKeys(
 
 async function readEntry(
     env: { records: KVNamespace },
-    key: string
+    ref: RecordRef
 ): Promise<SnapshotEntry | null> {
     const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
-        key,
+        snapshotKeys(ref.did, ref.collection, ref.rkey).record,
         "arrayBuffer"
     )
     if (value === null || metadata === null) return null
@@ -83,11 +84,14 @@ async function readEntry(
         verifiedWith: metadata.verifiedWith ?? null,
         cid: metadata.cid ?? null,
         seenKey: metadata.seenKey ?? null,
-        evidence: metadata.evidence ?? null,
+        evidence: storedEvidence(ref, metadata),
         messagingKeyFingerprint: metadata.messagingKeyFingerprint ?? null,
         messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
     }
 }
+
+/** Cloudflare KV's cap on one key's metadata, as UTF-8 bytes of its JSON. */
+export const KV_METADATA_MAX_BYTES = 1024
 
 async function writeEntry(
     env: { records: KVNamespace },
@@ -95,28 +99,141 @@ async function writeEntry(
     entry: SnapshotEntry,
     policies?: StoredPolicies
 ): Promise<void> {
+    const metadata: StoredMeta = {
+        rev: entry.rev,
+        commitCid: entry.commitCid ?? null,
+        observedAtMs: entry.observedAtMs,
+        source: entry.source,
+        signingKey: entry.signingKey,
+        verifiedWith: entry.verifiedWith,
+        cid: entry.cid,
+        seenKey: entry.seenKey ?? null,
+        evidence: entry.evidence ? slimEvidence(entry.evidence) : null,
+        ...(entry.messagingKeyFingerprint == null
+            ? {}
+            : { messagingKeyFingerprint: entry.messagingKeyFingerprint }),
+        ...(entry.messagingKeyFirstSeenAtMs == null
+            ? {}
+            : { messagingKeyFirstSeenAtMs: entry.messagingKeyFirstSeenAtMs }),
+        ...(policies ? { policies } : {}),
+    }
+    // A declaration must never fail to store over optional metadata: past the
+    // cap the put is a 413 and the snapshot goes stale.
+    const bytes = metadataBytes(metadata)
+    if (bytes > KV_METADATA_MAX_BYTES) {
+        metadata.evidence = null
+        if (metadataBytes(metadata) > KV_METADATA_MAX_BYTES) delete metadata.messagingKeyFirstSeenAtMs
+        if (metadataBytes(metadata) > KV_METADATA_MAX_BYTES) delete metadata.messagingKeyFingerprint
+        const trimmedBytes = metadataBytes(metadata)
+        if (trimmedBytes > KV_METADATA_MAX_BYTES) {
+            console.error("monitor: snapshot metadata over cap after trim", { key, bytes, trimmedBytes })
+        } else {
+            console.warn("monitor: snapshot metadata trimmed", { key, bytes, trimmedBytes })
+        }
+    }
     // No expirationTtl, deliberately: an unchanged record must stay served
     // indefinitely.
-    await env.records.put(key, entry.car, {
-        metadata: {
-            rev: entry.rev,
-            commitCid: entry.commitCid ?? null,
-            observedAtMs: entry.observedAtMs,
-            source: entry.source,
-            signingKey: entry.signingKey,
-            verifiedWith: entry.verifiedWith,
-            cid: entry.cid,
-            seenKey: entry.seenKey ?? null,
-            evidence: entry.evidence ?? null,
-            ...(entry.messagingKeyFingerprint == null
-                ? {}
-                : { messagingKeyFingerprint: entry.messagingKeyFingerprint }),
-            ...(entry.messagingKeyFirstSeenAtMs == null
-                ? {}
-                : { messagingKeyFirstSeenAtMs: entry.messagingKeyFirstSeenAtMs }),
-            ...(policies ? { policies } : {}),
-        } satisfies StoredMeta,
-    })
+    await env.records.put(key, entry.car, { metadata })
+}
+
+const metadataBytes = (metadata: StoredMeta) =>
+    new TextEncoder().encode(JSON.stringify(metadata)).byteLength
+
+/**
+ * The part of a {@link SnapshotEvidence} the metadata does not already hold.
+ * The rest is the record's path, `cid`, `commitCid`, `rev` and
+ * `verifiedWith`, which `storedEvidence` rebuilds it from.
+ */
+interface StoredEvidenceMeta {
+    authority: StoredAuthority
+    assurance: SnapshotEvidence["assurance"]
+    monitor: string
+    commitFirstObservedAtMs: number
+    anchorFirstObservedAtMs: number
+}
+
+/**
+ * A did:web authority without what the DID implies: `documentUrl` when it is
+ * the DID's own document URL, and `verificationMethodId` when it is
+ * `<did>#atproto`. Each repeats the DID's host, which put a did:web
+ * declaration's evidence over the cap.
+ */
+type StoredAuthority =
+    | Extract<SnapshotEvidence["authority"], { method: "plc" }>
+    | {
+          method: "web"
+          keyFingerprint: string
+          documentUrl?: string
+          verificationMethodId?: string
+      }
+
+const impliedDocumentUrl = (did: string): string | null => {
+    try {
+        return new URL(didWebDocumentURL(did)).href
+    } catch {
+        return null
+    }
+}
+
+function slimEvidence(evidence: SnapshotEvidence): StoredEvidenceMeta {
+    const { authority } = evidence
+    return {
+        authority:
+            authority.method === "plc"
+                ? authority
+                : {
+                      method: "web",
+                      keyFingerprint: authority.keyFingerprint,
+                      ...(authority.documentUrl === impliedDocumentUrl(evidence.did)
+                          ? {}
+                          : { documentUrl: authority.documentUrl }),
+                      ...(authority.verificationMethodId === `${evidence.did}#atproto`
+                          ? {}
+                          : { verificationMethodId: authority.verificationMethodId }),
+                  },
+        assurance: evidence.assurance,
+        monitor: evidence.monitor,
+        commitFirstObservedAtMs: evidence.commitFirstObservedAtMs,
+        anchorFirstObservedAtMs: evidence.anchorFirstObservedAtMs,
+    }
+}
+
+/**
+ * The full evidence for the record at `ref`, from either stored shape. An
+ * entry stored before evidence was slimmed carries the full object, which
+ * reads as it was written.
+ */
+function storedEvidence(ref: RecordRef, metadata: StoredMeta): SnapshotEvidence | null {
+    const stored = metadata.evidence
+    if (!stored) return null
+    if ("did" in stored) return stored
+    const { cid, commitCid, rev, verifiedWith } = metadata
+    if (cid == null || commitCid == null || verifiedWith == null) return null
+    const { authority } = stored
+    let fullAuthority: SnapshotEvidence["authority"]
+    if (authority.method === "plc") {
+        fullAuthority = authority
+    } else {
+        const documentUrl = authority.documentUrl ?? impliedDocumentUrl(ref.did)
+        if (documentUrl === null) return null
+        fullAuthority = {
+            method: "web",
+            documentUrl,
+            verificationMethodId: authority.verificationMethodId ?? `${ref.did}#atproto`,
+            keyFingerprint: authority.keyFingerprint,
+        }
+    }
+    return {
+        did: ref.did,
+        collection: ref.collection,
+        rkey: ref.rkey,
+        recordCid: cid,
+        commitCid,
+        rev,
+        verifiedWith,
+        ...stored,
+        authority: fullAuthority,
+    }
 }
 
 /** Singleton key — one marker for the whole digest, not one per window.
@@ -136,7 +253,8 @@ interface StoredMeta {
     verifiedWith: string | null
     cid: string | null
     seenKey: string | null
-    evidence?: SnapshotEvidence | null
+    /** Slim since the metadata cap was hit; the full shape on older entries. */
+    evidence?: StoredEvidenceMeta | SnapshotEvidence | null
     /** Internal currentKey history metadata; absent on legacy snapshots. */
     messagingKeyFingerprint?: string | null
     messagingKeyFirstSeenAtMs?: number | null
@@ -175,7 +293,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): SnapshotStore & RefreshSnapshots & SecondarySnapshotStore {
     return {
-        getRecord: (did) => readEntry(env, RECORD_PREFIX + did),
+        getRecord: (did) =>
+            readEntry(env, { did, collection: DECLARATION_COLLECTION_NSID, rkey: "self" }),
 
         putRecord: (did, entry) =>
             writeEntry(
@@ -195,8 +314,7 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
         },
 
-        getSecondary: (ref) =>
-            readEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record),
+        getSecondary: (ref) => readEntry(env, ref),
 
         putSecondary: (ref, entry) =>
             writeEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record, entry),
@@ -300,7 +418,7 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 rev: verifiedWith === null ? null : metadata.rev,
                 cid: verifiedWith === null ? null : (metadata.cid ?? null),
                 commitCid: verifiedWith === null ? null : (metadata.commitCid ?? null),
-                evidence: metadata.evidence ?? null,
+                evidence: storedEvidence({ did, collection, rkey }, metadata),
                 ...(metadata.policies ? { policies: metadata.policies } : {}),
             }
         },
@@ -351,7 +469,7 @@ export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorInge
                     commitCid: metadata.commitCid ?? null,
                     rev: metadata.rev ?? null,
                     freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
-                    evidenceState: metadata.evidence ?? null,
+                    evidenceState: storedEvidence(ref, metadata),
                     messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
                     ...(metadata.policies ? { policies: metadata.policies } : {}),
                 }
