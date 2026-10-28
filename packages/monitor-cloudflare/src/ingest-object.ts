@@ -28,6 +28,7 @@ import {
     settleSecondaryDue,
     sweepBackfill,
     sweepEvidenceRefresh,
+    sweepSnapshotLayout,
     windowOf,
     type BackfillProgress,
     type EvidenceAnchorRow,
@@ -74,6 +75,7 @@ import {
     type VerifiedWrite,
     type VerifiedDeclarationWrite,
     type HeldDeclarationState,
+    type SnapshotLayoutBackfillProgress,
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
@@ -423,6 +425,7 @@ export class MonitorIngest
     private drainAgain = false
     /** The evidence sweep finished, so later alarms skip even its progress read. */
     private evidenceRefreshDone = false
+    private snapshotLayoutDone = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -1972,8 +1975,87 @@ export class MonitorIngest
         )
     }
 
+    async snapshotLayoutBackfillPage(after: RecordRef | null, limit: number): Promise<IndexedRecord[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>(
+                "SELECT did, collection, rkey, rev, cid, verified_with FROM records " +
+                    "WHERE (?1 IS NULL OR (did, collection, rkey) > (?1, ?2, ?3)) " +
+                    "ORDER BY did, collection, rkey LIMIT ?4",
+                after?.did ?? null,
+                after?.collection ?? null,
+                after?.rkey ?? null,
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async readSnapshotLayoutBackfillProgress(): Promise<SnapshotLayoutBackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'snapshot_v2_backfill'")
+            .toArray()[0]
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as SnapshotLayoutBackfillProgress
+    }
+
+    async setSnapshotLayoutBackfillProgress(progress: SnapshotLayoutBackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('snapshot_v2_backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
+    async oweSnapshotLayoutRefresh(record: IndexedRecord): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            if (record.collection === this.env.MONITOR_COLLECTION && record.rkey === "self") {
+                const held = this.db.sql
+                    .exec("SELECT 1 FROM holder_state WHERE did = ? AND state = 'held'", record.did)
+                    .toArray()
+                if (held.length > 0) this.oweEvidenceRefreshSync(record.did, record.rev)
+                return
+            }
+            const interest = this.db.sql
+                .exec<{ epoch: number; registered: number }>(
+                    "SELECT epoch, registered FROM interest WHERE did = ? AND member = 1",
+                    record.did
+                )
+                .toArray()[0]
+            if (interest === undefined) return
+            if (record.collection === BLOCK_COLLECTION_NSID && interest.registered !== 1) return
+            this.db.sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(did, collection, rkey) DO NOTHING",
+                record.did,
+                record.collection,
+                record.rkey,
+                record.rev,
+                interest.epoch,
+                Date.now()
+            )
+        })
+    }
+
     /** `owe` for the evidence sweep, where a row already owed is left as it is. */
     async oweEvidenceRefresh(did: string, rev: string): Promise<void> {
+        this.oweEvidenceRefreshSync(did, rev)
+    }
+
+    private oweEvidenceRefreshSync(did: string, rev: string): void {
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
                 "VALUES (?, ?, 0, 0, ?, NULL, ?) ON CONFLICT(did) DO NOTHING",
@@ -5105,6 +5187,17 @@ export class MonitorIngest
                 } catch (err) {
                     console.error("monitor: backfill sweep failed", err)
                 }
+            }
+            try {
+                if (!this.snapshotLayoutDone) {
+                    const { done } = await sweepSnapshotLayout({
+                        index: this,
+                        limit: this.envInt(this.env.SETTLE_BATCH, 32),
+                    })
+                    this.snapshotLayoutDone = done
+                }
+            } catch (err) {
+                console.error("monitor: snapshot layout sweep failed", err)
             }
             try {
                 await this.sweepEvidenceRefreshIfConfigured()

@@ -63,6 +63,13 @@ function freshStub(): DurableObjectStub<MonitorIngest> {
     return testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
 }
 
+/** These alarm tests count fetches; the layout sweep's owed fetches are covered in snapshot-v2-backfill.spec.ts. */
+function skipLayoutSweep(obj: MonitorIngest): void {
+    obj.ctx.storage.sql.exec(
+        "INSERT INTO meta (k, v) VALUES ('snapshot_v2_backfill', '{\"done\":true}') ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+    )
+}
+
 /** Reach in to drive the ingest object with a stubbed authoritative fetch. */
 /** Enter the object with its own type, mirroring inPMR upstream. */
 function inMonitorObj<R>(
@@ -1075,6 +1082,7 @@ describe("snapshot refresh", () => {
         const log: string[] = []
         const old = Date.now() - 3 * HOUR
         await inMonitorObj(stub, async (obj) => {
+            skipLayoutSweep(obj)
             const o = obj as unknown as {
                 fetchRecord: (did: string) => Promise<StubFetched>
                 verifyRecord: IngestDeps["verify"]
@@ -1722,6 +1730,7 @@ describe("wiring stored DID documents into the monitor", () => {
         const stub = freshStub()
         const log: string[] = []
         await inMonitorObj(stub, async (obj) => {
+            skipLayoutSweep(obj)
             const o = obj as unknown as {
                 publishDidDocuments: (limit: number) => Promise<unknown>
                 windowMembers: (w: number) => Promise<string[]>

@@ -500,7 +500,26 @@ export interface MonitorIndex extends HeldStateIndex {
      * generation, unlike `owe`, where news ends backoff.
      */
     oweEvidenceRefresh?(did: string, rev: string): Promise<void>
+    /**
+     * Every indexed record after `after`, in (did, collection, rkey) order, for
+     * the sweep that re-stores each snapshot in the current layout.
+     */
+    snapshotLayoutBackfillPage?(after: RecordRef | null, limit: number): Promise<IndexedRecord[]>
+    readSnapshotLayoutBackfillProgress?(): Promise<SnapshotLayoutBackfillProgress>
+    setSnapshotLayoutBackfillProgress?(progress: SnapshotLayoutBackfillProgress): Promise<void>
+    /**
+     * Owes a fetch of one indexed record, leaving any obligation already owed
+     * as it is. A declaration is owed as a change (a window entry, no push); a
+     * secondary only while its DID is in interest, and an own-block proof only
+     * for a registered owner. Does nothing for a declaration not held or a secondary of a DID outside interest.
+     */
+    oweSnapshotLayoutRefresh?(record: IndexedRecord): Promise<void>
 }
+
+/** Resumable position of the layout sweep. */
+export type SnapshotLayoutBackfillProgress =
+    | { done: false; cursor: RecordRef | null }
+    | { done: true }
 
 /**
  * `done: false` carries `cursor: null` before the first page and the
