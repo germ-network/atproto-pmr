@@ -13,11 +13,23 @@ import type {
     SecondarySnapshotStore,
     SnapshotCheck,
     SnapshotEntry,
-    SnapshotEvidence,
     SnapshotStore,
 } from "@germ-network/atproto-pmr-monitor"
 import type { MonitorEnv } from "./env"
 import type { MonitorIngest } from "./ingest-object"
+import {
+    decodeSnapshotValue,
+    encodeSnapshotValue,
+    KV_METADATA_MAX_BYTES,
+    readIndexMeta,
+    slimEvidence,
+    SnapshotMetadataTooLarge,
+    snapshotIndexMetaBytes,
+    storedEvidence,
+    SNAPSHOT_FORMAT_VERSION,
+    type SnapshotDetail,
+    type SnapshotIndexMeta,
+} from "./snapshot-layout"
 
 /**
  * The serving half of the seam, on KV.
@@ -46,7 +58,7 @@ const CHECK_PREFIX = "chk:"
 /**
  * The KV keys of one record's snapshot and its confirmation. The declaration
  * keeps the bare `rec:<did>` / `chk:<did>` it has always had, so existing
- * snapshots need no migration; every other record is
+ * snapshots keep their key; every other record is
  * `rec:<collection>/<rkey>:<did>` / `chk:<collection>/<rkey>:<did>`. The two
  * forms cannot collide: a DID starts `did:`, an NSID never does. Keys are
  * built, never parsed: an rkey containing `:` would make one ambiguous. KV caps
@@ -64,59 +76,75 @@ export function snapshotKeys(
     return { record: RECORD_PREFIX + subject, check: CHECK_PREFIX + subject }
 }
 
+/** A held entry's parts, decoded from a v2 value and metadata; `null` for anything else. */
+function decodeEntry(
+    value: ArrayBuffer | null,
+    metadata: unknown,
+    describe: string
+): { meta: SnapshotIndexMeta; detail: SnapshotDetail; car: Uint8Array } | null {
+    if (value === null || metadata === null) return null
+    const meta = readIndexMeta(metadata)
+    const decoded = meta === null ? null : decodeSnapshotValue(new Uint8Array(value))
+    if (meta === null || decoded === null) {
+        console.warn("monitor: snapshot entry not v2", { key: describe })
+        return null
+    }
+    return { meta, ...decoded }
+}
+
 async function readEntry(
     env: { records: KVNamespace },
-    key: string
+    ref: RecordRef
 ): Promise<SnapshotEntry | null> {
-    const { value, metadata } = await env.records.getWithMetadata<StoredMeta>(
-        key,
-        "arrayBuffer"
-    )
-    if (value === null || metadata === null) return null
+    const key = snapshotKeys(ref.did, ref.collection, ref.rkey).record
+    const { value, metadata } = await env.records.getWithMetadata<unknown>(key, "arrayBuffer")
+    const entry = decodeEntry(value, metadata, key)
+    if (entry === null) return null
+    const { meta, detail, car } = entry
     return {
-        rev: metadata.rev,
-        commitCid: metadata.commitCid ?? null,
-        car: new Uint8Array(value),
-        observedAtMs: metadata.observedAtMs,
-        source: metadata.source,
-        signingKey: metadata.signingKey,
-        verifiedWith: metadata.verifiedWith ?? null,
-        cid: metadata.cid ?? null,
-        seenKey: metadata.seenKey ?? null,
-        evidence: metadata.evidence ?? null,
-        messagingKeyFingerprint: metadata.messagingKeyFingerprint ?? null,
-        messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
+        rev: meta.rev,
+        commitCid: meta.commitCid,
+        car,
+        observedAtMs: meta.observedAtMs,
+        source: detail.source,
+        signingKey: detail.signingKey,
+        verifiedWith: meta.verifiedWith,
+        cid: meta.cid,
+        evidence: storedEvidence(ref, meta),
+        messagingKeyFirstSeenAtMs: meta.messagingKeyFirstSeenAtMs ?? null,
     }
 }
 
+/**
+ * Stores `entry` as a v2 entry: bounded index metadata, and a value holding
+ * the public detail and the CAR in one put. Throws over the metadata cap
+ * rather than drop anything: every field is bounded, so exceeding it is a bug.
+ */
 async function writeEntry(
     env: { records: KVNamespace },
     key: string,
     entry: SnapshotEntry,
     policies?: StoredPolicies
 ): Promise<void> {
+    const metadata: SnapshotIndexMeta = {
+        v: SNAPSHOT_FORMAT_VERSION,
+        rev: entry.rev,
+        cid: entry.cid ?? null,
+        commitCid: entry.commitCid ?? null,
+        verifiedWith: entry.verifiedWith ?? null,
+        observedAtMs: entry.observedAtMs,
+        ...(policies ? { policies } : {}),
+        ...(entry.messagingKeyFirstSeenAtMs == null
+            ? {}
+            : { messagingKeyFirstSeenAtMs: entry.messagingKeyFirstSeenAtMs }),
+        evidence: entry.evidence ? slimEvidence(entry.evidence) : null,
+    }
+    const bytes = snapshotIndexMetaBytes(metadata)
+    if (bytes > KV_METADATA_MAX_BYTES) throw new SnapshotMetadataTooLarge(key, bytes)
+    const value = encodeSnapshotValue({ source: entry.source, signingKey: entry.signingKey }, entry.car)
     // No expirationTtl, deliberately: an unchanged record must stay served
     // indefinitely.
-    await env.records.put(key, entry.car, {
-        metadata: {
-            rev: entry.rev,
-            commitCid: entry.commitCid ?? null,
-            observedAtMs: entry.observedAtMs,
-            source: entry.source,
-            signingKey: entry.signingKey,
-            verifiedWith: entry.verifiedWith,
-            cid: entry.cid,
-            seenKey: entry.seenKey ?? null,
-            evidence: entry.evidence ?? null,
-            ...(entry.messagingKeyFingerprint == null
-                ? {}
-                : { messagingKeyFingerprint: entry.messagingKeyFingerprint }),
-            ...(entry.messagingKeyFirstSeenAtMs == null
-                ? {}
-                : { messagingKeyFirstSeenAtMs: entry.messagingKeyFirstSeenAtMs }),
-            ...(policies ? { policies } : {}),
-        } satisfies StoredMeta,
-    })
+    await env.records.put(key, value, { metadata })
 }
 
 /** Singleton key — one marker for the whole digest, not one per window.
@@ -125,27 +153,6 @@ async function writeEntry(
  * reset per test), and this is the one entry with no per-test-unique key
  * to naturally avoid collision the way record and window keys do. */
 export const DIGEST_MARKER_KEY = "digest:marker"
-
-/** Stored beside the bytes so a reader knows what it holds without the index. */
-interface StoredMeta {
-    rev: string
-    commitCid?: string | null
-    observedAtMs: number
-    source: string
-    signingKey: string | null
-    verifiedWith: string | null
-    cid: string | null
-    seenKey: string | null
-    evidence?: SnapshotEvidence | null
-    /** Internal currentKey history metadata; absent on legacy snapshots. */
-    messagingKeyFingerprint?: string | null
-    messagingKeyFirstSeenAtMs?: number | null
-    /**
-     * The declaration's decoded policies; absent on entries stored before
-     * they were kept and on any entry ingest did not verify.
-     */
-    policies?: StoredPolicies
-}
 
 /**
  * The policies `putRecord` stores beside a verified declaration CAR (only
@@ -175,7 +182,8 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
     env: MonitorEnv<TIngest>
 ): SnapshotStore & RefreshSnapshots & SecondarySnapshotStore {
     return {
-        getRecord: (did) => readEntry(env, RECORD_PREFIX + did),
+        getRecord: (did) =>
+            readEntry(env, { did, collection: DECLARATION_COLLECTION_NSID, rkey: "self" }),
 
         putRecord: (did, entry) =>
             writeEntry(
@@ -195,8 +203,6 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
         },
 
-        getSecondary: (ref) =>
-            readEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record),
 
         putSecondary: (ref, entry) =>
             writeEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record, entry),
@@ -258,15 +264,16 @@ export function kvDeclarationSnapshots<TIngest extends MonitorIngest = MonitorIn
 ): (did: string) => Promise<{ car: Uint8Array; freshAtMs: number } | null> {
     return async (did) => {
         const [{ value, metadata }, check] = await Promise.all([
-            env.records.getWithMetadata<StoredMeta>(RECORD_PREFIX + did, "arrayBuffer"),
+            env.records.getWithMetadata<unknown>(RECORD_PREFIX + did, "arrayBuffer"),
             env.records.get<SnapshotCheck>(CHECK_PREFIX + did, "json"),
         ])
-        if (value === null || metadata === null) return null
+        const entry = decodeEntry(value, metadata, RECORD_PREFIX + did)
+        if (entry === null) return null
         const confirmedAtMs =
-            check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
+            check !== null && check.rev === entry.meta.rev ? check.checkedAtMs : 0
         return {
-            car: new Uint8Array(value),
-            freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+            car: entry.car,
+            freshAtMs: Math.max(entry.meta.observedAtMs, confirmedAtMs),
         }
     }
 }
@@ -285,26 +292,51 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
         async get(did, collection, rkey) {
             const keys = snapshotKeys(did, collection, rkey)
             const [{ value, metadata }, check] = await Promise.all([
-                env.records.getWithMetadata<StoredMeta>(keys.record, "arrayBuffer"),
+                env.records.getWithMetadata<unknown>(keys.record, "arrayBuffer"),
                 env.records.get<SnapshotCheck>(keys.check, "json"),
             ])
-            if (value === null || metadata === null) return null
-            const verifiedWith = metadata.verifiedWith ?? null
+            const entry = decodeEntry(value, metadata, keys.record)
+            if (entry === null) return null
+            const { meta } = entry
+            const verifiedWith = meta.verifiedWith
             const confirmedAtMs =
-                check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
+                check !== null && check.rev === meta.rev ? check.checkedAtMs : 0
             return {
-                car: new Uint8Array(value),
-                freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
+                car: entry.car,
+                freshAtMs: Math.max(meta.observedAtMs, confirmedAtMs),
                 verifiedWith,
                 // An entry stored before ingest verified carries an unsigned rev.
-                rev: verifiedWith === null ? null : metadata.rev,
-                cid: verifiedWith === null ? null : (metadata.cid ?? null),
-                commitCid: verifiedWith === null ? null : (metadata.commitCid ?? null),
-                evidence: metadata.evidence ?? null,
-                ...(metadata.policies ? { policies: metadata.policies } : {}),
+                rev: verifiedWith === null ? null : meta.rev,
+                cid: verifiedWith === null ? null : meta.cid,
+                commitCid: verifiedWith === null ? null : meta.commitCid,
+                evidence: storedEvidence({ did, collection, rkey }, meta),
+                ...(meta.policies ? { policies: meta.policies } : {}),
             }
         },
     }
+}
+
+/**
+ * The index metadata of the bulk-read `keys` that hold a v2 entry. Entries
+ * that are not v2 are logged once per call with a count, not per key.
+ */
+async function readBulkMeta(
+    env: { records: KVNamespace },
+    keys: readonly string[]
+): Promise<Map<string, SnapshotIndexMeta>> {
+    const out = new Map<string, SnapshotIndexMeta>()
+    let notV2 = 0
+    for (let i = 0; i < keys.length; i += KV_BULK_READ_MAX) {
+        const rows = await env.records.getWithMetadata<unknown>(keys.slice(i, i + KV_BULK_READ_MAX), "text")
+        for (const [key, row] of rows) {
+            if (row === null || row.value === null) continue
+            const meta = readIndexMeta(row.metadata)
+            if (meta === null) notV2 += 1
+            else out.set(key, meta)
+        }
+    }
+    if (notV2 > 0) console.warn("monitor: snapshot entries not v2", { count: notV2 })
+    return out
 }
 
 /**
@@ -319,39 +351,33 @@ export function kvSummaryIndexReader<TIngest extends MonitorIngest = MonitorInge
     return {
         async entries(refs) {
             const keys = refs.map((r) => snapshotKeys(r.did, r.collection, r.rkey))
-            const records = new Map<string, StoredMeta | null>()
+            const records = await readBulkMeta(
+                env,
+                keys.map((k) => k.record)
+            )
             const checks = new Map<string, SnapshotCheck | null>()
             for (let i = 0; i < keys.length; i += KV_BULK_READ_MAX) {
-                const chunk = keys.slice(i, i + KV_BULK_READ_MAX)
-                const [recs, chks] = await Promise.all([
-                    env.records.getWithMetadata<StoredMeta>(
-                        chunk.map((k) => k.record),
-                        "text"
-                    ),
-                    env.records.get<SnapshotCheck>(
-                        chunk.map((k) => k.check),
-                        "json"
-                    ),
-                ])
-                for (const [key, entry] of recs) records.set(key, entry?.metadata ?? null)
+                const chks = await env.records.get<SnapshotCheck>(
+                    keys.slice(i, i + KV_BULK_READ_MAX).map((k) => k.check),
+                    "json"
+                )
                 for (const [key, check] of chks) checks.set(key, check)
             }
             return refs.map((ref, i) => {
                 const metadata = records.get(keys[i]!.record)
                 if (!metadata) return null
                 const { verifiedWith, cid } = metadata
-                if (verifiedWith === null || verifiedWith === undefined) return null
-                if (cid === null || cid === undefined) return null
+                if (verifiedWith === null || cid === null) return null
                 const check = checks.get(keys[i]!.check) ?? null
                 const confirmedAtMs = check !== null && check.rev === metadata.rev ? check.checkedAtMs : 0
                 return {
                     ...ref,
                     cid,
                     verifiedWith,
-                    commitCid: metadata.commitCid ?? null,
-                    rev: metadata.rev ?? null,
+                    commitCid: metadata.commitCid,
+                    rev: metadata.rev,
                     freshAtMs: Math.max(metadata.observedAtMs, confirmedAtMs),
-                    evidenceState: metadata.evidence ?? null,
+                    evidenceState: storedEvidence(ref, metadata),
                     messagingKeyFirstSeenAtMs: metadata.messagingKeyFirstSeenAtMs ?? null,
                     ...(metadata.policies ? { policies: metadata.policies } : {}),
                 }
@@ -366,18 +392,63 @@ export async function kvMessagingKeyFirstSeenMany(
     dids: readonly string[]
 ): Promise<Map<string, number | null>> {
     const distinct = [...new Set(dids)]
+    const keys = distinct.map((did) => snapshotKeys(did, DECLARATION_COLLECTION_NSID, "self").record)
+    const metas = await readBulkMeta(env, keys)
     const out = new Map<string, number | null>()
-    for (let i = 0; i < distinct.length; i += KV_BULK_READ_MAX) {
-        const chunk = distinct.slice(i, i + KV_BULK_READ_MAX)
-        const keys = chunk.map((did) => snapshotKeys(did, DECLARATION_COLLECTION_NSID, "self").record)
-        const rows = await env.records.getWithMetadata<StoredMeta>(keys, "text")
-        for (const did of chunk) {
-            const key = snapshotKeys(did, DECLARATION_COLLECTION_NSID, "self").record
-            const metadata = rows.get(key)?.metadata
-            out.set(did, metadata?.messagingKeyFirstSeenAtMs ?? null)
-        }
-    }
+    distinct.forEach((did, i) => out.set(did, metas.get(keys[i]!)?.messagingKeyFirstSeenAtMs ?? null))
     return out
+}
+
+/** A held declaration as the relay's declared-key index needs it. */
+export interface DeclaredKeyRecord {
+    did: string
+    rev: string
+    cid: string
+    verifiedWith: string
+    car: Uint8Array
+}
+
+/**
+ * The verified declarations the store holds, a page of at most `limit` at a
+ * time, for an index built over the declared keys. Entries that are not v2 or
+ * not verified are skipped.
+ */
+export async function kvDeclaredKeyPage<TIngest extends MonitorIngest = MonitorIngest>(
+    env: MonitorEnv<TIngest>,
+    page: { cursor?: string; limit?: number } = {}
+): Promise<{ records: DeclaredKeyRecord[]; cursor: string | null }> {
+    const listed = await env.records.list({
+        prefix: `${RECORD_PREFIX}did:`,
+        limit: page.limit ?? 100,
+        ...(page.cursor === undefined ? {} : { cursor: page.cursor }),
+    })
+    const records: DeclaredKeyRecord[] = []
+    let notV2 = 0
+    const rows = await Promise.all(
+        listed.keys.map(async ({ name }) => ({
+            name,
+            ...(await env.records.getWithMetadata<unknown>(name, "arrayBuffer")),
+        }))
+    )
+    for (const { name, value, metadata } of rows) {
+        if (value === null || metadata === null) continue
+        const meta = readIndexMeta(metadata)
+        const decoded = meta === null ? null : decodeSnapshotValue(new Uint8Array(value))
+        if (meta === null || decoded === null) {
+            notV2 += 1
+            continue
+        }
+        if (meta.verifiedWith === null || meta.cid === null) continue
+        records.push({
+            did: name.slice(RECORD_PREFIX.length),
+            rev: meta.rev,
+            cid: meta.cid,
+            verifiedWith: meta.verifiedWith,
+            car: decoded.car,
+        })
+    }
+    if (notV2 > 0) console.warn("monitor: snapshot entries not v2", { count: notV2 })
+    return { records, cursor: listed.list_complete ? null : listed.cursor }
 }
 
 /** Keys one KV bulk read accepts. */

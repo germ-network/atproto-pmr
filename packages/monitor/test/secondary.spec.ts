@@ -96,7 +96,6 @@ function harness(
             interestEpoch: async () => epoch,
         },
         snapshot: {
-            getSecondary: async () => stored,
             putSecondary: async (_r, e) => {
                 calls.push("put")
                 stored = e

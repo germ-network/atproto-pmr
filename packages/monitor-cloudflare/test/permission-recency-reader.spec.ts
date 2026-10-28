@@ -1,3 +1,4 @@
+import { putV2Entry } from "./secondary-read"
 import { env } from "cloudflare:test"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { MonitorEnv } from "../src/env"
@@ -26,8 +27,8 @@ beforeEach(async () => {
     await db.batch(["follows", "graph_owners", "graph_holders"].map((t) => db.prepare(`DELETE FROM ${t}`)))
     for (const did of [S, R]) await run("INSERT INTO graph_holders (did) VALUES (?)", did)
     await run("INSERT INTO graph_owners (did) VALUES (?)", R)
-    await testEnv.records.put(snapshotKeys(R, "com.germnetwork.declaration", "self").record, "car", {
-        metadata: { messagingKeyFirstSeenAtMs: at },
+    await putV2Entry(testEnv, snapshotKeys(R, "com.germnetwork.declaration", "self").record, {
+        messagingKeyFirstSeenAtMs: at,
     })
     await follow(S, R, tid(at + 100))
     await follow(R, S, tid(at + 200))

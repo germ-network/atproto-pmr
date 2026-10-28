@@ -1,4 +1,5 @@
 /** The summary index reader passes a declaration snapshot's stored policies through. */
+import { putV2Entry } from "./secondary-read"
 import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import type { SnapshotEntry } from "@germ-network/atproto-pmr-monitor"
 import { env } from "cloudflare:test"
@@ -42,9 +43,7 @@ describe("kvSummaryIndexReader policies", () => {
 
     it("returns no policies on an entry stored before policies were kept", async () => {
         const did = uniq()
-        await testEnv.records.put(`rec:${did}`, new Uint8Array([1]), {
-            metadata: { rev: "3k", observedAtMs: 1_000, source: "s", signingKey: "zKey", verifiedWith: "zKey", cid: "c", seenKey: null },
-        })
+        await putV2Entry(testEnv, `rec:${did}`, { rev: "3k", observedAtMs: 1_000, verifiedWith: "zKey", cid: "c" })
         const [read] = await kvSummaryIndexReader(testEnv).entries([ref(did)])
         expect(read).not.toBeNull()
         expect(read).not.toHaveProperty("policies")

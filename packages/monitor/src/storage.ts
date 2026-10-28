@@ -75,12 +75,8 @@ export interface SnapshotEntry {
     verifiedWith: string | null
     /** The record's CID (`bafyrei…`) as verified at ingest. */
     cid: string | null
-    /** The newest signing key a rotation push has been sent for. */
-    seenKey?: string | null
     /** Absent/null on legacy snapshots and entries whose evidence was not provable. */
     evidence?: SnapshotEvidence | null
-    /** Internal fingerprint of the declaration's validated currentKey. */
-    messagingKeyFingerprint?: string | null
     /** First observed only after a verified key rotation; null for legacy keys. */
     messagingKeyFirstSeenAtMs?: number | null
 }
@@ -121,6 +117,51 @@ export interface VerifiedWrite {
     /** The `#atproto` key the commit signature verified against. */
     verifiedWith: string
 }
+
+/**
+ * The writer's own state for one held declaration, kept on its index row and
+ * written in the transaction that indexes its rev. The ingest object decides
+ * from this and never reads the snapshot store back: that store serves public
+ * readers and is eventually consistent.
+ */
+export interface HeldDeclarationState {
+    rev: string
+    cid: string
+    verifiedWith: string
+    commitCid: string | null
+    /**
+     * The declaration's anchor key, which registration retirement compares;
+     * stored hex-encoded on the index row.
+     */
+    anchorKey: Uint8Array | null
+    /** Canonical fingerprint of the declaration's validated currentKey. */
+    messagingKeyFingerprint: string | null
+    messagingKeyFirstSeenAtMs: number | null
+    /** The newest signing key a rotation push has been sent for. */
+    seenKey: string | null
+}
+
+/** What a declaration's completion records beyond `VerifiedWrite`. */
+export interface VerifiedDeclarationWrite extends VerifiedWrite {
+    commitCid: string | null
+    anchorKey: Uint8Array | null
+    messagingKeyFingerprint: string | null
+    messagingKeyFirstSeenAtMs: number | null
+}
+
+/** The index reads and writes of the writer's own declaration state. */
+export interface HeldStateIndex {
+    /** `null` when the declaration is not held. */
+    heldDeclarationOf(did: string): Promise<HeldDeclarationState | null>
+    /** Records that a rotation push went out for `key`, without touching the snapshot. */
+    recordSeenKey(did: string, key: string): Promise<void>
+}
+
+/**
+ * The snapshot store as the ingest object sees it: write-only for records.
+ * Every decision about a record reads the index instead.
+ */
+export type SnapshotWriter = Omit<SnapshotStore, "getRecord">
 
 /** One stored snapshot as the index knows it; the rev authority for that record. */
 export interface IndexedRecord {
@@ -222,7 +263,7 @@ export type IntakeOutcome =
  * Single-writer state. Every method here is called by the one consumer;
  * none is on a read path.
  */
-export interface MonitorIndex {
+export interface MonitorIndex extends HeldStateIndex {
     readCursor(): Promise<Cursor | null>
 
     /**
@@ -307,7 +348,7 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         /** As `clearPending`'s `gen`. */
         gen?: number | null
     ): Promise<void>
@@ -358,7 +399,7 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         /** As `clearPending`'s `gen`. */
         gen?: number | null
     ): Promise<void>
@@ -459,7 +500,26 @@ export interface MonitorIndex {
      * generation, unlike `owe`, where news ends backoff.
      */
     oweEvidenceRefresh?(did: string, rev: string): Promise<void>
+    /**
+     * Every indexed record after `after`, in (did, collection, rkey) order, for
+     * the sweep that re-stores each snapshot in the current layout.
+     */
+    snapshotLayoutBackfillPage?(after: RecordRef | null, limit: number): Promise<IndexedRecord[]>
+    readSnapshotLayoutBackfillProgress?(): Promise<SnapshotLayoutBackfillProgress>
+    setSnapshotLayoutBackfillProgress?(progress: SnapshotLayoutBackfillProgress): Promise<void>
+    /**
+     * Owes a fetch of one indexed record, leaving any obligation already owed
+     * as it is. A declaration is owed as a change (a window entry, no push); a
+     * secondary only while its DID is in interest, and an own-block proof only
+     * for a registered owner. Does nothing for a declaration not held or a secondary of a DID outside interest.
+     */
+    oweSnapshotLayoutRefresh?(record: IndexedRecord): Promise<void>
 }
+
+/** Resumable position of the layout sweep. */
+export type SnapshotLayoutBackfillProgress =
+    | { done: false; cursor: RecordRef | null }
+    | { done: true }
 
 /**
  * `done: false` carries `cursor: null` before the first page and the
@@ -874,7 +934,6 @@ export interface SecondaryIndex {
  * declaration's entries, no TTL.
  */
 export interface SecondarySnapshotStore {
-    getSecondary(ref: RecordRef): Promise<SnapshotEntry | null>
     putSecondary(ref: RecordRef, entry: SnapshotEntry): Promise<void>
     /** Removes the record and its confirmation together. */
     deleteSecondary(ref: RecordRef): Promise<void>

@@ -22,29 +22,18 @@ function inObj<R>(did: string, fn: (obj: MonitorIngest) => R | Promise<R>): Prom
     return runInDurableObject(stub, (obj) => fn(obj as MonitorIngest))
 }
 
-/** Stores a verified held declaration naming `x`, as ingest would. */
-async function hold(
-    did: string,
-    currentKey: Uint8Array = Uint8Array.of(3, ...x),
-    rowCid?: string
-): Promise<void> {
-    const path = `${DECLARATION_COLLECTION_NSID}/self`
-    const { car, recordCids } = buildRepoCar({
-        did,
-        key: makeKey(),
-        records: { [path]: { currentKey } },
-    })
-    const cid = recordCids[path]!
-    await kvSnapshotStore(testEnv).putRecord(did, {
-        rev: "3kaaaaaaaaaaa",
-        car,
-        observedAtMs: 1_000,
-        source: "https://pds.example",
-        signingKey: SIGNING_KEY,
-        verifiedWith: SIGNING_KEY,
-        cid,
-    })
-    await inObj(did, (obj) => obj.complete(did, "3kaaaaaaaaaaa", Date.now(), { cid: rowCid ?? cid, verifiedWith: SIGNING_KEY }))
+/** Indexes a verified held declaration, as ingest would. */
+async function hold(did: string, anchorKey: Uint8Array | null = encodeOkpEd25519Key({ x })): Promise<void> {
+    await inObj(did, (obj) =>
+        obj.complete(did, "3kaaaaaaaaaaa", Date.now(), {
+            cid: "bafyreirecord",
+            verifiedWith: SIGNING_KEY,
+            commitCid: "bafyreicommit",
+            anchorKey,
+            messagingKeyFingerprint: null,
+            messagingKeyFirstSeenAtMs: null,
+        })
+    )
 }
 
 describe("MonitorIngest.verifiedAnchorOf", () => {
@@ -55,16 +44,32 @@ describe("MonitorIngest.verifiedAnchorOf", () => {
         expect(r).toEqual({ state: "present", anchorKey: encodeOkpEd25519Key({ x }) })
     })
 
-    it("a held declaration whose key field is unsupported answers unknown", async () => {
+    it("a held declaration with no supported anchor key answers unknown", async () => {
         const did = uniq()
-        await hold(did, Uint8Array.of(2, ...x))
+        await hold(did, null)
         expect(await inObj(did, (obj) => obj.verifiedAnchorOf(did))).toEqual({ state: "unknown" })
     })
 
-    it("a snapshot that is not the record the verified row names answers unknown", async () => {
+    it("a snapshot-store entry that disagrees with the index row is ignored", async () => {
         const did = uniq()
-        await hold(did, Uint8Array.of(3, ...x), "bafyreidifferentrecordcid")
-        expect(await inObj(did, (obj) => obj.verifiedAnchorOf(did))).toEqual({ state: "unknown" })
+        await hold(did)
+        const path = `${DECLARATION_COLLECTION_NSID}/self`
+        const { car, recordCids } = buildRepoCar({
+            did,
+            key: makeKey(),
+            records: { [path]: { currentKey: Uint8Array.of(3, ...new Uint8Array(32).fill(9)) } },
+        })
+        await kvSnapshotStore(testEnv).putRecord(did, {
+            rev: "3kaaaaaaaaaaa",
+            car,
+            observedAtMs: 1_000,
+            source: "https://pds.example",
+            signingKey: SIGNING_KEY,
+            verifiedWith: SIGNING_KEY,
+            cid: recordCids[path]!,
+        })
+        const r = await inObj(did, (obj) => obj.verifiedAnchorOf(did))
+        expect(r).toEqual({ state: "present", anchorKey: encodeOkpEd25519Key({ x }) })
     })
 
     it("the first sighting of an exclusion proof from a live repo answers absent", async () => {

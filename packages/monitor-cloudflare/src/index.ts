@@ -57,6 +57,10 @@
  * Every failed settle also logs one `monitor: settle deferred` line carrying
  * the DID, attempts, error or reason, and next try; a failed secondary settle
  * logs `monitor: secondary settle deferred` with the collection and rkey too.
+ * A DID the refresh pass fails on logs `monitor: refresh did failed` with the
+ * DID and error, and a snapshot whose metadata had to be trimmed under KV's
+ * cap logs `monitor: snapshot metadata trimmed`, or `monitor: snapshot metadata
+ * over cap after trim` when even that leaves it too large to store.
  * With `MONITOR_HOSTNAME` set, a declaration stored without summary evidence
  * logs `monitor: declaration evidence unavailable` with the DID and reason
  * (for a deployment `fetchRecord`, most often a missing `didDocument`).
@@ -85,6 +89,8 @@ export {
     kvRecordSnapshots,
     kvSummaryIndexReader,
     kvMessagingKeyFirstSeenMany,
+    kvDeclaredKeyPage,
+    type DeclaredKeyRecord,
 } from "./snapshot-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"

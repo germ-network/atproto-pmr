@@ -47,6 +47,7 @@ export {
     type EvidenceAnchorRow,
     type MessagingKeyHistoryRow,
     type EvidenceBackfillProgress,
+    type SnapshotLayoutBackfillProgress,
     type EvidenceAssurance,
     type EvidenceAuthorityIdentity,
     type SnapshotEvidence,
@@ -64,6 +65,10 @@ export {
     type GoneCause,
     type IndexedRecord,
     type VerifiedWrite,
+    type VerifiedDeclarationWrite,
+    type HeldDeclarationState,
+    type HeldStateIndex,
+    type SnapshotWriter,
     type SigningKeyCacheWriter,
     type SnapshotStore,
     type InterestIndex,
@@ -279,6 +284,7 @@ export { listReposByCollection, type ListReposOptions, type ListReposPage } from
 export {
     sweepBackfill,
     sweepEvidenceRefresh,
+    sweepSnapshotLayout,
     type BackfillDeps,
     type SweepBackfillResult,
 } from "./backfill"

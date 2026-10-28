@@ -28,6 +28,7 @@ import {
     settleSecondaryDue,
     sweepBackfill,
     sweepEvidenceRefresh,
+    sweepSnapshotLayout,
     windowOf,
     type BackfillProgress,
     type EvidenceAnchorRow,
@@ -72,6 +73,9 @@ import {
     type RefreshIndex,
     type SigningKeyUpdate,
     type VerifiedWrite,
+    type VerifiedDeclarationWrite,
+    type HeldDeclarationState,
+    type SnapshotLayoutBackfillProgress,
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
@@ -224,6 +228,14 @@ const KEY_DRAIN_BATCH = 64
 const PLC_CURSOR_PERSIST_MS = 5_000
 /** How often ignored declaration-stream events move the persisted cursor. */
 const IGNORED_CURSOR_PERSIST_MS = 5_000
+
+function hexOf(bytes: Uint8Array): string {
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+function bytesOfHex(hex: string): Uint8Array {
+    return Uint8Array.from(hex.match(/../g) ?? [], (h) => Number.parseInt(h, 16))
+}
 
 /** How often the registered set is re-listed from the directory. */
 const RECONCILE_INTERVAL_MS = 86_400_000
@@ -413,6 +425,7 @@ export class MonitorIngest
     private drainAgain = false
     /** The evidence sweep finished, so later alarms skip even its progress read. */
     private evidenceRefreshDone = false
+    private snapshotLayoutDone = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -596,6 +609,7 @@ export class MonitorIngest
                     requested_at INTEGER NOT NULL
                 );
             `)
+            this.ensureRecordsWriterState()
             if (
                 this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('holder_state') WHERE name = 'cause'")
@@ -685,8 +699,7 @@ export class MonitorIngest
                 // Rows from before anchors were kept per DID carry their DID
                 // and kind in the identity JSON (`["commit", {did, ...}]` or
                 // `["anchor", did, key, authority]`), so they move across in
-                // place: a held snapshot's evidence keeps its rows, which
-                // the unchanged skip in `retainSnapshotEvidence` relies on.
+                // place: a held snapshot's evidence keeps its rows.
                 // Each DID's superseded commit rows go as the store would
                 // have pruned them; its anchor rows are pruned on its next
                 // retain. No await separates these writes.
@@ -1492,6 +1505,70 @@ export class MonitorIngest
             }))
     }
 
+    /**
+     * The writer's state for a held declaration; rows held before these
+     * columns existed keep NULL until their next settle.
+     */
+    private ensureRecordsWriterState(): void {
+        for (const column of [
+            "commit_cid TEXT",
+            "anchor_key TEXT",
+            "messaging_key_fingerprint TEXT",
+            "messaging_key_first_seen_at INTEGER",
+            "seen_key TEXT",
+        ]) {
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('records') WHERE name = ?", column.split(" ")[0])
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(`ALTER TABLE records ADD COLUMN ${column}`)
+            }
+        }
+    }
+
+    async heldDeclarationOf(did: string): Promise<HeldDeclarationState | null> {
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                cid: string
+                verified_with: string
+                commit_cid: string | null
+                anchor_key: string | null
+                messaging_key_fingerprint: string | null
+                messaging_key_first_seen_at: number | null
+                seen_key: string | null
+            }>(
+                "SELECT r.rev, r.cid, r.verified_with, r.commit_cid, r.anchor_key, " +
+                    "r.messaging_key_fingerprint, r.messaging_key_first_seen_at, r.seen_key " +
+                    "FROM records r JOIN holder_state h ON h.did = r.did " +
+                    "WHERE r.did = ? AND r.collection = ? AND r.rkey = 'self' AND h.state = 'held'",
+                did,
+                this.env.MONITOR_COLLECTION
+            )
+            .toArray()[0]
+        if (row === undefined) return null
+        return {
+            rev: row.rev,
+            cid: row.cid,
+            verifiedWith: row.verified_with,
+            commitCid: row.commit_cid,
+            anchorKey: row.anchor_key === null ? null : bytesOfHex(row.anchor_key),
+            messagingKeyFingerprint: row.messaging_key_fingerprint,
+            messagingKeyFirstSeenAtMs: row.messaging_key_first_seen_at,
+            seenKey: row.seen_key,
+        }
+    }
+
+    async recordSeenKey(did: string, key: string): Promise<void> {
+        this.db.sql.exec(
+            "UPDATE records SET seen_key = ? WHERE did = ? AND collection = ? AND rkey = 'self'",
+            key,
+            did,
+            this.env.MONITOR_COLLECTION
+        )
+    }
+
     async holderStateOf(did: string): Promise<HolderState | null> {
         const row = this.db.sql
             .exec<{ state: HolderState }>("SELECT state FROM holder_state WHERE did = ?", did)
@@ -1504,7 +1581,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite
     ): void {
         const ownedBefore = this.ownsSync(did)
         this.db.sql.exec(
@@ -1515,15 +1592,24 @@ export class MonitorIngest
             observedAtMs
         )
         this.db.sql.exec(
-            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
-                "VALUES (?, ?, 'self', ?, ?, ?) " +
+            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with, commit_cid, " +
+                "anchor_key, messaging_key_fingerprint, messaging_key_first_seen_at) " +
+                "VALUES (?, ?, 'self', ?, ?, ?, ?, ?, ?, ?) " +
                 "ON CONFLICT(did, collection, rkey) DO UPDATE SET rev = excluded.rev, " +
-                "cid = excluded.cid, verified_with = excluded.verified_with",
+                "cid = excluded.cid, verified_with = excluded.verified_with, " +
+                "commit_cid = excluded.commit_cid, anchor_key = excluded.anchor_key, " +
+                "messaging_key_fingerprint = excluded.messaging_key_fingerprint, " +
+                "messaging_key_first_seen_at = excluded.messaging_key_first_seen_at, " +
+                "seen_key = CASE WHEN verified_with = excluded.verified_with THEN seen_key ELSE NULL END",
             did,
             this.env.MONITOR_COLLECTION,
             rev,
             verified.cid,
-            verified.verifiedWith
+            verified.verifiedWith,
+            verified.commitCid ?? null,
+            verified.anchorKey == null ? null : hexOf(verified.anchorKey),
+            verified.messagingKeyFingerprint ?? null,
+            verified.messagingKeyFirstSeenAtMs ?? null
         )
         // Only a transition into held restarts `held_at`. A permanently deleted
         // DID is not re-marked here: refresh never visits one.
@@ -1611,7 +1697,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
@@ -1889,8 +1975,87 @@ export class MonitorIngest
         )
     }
 
+    async snapshotLayoutBackfillPage(after: RecordRef | null, limit: number): Promise<IndexedRecord[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>(
+                "SELECT did, collection, rkey, rev, cid, verified_with FROM records " +
+                    "WHERE (?1 IS NULL OR (did, collection, rkey) > (?1, ?2, ?3)) " +
+                    "ORDER BY did, collection, rkey LIMIT ?4",
+                after?.did ?? null,
+                after?.collection ?? null,
+                after?.rkey ?? null,
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async readSnapshotLayoutBackfillProgress(): Promise<SnapshotLayoutBackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'snapshot_v2_backfill'")
+            .toArray()[0]
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as SnapshotLayoutBackfillProgress
+    }
+
+    async setSnapshotLayoutBackfillProgress(progress: SnapshotLayoutBackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('snapshot_v2_backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
+    async oweSnapshotLayoutRefresh(record: IndexedRecord): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            if (record.collection === this.env.MONITOR_COLLECTION && record.rkey === "self") {
+                const held = this.db.sql
+                    .exec("SELECT 1 FROM holder_state WHERE did = ? AND state = 'held'", record.did)
+                    .toArray()
+                if (held.length > 0) this.oweEvidenceRefreshSync(record.did, record.rev)
+                return
+            }
+            const interest = this.db.sql
+                .exec<{ epoch: number; registered: number }>(
+                    "SELECT epoch, registered FROM interest WHERE did = ? AND member = 1",
+                    record.did
+                )
+                .toArray()[0]
+            if (interest === undefined) return
+            if (record.collection === BLOCK_COLLECTION_NSID && interest.registered !== 1) return
+            this.db.sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(did, collection, rkey) DO NOTHING",
+                record.did,
+                record.collection,
+                record.rkey,
+                record.rev,
+                interest.epoch,
+                Date.now()
+            )
+        })
+    }
+
     /** `owe` for the evidence sweep, where a row already owed is left as it is. */
     async oweEvidenceRefresh(did: string, rev: string): Promise<void> {
+        this.oweEvidenceRefreshSync(did, rev)
+    }
+
+    private oweEvidenceRefreshSync(did: string, rev: string): void {
         this.db.sql.exec(
             "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
                 "VALUES (?, ?, 0, 0, ?, NULL, ?) ON CONFLICT(did) DO NOTHING",
@@ -2181,20 +2346,9 @@ export class MonitorIngest
         }
         if (holder.state !== "held") return unknown
 
-        const row = (await this.recordsOf(did)).find(
-            (r) => r.collection === this.env.MONITOR_COLLECTION && r.rkey === "self"
-        )
-        if (row === undefined) return unknown
-        const entry = await kvSnapshotStore(this.env).getRecord(did)
-        if (entry === null) return unknown
-        try {
-            const found = readRecordFromCar(entry.car, this.env.MONITOR_COLLECTION, "self")
-            if (found === null || found.cid !== row.cid) return unknown
-            const anchorKey = declarationAnchorKeyOf(found.record)
-            return anchorKey === null ? unknown : { state: "present", anchorKey }
-        } catch {
-            return unknown
-        }
+        const held = await this.heldDeclarationOf(did)
+        if (held === null || held.anchorKey === null) return unknown
+        return { state: "present", anchorKey: held.anchorKey }
     }
 
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
@@ -2237,7 +2391,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
@@ -4058,8 +4212,8 @@ export class MonitorIngest
                 ? (() => {
                       const currentKey = declarationAnchorKeyOf(outcome.record)
                       return currentKey === null
-                          ? { messagingKeyFingerprint: null }
-                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey) }
+                          ? { messagingKeyFingerprint: null, anchorKey: null }
+                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey), anchorKey: currentKey }
                   })()
                 : {}),
         }
@@ -5035,6 +5189,17 @@ export class MonitorIngest
                 }
             }
             try {
+                if (!this.snapshotLayoutDone) {
+                    const { done } = await sweepSnapshotLayout({
+                        index: this,
+                        limit: this.envInt(this.env.SETTLE_BATCH, 32),
+                    })
+                    this.snapshotLayoutDone = done
+                }
+            } catch (err) {
+                console.error("monitor: snapshot layout sweep failed", err)
+            }
+            try {
                 await this.sweepEvidenceRefreshIfConfigured()
             } catch (err) {
                 console.error("monitor: evidence refresh sweep failed", err)
@@ -5138,13 +5303,16 @@ type DeclarationEvidence =
 
 const unavailable = (reason: string): DeclarationEvidence => ({ kind: "unavailable", reason })
 
-function normalizeMonitorHostname(value: string | undefined): string | null {
+/** The longest DNS name; bounds the monitor name every stored evidence carries. */
+const MONITOR_HOSTNAME_MAX_CHARS = 253
+
+export function normalizeMonitorHostname(value: string | undefined): string | null {
     if (!value || value.includes(":") || value.includes("/") || value.includes("@")) return null
     try {
         const parsed = new URL(`https://${value}`)
         if (parsed.port || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") return null
         const hostname = parsed.hostname.replace(/\.$/, "").toLowerCase()
-        return hostname.length > 0 ? hostname : null
+        return hostname.length > 0 && hostname.length <= MONITOR_HOSTNAME_MAX_CHARS ? hostname : null
     } catch { return null }
 }
 

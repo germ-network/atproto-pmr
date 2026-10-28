@@ -2,6 +2,7 @@
  * `refreshDue`: keeps every held snapshot confirmed current, without
  * treating unrelated repo commits as declaration changes.
  */
+import { heldFromEntries } from "./held-from-entries"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError, verifyRecordProofOutcome } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/repo-car"
@@ -131,6 +132,7 @@ function harness(opts: {
         clearPending: async () => {},
         markAttempted: async (did: string, at: number) => void attempted.set(did, at),
         isWatched: async (did: string) => revs.has(did) && !deleted.has(did),
+        ...heldFromEntries(records),
         holderStateOf: async (did: string) =>
             (opts.gone ?? []).includes(did) ? "gone-reversible" : revs.has(did) ? "held" : null,
         recordsOf: async (did: string) => {
@@ -163,7 +165,7 @@ function harness(opts: {
     const ingest: IngestDeps = {
         index,
         snapshot,
-        fetchRecord: opts.fetchRecord ?? (async () => fetched("3m2", decl(1))),
+        fetchRecord: opts.fetchRecord ?? (async () => fetched("3mcaaaaaaaaaa", decl(1))),
         verify: async (did, record) => {
             if (record.signingKey === null) return { kind: "unverifiable" }
             try {
@@ -214,16 +216,15 @@ function harness(opts: {
         },
         interest: ingest.interest,
         snapshot: {
-            getSecondary: async () => null,
             putSecondary: async (_r, e) => void profileStored.push(e),
             deleteSecondary: async () => {},
             putSecondaryCheck: async (_r, c) => void profileChecks.push(c),
         },
-        fetchRecord: opts.profileFetch ?? (async () => fetched("3m2", decl(1))),
+        fetchRecord: opts.profileFetch ?? (async () => fetched("3mcaaaaaaaaaa", decl(1))),
         verify: async (_ref, record) =>
             opts.profileVerify !== undefined
                 ? opts.profileVerify(record)
-                : { kind: "verified", key: key.multikey, rev: "3m2", cid: "bafyreiprofile2" },
+                : { kind: "verified", key: key.multikey, rev: "3mcaaaaaaaaaa", cid: "bafyreiprofile2" },
         deferToDeclaration: async (did) => void deferred.push(did),
         nowMs: () => NOW,
     }
@@ -250,7 +251,7 @@ function harness(opts: {
             },
         },
         refreshSnapshots: { putCheck: async (did, c) => void checks.set(did, c) },
-        fetchHeadRev: opts.head ?? (async () => headAt("3m1")),
+        fetchHeadRev: opts.head ?? (async () => headAt("3mbaaaaaaaaaa")),
         collection: COLLECTION,
         rkey: RKEY,
         secondary: {
@@ -271,11 +272,11 @@ const run = (h: ReturnType<typeof harness>, limit = 64) =>
 
 describe("refreshDue", () => {
     it("an unchanged head rev writes a check at that rev and touches neither the CAR nor the digest window", async () => {
-        const stored = fetched("3m1", decl(1))
-        const h = harness({ indexed: { [DID]: "3m1" }, stored: { [DID]: stored } })
+        const stored = fetched("3mbaaaaaaaaaa", decl(1))
+        const h = harness({ indexed: { [DID]: "3mbaaaaaaaaaa" }, stored: { [DID]: stored } })
         const result = await run(h)
         expect(result.outcomes.confirmed).toBe(1)
-        expect(h.checks.get(DID)).toEqual({ rev: "3m1", checkedAtMs: NOW })
+        expect(h.checks.get(DID)).toEqual({ rev: "3mbaaaaaaaaaa", checkedAtMs: NOW })
         expect(h.checkedAt.get(DID)).toBe(NOW)
         expect(h.records.get(DID)!.car).toBe(stored.car)
         expect(h.windows).toEqual([])
@@ -283,53 +284,53 @@ describe("refreshDue", () => {
     })
 
     it("an advanced rev with the same declaration record CID stores the new CAR quietly: no window entry, no onChange", async () => {
-        const stored = fetched("3m1", decl(1))
-        const next = fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
+        const stored = fetched("3mbaaaaaaaaaa", decl(1))
+        const next = fetched("3mcaaaaaaaaaa", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
         const h = harness({
-            indexed: { [DID]: "3m1" },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
             stored: { [DID]: stored },
-            head: async () => headAt("3m2"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => next,
         })
         const result = await run(h)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.records.get(DID)!.car).toBe(next.car)
-        expect(h.records.get(DID)!.rev).toBe("3m2")
-        expect(h.revs.get(DID)).toBe("3m2")
+        expect(h.records.get(DID)!.rev).toBe("3mcaaaaaaaaaa")
+        expect(h.revs.get(DID)).toBe("3mcaaaaaaaaaa")
         expect(h.quiet).toEqual([DID])
         expect(h.quietVerified).toEqual([
-            { cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey },
+            expect.objectContaining({ cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey }),
         ])
-        expect(h.checks.get(DID)).toEqual({ rev: "3m2", checkedAtMs: NOW })
+        expect(h.checks.get(DID)).toEqual({ rev: "3mcaaaaaaaaaa", checkedAtMs: NOW })
         expect(h.windows).toEqual([])
         expect(h.onChange).not.toHaveBeenCalled()
     })
 
     it("an advanced rev with a different record CID takes the full settle path (window entry and onChange)", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", decl(2)),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", decl(2)),
         })
         const result = await run(h)
         expect(result.outcomes.changed).toBe(1)
         expect(h.windows).toEqual([DID])
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m2")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mcaaaaaaaaaa")
         expect(h.quiet).toEqual([])
     })
 
     it("a regressed head rev raises onRegression and stores nothing", async () => {
-        const stored = fetched("3m5", decl(1))
+        const stored = fetched("3mfaaaaaaaaaa", decl(1))
         const h = harness({
-            indexed: { [DID]: "3m5" },
+            indexed: { [DID]: "3mfaaaaaaaaaa" },
             stored: { [DID]: stored },
-            head: async () => headAt("3m1"),
+            head: async () => headAt("3mbaaaaaaaaaa"),
         })
         const result = await run(h)
         expect(result.outcomes.regressed).toBe(1)
-        expect(h.onRegression).toHaveBeenCalledWith(DID, "3m5", "3m1")
-        expect(h.records.get(DID)).toMatchObject({ rev: "3m5" })
+        expect(h.onRegression).toHaveBeenCalledWith(DID, "3mfaaaaaaaaaa", "3mbaaaaaaaaaa")
+        expect(h.records.get(DID)).toMatchObject({ rev: "3mfaaaaaaaaaa" })
         // Not re-confirmed at the relay, but not re-raised on the next pass either.
         expect(h.checks.size).toBe(0)
         expect(h.checkedAt.get(DID)).toBe(NOW)
@@ -337,13 +338,13 @@ describe("refreshDue", () => {
 
     it("a terminal Repo* error from the head-rev read deletes rec: and chk: through settle's deletion branch", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
             head: async () => {
                 throw new RecordNotFoundError("deactivated", true)
             },
         })
-        h.checks.set(DID, { rev: "3m1", checkedAtMs: 1 })
+        h.checks.set(DID, { rev: "3mbaaaaaaaaaa", checkedAtMs: 1 })
         const result = await run(h)
         expect(result.outcomes.deleted).toBe(1)
         expect(h.records.has(DID)).toBe(false)
@@ -356,10 +357,10 @@ describe("refreshDue", () => {
 
     it("an advanced rev whose CAR proves no record at the path is a non-permanent deletion", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
         })
         const result = await run(h)
         expect(result.outcomes.deleted).toBe(1)
@@ -371,8 +372,8 @@ describe("refreshDue", () => {
 
     it("a bare record-level not-found is unproven and records the repo cause", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => {
                 throw new RecordNotFoundError("RecordNotFound", false)
             },
@@ -384,7 +385,7 @@ describe("refreshDue", () => {
 
     it("a reversible deletion already applied is re-confirmed without another window entry or push", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
             head: async () => {
                 throw new RecordNotFoundError("deactivated", false)
             },
@@ -400,7 +401,7 @@ describe("refreshDue", () => {
 
     it("a reversible deletion that later hardens to permanent is recorded as deleted", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
             head: async () => {
                 throw new RecordNotFoundError("gone", true)
             },
@@ -413,10 +414,10 @@ describe("refreshDue", () => {
 
     it("a re-keyed DID document with the same record CID goes through settle so a registered device is told", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", decl(1), makeKey()),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", decl(1), makeKey()),
         })
         const result = await run(h)
         expect(result.outcomes.changed).toBe(1)
@@ -425,8 +426,8 @@ describe("refreshDue", () => {
 
     it("a transient fetch failure writes no check and marks the DID attempted", async () => {
         const down = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
             head: async () => {
                 throw new Error("pds down")
             },
@@ -438,9 +439,9 @@ describe("refreshDue", () => {
         expect(down.records.has(DID)).toBe(true)
 
         const half = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => {
                 throw new Error("pds down")
             },
@@ -449,11 +450,31 @@ describe("refreshDue", () => {
         expect(half.checks.size).toBe(0)
     })
 
+    it("a DID that fails logs its DID and the error", async () => {
+        const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
+        try {
+            const down = harness({
+                indexed: { [DID]: "3mbaaaaaaaaaa" },
+                stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+                head: async () => {
+                    throw new Error("pds down")
+                },
+            })
+            expect((await run(down)).outcomes.failed).toBe(1)
+            expect(warned).toHaveBeenCalledWith("monitor: refresh did failed", {
+                did: DID,
+                error: "Error: pds down",
+            })
+        } finally {
+            warned.mockRestore()
+        }
+    })
+
     it("processes at most limit DIDs, least recently checked first", async () => {
         const dids = ["did:plc:a", "did:plc:b", "did:plc:c"]
         const h = harness({
-            indexed: Object.fromEntries(dids.map((d) => [d, "3m1"])),
-            stored: Object.fromEntries(dids.map((d) => [d, fetched("3m1", decl(1))])),
+            indexed: Object.fromEntries(dids.map((d) => [d, "3mbaaaaaaaaaa"])),
+            stored: Object.fromEntries(dids.map((d) => [d, fetched("3mbaaaaaaaaaa", decl(1))])),
             due: dids,
         })
         const result = await run(h, 2)
@@ -468,13 +489,13 @@ describe("refresh keeps the stored DID document", () => {
         const document = { id: DID }
         const recordDidDocument = vi.fn(async () => {})
         const next = {
-            ...fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            ...fetched("3mcaaaaaaaaaa", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
             didDocument: { document, fetchedAtMs: 123_456 },
         }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => next,
         })
         h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
@@ -487,13 +508,13 @@ describe("refresh keeps the stored DID document", () => {
         const document = { id: DID }
         const recordDidDocument = vi.fn(async () => {})
         const gone = {
-            ...fetched("3m2", null),
+            ...fetched("3mcaaaaaaaaaa", null),
             didDocument: { document, fetchedAtMs: 50_000 },
         }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => gone,
         })
         h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
@@ -506,12 +527,12 @@ describe("refresh keeps the stored DID document", () => {
         const recordDidDocument = vi.fn(async () => {})
         let calls = 0
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => {
                 if (++calls > 1) throw new Error("pds down")
-                return { ...fetched("3m2", decl(2)), didDocument: { document, fetchedAtMs: 9_000 } }
+                return { ...fetched("3mcaaaaaaaaaa", decl(2)), didDocument: { document, fetchedAtMs: 9_000 } }
             },
         })
         h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale: async () => {} }
@@ -521,13 +542,13 @@ describe("refresh keeps the stored DID document", () => {
 
     it("a failing document write does not fail the quiet advance", async () => {
         const next = {
-            ...fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+            ...fetched("3mcaaaaaaaaaa", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
             didDocument: { document: { id: DID }, fetchedAtMs: 1 },
         }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => next,
         })
         h.deps.ingest.didDocuments = {
@@ -545,11 +566,11 @@ describe("refresh keeps the stored DID document", () => {
         const document = { id: DID }
         const recordDidDocument = vi.fn(async () => {})
         const markDidDocumentStale = vi.fn(async () => {})
-        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document, fetchedAtMs: 50_000 } }
+        const gone = { ...fetched("3mcaaaaaaaaaa", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document, fetchedAtMs: 50_000 } }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => gone,
         })
         h.deps.ingest.didDocuments = { recordDidDocument, markDidDocumentStale }
@@ -571,11 +592,11 @@ describe("refresh keeps the stored DID document", () => {
     it("a re-fetch for a DID that was not watched records nothing and withdraws nothing", async () => {
         const recordDidDocument = vi.fn(async () => {})
         const markDidDocumentStale = vi.fn(async () => {})
-        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const gone = { ...fetched("3mcaaaaaaaaaa", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => gone,
             gone: [DID],
         })
@@ -588,11 +609,11 @@ describe("refresh keeps the stored DID document", () => {
 
     it("a failing sink leaves nothing to withdraw", async () => {
         const markDidDocumentStale = vi.fn(async () => {})
-        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const gone = { ...fetched("3mcaaaaaaaaaa", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => gone,
         })
         h.deps.ingest.didDocuments = {
@@ -607,11 +628,11 @@ describe("refresh keeps the stored DID document", () => {
 
     it("a failing isWatched after the outcome is not taken for unwatched", async () => {
         const markDidDocumentStale = vi.fn(async () => {})
-        const gone = { ...fetched("3m2", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
+        const gone = { ...fetched("3mcaaaaaaaaaa", null, key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }), didDocument: { document: { id: DID }, fetchedAtMs: 50_000 } }
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => gone,
         })
         h.deps.ingest.didDocuments = { recordDidDocument: async () => {}, markDidDocumentStale }
@@ -627,13 +648,13 @@ describe("refresh keeps the stored DID document", () => {
 
 describe("refresh re-verifies", () => {
     const olderCar = (signWith = key) =>
-        fetched("3m1", decl(1), signWith, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
+        fetched("3mbaaaaaaaaaa", decl(1), signWith, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
 
     it("unchanged head with no records row re-fetches and verifies quietly", async () => {
-        const stored = fetched("3m1", decl(1))
+        const stored = fetched("3mbaaaaaaaaaa", decl(1))
         const fetchRecord = vi.fn(async () => stored)
         const h = harness({
-            indexed: { [DID]: "3m1" },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
             stored: { [DID]: stored },
             legacy: [DID],
             fetchRecord,
@@ -642,31 +663,31 @@ describe("refresh re-verifies", () => {
         expect(fetchRecord).toHaveBeenCalledTimes(1)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.quietVerified).toEqual([
-            { cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey },
+            expect.objectContaining({ cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey }),
         ])
         expect(h.records.get(DID)).toMatchObject({ verifiedWith: key.multikey })
     })
 
     it("unchanged head with an entry verified under a rotated key re-fetches", async () => {
         const rotated = makeKey()
-        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1), rotated))
+        const fetchRecord = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1), rotated))
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m1", rotated.multikey),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mbaaaaaaaaaa", rotated.multikey),
             fetchRecord,
         })
         const result = await run(h)
         expect(fetchRecord).toHaveBeenCalled()
         expect(result.outcomes.changed).toBe(1)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
     })
 
     it("an unchanged head under an unchanged key is only confirmed", async () => {
-        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1)))
+        const fetchRecord = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
             fetchRecord,
         })
         expect((await run(h)).outcomes.confirmed).toBe(1)
@@ -674,11 +695,11 @@ describe("refresh re-verifies", () => {
     })
 
     it("a document with no key is a mismatch and takes the fetch path", async () => {
-        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1)))
+        const fetchRecord = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m1", null),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mbaaaaaaaaaa", null),
             fetchRecord,
         })
         await run(h)
@@ -686,31 +707,31 @@ describe("refresh re-verifies", () => {
     })
 
     it("a declaration already reversibly gone is not re-fetched on an unchanged head", async () => {
-        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1)))
-        const h = harness({ indexed: { [DID]: "3m1" }, gone: [DID], fetchRecord })
+        const fetchRecord = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
+        const h = harness({ indexed: { [DID]: "3mbaaaaaaaaaa" }, gone: [DID], fetchRecord })
         expect((await run(h)).outcomes.confirmed).toBe(1)
         expect(fetchRecord).not.toHaveBeenCalled()
     })
 
     it("a fetched CAR older than the indexed rev is not stored quietly, even with the same record CID", async () => {
         const h = harness({
-            indexed: { [DID]: "3m5" },
-            stored: { [DID]: fetched("3m5", decl(1)) },
-            head: async () => headAt("3m6"),
-            fetchRecord: async () => fetched("3m4", decl(1)),
+            indexed: { [DID]: "3mfaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mfaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mgaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3meaaaaaaaaaa", decl(1)),
         })
         await run(h)
         expect(h.quiet).toEqual([])
-        expect(h.onRegression).toHaveBeenCalledWith(DID, "3m5", "3m4")
+        expect(h.onRegression).toHaveBeenCalledWith(DID, "3mfaaaaaaaaaa", "3meaaaaaaaaaa")
     })
 
     it("an exclusion proof that does not verify does not dispose the snapshot", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () =>
-                fetched("3m2", null, makeKey(), { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
+                fetched("3mcaaaaaaaaaa", null, makeKey(), { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } }),
         })
         h.deps.ingest.verify = async () => ({ kind: "unverifiable" })
         const result = await run(h)
@@ -724,14 +745,14 @@ describe("refresh re-verifies", () => {
         const verify = vi.fn(async () => ({
             kind: "verified" as const,
             key: key.multikey,
-            rev: "3m2",
+            rev: "3mcaaaaaaaaaa",
             cid: "bafyreistored",
         }))
-        const next = fetched("3m2", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
+        const next = fetched("3mcaaaaaaaaaa", decl(1), key, { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } })
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => next,
         })
         h.deps.ingest.verify = verify
@@ -745,8 +766,8 @@ describe("refresh re-verifies", () => {
     it("a DID attempted this interval is not retried until the next", async () => {
         const fetchRecord = vi.fn(async () => olderCar(makeKey()))
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
             legacy: [DID],
             fetchRecord,
         })
@@ -764,10 +785,10 @@ describe("refresh re-verifies", () => {
 
     it("the first pass after upgrade puts no legacy DID in the digest window", async () => {
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
             legacy: [DID],
-            fetchRecord: async () => fetched("3m1", decl(1)),
+            fetchRecord: async () => fetched("3mbaaaaaaaaaa", decl(1)),
         })
         const result = await run(h)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
@@ -782,10 +803,10 @@ describe("refresh pushes a re-key", () => {
     function rekeyed() {
         const other = makeKey()
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt("3m1", other.multikey),
-            fetchRecord: async () => fetched("3m1", decl(1), other),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt("3mbaaaaaaaaaa", other.multikey),
+            fetchRecord: async () => fetched("3mbaaaaaaaaaa", decl(1), other),
         })
         h.deps.ingest.verify = async () => ({ kind: "unverifiable" })
         return { h, other }
@@ -796,8 +817,8 @@ describe("refresh pushes a re-key", () => {
         const result = await run(h)
         expect(result.outcomes.failed).toBe(1)
         expect(h.onChange).toHaveBeenCalledTimes(1)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
-        expect(h.records.get(DID)!.seenKey).toBe(other.multikey)
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
+        expect((await h.deps.ingest.index.heldDeclarationOf(DID))?.seenKey).toBe(other.multikey)
         expect(h.records.get(DID)!.verifiedWith).toBe(key.multikey)
     })
 
@@ -829,43 +850,43 @@ describe("one head check covers every record", () => {
     const held = (rev: string) => ({ indexed: { [DID]: rev }, stored: { [DID]: fetched(rev, decl(1)) } })
 
     it("unchanged head confirms declaration and profile", async () => {
-        const profileFetch = vi.fn(async () => fetched("3m1", decl(1)))
-        const h = hp({ ...held("3m1"), profile: profileAt("3m1"), profileFetch })
+        const profileFetch = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
+        const h = hp({ ...held("3mbaaaaaaaaaa"), profile: profileAt("3mbaaaaaaaaaa"), profileFetch })
         const result = await run(h)
         expect(result.outcomes.confirmed).toBe(1)
-        expect(h.checks.get(DID)).toEqual({ rev: "3m1", checkedAtMs: NOW })
-        expect(h.profileChecks).toEqual([{ rev: "3m1", checkedAtMs: NOW }])
+        expect(h.checks.get(DID)).toEqual({ rev: "3mbaaaaaaaaaa", checkedAtMs: NOW })
+        expect(h.profileChecks).toEqual([{ rev: "3mbaaaaaaaaaa", checkedAtMs: NOW }])
         expect(profileFetch).not.toHaveBeenCalled()
         expect(h.profileStored).toEqual([])
     })
 
     it("moved head with unchanged profile CID stores it quietly at the signed rev", async () => {
         const h = hp({
-            ...held("3m1"),
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", decl(1)),
-            profile: profileAt("3m1", "bafyreisame"),
-            profileVerify: profileVerifyAt("3m2", "bafyreisame"),
+            ...held("3mbaaaaaaaaaa"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", decl(1)),
+            profile: profileAt("3mbaaaaaaaaaa", "bafyreisame"),
+            profileVerify: profileVerifyAt("3mcaaaaaaaaaa", "bafyreisame"),
         })
         const result = await run(h)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.profileStored).toHaveLength(1)
-        expect(h.profileStored[0]).toMatchObject({ rev: "3m2", cid: "bafyreisame" })
-        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m2", cid: "bafyreisame" })
+        expect(h.profileStored[0]).toMatchObject({ rev: "3mcaaaaaaaaaa", cid: "bafyreisame" })
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3mcaaaaaaaaaa", cid: "bafyreisame" })
         expect(h.windows).toEqual([])
         expect(h.onChange).not.toHaveBeenCalled()
     })
 
     it("moved head with changed profile CID settles the profile only", async () => {
         const h = hp({
-            ...held("3m1"),
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", decl(1)),
-            profile: profileAt("3m1", "bafyreiold"),
-            profileVerify: profileVerifyAt("3m2", "bafyreinew"),
+            ...held("3mbaaaaaaaaaa"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", decl(1)),
+            profile: profileAt("3mbaaaaaaaaaa", "bafyreiold"),
+            profileVerify: profileVerifyAt("3mcaaaaaaaaaa", "bafyreinew"),
         })
         await run(h)
-        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m2", cid: "bafyreinew" })
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3mcaaaaaaaaaa", cid: "bafyreinew" })
         expect(h.windows).toEqual([])
         expect(h.onChange).not.toHaveBeenCalled()
         expect(h.onDelete).not.toHaveBeenCalled()
@@ -874,41 +895,41 @@ describe("one head check covers every record", () => {
 
     it("missing profile is fetched on the next check", async () => {
         const h = hp({
-            ...held("3m1"),
-            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+            ...held("3mbaaaaaaaaaa"),
+            profileVerify: profileVerifyAt("3mbaaaaaaaaaa", "bafyreinew"),
         })
         const result = await run(h)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.profileStored).toHaveLength(1)
-        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m1" })
-        expect(h.checks.get(DID)).toEqual({ rev: "3m1", checkedAtMs: NOW })
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3mbaaaaaaaaaa" })
+        expect(h.checks.get(DID)).toEqual({ rev: "3mbaaaaaaaaaa", checkedAtMs: NOW })
     })
 
     it("a profile commit does not lapse the declaration's chk:", async () => {
         const h = hp({
-            ...held("3m1"),
-            head: async () => headAt("3m2"),
-            fetchRecord: async () => fetched("3m2", decl(1)),
-            profile: profileAt("3m1"),
-            profileVerify: profileVerifyAt("3m2", "bafyreinew"),
+            ...held("3mbaaaaaaaaaa"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
+            fetchRecord: async () => fetched("3mcaaaaaaaaaa", decl(1)),
+            profile: profileAt("3mbaaaaaaaaaa"),
+            profileVerify: profileVerifyAt("3mcaaaaaaaaaa", "bafyreinew"),
         })
         await run(h)
-        expect(h.checks.get(DID)).toEqual({ rev: "3m2", checkedAtMs: NOW })
-        expect(h.records.get(DID)!.rev).toBe("3m2")
+        expect(h.checks.get(DID)).toEqual({ rev: "3mcaaaaaaaaaa", checkedAtMs: NOW })
+        expect(h.records.get(DID)!.rev).toBe("3mcaaaaaaaaaa")
     })
 
     it("a non-holder's head check does not fetch the declaration", async () => {
-        const fetchRecord = vi.fn(async () => fetched("3m1", decl(1)))
+        const fetchRecord = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
         const h = hp({
             due: [DID],
-            head: async () => headAt("3m1"),
+            head: async () => headAt("3mbaaaaaaaaaa"),
             fetchRecord,
-            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+            profileVerify: profileVerifyAt("3mbaaaaaaaaaa", "bafyreinew"),
         })
         const result = await run(h)
         expect(fetchRecord).not.toHaveBeenCalled()
         expect(result.outcomes["advanced-quiet"]).toBe(1)
-        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3m1" })
+        expect(h.profileRows.get(DID)).toMatchObject({ rev: "3mbaaaaaaaaaa" })
         expect(h.checkedAt.get(DID)).toBe(NOW)
         expect(h.records.has(DID)).toBe(false)
     })
@@ -916,7 +937,7 @@ describe("one head check covers every record", () => {
     it("a record-level not-found for a non-holder does not mark it deleted", async () => {
         const h = hp({
             due: [DID],
-            head: async () => headAt("3m1"),
+            head: async () => headAt("3mbaaaaaaaaaa"),
             profileFetch: async () => {
                 throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
@@ -948,12 +969,12 @@ describe("one head check covers every record", () => {
     })
 
     it("a secondary under a non-current key is fetched again at an unchanged head", async () => {
-        const profileFetch = vi.fn(async () => fetched("3m1", decl(1)))
+        const profileFetch = vi.fn(async () => fetched("3mbaaaaaaaaaa", decl(1)))
         const h = hp({
-            ...held("3m1"),
-            profile: { rev: "3m1", verifiedWith: "zOldKey" },
+            ...held("3mbaaaaaaaaaa"),
+            profile: { rev: "3mbaaaaaaaaaa", verifiedWith: "zOldKey" },
             profileFetch,
-            profileVerify: profileVerifyAt("3m1", "bafyreinew"),
+            profileVerify: profileVerifyAt("3mbaaaaaaaaaa", "bafyreinew"),
         })
         await run(h)
         expect(profileFetch).toHaveBeenCalledTimes(1)
@@ -962,25 +983,25 @@ describe("one head check covers every record", () => {
 
     it("a record-level absence of the declaration keeps the profile; a repo-level one disposes it without fetching it again", async () => {
         const recordLevel = hp({
-            ...held("3m1"),
-            head: async () => headAt("3m2"),
+            ...held("3mbaaaaaaaaaa"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => {
                 throw new RecordNotFoundError("no record", false, "RecordNotFound")
             },
-            profile: profileAt("3m1"),
+            profile: profileAt("3mbaaaaaaaaaa"),
         })
         await run(recordLevel)
         expect(recordLevel.disposed).toEqual([])
         expect(recordLevel.profileRows.has(DID)).toBe(true)
 
-        const profileFetch = vi.fn(async () => fetched("3m2", decl(1)))
+        const profileFetch = vi.fn(async () => fetched("3mcaaaaaaaaaa", decl(1)))
         const repoLevel = hp({
-            ...held("3m1"),
-            head: async () => headAt("3m2"),
+            ...held("3mbaaaaaaaaaa"),
+            head: async () => headAt("3mcaaaaaaaaaa"),
             fetchRecord: async () => {
                 throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
             },
-            profile: profileAt("3m1"),
+            profile: profileAt("3mbaaaaaaaaaa"),
             profileFetch,
         })
         await run(repoLevel)
@@ -990,7 +1011,7 @@ describe("one head check covers every record", () => {
 
     it("a repo-level answer at a held DID's head check disposes its profile too", async () => {
         const h = hp({
-            ...held("3m1"),
+            ...held("3mbaaaaaaaaaa"),
             head: async () => {
                 throw new RecordNotFoundError("repo gone", false, "RepoTakendown")
             },
@@ -1005,12 +1026,12 @@ describe("a declaration gone by RecordNotFound comes back", () => {
     it("a held DID answered RecordNotFound, then republished, is held again by refresh with no firehose commit", async () => {
         let republished = false
         const h = harness({
-            indexed: { [DID]: "3m1" },
-            stored: { [DID]: fetched("3m1", decl(1)) },
-            head: async () => headAt(republished ? "3m3" : "3m2"),
+            indexed: { [DID]: "3mbaaaaaaaaaa" },
+            stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
+            head: async () => headAt(republished ? "3mdaaaaaaaaaa" : "3mcaaaaaaaaaa"),
             fetchRecord: (did) =>
                 republished
-                    ? Promise.resolve(fetched("3m3", decl(2)))
+                    ? Promise.resolve(fetched("3mdaaaaaaaaaa", decl(2)))
                     : pdsAnswering("RecordNotFound", COLLECTION)(did),
         })
         await run(h)
@@ -1021,8 +1042,8 @@ describe("a declaration gone by RecordNotFound comes back", () => {
         republished = true
         const result = await run(h)
         expect(result.outcomes.changed).toBe(1)
-        expect(h.records.get(DID)?.rev).toBe("3m3")
-        expect(h.revs.get(DID)).toBe("3m3")
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m3")
+        expect(h.records.get(DID)?.rev).toBe("3mdaaaaaaaaaa")
+        expect(h.revs.get(DID)).toBe("3mdaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mdaaaaaaaaaa")
     })
 })

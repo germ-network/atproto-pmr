@@ -18,7 +18,7 @@ import type {
 export interface InterestDeps {
     interest: InterestIndex
     index: Pick<MonitorIndex, "recordsOf">
-    snapshot: SnapshotStore & SecondarySnapshotStore
+    snapshot: Pick<SnapshotStore, "deleteRecord"> & Pick<SecondarySnapshotStore, "deleteSecondary">
     secondaries: readonly WatchedRecord[]
     didDocuments?: DidDocumentSink
     nowMs(): number

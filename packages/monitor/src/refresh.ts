@@ -26,7 +26,7 @@ import {
 } from "./ingest"
 import type { HeadRev } from "./fetch-record"
 import { settleSecondary, type SecondaryDeps } from "./secondary"
-import { compareRev, type GoneCause, type VerifiedWrite } from "./storage"
+import { compareRev, type GoneCause, type VerifiedDeclarationWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
 export interface SnapshotCheck {
@@ -76,7 +76,7 @@ export interface RefreshIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite
     ): Promise<void>
 }
 
@@ -161,8 +161,9 @@ export async function refreshDue(
         let outcome: RefreshOutcome
         try {
             outcome = await refreshOne(deps, did, opts.nowMs)
-        } catch {
+        } catch (err) {
             outcome = "failed"
+            console.warn("monitor: refresh did failed", { did, error: String(err) })
             await deps.refreshIndex.markAttempted(did, opts.nowMs).catch(() => {})
         }
         outcomes[outcome] += 1
@@ -265,17 +266,12 @@ async function refreshDeclaration(
     }
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 
-    const previous = await ingest.snapshot.getRecord(did)
-    const previousRecord =
-        previous === null
-            ? null
-            : readRecordFromCar(previous.car, deps.collection, deps.rkey)
-    const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-    const rekeyed = previousKey !== null && previousKey !== verified.key
+    const previous = await ingest.index.heldDeclarationOf(did)
+    const rekeyed = previous !== null && previous.verifiedWith !== verified.key
     const quiet =
-        previousRecord !== null &&
+        previous !== null &&
         incoming !== null &&
-        previousRecord.cid === incoming.cid &&
+        previous.cid === incoming.cid &&
         !rekeyed &&
         compareRev(indexed, verified.rev) !== "regressed"
     if (!quiet) {
@@ -285,16 +281,24 @@ async function refreshDeclaration(
         return { outcome: "changed", repoGone: false }
     }
 
-    const previousEvidence = previous?.evidence ?? null
-    const evidence = await prepareSnapshotEvidence(
-        ingest.index,
-        did,
-        verified,
-        previousEvidence,
-        nowMs
-    )
+    const evidence = await prepareSnapshotEvidence(ingest.index, did, verified, nowMs)
 
-    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence, previousEvidence)
+    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence)
+    const messagingKeyFingerprint =
+        verified.messagingKeyFingerprint === undefined
+            ? (previous?.messagingKeyFingerprint ?? null)
+            : verified.messagingKeyFingerprint
+    const messagingKeyFirstSeenAtMs = await (async () => {
+        if (verified.messagingKeyFingerprint === undefined) {
+            return previous?.messagingKeyFirstSeenAtMs ?? null
+        }
+        if (verified.messagingKeyFingerprint === null) return null
+        const history = await ingest.index.getMessagingKeyHistory?.(did, verified.messagingKeyFingerprint)
+        if (history !== null && history !== undefined) return history.firstSeenAtMs
+        return previous?.messagingKeyFingerprint === verified.messagingKeyFingerprint
+            ? (previous.messagingKeyFirstSeenAtMs ?? null)
+            : null
+    })()
     await ingest.snapshot.putRecord(did, {
         rev: verified.rev,
         commitCid: verified.commitCid ?? null,
@@ -305,25 +309,15 @@ async function refreshDeclaration(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
-        messagingKeyFingerprint:
-            verified.messagingKeyFingerprint === undefined
-                ? (previous?.messagingKeyFingerprint ?? null)
-                : verified.messagingKeyFingerprint,
-        messagingKeyFirstSeenAtMs: await (async () => {
-            if (verified.messagingKeyFingerprint === undefined) {
-                return previous?.messagingKeyFirstSeenAtMs ?? null
-            }
-            if (verified.messagingKeyFingerprint === null) return null
-            const history = await ingest.index.getMessagingKeyHistory?.(did, verified.messagingKeyFingerprint)
-            if (history !== null && history !== undefined) return history.firstSeenAtMs
-            return previous?.messagingKeyFingerprint === verified.messagingKeyFingerprint
-                ? (previous.messagingKeyFirstSeenAtMs ?? null)
-                : null
-        })(),
+        messagingKeyFirstSeenAtMs,
     })
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
         cid: verified.cid,
         verifiedWith: verified.key,
+        commitCid: verified.commitCid ?? null,
+        anchorKey: verified.anchorKey ?? null,
+        messagingKeyFingerprint,
+        messagingKeyFirstSeenAtMs,
     })
     await raiseSettled(ingest, did, { rev: verified.rev, cid: verified.cid, car: fetched.car })
     await confirm(deps, did, verified.rev, nowMs)
@@ -413,7 +407,7 @@ async function disposeGone(
         return "deleted"
     }
     let outcome: RefreshOutcome
-    if ((await ingest.snapshot.getRecord(did)) === null) {
+    if ((await ingest.index.heldDeclarationOf(did)) === null) {
         // An earlier reversible answer can harden into a permanent one.
         if (permanent && !(await ingest.index.isDeleted(did))) {
             await settleDeletion(ingest, did, true, false, cause)

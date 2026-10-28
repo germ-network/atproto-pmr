@@ -46,6 +46,8 @@ function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
         owedGenOf: async () => null,
         revOf: async (did: string) => revs.get(did) ?? null,
         holderStateOf: async () => null,
+        heldDeclarationOf: async () => null,
+        recordSeenKey: async () => {},
         isWatched: async () => true,
         isDeleted: async () => false,
         clearPending: async (did: string) => {

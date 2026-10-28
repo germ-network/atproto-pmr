@@ -40,7 +40,7 @@ import {
     type PendingFailure,
     type SnapshotEntry,
     type SnapshotEvidence,
-    type SnapshotStore,
+    type SnapshotWriter,
 } from "./storage"
 
 /** The authoritative record, as fetched from the DID's own PDS. */
@@ -83,7 +83,7 @@ export interface FetchedDidDocument {
 
 export interface IngestDeps {
     index: MonitorIndex
-    snapshot: SnapshotStore
+    snapshot: SnapshotWriter
     /**
      * Tier 2: `com.atproto.sync.getRecord` at the DID's own PDS. The only
      * bytes that may enter the snapshot.
@@ -324,6 +324,8 @@ export type VerifyOutcome =
           monitor?: string
           /** Canonical hex fingerprint of the validated declaration currentKey, when present. */
           messagingKeyFingerprint?: string | null
+          /** The declaration's anchor key (`declarationAnchorKeyOf`), kept for registration retirement. */
+          anchorKey?: Uint8Array | null
       }
     | { kind: "verified-absent"; key: string; rev: string; commitCid?: string }
     /** `reason` says what failed to verify, where the verifier knows. */
@@ -445,9 +447,6 @@ export async function raiseSettled(
  * again.
  */
 async function alreadyGone(deps: IngestDeps, did: string): Promise<boolean> {
-    // A snapshot read from KV may be stale; a stale non-null only makes the
-    // repeated answer loud, the safe direction.
-    if ((await deps.snapshot.getRecord(did)) !== null) return false
     return (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
 }
 
@@ -493,51 +492,20 @@ async function settleFetched(
 
     // A DID-document rotation lands here even when `rev` is unchanged —
     // `intake`'s "reverify" path exists for exactly this case (an identity
-    // event, not a repo commit). Compare against what was previously
-    // served so a pure key rotation still notifies a registered device,
+    // event, not a repo commit). Compare against the key the index holds
+    // so a pure key rotation still notifies a registered device,
     // not only a rev movement: a key rotation is arguably the single most
     // security-relevant thing this component exists to catch.
-    //
-    // Only checked on "unchanged" — an "advanced" movement already fires
-    // `onChange` below regardless, so resolving the full previous record
-    // (a KV round trip carrying the whole CAR) would be wasted work on
-    // every ordinary, non-rotation settle. Evidence needs no previous read
-    // on an advance either: the anchors it carries forward were retained in
-    // the index when the previous snapshot was stored.
-    let previous: SnapshotEntry | null = null
-    let keyRotated = false
-    if (movement === "unchanged") {
-        previous = await deps.snapshot.getRecord(did)
-        const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-        keyRotated = previousKey !== null && previousKey !== verified.key
-    }
-    if (
-        previous === null &&
-        verified.collection === DECLARATION_COLLECTION_NSID &&
-        verified.rkey === "self"
-    ) {
-        // Key-history tracking needs the prior declaration to distinguish a
-        // newly observed rotation from a legacy key whose first-seen date is
-        // unknowable. Other records keep the existing no-read fast path.
-        previous = await deps.snapshot.getRecord(did)
-    }
+    const held = await deps.index.heldDeclarationOf(did)
+    const keyRotated = movement === "unchanged" && held !== null && held.verifiedWith !== verified.key
 
     const observedAtMs = deps.nowMs()
-    const previousEvidence = previous?.evidence ?? null
-    const evidence = await prepareSnapshotEvidence(
-        deps.index,
-        did,
-        verified,
-        previousEvidence,
-        observedAtMs
-    )
+    const evidence = await prepareSnapshotEvidence(deps.index, did, verified, observedAtMs)
     // Retained before the put, so a snapshot carrying evidence never exists
     // without its anchors: a put that then fails leaves only rows the retry
-    // reuses, and `retainSnapshotEvidence`'s unchanged skip can trust that
-    // the evidence a stored snapshot carries is already in the index.
-    if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence, previousEvidence)
-    const previousKey = previous === null ? null : messagingKeyIdentity(previous.car, previous.messagingKeyFingerprint)
-    const previousMessagingKeyFingerprint = previousKey?.fingerprint ?? null
+    // reuses. A first observation already retained is never moved.
+    if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence)
+    const previousMessagingKeyFingerprint = held?.messagingKeyFingerprint ?? null
     const currentKey = verified.messagingKeyFingerprint
         ? messagingKeyIdentity(record.car, verified.messagingKeyFingerprint)
         : null
@@ -552,15 +520,15 @@ async function settleFetched(
         ) {
             // Preserve the legacy key as explicitly unknown so a later
             // reappearance cannot be mistaken for a new first observation.
-            if ((await deps.index.getMessagingKeyHistory?.(did, previousMessagingKeyFingerprint, previousKey?.legacyFingerprint)) == null) {
+            if ((await deps.index.getMessagingKeyHistory?.(did, previousMessagingKeyFingerprint)) == null) {
                 await deps.index.retainMessagingKeyFirstSeen?.(did, {
                     fingerprint: previousMessagingKeyFingerprint,
                     firstSeenAtMs: null,
-                    recordCid: previous?.cid ?? null,
-                    commitCid: previous?.commitCid ?? null,
-                    rev: previous?.rev ?? null,
-                    verifiedWith: previous?.verifiedWith ?? previous?.signingKey ?? null,
-                }, previousKey?.legacyFingerprint)
+                    recordCid: held?.cid ?? null,
+                    commitCid: held?.commitCid ?? null,
+                    rev: held?.rev ?? null,
+                    verifiedWith: held?.verifiedWith ?? null,
+                })
             }
             // A verified transition is the first trustworthy observation
             // after tracking started, unless this key already has an
@@ -597,10 +565,16 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
-        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
         messagingKeyFirstSeenAtMs,
     })
-    const written = { cid: verified.cid, verifiedWith: verified.key }
+    const written = {
+        cid: verified.cid,
+        verifiedWith: verified.key,
+        commitCid: verified.commitCid ?? null,
+        anchorKey: verified.anchorKey ?? null,
+        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
+        messagingKeyFirstSeenAtMs,
+    }
     const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
     if (quiet) {
         await deps.index.completeQuietly(did, verified.rev, observedAtMs, written, gen)
@@ -646,15 +620,13 @@ function messagingKeyIdentity(car: Uint8Array, fingerprint?: string | null): {
 
 /**
  * Construct stable evidence identity and reuse the first anchor for a
- * reappearing identity. `previous` is the evidence the stored snapshot
- * carries, where the caller has it; without it, both anchors come from the
- * index, which every evidence-bearing put has already retained them in.
+ * reappearing identity. Both first observations come from the index, which
+ * every evidence-bearing put has already retained them in.
  */
 export async function prepareSnapshotEvidence(
     index: MonitorIndex,
     did: string,
     verified: Extract<VerifyOutcome, { kind: "verified" }>,
-    previous: SnapshotEvidence | null,
     nowMs: number
 ): Promise<SnapshotEvidence | null> {
     if (
@@ -679,14 +651,8 @@ export async function prepareSnapshotEvidence(
     }
     const commitId = commitHistoryId(declaration)
     const anchorId = anchorHistoryId(declaration)
-    const sameCommit = previous !== null && commitHistoryId(previous) === commitId
-    const sameAnchor = previous !== null && anchorHistoryId(previous) === anchorId
-    const commitFirstObservedAtMs = sameCommit
-        ? previous!.commitFirstObservedAtMs
-        : ((await index.getEvidenceAnchor?.(commitId)) ?? nowMs)
-    const anchorFirstObservedAtMs = sameAnchor
-        ? previous!.anchorFirstObservedAtMs
-        : ((await index.getEvidenceAnchor?.(anchorId)) ?? nowMs)
+    const commitFirstObservedAtMs = (await index.getEvidenceAnchor?.(commitId)) ?? nowMs
+    const anchorFirstObservedAtMs = (await index.getEvidenceAnchor?.(anchorId)) ?? nowMs
     return {
         ...declaration,
         assurance: verified.assurance,
@@ -698,27 +664,15 @@ export async function prepareSnapshotEvidence(
 
 /**
  * Retain the anchors a snapshot about to be stored carries, so a later
- * identity that replaces or deletes it can still reuse them. Nothing is
- * written when `previous` (what the replaced snapshot carried) already held
- * the same identities at the same first observations — an assurance
- * upgrade changes no anchor.
+ * identity that replaces or deletes it can still reuse them. A first
+ * observation already retained is kept, never moved.
  */
 export async function retainSnapshotEvidence(
     index: MonitorIndex,
-    evidence: SnapshotEvidence,
-    previous: SnapshotEvidence | null = null
+    evidence: SnapshotEvidence
 ): Promise<void> {
     const commit = commitHistoryId(evidence)
     const anchor = anchorHistoryId(evidence)
-    if (
-        previous !== null &&
-        commitHistoryId(previous) === commit &&
-        anchorHistoryId(previous) === anchor &&
-        previous.commitFirstObservedAtMs === evidence.commitFirstObservedAtMs &&
-        previous.anchorFirstObservedAtMs === evidence.anchorFirstObservedAtMs
-    ) {
-        return
-    }
     await index.retainEvidenceAnchors?.(evidence.did, [
         { kind: "commit", identity: commit, firstObservedAtMs: evidence.commitFirstObservedAtMs },
         { kind: "anchor", identity: anchor, firstObservedAtMs: evidence.anchorFirstObservedAtMs },
@@ -802,14 +756,10 @@ export async function pushNewlySeenKey(
     fetchedKey: string | null
 ): Promise<void> {
     if (fetchedKey === null) return
-    const previous = await deps.snapshot.getRecord(did)
-    if (previous === null) return
-    const previousKey = previous.verifiedWith ?? previous.signingKey
-    if (previousKey === null || fetchedKey === previousKey) return
-    if (fetchedKey === previous.seenKey) return
-    // KV cannot update metadata alone, so recording the key rewrites the entry.
-    await deps.snapshot.putRecord(did, { ...previous, seenKey: fetchedKey })
-    await deps.onChange?.(did, previous.rev)
+    const held = await deps.index.heldDeclarationOf(did)
+    if (held === null || fetchedKey === held.verifiedWith || fetchedKey === held.seenKey) return
+    await deps.index.recordSeenKey(did, fetchedKey)
+    await deps.onChange?.(did, held.rev)
 }
 
 /**
