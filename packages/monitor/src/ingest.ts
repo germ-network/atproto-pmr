@@ -324,6 +324,8 @@ export type VerifyOutcome =
           monitor?: string
           /** Canonical hex fingerprint of the validated declaration currentKey, when present. */
           messagingKeyFingerprint?: string | null
+          /** The declaration's anchor key (`declarationAnchorKeyOf`), kept for registration retirement. */
+          anchorKey?: Uint8Array | null
       }
     | { kind: "verified-absent"; key: string; rev: string; commitCid?: string }
     /** `reason` says what failed to verify, where the verifier knows. */
@@ -600,7 +602,14 @@ async function settleFetched(
         messagingKeyFingerprint: currentKey?.fingerprint ?? null,
         messagingKeyFirstSeenAtMs,
     })
-    const written = { cid: verified.cid, verifiedWith: verified.key }
+    const written = {
+        cid: verified.cid,
+        verifiedWith: verified.key,
+        commitCid: verified.commitCid ?? null,
+        anchorKey: verified.anchorKey ?? null,
+        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
+        messagingKeyFirstSeenAtMs,
+    }
     const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
     if (quiet) {
         await deps.index.completeQuietly(did, verified.rev, observedAtMs, written, gen)

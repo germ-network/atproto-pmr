@@ -2901,6 +2901,7 @@ describe("verifying a fetched record", () => {
             collection: COLLECTION,
             rkey: "self",
             messagingKeyFingerprint: null,
+            anchorKey: null,
         })
     })
 
@@ -3045,6 +3046,7 @@ describe("declaration evidence", () => {
         collection: COLLECTION,
         rkey: "self",
         messagingKeyFingerprint: null,
+        anchorKey: null,
     })
 
     const appViewServes = (w: World, cid = w.recordCid) => () =>

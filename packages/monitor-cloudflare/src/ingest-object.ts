@@ -72,6 +72,8 @@ import {
     type RefreshIndex,
     type SigningKeyUpdate,
     type VerifiedWrite,
+    type VerifiedDeclarationWrite,
+    type HeldDeclarationState,
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
@@ -224,6 +226,14 @@ const KEY_DRAIN_BATCH = 64
 const PLC_CURSOR_PERSIST_MS = 5_000
 /** How often ignored declaration-stream events move the persisted cursor. */
 const IGNORED_CURSOR_PERSIST_MS = 5_000
+
+function hexOf(bytes: Uint8Array): string {
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+function bytesOfHex(hex: string): Uint8Array {
+    return Uint8Array.from(hex.match(/../g) ?? [], (h) => Number.parseInt(h, 16))
+}
 
 /** How often the registered set is re-listed from the directory. */
 const RECONCILE_INTERVAL_MS = 86_400_000
@@ -596,6 +606,7 @@ export class MonitorIngest
                     requested_at INTEGER NOT NULL
                 );
             `)
+            this.ensureRecordsWriterState()
             if (
                 this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('holder_state') WHERE name = 'cause'")
@@ -1492,6 +1503,70 @@ export class MonitorIngest
             }))
     }
 
+    /**
+     * The writer's state for a held declaration; rows held before these
+     * columns existed keep NULL until their next settle.
+     */
+    private ensureRecordsWriterState(): void {
+        for (const column of [
+            "commit_cid TEXT",
+            "anchor_key TEXT",
+            "messaging_key_fingerprint TEXT",
+            "messaging_key_first_seen_at INTEGER",
+            "seen_key TEXT",
+        ]) {
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('records') WHERE name = ?", column.split(" ")[0])
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(`ALTER TABLE records ADD COLUMN ${column}`)
+            }
+        }
+    }
+
+    async heldDeclarationOf(did: string): Promise<HeldDeclarationState | null> {
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                cid: string
+                verified_with: string
+                commit_cid: string | null
+                anchor_key: string | null
+                messaging_key_fingerprint: string | null
+                messaging_key_first_seen_at: number | null
+                seen_key: string | null
+            }>(
+                "SELECT r.rev, r.cid, r.verified_with, r.commit_cid, r.anchor_key, " +
+                    "r.messaging_key_fingerprint, r.messaging_key_first_seen_at, r.seen_key " +
+                    "FROM records r JOIN holder_state h ON h.did = r.did " +
+                    "WHERE r.did = ? AND r.collection = ? AND r.rkey = 'self' AND h.state = 'held'",
+                did,
+                this.env.MONITOR_COLLECTION
+            )
+            .toArray()[0]
+        if (row === undefined) return null
+        return {
+            rev: row.rev,
+            cid: row.cid,
+            verifiedWith: row.verified_with,
+            commitCid: row.commit_cid,
+            anchorKey: row.anchor_key === null ? null : bytesOfHex(row.anchor_key),
+            messagingKeyFingerprint: row.messaging_key_fingerprint,
+            messagingKeyFirstSeenAtMs: row.messaging_key_first_seen_at,
+            seenKey: row.seen_key,
+        }
+    }
+
+    async recordSeenKey(did: string, key: string): Promise<void> {
+        this.db.sql.exec(
+            "UPDATE records SET seen_key = ? WHERE did = ? AND collection = ? AND rkey = 'self'",
+            key,
+            did,
+            this.env.MONITOR_COLLECTION
+        )
+    }
+
     async holderStateOf(did: string): Promise<HolderState | null> {
         const row = this.db.sql
             .exec<{ state: HolderState }>("SELECT state FROM holder_state WHERE did = ?", did)
@@ -1504,7 +1579,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite
     ): void {
         const ownedBefore = this.ownsSync(did)
         this.db.sql.exec(
@@ -1515,15 +1590,23 @@ export class MonitorIngest
             observedAtMs
         )
         this.db.sql.exec(
-            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
-                "VALUES (?, ?, 'self', ?, ?, ?) " +
+            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with, commit_cid, " +
+                "anchor_key, messaging_key_fingerprint, messaging_key_first_seen_at) " +
+                "VALUES (?, ?, 'self', ?, ?, ?, ?, ?, ?, ?) " +
                 "ON CONFLICT(did, collection, rkey) DO UPDATE SET rev = excluded.rev, " +
-                "cid = excluded.cid, verified_with = excluded.verified_with",
+                "cid = excluded.cid, verified_with = excluded.verified_with, " +
+                "commit_cid = excluded.commit_cid, anchor_key = excluded.anchor_key, " +
+                "messaging_key_fingerprint = excluded.messaging_key_fingerprint, " +
+                "messaging_key_first_seen_at = excluded.messaging_key_first_seen_at",
             did,
             this.env.MONITOR_COLLECTION,
             rev,
             verified.cid,
-            verified.verifiedWith
+            verified.verifiedWith,
+            verified.commitCid ?? null,
+            verified.anchorKey == null ? null : hexOf(verified.anchorKey),
+            verified.messagingKeyFingerprint ?? null,
+            verified.messagingKeyFirstSeenAtMs ?? null
         )
         // Only a transition into held restarts `held_at`. A permanently deleted
         // DID is not re-marked here: refresh never visits one.
@@ -1611,7 +1694,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
@@ -2237,7 +2320,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite,
+        verified: VerifiedDeclarationWrite,
         gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
@@ -4058,8 +4141,8 @@ export class MonitorIngest
                 ? (() => {
                       const currentKey = declarationAnchorKeyOf(outcome.record)
                       return currentKey === null
-                          ? { messagingKeyFingerprint: null }
-                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey) }
+                          ? { messagingKeyFingerprint: null, anchorKey: null }
+                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey), anchorKey: currentKey }
                   })()
                 : {}),
         }

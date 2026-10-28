@@ -19,9 +19,11 @@ import {
     FETCH_AS_OF_SKEW_MS,
     type BackfillProgress,
     type DigestMarker,
+    type HeldDeclarationState,
     type MonitorIndex,
     type SnapshotEntry,
     type SnapshotStore,
+    type VerifiedDeclarationWrite,
 } from "../src/storage"
 
 const COLLECTION = "com.germnetwork.declaration"
@@ -78,6 +80,10 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
+    const held = new Map<string, HeldDeclarationState>()
+    const holdState = (did: string, rev: string, verified: VerifiedDeclarationWrite) =>
+        void held.set(did, { ...verified, rev, seenKey: held.get(did)?.seenKey ?? null })
+
     const addToWindow = (did: string, observedAtMs: number) => {
         const w = Math.floor(observedAtMs / 600_000)
         const set = members.get(w) ?? new Set<string>()
@@ -94,6 +100,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         complete: async (did, rev, observedAtMs, verified) => {
             completed.push(verified)
+            holdState(did, rev, verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
@@ -101,6 +108,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeDeletion: async (did, observedAtMs, permanent, quiet, cause) => {
             causes.push(cause)
+            held.delete(did)
             if (permanent) deleted.add(did)
             if (quiet !== true) addToWindow(did, observedAtMs)
             else quietDeletions.push(did)
@@ -108,6 +116,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeQuietly: async (did, rev, _at, verified) => {
             completed.push(verified)
+            holdState(did, rev, verified)
             revs.set(did, rev)
             quietCompletions.push(did)
             pending.delete(did)
@@ -127,6 +136,11 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
+        heldDeclarationOf: async (did) => held.get(did) ?? null,
+        recordSeenKey: async (did, key) => {
+            const state = held.get(did)
+            if (state !== undefined) held.set(did, { ...state, seenKey: key })
+        },
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
         owedGenOf: async (did) => (pending.has(did) ? 1 : null),
         clearPending: async (did) => void pending.delete(did),
@@ -953,7 +967,9 @@ describe("settle verifies at ingest", () => {
             cid: "bafyreisigned",
         })
         expect(h.revs.get(DID)).toBe("3m5")
-        expect(h.completed).toEqual([{ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }])
+        expect(h.completed).toEqual([
+            expect.objectContaining({ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }),
+        ])
     })
 
     it("verified exclusion proof at a current rev disposes the snapshot reversibly", async () => {

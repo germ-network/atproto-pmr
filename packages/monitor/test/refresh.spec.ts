@@ -298,7 +298,7 @@ describe("refreshDue", () => {
         expect(h.revs.get(DID)).toBe("3m2")
         expect(h.quiet).toEqual([DID])
         expect(h.quietVerified).toEqual([
-            { cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey },
+            expect.objectContaining({ cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey }),
         ])
         expect(h.checks.get(DID)).toEqual({ rev: "3m2", checkedAtMs: NOW })
         expect(h.windows).toEqual([])
@@ -662,7 +662,7 @@ describe("refresh re-verifies", () => {
         expect(fetchRecord).toHaveBeenCalledTimes(1)
         expect(result.outcomes["advanced-quiet"]).toBe(1)
         expect(h.quietVerified).toEqual([
-            { cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey },
+            expect.objectContaining({ cid: expect.stringMatching(/^bafyrei/), verifiedWith: key.multikey }),
         ])
         expect(h.records.get(DID)).toMatchObject({ verifiedWith: key.multikey })
     })
