@@ -1,7 +1,0 @@
----
-"@germ-network/atproto-pmr-core": minor
-"@germ-network/atproto-pmr-monitor": minor
-"@germ-network/atproto-pmr-monitor-cloudflare": minor
----
-
-Store monitor snapshots as v2 KV entries and stop the ingest object reading them back. A declaration's snapshot metadata kept growing past Cloudflare's 1024-byte cap (summary evidence, messaging-key fields), so its put failed with a 413 and the previous snapshot stayed served. Metadata is now a versioned, bounded index (`v: 2`: rev, cids, `verifiedWith`, policies, first-seen, slim evidence); `source` and `signingKey` move into the value beside the CAR, and `writeEntry` throws rather than trim. Readers serve only v2 and log anything else, so a deployment must re-pin and redeploy: a one-shot backfill re-settles every held declaration, secondary and registered owner's block proof from its PDS starting on the first alarm and advancing a page per alarm, and entries read as not held until it reaches them. The ingest object now decides from its own `records` row (commit CID, anchor key, messaging-key fingerprint and first-seen, last pushed signing key) written in the transaction that indexes the rev; `IngestDeps.snapshot` is a write-only `SnapshotWriter`, `SecondarySnapshotStore.getSecondary` is removed, and `kvDeclaredKeyPage` lists held declarations for a declared-key index. A commit whose `rev` is not a TID is now `commit-malformed`, and a `MONITOR_HOSTNAME` over 253 characters is ignored.

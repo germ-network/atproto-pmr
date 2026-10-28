@@ -1,5 +1,11 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.4.0
+
+### Minor Changes
+
+- [#92](https://github.com/germ-network/atproto-pmr/pull/92) [`880174c`](https://github.com/germ-network/atproto-pmr/commit/880174c84a19701be64e46ec67d97a0224ca9583) Thanks [@germ-mark](https://github.com/germ-mark)! - Serve a registered owner's own `app.bsky.graph.block` records on the record route as monitor-held proof CARs, presence only. A deployment opts in by wiring `servesOwnBlocks` in `RecordReadDeps`, for example from `d1InterestReader(...).isRegistered`; until then every block read stays `not-watched`. The monitor fetches an owner's block proofs on live block commits and at listing completion under a new `OWN_BLOCK_SETTLE_BATCH` budget, and removes them when the owner is deregistered.
+
 ## 0.3.0
 
 ### Minor Changes
