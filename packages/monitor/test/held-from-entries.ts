@@ -16,7 +16,8 @@ function recordCidOf(e: SnapshotEntry): string {
  */
 export function heldFromEntries(
     entries: Map<string, SnapshotEntry>,
-    seenKeys: Map<string, string> = new Map()
+    seenKeys: Map<string, string> = new Map(),
+    fingerprints: Map<string, string> = new Map()
 ): HeldStateIndex {
     return {
         heldDeclarationOf: async (did): Promise<HeldDeclarationState | null> => {
@@ -28,9 +29,9 @@ export function heldFromEntries(
                 verifiedWith: e.verifiedWith ?? e.signingKey ?? "",
                 commitCid: e.commitCid ?? null,
                 anchorKey: null,
-                messagingKeyFingerprint: e.messagingKeyFingerprint ?? null,
+                messagingKeyFingerprint: fingerprints.get(did) ?? null,
                 messagingKeyFirstSeenAtMs: e.messagingKeyFirstSeenAtMs ?? null,
-                seenKey: seenKeys.get(did) ?? e.seenKey ?? null,
+                seenKey: seenKeys.get(did) ?? null,
             }
         },
         recordSeenKey: async (did, key) => void seenKeys.set(did, key),

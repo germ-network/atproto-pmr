@@ -53,7 +53,7 @@ function harness(opts: {
             (async () => ({ car: CAR, source: "https://pds.example", signingKey: KEY })),
         verify:
             opts.verify ??
-            (async () => ({ kind: "verified", key: KEY, rev: "3m2", cid: "bafyreicid" })),
+            (async () => ({ kind: "verified", key: KEY, rev: "3mcaaaaaaaaaa", cid: "bafyreicid" })),
         interest: { inInterest: async () => true, interestEpoch: async () => 0 },
         nowMs: () => 1_000,
         onChange: async () => void events.push("onChange"),
@@ -69,14 +69,14 @@ function harness(opts: {
     return { deps, events, settled, records }
 }
 
-const absent: IngestDeps["verify"] = async () => ({ kind: "verified-absent", key: KEY, rev: "3m2" })
+const absent: IngestDeps["verify"] = async () => ({ kind: "verified-absent", key: KEY, rev: "3mcaaaaaaaaaa" })
 
 describe("onSettled", () => {
     it("fires with rev, cid and the stored CAR after an advancing settle's discharge", async () => {
         const h = harness()
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(h.settled).toEqual([
-            { did: DID, settled: { rev: "3m2", cid: "bafyreicid", car: CAR } },
+            { did: DID, settled: { rev: "3mcaaaaaaaaaa", cid: "bafyreicid", car: CAR } },
         ])
         expect(h.settled[0]!.settled!.car).toBe(h.records.get(DID)!.car)
     })
@@ -98,16 +98,16 @@ describe("onSettled", () => {
                 rev,
                 records: {
                     [`${COLLECTION}/self`]: { $type: COLLECTION, version: "1.1.0", n: 1 },
-                    ...(rev === "3m2" ? { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } } : {}),
+                    ...(rev === "3mcaaaaaaaaaa" ? { "app.bsky.feed.post/3kaaaaaaaaaaa": { $type: "x" } } : {}),
                 },
             }).car
-        const stored = { car: car("3m1"), source: "https://pds.example", signingKey: key.multikey }
-        const next = { car: car("3m2"), source: "https://pds.example", signingKey: key.multikey }
+        const stored = { car: car("3mbaaaaaaaaaa"), source: "https://pds.example", signingKey: key.multikey }
+        const next = { car: car("3mcaaaaaaaaaa"), source: "https://pds.example", signingKey: key.multikey }
         const settled: Array<SettledDeclaration | null> = []
         const order: string[] = []
-        let rev = "3m1"
+        let rev = "3mbaaaaaaaaaa"
         const records = new Map<string, SnapshotEntry>([
-            [DID, { ...stored, rev: "3m1", observedAtMs: 1, verifiedWith: key.multikey, cid: "bafyreistored" } as SnapshotEntry],
+            [DID, { ...stored, rev: "3mbaaaaaaaaaa", observedAtMs: 1, verifiedWith: key.multikey, cid: "bafyreistored" } as SnapshotEntry],
         ])
         const index = {
             revOf: async () => rev,
@@ -149,7 +149,7 @@ describe("onSettled", () => {
                 completeQuietly: async (_d: string, r: string) => void ((rev = r), order.push("completeQuietly")),
             },
             refreshSnapshots: { putCheck: async () => {} },
-            fetchHeadRev: async () => ({ rev: "3m2", signingKey: key.multikey }),
+            fetchHeadRev: async () => ({ rev: "3mcaaaaaaaaaa", signingKey: key.multikey }),
             collection: COLLECTION,
             rkey: "self",
             secondary: { deps: {} as never, records: [] },
@@ -161,7 +161,7 @@ describe("onSettled", () => {
             nonHolderStaleAfterMs: 86_400_000,
         })
         expect(result.outcomes["advanced-quiet"]).toBe(1)
-        expect(settled).toEqual([{ rev: "3m2", cid: expect.stringMatching(/^bafyrei/), car: next.car }])
+        expect(settled).toEqual([{ rev: "3mcaaaaaaaaaa", cid: expect.stringMatching(/^bafyrei/), car: next.car }])
         expect(order).toEqual(["completeQuietly", "onSettled"])
     })
 
@@ -169,15 +169,15 @@ describe("onSettled", () => {
         const gone = async () => {
             throw new RecordNotFoundError("RecordNotFound", false)
         }
-        const loud = harness({ indexed: "3m1", fetchRecord: gone })
+        const loud = harness({ indexed: "3mbaaaaaaaaaa", fetchRecord: gone })
         await settle(loud.deps, DID)
         expect(loud.settled).toEqual([{ did: DID, settled: null }])
 
-        const quiet = harness({ indexed: "3m1", fetchRecord: gone })
+        const quiet = harness({ indexed: "3mbaaaaaaaaaa", fetchRecord: gone })
         await settle(quiet.deps, DID, { quiet: true })
         expect(quiet.settled).toEqual([{ did: DID, settled: null }])
 
-        const absentLoud = harness({ indexed: "3m1", verify: absent })
+        const absentLoud = harness({ indexed: "3mbaaaaaaaaaa", verify: absent })
         await settle(absentLoud.deps, DID)
         expect(absentLoud.settled).toEqual([{ did: DID, settled: null }])
     })
@@ -226,16 +226,16 @@ describe("onSettled", () => {
     })
 
     it("does not fire for a regression or an unverifiable fetch", async () => {
-        const regressed = harness({ indexed: "3m9" })
+        const regressed = harness({ indexed: "3mjaaaaaaaaaa" })
         expect(await settle(regressed.deps, DID)).toBe("rejected")
         expect(regressed.settled).toEqual([])
 
         const unverifiable = harness({
-            indexed: "3m1",
+            indexed: "3mbaaaaaaaaaa",
             verify: async () => ({ kind: "unverifiable" }),
         })
         unverifiable.records.set(DID, {
-            rev: "3m1",
+            rev: "3mbaaaaaaaaaa",
             car: CAR,
             observedAtMs: 1,
             source: "https://pds.example",
@@ -258,7 +258,7 @@ describe("onSettled", () => {
         expect(h.events).toEqual(["index:complete", "onChange"])
 
         const del = harness({
-            indexed: "3m1",
+            indexed: "3mbaaaaaaaaaa",
             verify: absent,
             onSettled: async () => {
                 throw new Error("index down")
@@ -273,7 +273,7 @@ describe("onSettled", () => {
         await settle(h.deps, DID)
         expect(h.events).toEqual(["index:complete", "onSettled", "onChange"])
 
-        const del = harness({ indexed: "3m1", verify: absent })
+        const del = harness({ indexed: "3mbaaaaaaaaaa", verify: absent })
         await settle(del.deps, DID)
         expect(del.events).toEqual(["index:completeDeletion", "onSettled", "onDelete"])
     })

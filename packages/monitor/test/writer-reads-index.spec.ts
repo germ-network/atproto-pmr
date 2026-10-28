@@ -27,7 +27,7 @@ const CAR = new Uint8Array([1, 2, 3])
 
 function held(over: Partial<HeldDeclarationState> = {}): HeldDeclarationState {
     return {
-        rev: "3m1",
+        rev: "3mbaaaaaaaaaa",
         cid: "bafyreiheld",
         verifiedWith: OLD_KEY,
         commitCid: "bafyreiheldcommit",
@@ -91,7 +91,7 @@ function harness(state: HeldDeclarationState | null, opts: { verify?: IngestDeps
         fetchRecord: opts.fetch ?? (async () => ({ car: CAR, source: "https://pds.example", signingKey: NEW_KEY })),
         verify:
             opts.verify ??
-            (async () => ({ kind: "verified", key: NEW_KEY, rev: "3m1", cid: "bafyreiheld", commitCid: "bafyreiheldcommit" })),
+            (async () => ({ kind: "verified", key: NEW_KEY, rev: "3mbaaaaaaaaaa", cid: "bafyreiheld", commitCid: "bafyreiheldcommit" })),
         interest: { inInterest: async () => true, interestEpoch: async () => 0 },
         nowMs: () => 5_000,
         onChange,
@@ -116,14 +116,14 @@ describe("the writer never reads the snapshot store", () => {
             verify: async () => ({
                 kind: "verified",
                 key: NEW_KEY,
-                rev: "3m1",
+                rev: "3mbaaaaaaaaaa",
                 cid: "bafyreiheld",
                 commitCid: "bafyreinewcommit",
                 anchorKey,
             }),
         })
         expect(await settle(h.deps, DID)).toBe("stored")
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
         expect(h.completed[0]!.written).toMatchObject({
             cid: "bafyreiheld",
             verifiedWith: NEW_KEY,
@@ -141,7 +141,7 @@ describe("the writer never reads the snapshot store", () => {
             verify: async () => ({
                 kind: "verified",
                 key: NEW_KEY,
-                rev: "3m1",
+                rev: "3mbaaaaaaaaaa",
                 cid: "bafyreiheld",
                 collection: COLLECTION,
                 rkey: "self",
@@ -164,7 +164,7 @@ describe("the writer never reads the snapshot store", () => {
             verify: async () => ({
                 kind: "verified",
                 key: NEW_KEY,
-                rev: "3m1",
+                rev: "3mbaaaaaaaaaa",
                 cid: "bafyreinew",
                 messagingKeyFingerprint: FP_B,
             }),
@@ -175,14 +175,11 @@ describe("the writer never reads the snapshot store", () => {
             firstSeenAtMs: null,
             recordCid: "bafyreiheld",
             commitCid: "bafyreiheldcommit",
-            rev: "3m1",
+            rev: "3mbaaaaaaaaaa",
             verifiedWith: NEW_KEY,
         })
         expect(h.retainedKeys[1]).toMatchObject({ fingerprint: FP_B, firstSeenAtMs: 5_000 })
-        expect(h.putRecord.mock.calls[0]![1]).toMatchObject({
-            messagingKeyFingerprint: FP_B,
-            messagingKeyFirstSeenAtMs: 5_000,
-        })
+        expect(h.putRecord.mock.calls[0]![1]).toMatchObject({ messagingKeyFirstSeenAtMs: 5_000 })
         expect(h.completed[0]!.written).toMatchObject({
             messagingKeyFingerprint: FP_B,
             messagingKeyFirstSeenAtMs: 5_000,
@@ -195,13 +192,13 @@ describe("the writer never reads the snapshot store", () => {
             buildRepoCar({
                 did: DID,
                 key,
-                rev: n === 1 ? "3m1" : "3m2",
+                rev: n === 1 ? "3mbaaaaaaaaaa" : "3mcaaaaaaaaaa",
                 records: { [`${COLLECTION}/self`]: { $type: COLLECTION, version: "1.1.0", n: 1 } },
             })
         const next = car(2)
         const cid = next.recordCids[`${COLLECTION}/self`]!
         const run = async (indexedCid: string) => {
-            const h = harness(held({ rev: "3m1", cid: indexedCid, verifiedWith: key.multikey }))
+            const h = harness(held({ rev: "3mbaaaaaaaaaa", cid: indexedCid, verifiedWith: key.multikey }))
             const quiet = vi.fn(async (..._args: unknown[]) => {})
             const fetched = { car: next.car, source: "https://pds.example", signingKey: key.multikey } as FetchedRecord
             h.deps.fetchRecord = async () => fetched
@@ -233,7 +230,7 @@ describe("the writer never reads the snapshot store", () => {
                 ingest: h.deps,
                 refreshIndex,
                 refreshSnapshots: { putCheck: async () => {} },
-                fetchHeadRev: async () => ({ rev: "3m2", signingKey: key.multikey }),
+                fetchHeadRev: async () => ({ rev: "3mcaaaaaaaaaa", signingKey: key.multikey }),
                 collection: COLLECTION,
                 rkey: "self",
                 secondary: { deps: {} as never, records: [] },
@@ -246,7 +243,7 @@ describe("the writer never reads the snapshot store", () => {
         expect(same.quiet).toHaveBeenCalledTimes(1)
         expect(same.quiet).toHaveBeenCalledWith(
             DID,
-            "3m2",
+            "3mcaaaaaaaaaa",
             expect.any(Number),
             expect.objectContaining({ cid, commitCid: "bafyreirefreshcommit", anchorKey: Uint8Array.of(3, 7) })
         )
@@ -259,7 +256,7 @@ describe("the writer never reads the snapshot store", () => {
         const h = harness(held({ verifiedWith: OLD_KEY }))
         await pushNewlySeenKey(h.deps, DID, NEW_KEY)
         expect(h.held()?.seenKey).toBe(NEW_KEY)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
         expect(h.putRecord).not.toHaveBeenCalled()
     })
 
@@ -275,11 +272,11 @@ describe("the writer never reads the snapshot store", () => {
     })
 
     it("a repeated gone answer is quiet when the index holds the DID as gone", async () => {
-        const absent: IngestDeps["verify"] = async () => ({ kind: "verified-absent", key: NEW_KEY, rev: "3m1" })
+        const absent: IngestDeps["verify"] = async () => ({ kind: "verified-absent", key: NEW_KEY, rev: "3mbaaaaaaaaaa" })
         const gone = harness(null, { verify: absent })
         gone.holderState.value = "gone-reversible"
         // Indexed rev stays, as completeDeletion leaves it.
-        ;(gone.index as unknown as { revOf: () => Promise<string> }).revOf = async () => "3m1"
+        ;(gone.index as unknown as { revOf: () => Promise<string> }).revOf = async () => "3mbaaaaaaaaaa"
         await settle(gone.deps, DID)
         expect(gone.deletions).toEqual([{ quiet: true }])
 
@@ -298,7 +295,7 @@ describe("the writer never reads the snapshot store", () => {
         const verify: IngestDeps["verify"] = async () => ({
             kind: "verified",
             key: NEW_KEY,
-            rev: "3m2",
+            rev: "3mcaaaaaaaaaa",
             cid: "bafyreinew",
             collection: COLLECTION,
             rkey: "self",

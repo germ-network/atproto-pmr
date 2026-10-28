@@ -3,6 +3,7 @@
  * verdict read and the owner summary's index read get them without parsing
  * the CAR.
  */
+import { putV2Entry } from "./secondary-read"
 import { DECLARATION_COLLECTION_NSID, type StoredPolicies } from "@germ-network/atproto-pmr-core"
 import type { SnapshotEntry } from "@germ-network/atproto-pmr-monitor"
 import { env } from "cloudflare:test"
@@ -110,9 +111,7 @@ describe("reading policies back", () => {
 
     it("an entry stored without policies reads with policies absent, not undecodable", async () => {
         const did = uniq()
-        await env.records.put(`rec:${did}`, new Uint8Array([1]), {
-            metadata: { rev: "r", observedAtMs: 1, source: "s", signingKey: "k", verifiedWith: "k", cid: "c", seenKey: null },
-        })
+        await putV2Entry(env, `rec:${did}`, { rev: "r", observedAtMs: 1, verifiedWith: "k", cid: "c" })
         const read = await kvRecordSnapshots(env).get(did, DECLARATION_COLLECTION_NSID, "self")
         expect(read).not.toBeNull()
         expect("policies" in read!).toBe(false)

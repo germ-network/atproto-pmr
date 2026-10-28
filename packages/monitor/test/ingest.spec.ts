@@ -79,6 +79,11 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
+    const fingerprints = new Map<string, string>()
+    const noteFingerprint = (did: string, verified: { messagingKeyFingerprint: string | null }) => {
+        if (verified.messagingKeyFingerprint === null) fingerprints.delete(did)
+        else fingerprints.set(did, verified.messagingKeyFingerprint)
+    }
     const addToWindow = (did: string, observedAtMs: number) => {
         const w = Math.floor(observedAtMs / 600_000)
         const set = members.get(w) ?? new Set<string>()
@@ -95,6 +100,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         complete: async (did, rev, observedAtMs, verified) => {
             completed.push(verified)
+            noteFingerprint(did, verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
@@ -109,6 +115,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeQuietly: async (did, rev, _at, verified) => {
             completed.push(verified)
+            noteFingerprint(did, verified)
             revs.set(did, rev)
             quietCompletions.push(did)
             pending.delete(did)
@@ -128,7 +135,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
-        ...heldFromEntries(records),
+        ...heldFromEntries(records, new Map(), fingerprints),
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
         owedGenOf: async (did) => (pending.has(did) ? 1 : null),
         clearPending: async (did) => void pending.delete(did),

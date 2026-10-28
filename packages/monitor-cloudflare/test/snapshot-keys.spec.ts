@@ -2,7 +2,7 @@
  * Where a record's snapshot lives in KV. The declaration's keys predate any
  * other collection and are already populated, so they must not move.
  */
-import { readSecondary } from "./secondary-read"
+import { putV2Entry, readSecondary } from "./secondary-read"
 import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import type { SnapshotEntry } from "@germ-network/atproto-pmr-monitor"
 import { env } from "cloudflare:test"
@@ -85,9 +85,7 @@ describe("kvRecordSnapshots", () => {
 
     it("entry without verified metadata reads verifiedWith null", async () => {
         const did = uniq()
-        await env.records.put(`rec:${did}`, new Uint8Array([9]), {
-            metadata: { rev: "3m1", observedAtMs: 2_000, source: "s", signingKey: "zKey" },
-        })
+        await putV2Entry(env, `rec:${did}`, { rev: "3m1", observedAtMs: 2_000 }, new Uint8Array([9]))
         expect(
             await kvRecordSnapshots(env).get(did, DECLARATION_COLLECTION_NSID, "self")
         ).toMatchObject({ verifiedWith: null, rev: null, cid: null, freshAtMs: 2_000 })

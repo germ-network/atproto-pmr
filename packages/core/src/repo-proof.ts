@@ -14,6 +14,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js"
 import { p256 } from "@noble/curves/nist.js"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { Token, Type, decode, encode } from "cborg"
+import { isTidShape } from "./owner-graph.js"
 
 export type RepoProofErrorCode =
     | "car-malformed"
@@ -341,6 +342,7 @@ export function parseCommit(bytes: Uint8Array): Commit {
         value.version !== 3 ||
         !(value.data instanceof CidLink) ||
         typeof value.rev !== "string" ||
+        !isTidShape(value.rev) ||
         !(value.prev === null || value.prev instanceof CidLink) ||
         !(value.sig instanceof Uint8Array)
     ) {

@@ -309,7 +309,6 @@ async function refreshDeclaration(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
-        messagingKeyFingerprint,
         messagingKeyFirstSeenAtMs,
     })
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {

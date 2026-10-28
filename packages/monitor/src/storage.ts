@@ -75,12 +75,8 @@ export interface SnapshotEntry {
     verifiedWith: string | null
     /** The record's CID (`bafyrei…`) as verified at ingest. */
     cid: string | null
-    /** The newest signing key a rotation push has been sent for. */
-    seenKey?: string | null
     /** Absent/null on legacy snapshots and entries whose evidence was not provable. */
     evidence?: SnapshotEvidence | null
-    /** Internal fingerprint of the declaration's validated currentKey. */
-    messagingKeyFingerprint?: string | null
     /** First observed only after a verified key rotation; null for legacy keys. */
     messagingKeyFirstSeenAtMs?: number | null
 }

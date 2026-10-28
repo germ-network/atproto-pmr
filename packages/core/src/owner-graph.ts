@@ -91,11 +91,16 @@ export function ownerGraph(
     }
 }
 
+/** Whether `value` has the shape of an AT Protocol TID: 13 characters, zero top bit. Shape only. */
+export function isTidShape(value: string): boolean {
+    return value.length === 13 && /^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$/.test(value)
+}
+
 /** AT Protocol TID: zero top bit, 53-bit Unix microseconds, then 10 clock-ID bits. */
 export function followRkeyAtMs(rkey: string): number | null {
     // https://atproto.com/specs/tid: syntax alone allows a 64-bit value,
     // but a timestamp must fit the 53-bit field beneath the zero top bit.
-    if (rkey.length !== 13 || !/^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$/.test(rkey)) return null
+    if (!isTidShape(rkey)) return null
     let value = 0n
     for (const char of rkey) {
         const digit = "234567abcdefghijklmnopqrstuvwxyz".indexOf(char)

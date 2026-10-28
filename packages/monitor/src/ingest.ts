@@ -565,7 +565,6 @@ async function settleFetched(
         verifiedWith: verified.key,
         cid: verified.cid,
         evidence,
-        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
         messagingKeyFirstSeenAtMs,
     })
     const written = {

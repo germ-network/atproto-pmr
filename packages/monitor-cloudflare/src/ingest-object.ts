@@ -5210,13 +5210,16 @@ type DeclarationEvidence =
 
 const unavailable = (reason: string): DeclarationEvidence => ({ kind: "unavailable", reason })
 
-function normalizeMonitorHostname(value: string | undefined): string | null {
+/** The longest DNS name; bounds the monitor name every stored evidence carries. */
+const MONITOR_HOSTNAME_MAX_CHARS = 253
+
+export function normalizeMonitorHostname(value: string | undefined): string | null {
     if (!value || value.includes(":") || value.includes("/") || value.includes("@")) return null
     try {
         const parsed = new URL(`https://${value}`)
         if (parsed.port || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") return null
         const hostname = parsed.hostname.replace(/\.$/, "").toLowerCase()
-        return hostname.length > 0 ? hostname : null
+        return hostname.length > 0 && hostname.length <= MONITOR_HOSTNAME_MAX_CHARS ? hostname : null
     } catch { return null }
 }
 
