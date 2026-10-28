@@ -8,6 +8,7 @@
  * whose fetch failed. The cursor guarantees coverage only if the pending
  * set covers the gap between "seen" and "stored".
  */
+import { heldFromEntries } from "./held-from-entries"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
@@ -19,11 +20,9 @@ import {
     FETCH_AS_OF_SKEW_MS,
     type BackfillProgress,
     type DigestMarker,
-    type HeldDeclarationState,
     type MonitorIndex,
     type SnapshotEntry,
     type SnapshotStore,
-    type VerifiedDeclarationWrite,
 } from "../src/storage"
 
 const COLLECTION = "com.germnetwork.declaration"
@@ -80,10 +79,6 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
-    const held = new Map<string, HeldDeclarationState>()
-    const holdState = (did: string, rev: string, verified: VerifiedDeclarationWrite) =>
-        void held.set(did, { ...verified, rev, seenKey: held.get(did)?.seenKey ?? null })
-
     const addToWindow = (did: string, observedAtMs: number) => {
         const w = Math.floor(observedAtMs / 600_000)
         const set = members.get(w) ?? new Set<string>()
@@ -100,7 +95,6 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         complete: async (did, rev, observedAtMs, verified) => {
             completed.push(verified)
-            holdState(did, rev, verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
@@ -108,7 +102,6 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeDeletion: async (did, observedAtMs, permanent, quiet, cause) => {
             causes.push(cause)
-            held.delete(did)
             if (permanent) deleted.add(did)
             if (quiet !== true) addToWindow(did, observedAtMs)
             else quietDeletions.push(did)
@@ -116,7 +109,6 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeQuietly: async (did, rev, _at, verified) => {
             completed.push(verified)
-            holdState(did, rev, verified)
             revs.set(did, rev)
             quietCompletions.push(did)
             pending.delete(did)
@@ -136,11 +128,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
-        heldDeclarationOf: async (did) => held.get(did) ?? null,
-        recordSeenKey: async (did, key) => {
-            const state = held.get(did)
-            if (state !== undefined) held.set(did, { ...state, seenKey: key })
-        },
+        ...heldFromEntries(records),
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
         owedGenOf: async (did) => (pending.has(did) ? 1 : null),
         clearPending: async (did) => void pending.delete(did),
@@ -357,25 +345,7 @@ describe("settle", () => {
         expect(onChange).not.toHaveBeenCalled()
     })
 
-    it("reads the previous snapshot only when the rev is unchanged", async () => {
-        // The previous entry is a KV read carrying the whole CAR; an advance
-        // fires onChange anyway and its evidence anchors come from the index.
-        const advancing = harness()
-        advancing.revs.set(DID, "3m1")
-        advancing.records.set(DID, storedEntry())
-        const advanceRead = vi.spyOn(advancing.deps.snapshot, "getRecord")
-        expect(await settle(advancing.deps, DID)).toBe("stored")
-        expect(advanceRead).not.toHaveBeenCalled()
-
-        const unchanged = harness()
-        unchanged.revs.set(DID, "3m2")
-        unchanged.records.set(DID, storedEntry({ rev: "3m2" }))
-        const unchangedRead = vi.spyOn(unchanged.deps.snapshot, "getRecord")
-        expect(await settle(unchanged.deps, DID)).toBe("stored")
-        expect(unchangedRead).toHaveBeenCalledTimes(1)
-    })
-
-    it("retains evidence anchors once on an advance and not again on an unchanged settle", async () => {
+    it("re-retains evidence anchors on every settle and keeps their first-observed times", async () => {
         const h = harness({
             verify: async (_did, record) => ({
                 kind: "verified",
@@ -407,8 +377,7 @@ describe("settle", () => {
         getEvidenceAnchor.mockClear()
         retainEvidenceAnchors.mockClear()
         expect(await settle(h.deps, DID)).toBe("stored")
-        expect(getEvidenceAnchor).not.toHaveBeenCalled()
-        expect(retainEvidenceAnchors).not.toHaveBeenCalled()
+        expect(retainEvidenceAnchors).toHaveBeenCalledTimes(1)
         expect(h.records.get(DID)!.evidence).toEqual(stored)
     })
 
@@ -1090,7 +1059,7 @@ describe("settle verifies at ingest", () => {
         await settle(h.deps, DID)
         expect(onChange).toHaveBeenCalledTimes(1)
         expect(onChange).toHaveBeenCalledWith(DID, "3m1")
-        expect(h.records.get(DID)?.seenKey).toBe(ROTATED_KEY)
+        expect((await h.deps.index.heldDeclarationOf(DID))?.seenKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)?.rev).toBe("3m1")
     })
 

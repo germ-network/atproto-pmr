@@ -919,7 +919,6 @@ export interface SecondaryIndex {
  * declaration's entries, no TTL.
  */
 export interface SecondarySnapshotStore {
-    getSecondary(ref: RecordRef): Promise<SnapshotEntry | null>
     putSecondary(ref: RecordRef, entry: SnapshotEntry): Promise<void>
     /** Removes the record and its confirmation together. */
     deleteSecondary(ref: RecordRef): Promise<void>

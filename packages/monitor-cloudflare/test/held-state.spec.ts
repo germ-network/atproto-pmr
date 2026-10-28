@@ -118,6 +118,17 @@ describe("held declaration state", () => {
         })
     })
 
+    it("a settle under a new signing key clears the seen key, so a return to an earlier seen key is pushed", async () => {
+        const did = uniq()
+        await inObj(did, (obj) => obj.complete(did, REV, 5_000, written()))
+        await inObj(did, (obj) => obj.recordSeenKey(did, "zOtherKey"))
+        await inObj(did, (obj) => obj.complete(did, "3kbbbbbbbbbbb", 6_000, written({ verifiedWith: "zNewKey" })))
+        expect(await inObj(did, (obj) => obj.heldDeclarationOf(did))).toMatchObject({
+            verifiedWith: "zNewKey",
+            seenKey: null,
+        })
+    })
+
     it("the schema upgrade adds the writer-state columns to a records table that lacks them", async () => {
         const did = uniq()
         await inObj(did, (obj) => obj.complete(did, REV, 5_000, written()))

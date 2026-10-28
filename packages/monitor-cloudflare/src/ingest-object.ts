@@ -696,8 +696,7 @@ export class MonitorIngest
                 // Rows from before anchors were kept per DID carry their DID
                 // and kind in the identity JSON (`["commit", {did, ...}]` or
                 // `["anchor", did, key, authority]`), so they move across in
-                // place: a held snapshot's evidence keeps its rows, which
-                // the unchanged skip in `retainSnapshotEvidence` relies on.
+                // place: a held snapshot's evidence keeps its rows.
                 // Each DID's superseded commit rows go as the store would
                 // have pruned them; its anchor rows are pruned on its next
                 // retain. No await separates these writes.
@@ -1597,7 +1596,8 @@ export class MonitorIngest
                 "cid = excluded.cid, verified_with = excluded.verified_with, " +
                 "commit_cid = excluded.commit_cid, anchor_key = excluded.anchor_key, " +
                 "messaging_key_fingerprint = excluded.messaging_key_fingerprint, " +
-                "messaging_key_first_seen_at = excluded.messaging_key_first_seen_at",
+                "messaging_key_first_seen_at = excluded.messaging_key_first_seen_at, " +
+                "seen_key = CASE WHEN verified_with = excluded.verified_with THEN seen_key ELSE NULL END",
             did,
             this.env.MONITOR_COLLECTION,
             rev,
@@ -2264,20 +2264,9 @@ export class MonitorIngest
         }
         if (holder.state !== "held") return unknown
 
-        const row = (await this.recordsOf(did)).find(
-            (r) => r.collection === this.env.MONITOR_COLLECTION && r.rkey === "self"
-        )
-        if (row === undefined) return unknown
-        const entry = await kvSnapshotStore(this.env).getRecord(did)
-        if (entry === null) return unknown
-        try {
-            const found = readRecordFromCar(entry.car, this.env.MONITOR_COLLECTION, "self")
-            if (found === null || found.cid !== row.cid) return unknown
-            const anchorKey = declarationAnchorKeyOf(found.record)
-            return anchorKey === null ? unknown : { state: "present", anchorKey }
-        } catch {
-            return unknown
-        }
+        const held = await this.heldDeclarationOf(did)
+        if (held === null || held.anchorKey === null) return unknown
+        return { state: "present", anchorKey: held.anchorKey }
     }
 
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {

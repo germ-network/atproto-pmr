@@ -314,7 +314,6 @@ export function kvSnapshotStore<TIngest extends MonitorIngest = MonitorIngest>(
             await env.records.put(CHECK_PREFIX + did, JSON.stringify(check))
         },
 
-        getSecondary: (ref) => readEntry(env, ref),
 
         putSecondary: (ref, entry) =>
             writeEntry(env, snapshotKeys(ref.did, ref.collection, ref.rkey).record, entry),

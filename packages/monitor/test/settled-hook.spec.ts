@@ -1,3 +1,4 @@
+import { heldFromEntries } from "./held-from-entries"
 import { describe, expect, it } from "vitest"
 import { RecordNotFoundError, verifyRecordProofOutcome } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, makeKey } from "../../core/test/fixtures/repo-car"
@@ -22,6 +23,7 @@ function harness(opts: {
     const records = new Map<string, SnapshotEntry>()
     const index = {
         revOf: async () => rev,
+        ...heldFromEntries(records),
         holderStateOf: async () => (rev === null ? null : "held"),
         owedGenOf: async () => 1,
         complete: async (_d: string, r: string) => {
@@ -109,6 +111,7 @@ describe("onSettled", () => {
         ])
         const index = {
             revOf: async () => rev,
+            ...heldFromEntries(records),
             holderStateOf: async () => "held",
             recordsOf: async () => [],
             isWatched: async () => true,
@@ -242,7 +245,7 @@ describe("onSettled", () => {
         } as SnapshotEntry)
         expect(await settle(unverifiable.deps, DID)).toBe("unverifiable")
         expect(unverifiable.settled).toEqual([])
-        expect(unverifiable.records.get(DID)!.seenKey).toBe(KEY)
+        expect((await unverifiable.deps.index.heldDeclarationOf(DID))?.seenKey).toBe(KEY)
     })
 
     it("a throw is swallowed and the settle still discharges", async () => {

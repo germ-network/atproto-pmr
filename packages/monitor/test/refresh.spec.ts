@@ -2,6 +2,7 @@
  * `refreshDue`: keeps every held snapshot confirmed current, without
  * treating unrelated repo commits as declaration changes.
  */
+import { heldFromEntries } from "./held-from-entries"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError, verifyRecordProofOutcome } from "@germ-network/atproto-pmr-core"
 import { buildRepoCar, type TestKey, makeKey } from "../../core/test/fixtures/repo-car"
@@ -131,6 +132,7 @@ function harness(opts: {
         clearPending: async () => {},
         markAttempted: async (did: string, at: number) => void attempted.set(did, at),
         isWatched: async (did: string) => revs.has(did) && !deleted.has(did),
+        ...heldFromEntries(records),
         holderStateOf: async (did: string) =>
             (opts.gone ?? []).includes(did) ? "gone-reversible" : revs.has(did) ? "held" : null,
         recordsOf: async (did: string) => {
@@ -214,7 +216,6 @@ function harness(opts: {
         },
         interest: ingest.interest,
         snapshot: {
-            getSecondary: async () => null,
             putSecondary: async (_r, e) => void profileStored.push(e),
             deleteSecondary: async () => {},
             putSecondaryCheck: async (_r, c) => void profileChecks.push(c),
@@ -817,7 +818,7 @@ describe("refresh pushes a re-key", () => {
         expect(result.outcomes.failed).toBe(1)
         expect(h.onChange).toHaveBeenCalledTimes(1)
         expect(h.onChange).toHaveBeenCalledWith(DID, "3m1")
-        expect(h.records.get(DID)!.seenKey).toBe(other.multikey)
+        expect((await h.deps.ingest.index.heldDeclarationOf(DID))?.seenKey).toBe(other.multikey)
         expect(h.records.get(DID)!.verifiedWith).toBe(key.multikey)
     })
 

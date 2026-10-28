@@ -3,6 +3,7 @@
  * policy, how registrations reach it, and what joining and leaving do to
  * everything kept for a DID.
  */
+import { readSecondary } from "./secondary-read"
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
@@ -664,7 +665,7 @@ describe("joining and leaving interest", () => {
             expect(await applyTransitions(obj)).toBe(1)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
             expect(await env.records.get(`chk:${PROFILE}/self:${did}`)).toBeNull()
         })
         expect(pushed).toEqual([])
@@ -721,7 +722,7 @@ describe("joining and leaving interest", () => {
             await obj.setRegistered(did, true, 1)
             await applyTransitions(obj)
             expect(await settleSecondaries()).toBe(1)
-            const got = await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })
+            const got = await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })
             expect(got).toMatchObject({ rev: "3m4", verifiedWith: KEY, cid: "bafyreiprofile" })
             expect(await obj.secondaryRevOf({ did, collection: PROFILE, rkey: "self" })).toBe("3m4")
             expect(await obj.revOf(did)).toBeNull()
@@ -744,7 +745,7 @@ describe("joining and leaving interest", () => {
             await obj.setRegistered(did, false, 2) // left, leave not yet applied
             expect(await settleSecondaries()).toBe(0)
             expect(fetches).toEqual([])
-            expect(await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
         })
         expect(await rows(stub, "SELECT did FROM rec_pending")).toEqual([])
     })
@@ -775,7 +776,7 @@ describe("joining and leaving interest", () => {
                     throw new RecordNotFoundError("gone", false, reason)
                 })
                 await settle(o.deps(), did)
-                const profile = await kvSnapshotStore(testEnv).getSecondary({
+                const profile = await readSecondary(testEnv, {
                     did,
                     collection: PROFILE,
                     rkey: "self",
@@ -858,7 +859,7 @@ describe("joining and leaving interest", () => {
             const [owed] = await obj.duePending(Date.now(), 10)
             expect(owed).toMatchObject({ did, quiet: true })
             await settleOwed(obj)
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
             expect((await obj.recordsOf(did)).filter((r) => r.collection === PROFILE)).toEqual([])
         })
         expect(pushed).toEqual([])
@@ -873,7 +874,7 @@ describe("joining and leaving interest", () => {
             await settleDeletion((obj as unknown as Internals).deps(), did, false)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).not.toBeNull()
             expect((await obj.recordsOf(did)).map((r) => r.collection)).toEqual([PROFILE])
         })
     })
@@ -1117,7 +1118,7 @@ describe("joining and leaving interest", () => {
             await applyTransitions(obj)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).not.toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).not.toBeNull()
             expect(await obj.revOf(did)).toBe("3m1")
         })
     })

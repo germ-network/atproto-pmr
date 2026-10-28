@@ -2,6 +2,7 @@
  * Where a record's snapshot lives in KV. The declaration's keys predate any
  * other collection and are already populated, so they must not move.
  */
+import { readSecondary } from "./secondary-read"
 import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import type { SnapshotEntry } from "@germ-network/atproto-pmr-monitor"
 import { env } from "cloudflare:test"
@@ -75,7 +76,7 @@ describe("kvRecordSnapshots", () => {
             rev: "3m2",
             freshAtMs: 1_000,
         })
-        expect(await kvSnapshotStore(env).getSecondary(ref)).toMatchObject({ rev: "3m2" })
+        expect(await readSecondary(env, ref)).toMatchObject({ rev: "3m2" })
         await kvSnapshotStore(env).putSecondaryCheck(ref, { rev: "3m2", checkedAtMs: 9_000 })
         await kvSnapshotStore(env).deleteSecondary(ref)
         expect(await kvRecordSnapshots(env).get(did, PROFILE, "self")).toBeNull()

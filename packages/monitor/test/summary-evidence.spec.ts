@@ -36,7 +36,7 @@ function evidenceIndex() {
 describe("summary evidence anchors", () => {
     it("retains the first observation through assurance upgrades and commit changes", async () => {
         const { index } = evidenceIndex()
-        const first = await prepareSnapshotEvidence(index, "did:plc:alice", verified(), null, 1_000)
+        const first = await prepareSnapshotEvidence(index, "did:plc:alice", verified(), 1_000)
         expect(first).not.toBeNull()
         await retainSnapshotEvidence(index, first!)
 
@@ -44,7 +44,6 @@ describe("summary evidence anchors", () => {
             index,
             "did:plc:alice",
             verified({ assurance: "custody-chain" }),
-            first,
             2_000
         )
         expect(upgraded).toMatchObject({
@@ -52,15 +51,13 @@ describe("summary evidence anchors", () => {
             commitFirstObservedAtMs: 1_000,
             anchorFirstObservedAtMs: 1_000,
         })
-        await retainSnapshotEvidence(index, upgraded!, first)
+        await retainSnapshotEvidence(index, upgraded!)
 
-        // An advance settles without reading the previous snapshot: the
-        // anchor comes from what the index retained.
+        // The anchor comes from what the index retained.
         const nextCommit = await prepareSnapshotEvidence(
             index,
             "did:plc:alice",
             verified({ commitCid: "bafCommit2", rev: "3m2", cid: "bafRecord2" }),
-            null,
             3_000
         )
         expect(nextCommit).toMatchObject({
@@ -69,9 +66,9 @@ describe("summary evidence anchors", () => {
         })
     })
 
-    it("writes the index once per new identity and not at all when nothing changed", async () => {
+    it("retains each settle's anchors, keeping the first observation of an identity it has seen", async () => {
         const { index, writes } = evidenceIndex()
-        const first = (await prepareSnapshotEvidence(index, "did:plc:alice", verified(), null, 1_000))!
+        const first = (await prepareSnapshotEvidence(index, "did:plc:alice", verified(), 1_000))!
         await retainSnapshotEvidence(index, first)
         expect(writes).toHaveLength(1)
         expect(writes[0]).toMatchObject({
@@ -82,26 +79,27 @@ describe("summary evidence anchors", () => {
             ],
         })
 
-        await retainSnapshotEvidence(index, first, first)
         const upgraded = (await prepareSnapshotEvidence(
             index,
             "did:plc:alice",
             verified({ assurance: "custody-chain" }),
-            first,
             2_000
         ))!
-        await retainSnapshotEvidence(index, upgraded, first)
-        expect(writes).toHaveLength(1)
+        await retainSnapshotEvidence(index, upgraded)
+        expect(writes).toHaveLength(2)
 
         const nextCommit = (await prepareSnapshotEvidence(
             index,
             "did:plc:alice",
             verified({ commitCid: "bafCommit2", rev: "3m2", cid: "bafRecord2" }),
-            upgraded,
             3_000
         ))!
-        await retainSnapshotEvidence(index, nextCommit, upgraded)
-        expect(writes).toHaveLength(2)
+        await retainSnapshotEvidence(index, nextCommit)
+        expect(writes).toHaveLength(3)
+        expect(writes[2]!.rows).toMatchObject([
+            { kind: "commit", firstObservedAtMs: 3_000 },
+            { kind: "anchor", firstObservedAtMs: 1_000 },
+        ])
     })
 
     it("returns unavailable evidence when the proof lacks method authority", async () => {
@@ -111,7 +109,6 @@ describe("summary evidence anchors", () => {
                 index,
                 "did:plc:alice",
                 verified({ authority: undefined }) as ReturnType<typeof verified>,
-                null,
                 1_000
             )
         ).toBeNull()

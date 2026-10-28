@@ -266,17 +266,12 @@ async function refreshDeclaration(
     }
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 
-    const previous = await ingest.snapshot.getRecord(did)
-    const previousRecord =
-        previous === null
-            ? null
-            : readRecordFromCar(previous.car, deps.collection, deps.rkey)
-    const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-    const rekeyed = previousKey !== null && previousKey !== verified.key
+    const previous = await ingest.index.heldDeclarationOf(did)
+    const rekeyed = previous !== null && previous.verifiedWith !== verified.key
     const quiet =
-        previousRecord !== null &&
+        previous !== null &&
         incoming !== null &&
-        previousRecord.cid === incoming.cid &&
+        previous.cid === incoming.cid &&
         !rekeyed &&
         compareRev(indexed, verified.rev) !== "regressed"
     if (!quiet) {
@@ -286,16 +281,9 @@ async function refreshDeclaration(
         return { outcome: "changed", repoGone: false }
     }
 
-    const previousEvidence = previous?.evidence ?? null
-    const evidence = await prepareSnapshotEvidence(
-        ingest.index,
-        did,
-        verified,
-        previousEvidence,
-        nowMs
-    )
+    const evidence = await prepareSnapshotEvidence(ingest.index, did, verified, nowMs)
 
-    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence, previousEvidence)
+    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence)
     const messagingKeyFingerprint =
         verified.messagingKeyFingerprint === undefined
             ? (previous?.messagingKeyFingerprint ?? null)
@@ -420,7 +408,7 @@ async function disposeGone(
         return "deleted"
     }
     let outcome: RefreshOutcome
-    if ((await ingest.snapshot.getRecord(did)) === null) {
+    if ((await ingest.index.heldDeclarationOf(did)) === null) {
         // An earlier reversible answer can harden into a permanent one.
         if (permanent && !(await ingest.index.isDeleted(did))) {
             await settleDeletion(ingest, did, true, false, cause)
