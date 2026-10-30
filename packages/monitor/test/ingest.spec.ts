@@ -897,12 +897,12 @@ describe("identity events and the signing-key cache", () => {
 
     // The relay's cached key must be dropped for every DID whose document the
     // monitor keeps, not only for the ones holding a declaration.
-    it("an identity event for a watched DID with no declaration owes a key update, returns ignored and leaves pending unchanged", async () => {
+    it("an identity event for a watched DID with no declaration signals key-only work and leaves pending unchanged", async () => {
         const { owed, keyUpdates } = withKeyUpdates()
         const h = harness({ keyUpdates })
         const entry = { rev: "3m1", attempts: 2, notBeforeMs: 5, quiet: false }
         h.pending.set(DID, entry)
-        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("key-update")
         expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
         expect(h.pending.get(DID)).toEqual(entry)
     })

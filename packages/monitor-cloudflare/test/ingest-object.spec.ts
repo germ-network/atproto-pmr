@@ -377,6 +377,66 @@ describe("settling what is owed", () => {
 })
 
 describe("the way in", () => {
+    it("migrates a legacy shared cooldown to both lanes so a successful lane can reset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                cooldownUntilSync(lane: "declaration" | "key"): number
+                cooldownDurationSync(lane: "declaration" | "key"): number
+                clearCooldownSync(lane: "declaration" | "key"): void
+            }
+            const until = Date.now() + 60_000
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('scheduler_cooldown', ?), ('scheduler_cooldown_ms', '8000')",
+                String(until)
+            )
+            const declarationUntil = internal.cooldownUntilSync("declaration")
+            const keyUntil = internal.cooldownUntilSync("key")
+            internal.clearCooldownSync("declaration")
+            return {
+                declarationUntil,
+                keyUntil,
+                declarationDuration: internal.cooldownDurationSync("declaration"),
+                keyDuration: internal.cooldownDurationSync("key"),
+                legacyRows: obj.ctx.storage.sql.exec("SELECT 1 FROM meta WHERE k LIKE 'scheduler_cooldown%'").toArray().length,
+            }
+        })
+        expect(result.declarationUntil).toBeGreaterThan(Date.now())
+        expect(result.keyUntil).toBe(result.declarationUntil)
+        expect(result.declarationDuration).toBe(0)
+        expect(result.keyDuration).toBe(8_000)
+        expect(result.legacyRows).toBe(0)
+    })
+
+    it("claims the first timed resume frame before waiting on serialized storage", async () => {
+        const stub = freshStub()
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const state = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                resumeFromUs: number | null
+                checkResumeFrame(frameMs: number | null): Promise<void>
+                serializeStorage<T>(work: () => Promise<T>): Promise<T>
+                startFirehoseRun(nowMs: number): void
+            }
+            internal.resumeFromUs = 1_000_000
+            let started = 0
+            internal.serializeStorage = async (work) => {
+                await blocked
+                return work()
+            }
+            internal.startFirehoseRun = () => { started += 1 }
+            const first = internal.checkResumeFrame(100_000)
+            const claimedAfterFirst = internal.resumeFromUs
+            await internal.checkResumeFrame(200_000)
+            release()
+            await first
+            return { claimedAfterFirst, started }
+        })
+        expect(state.claimedAfterFirst).toBeNull()
+        expect(state.started).toBe(1)
+    })
+
     it("records a prompt wake at intake and dispatches a bounded settlement before maintenance", async () => {
         const stub = freshStub()
         let fetched = 0
@@ -495,10 +555,12 @@ describe("the way in", () => {
             console.error = originalError
         }
         const state = await runInDurableObject(stub, (obj: MonitorIngest) => ({
-            cooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'scheduler_cooldown_ms'").one().v),
+            cooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'declaration_cooldown_ms'").one().v),
+            keyCooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'key_cooldown_ms'").toArray()[0]?.v ?? "0"),
             due: obj.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", Date.now()).one().n,
         }))
         expect(state.cooldownMs).toBeGreaterThanOrEqual(1_000)
+        expect(state.keyCooldownMs).toBe(0)
         expect(state.due).toBe(33)
     })
 
@@ -529,8 +591,13 @@ describe("the way in", () => {
                 armWatchdog(): Promise<void>
                 reconcileAlarm(): Promise<void>
                 fetchRecord(did: string): Promise<StubFetched>
+                clearCooldownSync(lane: "declaration" | "key"): void
             }
             await internal.armWatchdog()
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('declaration_cooldown_until', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                String(Date.now() + 60_000)
+            )
             internal.fetchRecord = async () => {
                 fetched += 1
                 throw new Error("controlled fetch failure")
@@ -538,6 +605,7 @@ describe("the way in", () => {
             for (let n = 0; n < 33; n++) await obj.owe(`did:plc:batch-${n}`, "3m1")
             await internal.reconcileAlarm()
             obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            internal.clearCooldownSync("declaration")
             await obj.ctx.storage.setAlarm(Date.now() + 100)
         })
         await runDurableObjectAlarm(stub)
@@ -547,6 +615,7 @@ describe("the way in", () => {
 
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            ;(obj as unknown as { clearCooldownSync(lane: "declaration" | "key"): void }).clearCooldownSync("declaration")
             await obj.ctx.storage.setAlarm(Date.now() + 100)
         })
         await runDurableObjectAlarm(stub)

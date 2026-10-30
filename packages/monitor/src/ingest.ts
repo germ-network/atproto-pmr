@@ -237,6 +237,8 @@ export interface IngestConfig {
 
 export type IntakeDecision =
     | "ignored"
+    /** The event is irrelevant to declaration custody but owed a signing-key hint. */
+    | "key-update"
     | "duplicate"
     | "accepted"
     /** In the snapshot, and its DID document may have re-keyed. */
@@ -270,10 +272,11 @@ export async function intake(
         // The relay's cached key is dropped for every DID whose document the
         // monitor keeps, declaration or not. After the owe, so a holder that
         // reverifies is watched.
-        if (await deps.index.isWatched(event.did)) {
+        const keyOwed = await deps.index.isWatched(event.did) && deps.keyUpdates !== undefined
+        if (keyOwed) {
             await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
         }
-        return reverify ? "reverify" : "ignored"
+        return reverify ? "reverify" : keyOwed ? "key-update" : "ignored"
     }
 
     const commit: CommitEvent = event

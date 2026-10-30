@@ -423,6 +423,8 @@ export class MonitorIngest
     private draining: Promise<boolean> | null = null
     private storageQueue: Promise<void> = Promise.resolve()
     private alarmPass: Promise<void> | null = null
+    private alarmReconcile: Promise<void> | null = null
+    private alarmReconcileAgain = false
     /** The cursor this connection resumed from, until its first timed frame has been checked. */
     private resumeFromUs: number | null = null
     /** The evidence sweep finished, so later alarms skip even its progress read. */
@@ -669,6 +671,10 @@ export class MonitorIngest
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN selection_turn INTEGER NOT NULL DEFAULT 0")
             }
             this.db.sql.exec("CREATE INDEX IF NOT EXISTS pending_by_turn ON pending (selection_turn, did, not_before)")
+            this.db.sql.exec("CREATE INDEX IF NOT EXISTS pending_by_not_before ON pending (not_before, selection_turn, did)")
+            // Explicitly assigned turns are the fairness path for current
+            // writes. The trigger is a compatibility fallback for legacy
+            // migrations and secondary write paths that still insert 0.
             this.db.sql.exec(`
                 CREATE TRIGGER IF NOT EXISTS pending_assign_turn
                 AFTER INSERT ON pending WHEN NEW.selection_turn = 0
@@ -1302,9 +1308,8 @@ export class MonitorIngest
     private requestPromptSync(nowMs: number): void {
         const requested = nowMs + PROMPT_WAKE_DELAY_MS
         const prior = Number(this.metaOf("prompt_at"))
-        this.setMeta("prompt_at", String(Number.isFinite(prior) && prior > 0 ? Math.min(prior, requested) : requested))
-        this.setMeta("scheduler_cooldown_ms", "0")
-        this.setMeta("scheduler_cooldown", null)
+        const next = Number.isFinite(prior) && prior > 0 ? Math.min(prior, requested) : requested
+        if (next !== prior) this.setMeta("prompt_at", String(next))
     }
 
     private nextSelectionTurnSync(): number {
@@ -4123,17 +4128,39 @@ export class MonitorIngest
         return run
     }
 
-    private pendingStateSync(nowMs: number): { due: number; earliest: number | null } {
-        const due = this.db.sql.exec<{ n: number }>(
-            "SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", nowMs
-        ).one().n
-        const earliest = this.db.sql.exec<{ at: number | null }>(
-            "SELECT MIN(not_before) AS at FROM pending WHERE not_before > ?", nowMs
-        ).one().at
+    private pendingStateSync(nowMs: number): { due: boolean; earliest: number | null } {
+        const due = this.db.sql.exec(
+            "SELECT 1 FROM pending WHERE not_before <= ? LIMIT 1", nowMs
+        ).toArray().length > 0
+        const earliest = this.db.sql.exec<{ at: number }>(
+            "SELECT not_before AS at FROM pending WHERE not_before > ? ORDER BY not_before LIMIT 1",
+            nowMs
+        ).toArray()[0]?.at ?? null
         return { due, earliest }
     }
 
     private async reconcileAlarm(): Promise<void> {
+        if (this.alarmReconcile !== null) {
+            this.alarmReconcileAgain = true
+            return this.alarmReconcile
+        }
+        const run = (async () => {
+            do {
+                this.alarmReconcileAgain = false
+                await this.reconcileAlarmOnce()
+            } while (this.alarmReconcileAgain)
+        })().finally(() => {
+            if (this.alarmReconcile === run) this.alarmReconcile = null
+            if (this.alarmReconcileAgain) {
+                this.alarmReconcileAgain = false
+                void this.reconcileAlarm()
+            }
+        })
+        this.alarmReconcile = run
+        return run
+    }
+
+    private async reconcileAlarmOnce(): Promise<void> {
         await this.serializeStorage(async () => {
             const now = Date.now()
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
@@ -4156,7 +4183,8 @@ export class MonitorIngest
                 const pending = this.pendingStateSync(now)
                 const keysRemain = this.db.sql.exec("SELECT 1 FROM key_updates LIMIT 1").toArray().length > 0
                 let promptAt = Number(this.metaOf("prompt_at"))
-                const settlementAt = pending.due > 0 || keysRemain
+                const hasImmediateWork = pending.due || keysRemain
+                const settlementAt = hasImmediateWork
                     ? now + PROMPT_WAKE_DELAY_MS
                     : pending.earliest
                 if (settlementAt !== null) {
@@ -4167,24 +4195,85 @@ export class MonitorIngest
                         : settlementAt
                     this.setMeta("prompt_at", String(promptAt))
                 }
-                const cooldown = Number(this.metaOf("scheduler_cooldown"))
-                const requested = Number.isFinite(promptAt) && promptAt > 0
-                    ? Math.max(promptAt > now ? promptAt : now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0)
-                    : 0
-                const pendingAt = pending.due > 0
-                    ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0)
+                const promptDeadline = Number.isFinite(promptAt) && promptAt > 0
+                    ? promptAt > now ? promptAt : now + PROMPT_WAKE_DELAY_MS
+                    : now + PROMPT_WAKE_DELAY_MS
+                const declarationCooldown = this.cooldownUntilSync("declaration")
+                const keyCooldown = this.cooldownUntilSync("key")
+                const pendingAt = pending.due
+                    ? Math.max(promptDeadline, declarationCooldown)
                     : pending.earliest === null
                       ? 0
-                      : Math.max(pending.earliest, Number.isFinite(cooldown) ? cooldown : 0)
+                      : Math.max(pending.earliest, declarationCooldown)
+                const keyAt = keysRemain ? Math.max(promptDeadline, keyCooldown) : 0
                 const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + PROMPT_WAKE_DELAY_MS : 0
-                const candidates = [maintenanceWake, requested, keysRemain ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0) : 0, pendingAt, existingAlarm !== null && existingAlarm > now ? existingAlarm : 0].filter((v) => v > 0)
+                const candidates = [
+                    maintenanceWake,
+                    keyAt,
+                    pendingAt,
+                    existingAlarm !== null && existingAlarm > now ? existingAlarm : 0,
+                ].filter((value) => value > 0)
                 if (candidates.length === 0) {
-                    await this.db.deleteAlarm()
+                    if (existingAlarm !== null) await this.db.deleteAlarm()
                     return
                 }
-                await this.db.setAlarm(Math.min(...candidates))
+                const nextAlarm = Math.min(...candidates)
+                if (nextAlarm !== existingAlarm) await this.db.setAlarm(nextAlarm)
             })
         })
+    }
+
+    private cooldownUntilSync(lane: "declaration" | "key"): number {
+        this.migrateLegacyCooldownSync()
+        const laneUntil = Number(this.metaOf(`${lane}_cooldown_until`))
+        return Number.isFinite(laneUntil) && laneUntil > 0 ? laneUntil : 0
+    }
+
+    private cooldownDurationSync(lane: "declaration" | "key"): number {
+        this.migrateLegacyCooldownSync()
+        const laneDuration = Number(this.metaOf(`${lane}_cooldown_ms`))
+        return Number.isFinite(laneDuration) && laneDuration > 0 ? laneDuration : 0
+    }
+
+    /** Copy the pre-lane shared cooldown to both independent lanes exactly once. */
+    private migrateLegacyCooldownSync(): void {
+        const legacyUntilValue = this.metaOf("scheduler_cooldown")
+        const legacyDurationValue = this.metaOf("scheduler_cooldown_ms")
+        if (legacyUntilValue === undefined && legacyDurationValue === undefined) return
+        const legacyUntil = Number(legacyUntilValue)
+        const legacyDuration = Number(legacyDurationValue)
+        if (Number.isFinite(legacyUntil) && legacyUntil > 0) {
+            for (const lane of ["declaration", "key"] as const) {
+                const laneUntil = Number(this.metaOf(`${lane}_cooldown_until`))
+                if (!Number.isFinite(laneUntil) || laneUntil <= 0) {
+                    this.setMeta(`${lane}_cooldown_until`, String(legacyUntil))
+                }
+            }
+        }
+        if (Number.isFinite(legacyDuration) && legacyDuration > 0) {
+            for (const lane of ["declaration", "key"] as const) {
+                const laneDuration = Number(this.metaOf(`${lane}_cooldown_ms`))
+                if (!Number.isFinite(laneDuration) || laneDuration <= 0) {
+                    this.setMeta(`${lane}_cooldown_ms`, String(legacyDuration))
+                }
+            }
+        }
+        if (legacyUntilValue !== undefined) this.setMeta("scheduler_cooldown", null)
+        if (legacyDurationValue !== undefined) this.setMeta("scheduler_cooldown_ms", null)
+    }
+
+    private recordCooldownSync(lane: "declaration" | "key", nowMs: number): void {
+        const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+        const cap = Number.isFinite(interval) && interval > 0 ? interval : 120_000
+        const prior = this.cooldownDurationSync(lane)
+        const next = prior > 0 ? Math.min(prior * 2, cap) : Math.min(1_000, cap)
+        this.setMeta(`${lane}_cooldown_ms`, String(next))
+        this.setMeta(`${lane}_cooldown_until`, String(nowMs + next))
+    }
+
+    private clearCooldownSync(lane: "declaration" | "key"): void {
+        this.setMeta(`${lane}_cooldown_ms`, "0")
+        this.setMeta(`${lane}_cooldown_until`, null)
     }
 
     private async requestPromptWakeBestEffort(): Promise<void> {
@@ -4204,49 +4293,12 @@ export class MonitorIngest
                 const requested = Number(this.metaOf("prompt_at"))
                 if (Number.isFinite(requested) && requested <= nowMs) this.setMeta("prompt_at", null)
             })
-            const keyFailed = await this.drainKeys()
-            const batch = this.settleBatch()
-            let selectedDids: string[] = []
-            let before = ""
-            try {
-                await settleDue(this.deps(), batch, undefined, (selected) => {
-                    selectedDids = selected.map((row) => row.did)
-                    before = selected
-                        .map((row) => `${row.did}:${row.rev}:${row.owedGen ?? ""}:${row.attempts}:${row.notBeforeMs}:${row.quiet}`)
-                        .sort()
-                        .join("|")
-                })
-            } catch (err) {
-                console.error("monitor: settle failed", err)
+            const now = Date.now()
+            if (this.cooldownUntilSync("key") <= now) {
+                if (await this.drainKeys()) this.recordCooldownSync("key", Date.now())
+                else this.clearCooldownSync("key")
             }
-            const afterRows = selectedDids.length === 0
-                ? []
-                : this.db.sql.exec<{
-                      did: string
-                      rev: string
-                      owed_gen: number
-                      attempts: number
-                      not_before: number
-                      quiet: number
-                  }>(
-                      `SELECT did, rev, owed_gen, attempts, not_before, quiet FROM pending WHERE did IN (${selectedDids.map(() => "?").join(",")})`,
-                      ...selectedDids
-                  ).toArray()
-            const after = afterRows
-                .map((row) => `${row.did}:${row.rev}:${row.owed_gen}:${row.attempts}:${row.not_before}:${row.quiet === 1}`)
-                .sort()
-                .join("|")
-            const pending = this.pendingStateSync(Date.now())
-            if (keyFailed || (pending.due > 0 && before === after)) {
-                const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
-                const prior = Number(this.metaOf("scheduler_cooldown_ms"))
-                const base = Number.isFinite(prior) && prior > 0 ? Math.min(prior * 2, Number.isFinite(interval) && interval > 0 ? interval : 120_000) : 1_000
-                this.setMeta("scheduler_cooldown_ms", String(base))
-                this.setMeta("scheduler_cooldown", String(Date.now() + base))
-            } else {
-                this.setMeta("scheduler_cooldown_ms", "0")
-                this.setMeta("scheduler_cooldown", null)
-            }
+            await this.settleDeclarationBatch()
         })().finally(async () => {
             this.alarmPass = null
             await this.reconcileAlarm()
@@ -4254,11 +4306,52 @@ export class MonitorIngest
         return this.alarmPass
     }
 
+    /** One bounded declaration dispatch with its own cooldown and progress accounting. */
+    private async settleDeclarationBatch(): Promise<void> {
+        const now = Date.now()
+        if (this.cooldownUntilSync("declaration") > now) return
+
+        const batch = this.settleBatch()
+        let selectedDids: string[] = []
+        let before = ""
+        try {
+            await settleDue(this.deps(), batch, undefined, (selected) => {
+                selectedDids = selected.map((row) => row.did)
+                before = selected
+                    .map((row) => `${row.did}:${row.rev}:${row.owedGen ?? ""}:${row.attempts}:${row.notBeforeMs}:${row.quiet}`)
+                    .sort()
+                    .join("|")
+            })
+        } catch (err) {
+            console.error("monitor: settle failed", err)
+        }
+        const afterRows = selectedDids.length === 0
+            ? []
+            : this.db.sql.exec<{
+                  did: string
+                  rev: string
+                  owed_gen: number
+                  attempts: number
+                  not_before: number
+                  quiet: number
+              }>(
+                  `SELECT did, rev, owed_gen, attempts, not_before, quiet FROM pending WHERE did IN (${selectedDids.map(() => "?").join(",")})`,
+                  ...selectedDids
+              ).toArray()
+        const after = afterRows
+            .map((row) => `${row.did}:${row.rev}:${row.owed_gen}:${row.attempts}:${row.not_before}:${row.quiet === 1}`)
+            .sort()
+            .join("|")
+        const pending = this.pendingStateSync(Date.now())
+        if (pending.due && before === after) this.recordCooldownSync("declaration", Date.now())
+        else this.clearCooldownSync("declaration")
+    }
+
     private settleBatch(): number {
-        const configured = Number.parseInt(this.env.SETTLE_BATCH, 10)
-        return !Number.isFinite(configured) || configured <= 0
-            ? MAX_SETTLE_BATCH
-            : Math.min(MAX_SETTLE_BATCH, configured)
+        const configured = Number(this.env.SETTLE_BATCH)
+        return Number.isInteger(configured) && configured > 0
+            ? Math.min(MAX_SETTLE_BATCH, configured)
+            : MAX_SETTLE_BATCH
     }
 
     /** One page of the daily re-count of owner-followed DIDs; the cursor persists until a pass completes. */
@@ -4910,11 +5003,14 @@ export class MonitorIngest
     private async checkResumeFrame(frameMs: number | null): Promise<void> {
         if (this.resumeFromUs === null || frameMs === null) return
         const cursorUs = this.resumeFromUs
+        // Claim the first timed frame before awaiting storage. Socket message
+        // handlers can overlap while the storage queue is blocked; later
+        // frames must not independently decide the same resume gap.
+        this.resumeFromUs = null
         const toleranceMs = this.envInt(this.env.JETSTREAM_RESUME_TOLERANCE_MS, 60_000)
         if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) {
             await this.serializeStorage(async () => this.startFirehoseRun(Date.now()))
         }
-        this.resumeFromUs = null
     }
 
     /**
@@ -5158,10 +5254,12 @@ export class MonitorIngest
             event,
             cursor ?? ""
         ))
-        if (decision === "accepted" || decision === "reverify" || decision === "ignored") {
+        if (decision === "accepted" || decision === "reverify" || decision === "key-update") {
             await this.requestPromptWakeBestEffort()
         }
-        if (decision === "ignored" && cursor !== null && cursor !== "") this.advanceIgnoredCursor(cursor)
+        if ((decision === "ignored" || decision === "key-update") && cursor !== null && cursor !== "") {
+            this.advanceIgnoredCursor(cursor)
+        }
     }
 
     /**
@@ -5304,9 +5402,7 @@ export class MonitorIngest
         const promptAt = Number(this.metaOf("prompt_at"))
         const maintenanceDue = Number.isFinite(maintenanceAt) && maintenanceAt > 0 && maintenanceAt <= now
         const promptDue = Number.isFinite(promptAt) && promptAt > 0 && promptAt <= now
-        const maintenanceScheduled = Number.isFinite(maintenanceAt) && maintenanceAt > 0
-        const maintenanceDisabled = this.metaOf("maintenance_disabled") === "1"
-        if (!maintenanceDue && promptDue && (maintenanceScheduled || maintenanceDisabled)) {
+        if (!maintenanceDue && promptDue) {
             await this.runPromptPass(now)
             return
         }
@@ -5331,14 +5427,9 @@ export class MonitorIngest
             }
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
-            if (await this.drainKeys()) {
-                const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
-                const prior = Number(this.metaOf("scheduler_cooldown_ms"))
-                const cooldown = Number.isFinite(prior) && prior > 0
-                    ? Math.min(prior * 2, Number.isFinite(interval) && interval > 0 ? interval : 120_000)
-                    : 1_000
-                this.setMeta("scheduler_cooldown_ms", String(cooldown))
-                this.setMeta("scheduler_cooldown", String(Date.now() + cooldown))
+            if (this.cooldownUntilSync("key") <= Date.now()) {
+                if (await this.drainKeys()) this.recordCooldownSync("key", Date.now())
+                else this.clearCooldownSync("key")
             }
             try {
                 this.persistPlcCursor()
@@ -5444,12 +5535,12 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: evidence refresh sweep failed", err)
             }
-            const batch = this.settleBatch()
             try {
-                await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+                await this.settleDeclarationBatch()
             } catch (err) {
                 console.error("monitor: settle failed", err)
             }
+            const batch = this.settleBatch()
             try {
                 await settleSecondaryDue(
                     this.secondaryDeps(),

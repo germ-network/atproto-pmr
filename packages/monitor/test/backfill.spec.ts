@@ -21,13 +21,17 @@ function fakeIndex(overrides: Partial<MonitorIndex> = {}): {
 } {
     const revs = new Map<string, string>()
     const owed: string[] = []
+    const owedGenerations = new Map<string, number>()
     let progress: BackfillProgress = { done: false, cursor: null }
 
     const index: MonitorIndex = {
         readCursor: async () => null,
         intake: async () => ({ outcome: "accepted" }),
-        owe: async (did) => void owed.push(did),
-        owedGenOf: async () => null,
+        owe: async (did) => {
+            owed.push(did)
+            owedGenerations.set(did, (owedGenerations.get(did) ?? 0) + 1)
+        },
+        owedGenOf: async (did) => owedGenerations.get(did) ?? null,
         clearPending: async () => {},
         markAttempted: async () => {},
         isWatched: async () => false,

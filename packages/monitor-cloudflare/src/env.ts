@@ -179,7 +179,12 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      */
     WATCHDOG_INTERVAL_MS: string
 
-    /** How many owed fetches to settle per wake. */
+    /**
+     * Maximum owed declaration fetches selected per prompt or maintenance
+     * wake. Defaults to 32 and is capped at 32; invalid, zero, or negative
+     * values use the default. Each wake processes one bounded batch; a larger
+     * backlog continues in successive prompt alarms, usually about 100 ms apart.
+     */
     SETTLE_BATCH: string
 
     /**
