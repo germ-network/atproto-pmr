@@ -3329,7 +3329,12 @@ describe("declaration evidence", () => {
             const outcome = await inEvidenceObj(w, { appView }, (obj) => verify(obj, w.did, fetched(w)))
             expect(outcome).toEqual(base(w))
         }
-        const reasons = warn.mock.calls.map((call) => (call[1] as { reason: string }).reason)
+        const reasons = warn.mock.calls.flatMap(([message, details]) => {
+            const warning = details as { did?: string; reason?: string } | undefined
+            return message === "monitor: declaration evidence unavailable" && warning?.did === w.did
+                ? [warning.reason]
+                : []
+        })
         expect(reasons).toEqual([
             expect.stringMatching(/^AppView unreachable: /),
             expect.stringMatching(/^AppView unreachable: .*down/),
