@@ -245,6 +245,8 @@ export interface PendingFetch {
      * DID clears it, so a commit that coalesces into the row still counts.
      */
     quiet: boolean
+    /** Generation captured with this selection; failures may defer only this generation. */
+    owedGen?: number
 }
 
 /** Why a pending fetch was deferred instead of settled. */
@@ -428,7 +430,12 @@ export interface MonitorIndex extends HeldStateIndex {
     /** Counts the attempt and keeps `failure` on the row, so an operator can
      * see why a DID is still owed without searching logs. Answers the row's
      * attempts after the update, or null when the DID has no pending row. */
-    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
+    deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure,
+        expectedGeneration?: number | null
+    ): Promise<number | null>
 
     /** The indexed rev, for regression detection and duplicate suppression. */
     revOf(did: string): Promise<string | null>

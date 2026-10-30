@@ -194,13 +194,15 @@ async function deferFailure(
     deps: IngestDeps,
     did: string,
     notBeforeMs: number,
-    failure: PendingFailure
+    failure: PendingFailure,
+    expectedGeneration: number | null
 ): Promise<void> {
     const kept: PendingFailure =
         failure.kind === "threw"
             ? { ...failure, message: truncated(failure.message) }
             : { ...failure, reason: failure.reason === null ? null : truncated(failure.reason) }
-    const attempts = await deps.index.deferPending(did, notBeforeMs, kept)
+    if (expectedGeneration === null) return
+    const attempts = await deps.index.deferPending(did, notBeforeMs, kept, expectedGeneration)
     if (attempts === null) return
     try {
         deps.onSettleFailure?.({ did, attempts, failure: kept, notBeforeMs })
@@ -383,6 +385,8 @@ export interface SettleOptions {
      * nothing is recorded.
      */
     quiet?: boolean
+    /** Generation selected before the fetch; null fences failure deferral if no row existed. */
+    owedGen?: number | null
 }
 
 export async function settle(
@@ -392,7 +396,7 @@ export async function settle(
 ): Promise<SettleOutcome> {
     const quiet = opts.quiet === true
     const epoch = await deps.interest.interestEpoch(did)
-    const gen = await deps.index.owedGenOf(did)
+    const gen = opts.owedGen === undefined ? await deps.index.owedGenOf(did) : opts.owedGen
     const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
@@ -740,7 +744,7 @@ async function settleUnverifiable(
             kind: "unverifiable",
             reason: reason ?? null,
             atMs: deps.nowMs(),
-        })
+        }, gen)
     }
     await pushNewlySeenKey(deps, did, record.signingKey)
 }
@@ -844,7 +848,7 @@ export async function settleDue(
     for (const p of due) {
         try {
             if (
-                (await settle(deps, p.did, { quiet: p.quiet, attempts: p.attempts })) === "stored"
+                (await settle(deps, p.did, { quiet: p.quiet, attempts: p.attempts, owedGen: p.owedGen })) === "stored"
             ) {
                 settled += 1
             }
@@ -859,7 +863,7 @@ export async function settleDue(
                     errorName: err instanceof Error ? err.name : typeof err,
                     message: String(err instanceof Error ? err.message : err),
                     atMs: now,
-                })
+                }, p.owedGen ?? (await deps.index.owedGenOf(p.did)))
             } catch (deferErr) {
                 // The row keeps its `not_before`, so it is due again next
                 // drain; letting this escape would skip the rest of the batch.

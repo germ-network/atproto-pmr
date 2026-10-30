@@ -6,7 +6,6 @@ import {
     decodeEvent,
     fetchRecordCar,
     decodePlcExportFrame,
-    drainKeyUpdates,
     drainPlcLogs,
     FETCH_AS_OF_SKEW_MS,
     intake,
@@ -219,6 +218,8 @@ type PublishRow = {
 
 /** Owed key updates applied per drain. */
 const KEY_DRAIN_BATCH = 64
+const PROMPT_WAKE_DELAY_MS = 100
+const MAX_SETTLE_BATCH = 32
 
 /**
  * Longest the PLC cursor goes unpersisted while the stream runs. A lost
@@ -419,10 +420,11 @@ export class MonitorIngest
     private plcRunPersisted = false
     /** What `plc:coverage` last claimed in this run. */
     private plcCoveredThroughMs: number | null = null
-    private draining: Promise<void> | null = null
+    private draining: Promise<boolean> | null = null
+    private storageQueue: Promise<void> = Promise.resolve()
+    private alarmPass: Promise<void> | null = null
     /** The cursor this connection resumed from, until its first timed frame has been checked. */
     private resumeFromUs: number | null = null
-    private drainAgain = false
     /** The evidence sweep finished, so later alarms skip even its progress read. */
     private evidenceRefreshDone = false
     private snapshotLayoutDone = false
@@ -441,7 +443,8 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     rev TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    not_before INTEGER NOT NULL DEFAULT 0
+                    not_before INTEGER NOT NULL DEFAULT 0,
+                    selection_turn INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS applied_recent (
                     did TEXT PRIMARY KEY,
@@ -658,6 +661,25 @@ export class MonitorIngest
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN owed_since_us INTEGER")
                 this.db.sql.exec("UPDATE pending SET owed_since_us = 0")
             }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'selection_turn'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN selection_turn INTEGER NOT NULL DEFAULT 0")
+            }
+            this.db.sql.exec("CREATE INDEX IF NOT EXISTS pending_by_turn ON pending (selection_turn, did, not_before)")
+            this.db.sql.exec(`
+                CREATE TRIGGER IF NOT EXISTS pending_assign_turn
+                AFTER INSERT ON pending WHEN NEW.selection_turn = 0
+                BEGIN
+                    INSERT INTO meta (k, v) VALUES ('selection_clock', '1')
+                    ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);
+                    UPDATE pending SET selection_turn = CAST(
+                        (SELECT v FROM meta WHERE k = 'selection_clock') AS INTEGER
+                    ) WHERE did = NEW.did;
+                END
+            `)
             if (
                 this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('listing_stage') WHERE name = 'collection'")
@@ -894,19 +916,22 @@ export class MonitorIngest
     ): Promise<void> {
         // Load the stored cursor first so the max below cannot start from nothing.
         if (plcSeq !== undefined) await this.readPlcCursor()
-        this.db.sql.exec(
-            "INSERT INTO key_updates (did, kind, key, as_of, version) VALUES (?, ?, ?, ?, 1) " +
-                "ON CONFLICT(did) DO UPDATE SET kind = excluded.kind, key = excluded.key, " +
-                "as_of = excluded.as_of, version = key_updates.version + 1",
-            did,
-            update.kind,
-            update.kind === "put" ? update.key : null,
-            update.kind === "put" ? update.asOfMs : null
-        )
-        if (plcSeq !== undefined) {
-            this.raisePlcCursor(plcSeq, createdAtMs)
-            this.persistPlcCursor()
-        }
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO key_updates (did, kind, key, as_of, version) VALUES (?, ?, ?, ?, 1) " +
+                    "ON CONFLICT(did) DO UPDATE SET kind = excluded.kind, key = excluded.key, " +
+                    "as_of = excluded.as_of, version = key_updates.version + 1",
+                did,
+                update.kind,
+                update.kind === "put" ? update.key : null,
+                update.kind === "put" ? update.asOfMs : null
+            )
+            this.requestPromptSync(Date.now())
+            if (plcSeq !== undefined) {
+                this.raisePlcCursor(plcSeq, createdAtMs)
+                this.persistPlcCursor()
+            }
+        })
     }
 
     async dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]> {
@@ -1219,51 +1244,75 @@ export class MonitorIngest
         event: { did: string; rev: string },
         cursor: Cursor
     ): Promise<IntakeOutcome> {
-        const known = this.db.sql
-            .exec<{ rev: string }>("SELECT rev FROM revs WHERE did = ?", event.did)
-            .toArray()[0]
-        if (known?.rev === event.rev) {
-            // Still advance: this event is accounted for.
+        return this.ctx.storage.transactionSync(() => {
+            const known = this.db.sql
+                .exec<{ rev: string }>("SELECT rev FROM revs WHERE did = ?", event.did)
+                .toArray()[0]
+            if (known?.rev === event.rev) {
+                // Still advance: this event is accounted for.
+                this.db.sql.exec(
+                    "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
+                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    cursor
+                )
+                return { outcome: "duplicate" }
+            }
+            // A new event is news about the DID: it ends any retry backoff.
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                    "VALUES (?, ?, 0, 0, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                    `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                event.did,
+                event.rev,
+                this.nextOweGen(),
+                streamTimeUs(cursor),
+                Date.now(),
+                this.nextSelectionTurnSync()
+            )
+            this.requestPromptSync(Date.now())
             this.db.sql.exec(
                 "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
                     "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 cursor
             )
-            return { outcome: "duplicate" }
-        }
-        // A new event is news about the DID: it ends any retry backoff.
-        this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
-                "VALUES (?, ?, 0, 0, ?, ?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
-            event.did,
-            event.rev,
-            this.nextOweGen(),
-            streamTimeUs(cursor),
-            Date.now()
-        )
-        this.db.sql.exec(
-            "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            cursor
-        )
-        return { outcome: "accepted" }
+            return { outcome: "accepted" }
+        })
     }
 
     /** Owe a fetch the dedupe check would otherwise suppress. */
     async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                    "VALUES (?, ?, 0, 0, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                    `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                did,
+                rev,
+                this.nextOweGen(),
+                owedSinceUs ?? null,
+                Date.now(),
+                this.nextSelectionTurnSync()
+            )
+            this.requestPromptSync(Date.now())
+        })
+    }
+
+    private requestPromptSync(nowMs: number): void {
+        const requested = nowMs + PROMPT_WAKE_DELAY_MS
+        const prior = Number(this.metaOf("prompt_at"))
+        this.setMeta("prompt_at", String(Number.isFinite(prior) && prior > 0 ? Math.min(prior, requested) : requested))
+        this.setMeta("scheduler_cooldown_ms", "0")
+        this.setMeta("scheduler_cooldown", null)
+    }
+
+    private nextSelectionTurnSync(): number {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
-                "VALUES (?, ?, 0, 0, ?, ?, ?) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
-                `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
-            did,
-            rev,
-            this.nextOweGen(),
-            owedSinceUs ?? null,
-            Date.now()
+            "INSERT INTO meta (k, v) VALUES ('selection_clock', '1') " +
+                "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)"
         )
+        return Number(this.metaOf("selection_clock") ?? 1)
     }
 
     /**
@@ -2057,45 +2106,62 @@ export class MonitorIngest
 
     private oweEvidenceRefreshSync(did: string, rev: string): void {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
-                "VALUES (?, ?, 0, 0, ?, NULL, ?) ON CONFLICT(did) DO NOTHING",
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                "VALUES (?, ?, 0, 0, ?, NULL, ?, ?) ON CONFLICT(did) DO NOTHING",
             did,
             rev,
             this.nextOweGen(),
-            Date.now()
+            Date.now(),
+            this.nextSelectionTurnSync()
         )
     }
 
     async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
-        return this.db.sql
-            .exec<{ did: string; rev: string; attempts: number; not_before: number; quiet: number }>(
-                "SELECT did, rev, attempts, not_before, quiet FROM pending " +
-                    "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
-                nowMs,
-                limit
-            )
-            .toArray()
-            .map((r) => ({
+        const bounded = Math.max(1, Math.min(MAX_SETTLE_BATCH, Math.floor(limit) || MAX_SETTLE_BATCH))
+        return this.ctx.storage.transactionSync(() => {
+            const rows = this.db.sql
+                .exec<{ did: string; rev: string; attempts: number; not_before: number; quiet: number; owed_gen: number }>(
+                    "SELECT did, rev, attempts, not_before, quiet, owed_gen FROM pending " +
+                        "WHERE not_before <= ? ORDER BY selection_turn, did LIMIT ?",
+                    nowMs,
+                    bounded
+                )
+                .toArray()
+            const result = rows.map((r) => ({
                 did: r.did,
                 rev: r.rev,
                 attempts: r.attempts,
                 notBeforeMs: r.not_before,
                 quiet: r.quiet === 1,
+                owedGen: r.owed_gen,
             }))
+            for (const row of rows) {
+                this.db.sql.exec(
+                    "UPDATE pending SET selection_turn = ? WHERE did = ? AND owed_gen = ?",
+                    this.nextSelectionTurnSync(), row.did, row.owed_gen
+                )
+            }
+            return result
+        })
     }
 
     async deferPending(
         did: string,
         notBeforeMs: number,
-        failure: PendingFailure
+        failure: PendingFailure,
+        expectedGeneration?: number | null
     ): Promise<number | null> {
+        if (expectedGeneration === null) return null
+        const generation = expectedGeneration ?? await this.owedGenOf(did)
+        if (generation === null) return null
         const row = this.db.sql
             .exec<{ attempts: number }>(
                 "UPDATE pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
-                    "WHERE did = ? RETURNING attempts",
+                    "WHERE did = ? AND owed_gen = ? RETURNING attempts",
                 notBeforeMs,
                 JSON.stringify(failure),
-                did
+                did,
+                generation
             )
             .toArray()[0]
         return row?.attempts ?? null
@@ -4051,6 +4117,123 @@ export class MonitorIngest
             )
     }
 
+    private serializeStorage<T>(work: () => Promise<T>): Promise<T> {
+        const run = this.storageQueue.then(work, work)
+        this.storageQueue = run.then(() => undefined, () => undefined)
+        return run
+    }
+
+    private pendingStateSync(nowMs: number): { due: number; earliest: number | null } {
+        const due = this.db.sql.exec<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", nowMs
+        ).one().n
+        const earliest = this.db.sql.exec<{ at: number | null }>(
+            "SELECT MIN(not_before) AS at FROM pending WHERE not_before > ?", nowMs
+        ).one().at
+        return { due, earliest }
+    }
+
+    private async reconcileAlarm(): Promise<void> {
+        await this.serializeStorage(async () => {
+            const now = Date.now()
+            const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+            const existingAlarm = await this.db.getAlarm()
+            await this.db.transaction(async () => {
+                let maintenanceAt = Number(this.metaOf("maintenance_at"))
+                if (!Number.isFinite(interval) || interval <= 0) {
+                    maintenanceAt = 0
+                    this.setMeta("maintenance_at", null)
+                    this.setMeta("maintenance_disabled", "1")
+                } else {
+                    this.setMeta("maintenance_disabled", null)
+                }
+                if (!Number.isFinite(maintenanceAt) || maintenanceAt <= 0) {
+                    maintenanceAt = Number.isFinite(interval) && interval > 0 && existingAlarm !== null
+                        ? existingAlarm > now ? existingAlarm : now + PROMPT_WAKE_DELAY_MS
+                        : Number.isFinite(interval) && interval > 0 ? now + interval : 0
+                    this.setMeta("maintenance_at", maintenanceAt > 0 ? String(maintenanceAt) : null)
+                }
+                const pending = this.pendingStateSync(now)
+                const keysRemain = this.db.sql.exec("SELECT 1 FROM key_updates LIMIT 1").toArray().length > 0
+                let promptAt = Number(this.metaOf("prompt_at"))
+                if ((pending.due > 0 || keysRemain) && (!Number.isFinite(promptAt) || promptAt <= 0)) {
+                    promptAt = now + PROMPT_WAKE_DELAY_MS
+                    this.setMeta("prompt_at", String(promptAt))
+                }
+                const cooldown = Number(this.metaOf("scheduler_cooldown"))
+                const requested = Number.isFinite(promptAt) && promptAt > 0
+                    ? Math.max(promptAt > now ? promptAt : now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0)
+                    : 0
+                const pendingAt = pending.due > 0
+                    ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0)
+                    : pending.earliest ?? 0
+                const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + PROMPT_WAKE_DELAY_MS : 0
+                const candidates = [maintenanceWake, requested, keysRemain ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0) : 0, pendingAt, existingAlarm !== null && existingAlarm > now ? existingAlarm : 0].filter((v) => v > 0)
+                if (candidates.length === 0) {
+                    await this.db.deleteAlarm()
+                    return
+                }
+                await this.db.setAlarm(Math.min(...candidates))
+            })
+        })
+    }
+
+    private async requestPromptWakeBestEffort(): Promise<void> {
+        try {
+            await this.reconcileAlarm()
+        } catch (err) {
+            // The durable pending/key row and prompt intent are already committed.
+            // The watchdog or a later start repairs this scheduling gap.
+            console.error("monitor: prompt alarm scheduling failed", err)
+        }
+    }
+
+    private async runPromptPass(nowMs: number): Promise<void> {
+        if (this.alarmPass !== null) return this.alarmPass
+        this.alarmPass = (async () => {
+            await this.db.transaction(async () => {
+                const requested = Number(this.metaOf("prompt_at"))
+                if (Number.isFinite(requested) && requested <= nowMs) this.setMeta("prompt_at", null)
+            })
+            const before = this.db.sql.exec<{ did: string; owed_gen: number; attempts: number; not_before: number }>(
+                "SELECT did, owed_gen, attempts, not_before FROM pending ORDER BY selection_turn, did"
+            ).toArray().map((r) => `${r.did}:${r.owed_gen}:${r.attempts}:${r.not_before}`).join("|")
+            const keyFailed = await this.drainKeys()
+            const batch = this.settleBatch()
+            try {
+                await settleDue(this.deps(), batch)
+            } catch (err) {
+                console.error("monitor: settle failed", err)
+            }
+            const afterRows = this.db.sql.exec<{ did: string; owed_gen: number; attempts: number; not_before: number }>(
+                "SELECT did, owed_gen, attempts, not_before FROM pending ORDER BY selection_turn, did"
+            ).toArray()
+            const after = afterRows.map((r) => `${r.did}:${r.owed_gen}:${r.attempts}:${r.not_before}`).join("|")
+            const pending = this.pendingStateSync(Date.now())
+            if (keyFailed || (pending.due > 0 && before === after)) {
+                const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+                const prior = Number(this.metaOf("scheduler_cooldown_ms"))
+                const base = Number.isFinite(prior) && prior > 0 ? Math.min(prior * 2, Number.isFinite(interval) && interval > 0 ? interval : 120_000) : 1_000
+                this.setMeta("scheduler_cooldown_ms", String(base))
+                this.setMeta("scheduler_cooldown", String(Date.now() + base))
+            } else {
+                this.setMeta("scheduler_cooldown_ms", "0")
+                this.setMeta("scheduler_cooldown", null)
+            }
+        })().finally(async () => {
+            this.alarmPass = null
+            await this.reconcileAlarm()
+        })
+        return this.alarmPass
+    }
+
+    private settleBatch(): number {
+        const configured = Number.parseInt(this.env.SETTLE_BATCH, 10)
+        return !Number.isFinite(configured) || configured <= 0
+            ? MAX_SETTLE_BATCH
+            : Math.min(MAX_SETTLE_BATCH, configured)
+    }
+
     /** One page of the daily re-count of owner-followed DIDs; the cursor persists until a pass completes. */
     private async reconcileOwnerFollowerCounts(
         deps: Parameters<typeof reconcileOwnerFollowers>[0]
@@ -4654,7 +4837,7 @@ export class MonitorIngest
         if (this.socket !== null) return
         const cursor = await this.readCursor()
         this.resumeFromUs = null
-        if (cursor !== null) this.checkStaleCursor(cursor, Date.now())
+        if (cursor !== null) await this.checkStaleCursor(cursor, Date.now())
         const url = new URL(this.env.JETSTREAM_URL)
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
@@ -4682,7 +4865,7 @@ export class MonitorIngest
      * relies on identity and account events keeping the cursor moving on a
      * quiet collection.
      */
-    private checkStaleCursor(cursor: string, nowMs: number): void {
+    private async checkStaleCursor(cursor: string, nowMs: number): Promise<void> {
         const cursorUs = streamTimeUs(cursor)
         if (cursorUs === 0) return
         const lookbackMs = this.envInt(this.env.JETSTREAM_LOOKBACK_MS, 129_600_000)
@@ -4690,19 +4873,21 @@ export class MonitorIngest
             this.resumeFromUs = cursorUs
             return
         }
-        this.startFirehoseRun(nowMs)
+        await this.serializeStorage(async () => this.startFirehoseRun(nowMs))
     }
 
     /**
      * After a resume, a first frame well past the cursor means the stream
      * skipped events.
      */
-    private checkResumeFrame(frameMs: number | null): void {
+    private async checkResumeFrame(frameMs: number | null): Promise<void> {
         if (this.resumeFromUs === null || frameMs === null) return
         const cursorUs = this.resumeFromUs
-        this.resumeFromUs = null
         const toleranceMs = this.envInt(this.env.JETSTREAM_RESUME_TOLERANCE_MS, 60_000)
-        if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) this.startFirehoseRun(Date.now())
+        if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) {
+            await this.serializeStorage(async () => this.startFirehoseRun(Date.now()))
+        }
+        this.resumeFromUs = null
     }
 
     /**
@@ -4724,6 +4909,7 @@ export class MonitorIngest
                 this.env.MONITOR_COLLECTION,
                 nowMs
             )
+            this.requestPromptSync(nowMs)
         })
     }
 
@@ -4844,7 +5030,10 @@ export class MonitorIngest
         const next = this.plcChain.then(async () => {
             const event = decodePlcExportFrame(raw)
             if (event === null) return
-            if ((await intakePlcEvent(this, event, this, this)) === "owed") this.kickDrain()
+            const outcome = await this.serializeStorage(() => intakePlcEvent(this, event, this, this))
+            if (outcome === "owed") {
+                await this.requestPromptWakeBestEffort()
+            }
         })
         this.plcChain = next.catch((err) => {
             console.error("monitor: plc frame failed", err)
@@ -4883,33 +5072,35 @@ export class MonitorIngest
         if (this.plcSocket === ws) this.plcSocket = null
     }
 
-    private kickDrain(): void {
-        void this.drainKeys()
-    }
-
     /**
-     * Apply owed key updates to the cache. Single-flight (a call during a
-     * drain makes it run once more), and never throws:
-     * a failure leaves the updates owed for the next alarm.
+     * Apply one bounded key batch. Remaining rows are continued by a durable
+     * prompt alarm, so continuous stream intake cannot create an unbounded pass.
      */
-    private drainKeys(): Promise<void> {
+    private drainKeys(): Promise<boolean> {
         if (this.draining !== null) {
-            // Owed after the running drain read its batch: go again, rather
-            // than leave it for the next alarm.
-            this.drainAgain = true
             return this.draining
         }
         this.draining = (async () => {
             try {
-                do {
-                    this.drainAgain = false
-                    await drainKeyUpdates(
-                        { index: this, cache: kvSigningKeyCache(this.env), nowMs: () => Date.now() },
-                        KEY_DRAIN_BATCH
-                    )
-                } while (this.drainAgain)
+                const due = await this.dueKeyUpdates(KEY_DRAIN_BATCH)
+                const cache = kvSigningKeyCache(this.env)
+                for (const { did, update, version } of due) {
+                    try {
+                        if (update.kind === "put") {
+                            await cache.put(did, { key: update.key, fetchedAtMs: Math.min(update.asOfMs, Date.now()) })
+                        } else {
+                            await cache.delete(did)
+                        }
+                    } catch (err) {
+                        console.error("monitor: key drain failed", err)
+                        return true
+                    }
+                    await this.clearKeyUpdate(did, version)
+                }
+                return false
             } catch (err) {
                 console.error("monitor: key drain failed", err)
+                return true
             } finally {
                 this.draining = null
             }
@@ -4925,7 +5116,7 @@ export class MonitorIngest
     private async onFrame(raw: string): Promise<void> {
         const event = decodeEvent(raw)
         if (event === null) return
-        this.checkResumeFrame(event.timeMs)
+        await this.checkResumeFrame(event.timeMs)
         // A frame without a parseable time still carries a DID worth
         // looking at; only the cursor is unknown, so hold the last one
         // rather than discard the event. Replaying a little on resume is
@@ -4934,13 +5125,15 @@ export class MonitorIngest
             event.timeMs === null
                 ? await this.readCursor()
                 : String(Math.round(event.timeMs * 1000))
-        const decision = await intake(
+        const decision = await this.serializeStorage(() => intake(
             this.deps(),
             { collection: this.env.MONITOR_COLLECTION, policy: this.interestPolicy() },
             event,
             cursor ?? ""
-        )
-        if (decision === "reverify") this.kickDrain()
+        ))
+        if (decision === "accepted" || decision === "reverify" || decision === "ignored") {
+            await this.requestPromptWakeBestEffort()
+        }
         if (decision === "ignored" && cursor !== null && cursor !== "") this.advanceIgnoredCursor(cursor)
     }
 
@@ -5054,12 +5247,7 @@ export class MonitorIngest
     }
 
     protected async armWatchdog(): Promise<void> {
-        const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
-        if (!Number.isFinite(interval) || interval <= 0) return
-        const existing = await this.db.getAlarm()
-        if (needsRearm(existing, Date.now())) {
-            await this.db.setAlarm(Date.now() + interval)
-        }
+        await this.reconcileAlarm()
     }
 
     /**
@@ -5084,9 +5272,26 @@ export class MonitorIngest
      * and a silently dropped DID, since the stream will not redeliver.
      */
     async alarm(): Promise<void> {
+        const now = Date.now()
+        const maintenanceAt = Number(this.metaOf("maintenance_at"))
+        const promptAt = Number(this.metaOf("prompt_at"))
+        const maintenanceDue = Number.isFinite(maintenanceAt) && maintenanceAt > 0 && maintenanceAt <= now
+        const promptDue = Number.isFinite(promptAt) && promptAt > 0 && promptAt <= now
+        const maintenanceScheduled = Number.isFinite(maintenanceAt) && maintenanceAt > 0
+        const maintenanceDisabled = this.metaOf("maintenance_disabled") === "1"
+        if (!maintenanceDue && promptDue && (maintenanceScheduled || maintenanceDisabled)) {
+            await this.runPromptPass(now)
+            return
+        }
+        if (promptDue) {
+            // This maintenance pass owns both reasons that were due at entry.
+            // A later intake writes a fresh prompt request after this commit.
+            this.ctx.storage.transactionSync(() => this.setMeta("prompt_at", null))
+        }
         try {
             if (this.socket === null) await this.connect()
         } finally {
+          try {
             try {
                 await this.connectPlc()
             } catch (err) {
@@ -5099,7 +5304,15 @@ export class MonitorIngest
             }
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
-            await this.drainKeys()
+            if (await this.drainKeys()) {
+                const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+                const prior = Number(this.metaOf("scheduler_cooldown_ms"))
+                const cooldown = Number.isFinite(prior) && prior > 0
+                    ? Math.min(prior * 2, Number.isFinite(interval) && interval > 0 ? interval : 120_000)
+                    : 1_000
+                this.setMeta("scheduler_cooldown_ms", String(cooldown))
+                this.setMeta("scheduler_cooldown", String(Date.now() + cooldown))
+            }
             try {
                 this.persistPlcCursor()
             } catch (err) {
@@ -5204,7 +5417,7 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: evidence refresh sweep failed", err)
             }
-            const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
+            const batch = this.settleBatch()
             try {
                 await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
             } catch (err) {
@@ -5288,10 +5501,13 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: graph steps failed", err)
             }
+          } finally {
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
             if (Number.isFinite(interval) && interval > 0) {
-                await this.db.setAlarm(Date.now() + interval)
+                this.setMeta("maintenance_at", String(Date.now() + interval))
             }
+            await this.reconcileAlarm()
+          }
         }
     }
 }

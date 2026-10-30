@@ -269,7 +269,7 @@ describe("the one-time re-owe of DIDs marked deleted before the upgrade", () => 
     }
     const windowed = (sql: SqlStorage) => rows(sql, "SELECT did FROM window_members")
 
-    it("every deleted DID is owed once, behind live owes, and the seed never runs twice across evictions", async () => {
+    it("every deleted DID keeps its earlier selection turn, and the seed never runs twice across evictions", async () => {
         const stub = freshStub()
         const t0 = Date.now()
         await upgraded(stub, [DID, BOB])
@@ -280,7 +280,8 @@ describe("the one-time re-owe of DIDs marked deleted before the upgrade", () => 
                 expect(rows(sql, PENDING, did)[0]?.not_before).toBeGreaterThanOrEqual(t0)
             }
             const due = await obj.duePending(Date.now() + 1_000, 10)
-            expect(due[0]?.did).toBe("did:plc:live")
+            expect([DID, BOB]).toContain(due[0]?.did)
+            expect(due.at(-1)?.did).toBe("did:plc:live")
             expect(due.map((d) => d.did).sort()).toEqual(["did:plc:live", BOB, DID].sort())
             await obj.clearPending(DID)
         })
