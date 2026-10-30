@@ -58,17 +58,22 @@ PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 
 # An outbound socket does not hibernate, so this object is evicted on the
 # platform's schedule whatever this value is. The alarm is what reconnects
-# from the stored cursor; eviction is expected, not exceptional.
+# from the stored cursor; eviction is expected, not exceptional. This also
+# caps declaration/key no-progress cooldowns. A declaration cooldown can delay
+# fresh declarations and maintenance's declaration-settlement step, but other
+# maintenance and key work stay independent. The cap is 120 s if disabled.
 WATCHDOG_INTERVAL_MS = "120000"
 
 # Delay before a prompt settlement/key-update alarm after durable intake.
 # Defaults to 100 ms. Tests use a longer delay and explicitly fire alarms.
 PROMPT_WAKE_DELAY_MS = "100"
 
-# Maximum owed declaration fetches selected per prompt or maintenance wake.
+# Maximum owed declaration fetches per prompt wake and ordinary secondary-record
+# fetches per maintenance wake. Own-block proofs use OWN_BLOCK_SETTLE_BATCH.
 # Defaults to 32 and is capped at 32; invalid, zero, or negative values use
-# the default. A larger backlog continues in successive prompt alarms, usually
-# about 100 ms apart. A failed fetch stays owed with backoff: the stream will not redeliver it.
+# the default. Declaration backlogs continue in successive prompt alarms,
+# usually about 100 ms apart; secondary backlogs continue on maintenance wakes.
+# A failed fetch stays owed with backoff: the stream will not redeliver it.
 SETTLE_BATCH = "32"
 # Registered owners' block-record proofs settled per wake, on their own
 # budget so a large owner's backfill never delays the fetches above. At the

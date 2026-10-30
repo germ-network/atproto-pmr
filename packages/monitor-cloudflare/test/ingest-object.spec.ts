@@ -393,6 +393,24 @@ describe("settling what is owed", () => {
 })
 
 describe("the way in", () => {
+    it("keeps the production prompt deadline at 100 ms when unset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                env: MonitorEnv
+                requestPromptSync(nowMs: number): void
+            }
+            internal.env = { ...internal.env, PROMPT_WAKE_DELAY_MS: undefined }
+            const requestedAt = Date.now()
+            internal.requestPromptSync(requestedAt)
+            return {
+                requestedAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(result.promptAt).toBe(result.requestedAt + 100)
+    })
+
     it("migrates a legacy shared cooldown to both lanes so a successful lane can reset", async () => {
         const stub = freshStub()
         const result = await runInDurableObject(stub, (obj: MonitorIngest) => {

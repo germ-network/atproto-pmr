@@ -71,7 +71,8 @@ function harness(state: HeldDeclarationState | null, opts: { verify?: IngestDeps
         completeDeletion: async (_d: string, _at: number, _p: boolean, quiet?: boolean) => void deletions.push({ quiet }),
         clearPending: async () => {},
         markAttempted: async () => {},
-        owedGenOf: async () => 1,
+        // This test exercises direct settles; it does not create a pending row.
+        owedGenOf: async () => null,
         isWatched: async () => true,
         isDeleted: async () => false,
     } as unknown as MonitorIndex

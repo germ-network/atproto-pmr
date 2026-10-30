@@ -237,7 +237,10 @@ export interface IngestConfig {
 
 export type IntakeDecision =
     | "ignored"
-    /** The event is irrelevant to declaration custody but owed a signing-key hint. */
+    /**
+     * The event needs no declaration fetch, but a durable signing-key update
+     * was owed. Adapters must schedule that work and preserve its cursor.
+     */
     | "key-update"
     | "duplicate"
     | "accepted"

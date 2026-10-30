@@ -262,14 +262,18 @@ describe("a repo-level answer on the declaration path", () => {
         const dispose = vi.fn(async () => {})
         const onDelete = vi.fn(async () => {})
         const completeDeletion = vi.fn(async () => {})
-        const clearPending = vi.fn(async () => {})
+        // These helper settles model an already-queued declaration at gen 1.
+        let generation: number | null = 1
+        const clearPending = vi.fn(async (_did: string, expected?: number | null) => {
+            if (expected === generation) generation = null
+        })
         const deps = {
             index: {
                 revOf: async () => (held ? "3m1" : null),
                 holderStateOf: async () => (held ? "held" : null),
                 completeDeletion,
                 clearPending,
-                owedGenOf: async () => 1,
+                owedGenOf: async () => generation,
                 isDeleted: async () => false,
                 isWatched: async () => true,
             } as unknown as MonitorIndex,

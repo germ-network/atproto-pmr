@@ -32,7 +32,7 @@ function fakeIndex(overrides: Partial<MonitorIndex> = {}): {
             owedGenerations.set(did, (owedGenerations.get(did) ?? 0) + 1)
         },
         owedGenOf: async (did) => owedGenerations.get(did) ?? null,
-        clearPending: async () => {},
+        clearPending: async (did) => void owedGenerations.delete(did),
         markAttempted: async () => {},
         isWatched: async () => false,
         complete: async () => {},

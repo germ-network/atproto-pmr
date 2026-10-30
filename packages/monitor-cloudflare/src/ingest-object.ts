@@ -1286,7 +1286,10 @@ export class MonitorIngest
         })
     }
 
-    /** Owe a fetch the dedupe check would otherwise suppress. */
+    /**
+     * Owe a fetch the dedupe check would otherwise suppress. Persists prompt
+     * intent for callers; socket intake also reconciles the alarm after commit.
+     */
     async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
@@ -2914,6 +2917,11 @@ export class MonitorIngest
         )
     }
 
+    /**
+     * Add quiet join obligations while applying an interest transition in an
+     * alarm. It does not arm a prompt itself; that alarm's final reconciliation
+     * schedules any declaration still pending after the bounded settle pass.
+     */
     async oweJoin(did: string, records: readonly WatchedRecord[], epoch: number): Promise<void> {
         if ((await this.interestEpoch(did)) !== epoch) return
         this.ctx.storage.transactionSync(() => {
@@ -4355,6 +4363,8 @@ export class MonitorIngest
     }
 
     private settleBatch(): number {
+        // Shared by declarations and ordinary secondary records. The own-block
+        // proof lane has its own separate OWN_BLOCK_SETTLE_BATCH budget.
         const configured = Number(this.env.SETTLE_BATCH)
         return Number.isInteger(configured) && configured > 0
             ? Math.min(MAX_SETTLE_BATCH, configured)
@@ -4888,7 +4898,10 @@ export class MonitorIngest
             snapshot: kvSnapshotStore(this.env),
             fetchRecord: (ref) => this.fetchRecordAt(ref),
             verify: (ref, record) => this.verifyRecordAt(ref, record),
-            // Owed quietly for a DID never held, which no one is waiting to hear about.
+            // Alarm-owned secondary settlement can owe a quiet declaration.
+            // Held DIDs use owe(), which persists prompt intent. For a never-held
+            // DID this inserts directly; the maintenance alarm's final
+            // reconciliation schedules any row left after its bounded settle.
             deferToDeclaration: async (did) => {
                 const held = await this.revOf(did)
                 if (held === null) {
