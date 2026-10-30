@@ -73,8 +73,8 @@ export interface VerificationHint {
     /**
      * CID of the sender's declaration record the relay verified the payload
      * against (CIDv1, dag-cbor, sha2-256, base32-lower: `bafyrei…`). A
-     * freshness cue for the device — the newest declaration this relay has
-     * seen — not a trust signal and not a key identifier.
+     * Locator for the one selected proof held for this sender-specific pair
+     * generation — not a trust signal or key identifier.
      */
     declarationCID: string
 }
@@ -83,6 +83,29 @@ export interface MessageRef {
     messageId: MessageId
     byteLength: number
     hint?: VerificationHint
+    /** Opaque generation of a sender-specific pair mailbox. Absent on legacy rows. */
+    pairGeneration?: string
+}
+
+/** The independently verified proof selected for one sender-specific mailbox generation. */
+export interface PairMailboxEvidence {
+    senderDID: PairMailboxKey
+    anchorKey: Uint8Array
+    declarationCID: string
+    car: Uint8Array
+}
+
+export interface StoredPairMailboxEvidence extends PairMailboxEvidence {
+    generation: string
+}
+
+export interface PairAppendResult {
+    result: AppendResult | PoolAppendResult
+    generation: string
+    evidenceCID: string
+    generationChanged: boolean
+    /** Accepted refs discarded when a confirmed sender-key change recycled this mailbox. */
+    recycledMessageIds: MessageId[]
 }
 
 export type AppendResult =
@@ -150,6 +173,8 @@ export type PoolAppendResult =
 export interface MailboxSnapshot {
     key: MailboxKey
     messages: MessageRef[]
+    /** Current sender-specific pair generation, including an empty mailbox. */
+    pairGeneration?: string
 }
 
 export interface OpenMailboxesPage {
@@ -444,10 +469,26 @@ export interface PMRStore {
         nowSeconds: number
     ): Promise<AppendResult>
 
+    /**
+     * Pair-put variant that atomically reconciles the sender key generation
+     * and then appends to the provisioned mailbox or recovery pool. A changed
+     * key is supplied only after independent declaration verification.
+     */
+    appendPair(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        evidence: PairMailboxEvidence
+    ): Promise<PairAppendResult>
+
+    /** Exact selected proof for a sender-specific mailbox, or null on a miss. */
+    getPairEvidence(key: PairMailboxKey, evidenceCID: string): Promise<StoredPairMailboxEvidence | null>
+
     list(key: MailboxKey, limit: number): Promise<MessageRef[]>
 
     /** CONSISTENCY CONTRACT (6): MUST succeed on an already-removed record. */
-    remove(key: MailboxKey, messageId: MessageId): Promise<void>
+    remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void>
 
     /**
      * Best-effort live delivery of a message that was just appended and whose
@@ -470,6 +511,7 @@ export interface PMRStore {
      * it is a separate operation rather than folded into `append`.
      */
     deliverLive?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
+
 
     /**
      * Best-effort Web Push notification for a message that was just

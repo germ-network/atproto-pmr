@@ -17,8 +17,8 @@ import { snapshotRecordReader, type RecordSnapshot } from "./snapshot-read"
  * sender's PDS: an inline fetch there would tell the sender's PDS when the
  * sender sends, and the sender's PDS is the party whose claim is being
  * checked. Only a snapshot the monitor has let lapse is checked against the
- * PDS, for change alone. It returns the declaration record's CID alongside
- * the anchor key so the delivery hint can name exactly what was verified.
+ * PDS, for change alone. It returns the verified declaration CAR, CID and
+ * anchor key so the receiver can fetch exactly what was verified.
  */
 
 export type DeclarationResolution =
@@ -42,13 +42,12 @@ export type DeclarationResolution =
       }
 
 /**
- * What pair-put admission needs: the anchor key AND the CID of the
- * declaration record it came from, so the delivery hint can name exactly the
- * declaration the relay verified against. Kept distinct from
+ * What pair-put admission needs: the anchor key, CID and proof CAR of the
+ * declaration record it came from. Kept distinct from
  * `DeclarationResolution` so the PDS resolver cannot be wired into pair put.
  */
 export type SenderDeclarationResolution =
-    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string }
+    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string; evidenceCAR: Uint8Array }
     | { found: false; reason: string }
 
 /** A third party's stored proof of a DID's declaration. */
@@ -100,6 +99,7 @@ export function snapshotDeclarationResolver(
                 found: true,
                 anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
                 declarationCID: result.cid,
+                evidenceCAR: result.car,
             }
         } catch (error) {
             return { found: false, reason: `malformed currentKey: ${String(error)}` }

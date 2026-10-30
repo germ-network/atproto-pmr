@@ -7,6 +7,7 @@ import {
     BodyStore,
     Directory,
     Locator,
+    MessageRef,
     PairMailboxKey,
     PMRStore,
 } from "./storage.js"
@@ -27,9 +28,9 @@ export interface PairPutDeps {
     store: (locator: Locator) => PMRStore
     bodies: BodyStore
     /**
-     * DID → declaration → anchor key. Injected because it makes a network
-     * call, which a test must be able to replace and a platform may want to
-     * route through its own fetch.
+     * DID → independently verified declaration CAR → anchor key and CID.
+     * Injected because the monitor read makes a network call, which a test
+     * must be able to replace and a platform may route through its own fetch.
      */
     resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
     /**
@@ -163,7 +164,7 @@ export async function handlePairPut(
 
     const mailboxKey = senderKey
     const messageId = deriveMessageId(envelope.payload.payload)
-    const ref = {
+    const ref: MessageRef = {
         messageId,
         byteLength: envelope.payload.payload.byteLength,
         hint: {
@@ -179,74 +180,38 @@ export async function handlePairPut(
             nowSeconds + config.limits.messageExpirySeconds
         )
 
-    if (await store.hasMailbox(mailboxKey)) {
-        const result = await store.append(
-            mailboxKey,
-            ref,
-            envelope.payload.nonce,
-            nowSeconds
-        )
-        if (result.outcome === "refused") {
-            return new Response(null, {
-                status: 429,
-                headers: {
-                    "Retry-After": String(
-                        Math.max(0, result.retryAfter - nowSeconds)
-                    ),
-                },
-            })
-        }
-        if (result.outcome === "appended" && result.persistBody) {
-            // `persistBody` is false when the append was absorbed by the
-            // synthetic mailbox. Checking it — rather than storing
-            // unconditionally — is what keeps "no bytes for a blocked
-            // sender" true even though this code cannot tell blocked from
-            // real. `duplicate` never re-stores; the body already landed.
-            deps.defer(
-                (async () => {
-                    await storeBody()
-                    // Best effort, and sequenced after the body write: a
-                    // failed push costs the recipient a reconnect-drain,
-                    // never a message, since the entry stays queued either
-                    // way. Swallowing the error here (not on storeBody)
-                    // keeps that asymmetry — the body MUST land even if the
-                    // live push doesn't.
-                    try {
-                        await store.deliverLive?.(
-                            mailboxKey,
-                            ref,
-                            envelope.payload.payload
-                        )
-                    } catch {}
-                    // Same asymmetry as deliverLive: a failed push costs
-                    // nothing beyond itself, so its error is swallowed
-                    // separately rather than let it prevent deliverLive
-                    // from running or vice versa.
-                    try {
-                        await store.deliverPush?.(
-                            mailboxKey,
-                            ref,
-                            envelope.payload.payload
-                        )
-                    } catch {}
-                })()
-            )
-        }
-        return new Response(null, { status: 202 })
-    }
-
-    // Unprovisioned: the recovery pool. Discard status is checked INSIDE
-    // `appendToPool`, not by a separate call this code branches on — a
-    // discarded sender's put must cost the same round trip a pooled one
-    // does, or the count itself becomes an oracle.
-    const pooled = await store.appendToPool(
+    // The key binding, generation recycle, and append must be one atomic
+    // store operation. Splitting reconciliation from append can admit an
+    // obsolete-key put between the two calls.
+    const pair = await store.appendPair(
         mailboxKey,
         ref,
         envelope.payload.nonce,
-        nowSeconds
+        nowSeconds,
+        {
+            senderDID: mailboxKey,
+            anchorKey: declaration.anchorKey.x,
+            declarationCID: declaration.declarationCID,
+            car: declaration.evidenceCAR,
+        }
     )
-    if (pooled.outcome === "pooled" && pooled.persistBody) {
-        deps.defer(storeBody())
+    ref.pairGeneration = pair.generation
+    ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
+    const appendResult = pair.result
+    if (appendResult.outcome === "refused") {
+        return new Response(null, {
+            status: 429,
+            headers: { "Retry-After": String(Math.max(0, appendResult.retryAfter - nowSeconds)) },
+        })
+    }
+    if ((appendResult.outcome === "appended" || appendResult.outcome === "pooled") && appendResult.persistBody) {
+        deps.defer((async () => {
+            await storeBody()
+            if (appendResult.outcome === "appended") {
+                try { await store.deliverLive?.(mailboxKey, ref, envelope.payload.payload) } catch {}
+                try { await store.deliverPush?.(mailboxKey, ref, envelope.payload.payload) } catch {}
+            }
+        })())
     }
     return new Response(null, { status: 202 })
 }

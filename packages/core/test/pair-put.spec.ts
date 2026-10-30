@@ -36,13 +36,16 @@ function world(resolution: (did: string) => SenderDeclarationResolution) {
     let recipientKnown = true
     const store = {
         hasMailbox: async () => hasMailbox,
-        append: async (key: string, ref: MessageRef) => {
+        appendPair: async (key: string, ref: MessageRef) => {
             appended.push({ key, ref })
-            return { outcome: "appended", persistBody: true }
-        },
-        appendToPool: async (key: string, ref: MessageRef) => {
-            appended.push({ key, ref })
-            return { outcome: "pooled", persistBody: true }
+            return {
+                result: hasMailbox
+                    ? { outcome: "appended", persistBody: true }
+                    : { outcome: "pooled", persistBody: true },
+                generation: "generation-1",
+                evidenceCID: DC,
+                recycledMessageIds: [],
+            }
         },
     } as unknown as PMRStore
     const deferred: Promise<unknown>[] = []
@@ -57,6 +60,7 @@ function world(resolution: (did: string) => SenderDeclarationResolution) {
         store: () => store,
         bodies: {
             putBody: async (id: string) => void bodies.push(id),
+            deleteBody: async () => {},
         } as never,
         resolveDeclaration: async (did) => resolution(did),
         defer: (work) => void deferred.push(work),
@@ -98,6 +102,7 @@ const known = (publicKey: Uint8Array) => (): SenderDeclarationResolution => ({
     found: true,
     anchorKey: { x: publicKey },
     declarationCID: DC,
+    evidenceCAR: new Uint8Array([1]),
 })
 
 describe("handlePairPut", () => {
@@ -109,6 +114,7 @@ describe("handlePairPut", () => {
         expect(response.status).toBe(202)
         expect(w.appended).toHaveLength(1)
         expect(w.appended[0]!.ref.hint).toEqual({ senderDID: SENDER, declarationCID: DC })
+        expect(w.appended[0]!.ref.pairGeneration).toBe("generation-1")
         expect(w.bodies).toHaveLength(1)
     })
 

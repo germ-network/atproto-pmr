@@ -44,6 +44,102 @@ function freshStub(): DurableObjectStub<PMRObject> {
 }
 
 describe("a provisioned pair mailbox refuses when full", () => {
+    it("keeps one proof for same-key edits and atomically recycles only that sender on key change", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:pair-evidence-sender" as const
+        const other = "did:plc:pair-evidence-other" as const
+        const firstEvidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(1),
+            declarationCID: "bafy-first",
+            car: new Uint8Array([1, 2, 3]),
+        }
+        const nonce = (value: number) => new Uint8Array(16).fill(value)
+
+        await inPMR(stub, async (pmr) => {
+            const first = await pmr.appendPair(sender, ref("same-id"), nonce(1), T0, firstEvidence)
+            expect(first.generationChanged).toBe(true)
+            await pmr.provisionFromPool(sender, T0)
+            const sameKey = await pmr.appendPair(
+                sender,
+                ref("same-id"),
+                nonce(2),
+                T0,
+                { ...firstEvidence, declarationCID: "bafy-edited", car: new Uint8Array([4]) }
+            )
+            expect(sameKey.generation).toBe(first.generation)
+            expect(sameKey.generationChanged).toBe(false)
+            expect(sameKey.evidenceCID).toBe("bafy-first")
+            expect(await pmr.getPairEvidence(sender, "bafy-first")).toMatchObject({
+                generation: first.generation,
+                declarationCID: "bafy-first",
+                car: new Uint8Array([1, 2, 3]),
+            })
+            expect(await pmr.getPairEvidence(sender, "bafy-edited")).toBeNull()
+
+            await pmr.appendPair(other, ref("other-id"), nonce(3), T0, {
+                ...firstEvidence,
+                senderDID: other,
+            })
+            const rotated = await pmr.appendPair(
+                sender,
+                ref("same-id"),
+                nonce(4),
+                T0,
+                {
+                    ...firstEvidence,
+                    anchorKey: new Uint8Array(32).fill(2),
+                    declarationCID: "bafy-rotated",
+                    car: new Uint8Array([9]),
+                }
+            )
+            expect(rotated.generation).not.toBe(first.generation)
+            expect(rotated.generationChanged).toBe(true)
+            expect(rotated.recycledMessageIds).toContain("same-id")
+            expect(await pmr.list(sender, 10)).toEqual([
+                expect.objectContaining({ messageId: "same-id", pairGeneration: rotated.generation }),
+            ])
+
+            // An ack from the disposed generation cannot remove a same-ID
+            // entry accepted into its replacement generation.
+            await pmr.remove(sender, "same-id", first.generation)
+            await pmr.remove(sender, "same-id")
+            expect(await pmr.list(sender, 10)).toHaveLength(1)
+            await pmr.remove(sender, "same-id", rotated.generation)
+            expect(await pmr.list(sender, 10)).toHaveLength(0)
+            expect(await pmr.getPairEvidence(other, "bafy-first")).not.toBeNull()
+        })
+    })
+
+    it("paginates empty pair-generation descriptors alongside queued mailboxes", async () => {
+        const stub = freshStub()
+        const first = "did:plc:generation-a" as const
+        const second = "did:plc:generation-b" as const
+        const nonce = (value: number) => new Uint8Array(16).fill(value)
+        const evidence = (senderDID: typeof first) => ({
+            senderDID,
+            anchorKey: new Uint8Array(32).fill(3),
+            declarationCID: `bafy-${senderDID.slice(-1)}`,
+            car: new Uint8Array([3]),
+        })
+        await inPMR(stub, async (pmr) => {
+            const a = await pmr.appendPair(first, ref("a"), nonce(5), T0, evidence(first))
+            await pmr.provisionFromPool(first, T0)
+            await pmr.remove(first, "a", a.generation)
+            const b = await pmr.appendPair(second, ref("b"), nonce(6), T0, evidence(second))
+
+            const one = await pmr.openMailboxes(null, 1)
+            expect(one.entries).toEqual([
+                { key: first, messages: [], pairGeneration: a.generation },
+            ])
+            const two = await pmr.openMailboxes(one.nextCursor, 1)
+            expect(two.entries).toEqual([
+                { key: second, messages: [], pairGeneration: b.generation },
+            ])
+            expect(two.nextCursor).toBeNull()
+        })
+    })
+
     it("accepts up to capacity, then refuses", async () => {
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)

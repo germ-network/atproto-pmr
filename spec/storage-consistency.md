@@ -144,6 +144,24 @@ distinct name.
 | `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps |
 | `poolSenders() -> [senderKey]` | adjudication; **DIDs only, never bodies** |
 
+`appendPair(senderDID, messageRef, nonce, verifiedEvidence)` is the pair-put
+operation for generation-aware stores. Its key binding, generation selection,
+rotation disposal, nonce check, and append MUST be one serialized operation.
+The store retains one verified CAR and its declaration CID per sender-specific
+pair generation. A same-anchor-key declaration edit keeps that generation and
+selected evidence; it MUST NOT create per-message or per-revision proof rows.
+A confirmed different anchor key allocates a new opaque generation, removes
+undelivered queue and pool refs for that sender, clears its replay nonce set,
+and replaces the old proof. It MUST NOT affect another sender. Missing or
+unverifiable evidence cannot call this operation and never establishes a
+rotation.
+
+Pair deliveries carry the generation. An acknowledgement removes a pair ref
+only when its generation matches that ref's current generation. Missing or
+stale generations are no-ops; grant mailbox acknowledgements remain unchanged.
+The relay advertises pair-generation support with `pg: true`; on upgraded
+stores, legacy refs without a generation remain distinguishable until drained.
+
 **Do not implement the pool by reusing `append` with a different cap.** The
 eviction direction is opposite, and conflating them is how a recovery
 attempt gets refused or a first-contact message silently dropped — the two

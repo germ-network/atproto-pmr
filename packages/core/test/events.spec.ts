@@ -60,6 +60,27 @@ describe("frame encode/decode", () => {
         expect(decoded.body.get("dc")).toBe(DC)
     })
 
+    it("carries the pair generation on delivery and ack frames", () => {
+        const delivery = decodeFrame(
+            encodeDeliveryFrame(
+                "did:plc:alice",
+                { ...ref("m1", { senderDID: "did:plc:sender", declarationCID: DC }), pairGeneration: "g-7" },
+                new Uint8Array([1])
+            )
+        )
+        expect(delivery.body.get("g")).toBe("g-7")
+
+        const ack = new Uint8Array([
+            ...encodeCose(new Map<string, CoseValue>([["op", 1], ["t", "#ack"]])),
+            ...encodeCose(new Map<string, CoseValue>([["k", "did:plc:alice"], ["id", "m1"], ["g", "g-7"]])),
+        ])
+        expect(decodeAckFrame(ack)).toEqual({
+            key: "did:plc:alice",
+            messageId: "m1",
+            pairGeneration: "g-7",
+        })
+    })
+
     it("the pool and caughtUp frames carry empty bodies", () => {
         expect(decodeFrame(encodePoolFrame())).toEqual({ type: "pool", body: new Map() })
         expect(decodeFrame(encodeCaughtUpFrame())).toEqual({
@@ -74,6 +95,13 @@ describe("frame encode/decode", () => {
             expect(decoded.type).toBe("capabilities")
             expect(decoded.body.get("gr")).toBe(grant)
         }
+    })
+
+    it("advertises and decodes pair-generation support", () => {
+        const decoded = decodeFrame(
+            encodeCapabilitiesFrame({ grant: "active", pairGeneration: true })
+        )
+        expect(decoded.body.get("pg")).toBe(true)
     })
 
     it("is two concatenated top-level canonical CBOR values, not one wrapped structure", () => {

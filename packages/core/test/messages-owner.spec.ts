@@ -38,8 +38,8 @@ const ORIGIN = "https://relay.example"
 const MESSAGES_URL = `${ORIGIN}/pmr/v1/messages`
 const ACKS_URL = `${ORIGIN}/pmr/v1/messages/acks`
 
-function ref(id: string, hint?: MessageRef["hint"]): MessageRef {
-    return { messageId: id, byteLength: 5, hint }
+function ref(id: string, hint?: MessageRef["hint"], pairGeneration?: string): MessageRef {
+    return { messageId: id, byteLength: 5, hint, ...(pairGeneration === undefined ? {} : { pairGeneration }) }
 }
 
 function memoryChallenges(): ChallengeStore {
@@ -67,7 +67,7 @@ function world() {
     const challenges = memoryChallenges()
     const mailboxesByLocator = new Map<string, Map<string, MessageRef[]>>()
     const bodies = new Map<string, Uint8Array>()
-    const removed: { locator: string; key: string; messageId: string }[] = []
+    const removed: { locator: string; key: string; messageId: string; pairGeneration?: string }[] = []
 
     const directory = {
         async resolve(did: string): Promise<Locator | null> {
@@ -104,8 +104,8 @@ function world() {
                     startIndex + limit < keys.length ? page[page.length - 1] : null
                 return { entries, nextCursor }
             },
-            async remove(key, messageId) {
-                removed.push({ locator, key, messageId })
+            async remove(key, messageId, pairGeneration) {
+                removed.push({ locator, key, messageId, ...(pairGeneration === undefined ? {} : { pairGeneration }) })
                 const queue = mailboxes.get(key)
                 if (queue === undefined) return
                 mailboxes.set(key, queue.filter((r) => r.messageId !== messageId))
@@ -186,7 +186,7 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         expect(response.status).toBe(401)
     })
 
-    it("carries k/id/m, and sd/kt only when the ref has a hint", async () => {
+    it("carries k/id/m, proof locator and generation only on pair refs", async () => {
         const w = world()
         const did = "did:plc:alice0000000000000000"
         const secretKey = await registeredOwner(w, did)
@@ -194,7 +194,7 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         const mailboxes = w.mailboxesFor(locator)
 
         mailboxes.set(did, [
-            ref("m1", { senderDID: "did:plc:sender", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" }),
+            ref("m1", { senderDID: "did:plc:sender", declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e" }, "generation-2"),
         ])
         mailboxes.set("grant:addr", [ref("m2")])
         w.bodies.set("m1", new TextEncoder().encode("hello"))
@@ -214,7 +214,7 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         expect(pairEntry.get("m")).toEqual(new TextEncoder().encode("hello"))
         expect(pairEntry.get("sd")).toBe("did:plc:sender")
         expect(pairEntry.get("dc")).toBe("bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e")
-        expect(pairEntry.has("kt")).toBe(false)
+        expect(pairEntry.get("g")).toBe("generation-2")
 
         const grantEntry = ms.find((m) => m.get("id") === "m2")!
         expect(grantEntry.get("k")).toBe("grant:addr")
@@ -331,13 +331,17 @@ describe("GET /pmr/v1/messages — catch-up", () => {
 })
 
 describe("POST /pmr/v1/messages/acks — batch ack", () => {
-    function ackBody(acks: { k: string; id: string }[]): Uint8Array {
+    function ackBody(acks: { k: string; id: string; g?: string }[]): Uint8Array {
         return encodeCose(
             new Map<string, CoseValue>([
                 [
                     "a",
                     acks.map(
-                        (a) => new Map<string, CoseValue>([["k", a.k], ["id", a.id]])
+                        (a) => new Map<string, CoseValue>([
+                            ["k", a.k],
+                            ["id", a.id],
+                            ...(a.g === undefined ? [] : [["g", a.g] as [string, CoseValue]]),
+                        ])
                     ),
                 ],
             ])
@@ -367,6 +371,24 @@ describe("POST /pmr/v1/messages/acks — batch ack", () => {
         )
         expect(response.status).toBe(204)
         expect(w.mailboxesFor(locator).get(did)).toEqual([])
+    })
+
+    it("passes the pair generation through to atomic storage removal", async () => {
+        const w = world()
+        const did = "did:plc:frank-generation0000000"
+        const secretKey = await registeredOwner(w, did)
+        const body = ackBody([{ k: "did:plc:sender", id: "m1", g: "generation-4" }])
+        const response = await handleMessagesAcks(
+            signedRequest(ACKS_URL, "POST", secretKey, await challengeFor(w, did), body),
+            deps(w)
+        )
+        expect(response.status).toBe(204)
+        expect(w.removed).toContainEqual({
+            locator: `loc:${did}`,
+            key: "did:plc:sender",
+            messageId: "m1",
+            pairGeneration: "generation-4",
+        })
     })
 
     it("re-posting the identical batch is a no-op — acks are idempotent", async () => {

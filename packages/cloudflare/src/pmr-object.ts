@@ -7,11 +7,15 @@ import {
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
+    encodePairGenerationFrame,
     handleAckFrame,
     isPairMailboxKey,
     parseGrantLifecycle,
     reconcileWatchState,
     type AppendResult,
+    type PairAppendResult,
+    type PairMailboxEvidence,
+    type StoredPairMailboxEvidence,
     type EffectiveCapabilities,
     type GrantLifecycle,
     type GrantSummary,
@@ -111,6 +115,7 @@ const POOL_PREFIX = "pool:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
+const PAIR_EVIDENCE_PREFIX = "pairEvidence:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
@@ -118,6 +123,7 @@ const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
+const pairEvidenceKey = (k: MailboxKey) => `${PAIR_EVIDENCE_PREFIX}${k}`
 const grantRowKey = (address: string) => `${GRANT_ROW_PREFIX}${address}`
 
 interface GrantRow {
@@ -125,6 +131,8 @@ interface GrantRow {
     expiresAt: number
     closed: boolean
 }
+
+type StoredPairEvidence = StoredPairMailboxEvidence
 
 /**
  * How many recently-accepted nonces a mailbox key remembers.
@@ -142,9 +150,17 @@ interface GrantRow {
  * after legitimately sending this many fresher ones.
  */
 const NONCE_SEEN_SET_SIZE = 256
+const MAX_PAIR_EVIDENCE_BYTES = 1_000_000
 
 const nonceHex = (n: Nonce) =>
     [...n].map((b) => b.toString(16).padStart(2, "0")).join("")
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.byteLength !== b.byteLength) return false
+    let diff = 0
+    for (let i = 0; i < a.byteLength; i++) diff |= a[i]! ^ b[i]!
+    return diff === 0
+}
 
 /** For logging: the push-service host, never the full capability URL. */
 const safeOrigin = (endpoint: string): string => {
@@ -202,7 +218,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             if (!live) grant = "absent"
         }
 
-        return { grant }
+        return { grant, pairGeneration: true }
     }
 
     /**
@@ -532,6 +548,92 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     // MARK: - Pair mailboxes
 
     /**
+     * Pair evidence, its generation and the accepted append share one
+     * serialized operation. Unknown evidence never reaches this method: the
+     * caller supplies only a declaration independently verified at ingest.
+     */
+    async appendPair(
+        key: `did:${string}`,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        evidence: PairMailboxEvidence
+    ): Promise<PairAppendResult> {
+        return this.ctx.blockConcurrencyWhile(async () => {
+        if (evidence.senderDID !== key || evidence.anchorKey.byteLength !== 32) {
+            throw new Error("pair evidence does not match sender mailbox")
+        }
+        if (evidence.car.byteLength > MAX_PAIR_EVIDENCE_BYTES) {
+            throw new Error("pair evidence exceeds storage limit")
+        }
+
+        const evidenceKey = pairEvidenceKey(key)
+        const prior = await this.db.get<StoredPairEvidence>(evidenceKey)
+        let selected: StoredPairEvidence
+        let recycledMessageIds: string[] = []
+        let generationChanged = false
+        if (prior === undefined) {
+            selected = { ...evidence, generation: crypto.randomUUID() }
+            await this.db.put(evidenceKey, selected)
+            generationChanged = true
+        } else if (!sameBytes(prior.anchorKey, evidence.anchorKey)) {
+            const [queue, pool] = await Promise.all([
+                this.db.get<MessageRef[]>(mailboxKey(key)),
+                this.db.get<MessageRef[]>(poolKey(key)),
+            ])
+            recycledMessageIds = [...(queue ?? []), ...(pool ?? [])].map((r) => r.messageId)
+            // Preserve provisioned-vs-pooled status while disposing of all
+            // undelivered old-key work. The evidence row changes atomically
+            // with the generation that subsequent puts will carry.
+            if (queue !== undefined) await this.db.put(mailboxKey(key), [])
+            await this.releasePool(key, pool ?? [])
+            await this.db.delete(nonceSetKey(key))
+            await this.db.delete(retryHintKey(key))
+            selected = { ...evidence, generation: crypto.randomUUID() }
+            await this.db.put(evidenceKey, selected)
+            generationChanged = true
+        } else {
+            // A declaration edit is not a new mailbox generation. Retain one
+            // selected proof rather than archiving every same-key revision.
+            selected = prior
+        }
+
+        if (
+            generationChanged &&
+            (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined &&
+            this.ctx.getWebSockets().length > 0
+        ) {
+            this.broadcast(encodePairGenerationFrame(key, selected.generation))
+        }
+
+        const boundRef: MessageRef = {
+            ...ref,
+            pairGeneration: selected.generation,
+            hint: { senderDID: key, declarationCID: selected.declarationCID },
+        }
+        const result = (await this.hasMailbox(key))
+            ? await this.append(key, boundRef, nonce, nowSeconds)
+            : await this.appendToPool(key, boundRef, nonce, nowSeconds)
+        return {
+            result,
+            generation: selected.generation,
+            evidenceCID: selected.declarationCID,
+            generationChanged,
+            recycledMessageIds,
+        }
+        })
+    }
+
+    async getPairEvidence(
+        key: `did:${string}`,
+        evidenceCID: string
+    ): Promise<StoredPairMailboxEvidence | null> {
+        const evidence = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
+        if (evidence === undefined || evidence.declarationCID !== evidenceCID) return null
+        return evidence
+    }
+
+    /**
      * Appends to a provisioned pair mailbox, or advances the synthetic
      * mailbox if the sender is blocked. The caller cannot tell which
      * happened, and neither can the sender.
@@ -677,9 +779,13 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     /** Idempotent: the client's ack path retries (contract 6). */
-    async remove(key: MailboxKey, messageId: MessageId): Promise<void> {
+    async remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void> {
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
         if (queue === undefined) return
+        const existing = queue.find((r) => r.messageId === messageId)
+        if (existing === undefined) return
+        if (isPairMailboxKey(key) && existing.pairGeneration !== undefined &&
+            (pairGeneration === undefined || pairGeneration !== existing.pairGeneration)) return
         const remaining = queue.filter((r) => r.messageId !== messageId)
         if (remaining.length === queue.length) return
         await this.db.put(mailboxKey(key), remaining)
@@ -705,27 +811,67 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         cursor: string | null,
         limit: number
     ): Promise<OpenMailboxesPage> {
-        const raw = await this.db.list<MessageRef[]>({
-            prefix: MAILBOX_PREFIX,
-            startAfter: cursor ?? undefined,
-            limit: limit + 1,
-        })
-        const rows = [...raw].slice(0, limit)
-        const hasMore = raw.size > limit
-
-        const entries: MailboxSnapshot[] = []
-        for (const [k, messages] of rows) {
-            if (messages.length === 0) continue
-            // `mailboxKey()` is the only writer of this family, and it takes
-            // a `MailboxKey`, so slicing its prefix back off recovers one.
-            entries.push({
-                key: k.slice(MAILBOX_PREFIX.length) as MailboxKey,
-                messages,
+        // Older clients may return the prior physical `mbox:` cursor; newer
+        // pages use the shared logical mailbox key to merge message rows and
+        // empty pair-generation descriptors in one stable order.
+        const encoded = cursor?.startsWith("@") === true
+        const physical =
+            cursor?.startsWith(MAILBOX_PREFIX) === true ||
+            cursor?.startsWith(PAIR_EVIDENCE_PREFIX) === true
+        const after = encoded
+            ? cursor!.slice(1)
+            : cursor?.startsWith(MAILBOX_PREFIX)
+              ? cursor.slice(MAILBOX_PREFIX.length)
+              : cursor?.startsWith(PAIR_EVIDENCE_PREFIX)
+                ? cursor.slice(PAIR_EVIDENCE_PREFIX.length)
+                : cursor
+        const startAfterMailbox =
+            after === null
+                ? undefined
+                : encoded || physical
+                  ? mailboxKey(after as MailboxKey)
+                  : cursor!
+        const startAfterEvidence =
+            after === null
+                ? undefined
+                : encoded || physical
+                  ? pairEvidenceKey(after as MailboxKey)
+                  : cursor!
+        const [mailboxes, proofs] = await Promise.all([
+            this.db.list<MessageRef[]>({
+                prefix: MAILBOX_PREFIX,
+                startAfter: startAfterMailbox,
+                limit: limit + 1,
+            }),
+            this.db.list<StoredPairEvidence>({
+                prefix: PAIR_EVIDENCE_PREFIX,
+                startAfter: startAfterEvidence,
+                limit: limit + 1,
+            }),
+        ])
+        const combined = new Map<MailboxKey, MailboxSnapshot>()
+        for (const [rawKey, messages] of mailboxes) {
+            const key = rawKey.slice(MAILBOX_PREFIX.length) as MailboxKey
+            combined.set(key, { key, messages })
+        }
+        for (const [rawKey, evidence] of proofs) {
+            const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as MailboxKey
+            const previous = combined.get(key)
+            combined.set(key, {
+                key,
+                messages: previous?.messages ?? [],
+                pairGeneration: evidence.generation,
             })
         }
+        const all = [...combined.values()].sort((a, b) =>
+            a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+        )
+        const rows = all.slice(0, limit)
+        const hasMore = all.length > limit || mailboxes.size > limit || proofs.size > limit
+        const entries = rows.filter((entry) => entry.messages.length > 0 || entry.pairGeneration !== undefined)
         return {
             entries,
-            nextCursor: hasMore ? rows[rows.length - 1][0] : null,
+            nextCursor: hasMore && rows.length > 0 ? `@${rows[rows.length - 1]!.key}` : null,
         }
     }
 
@@ -898,6 +1044,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         moved: MessageRef[]
     ): Promise<void> {
+        if (isPairMailboxKey(key)) {
+            const generation = moved.find((ref) => ref.pairGeneration !== undefined)?.pairGeneration
+            if (generation !== undefined) {
+                this.broadcast(encodePairGenerationFrame(key, generation))
+            }
+        }
         const bodies = kvBodyStore(this.env)
         for (const ref of moved) {
             const body = await bodies.getBody(ref.messageId)
