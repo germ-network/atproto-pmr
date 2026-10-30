@@ -4156,8 +4156,15 @@ export class MonitorIngest
                 const pending = this.pendingStateSync(now)
                 const keysRemain = this.db.sql.exec("SELECT 1 FROM key_updates LIMIT 1").toArray().length > 0
                 let promptAt = Number(this.metaOf("prompt_at"))
-                if ((pending.due > 0 || keysRemain) && (!Number.isFinite(promptAt) || promptAt <= 0)) {
-                    promptAt = now + PROMPT_WAKE_DELAY_MS
+                const settlementAt = pending.due > 0 || keysRemain
+                    ? now + PROMPT_WAKE_DELAY_MS
+                    : pending.earliest
+                if (settlementAt !== null) {
+                    // A future retry is still a settlement wake. Persist its
+                    // reason so alarm() does not mistake it for maintenance.
+                    promptAt = Number.isFinite(promptAt) && promptAt > 0
+                        ? Math.min(promptAt, settlementAt)
+                        : settlementAt
                     this.setMeta("prompt_at", String(promptAt))
                 }
                 const cooldown = Number(this.metaOf("scheduler_cooldown"))
@@ -4166,7 +4173,9 @@ export class MonitorIngest
                     : 0
                 const pendingAt = pending.due > 0
                     ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0)
-                    : pending.earliest ?? 0
+                    : pending.earliest === null
+                      ? 0
+                      : Math.max(pending.earliest, Number.isFinite(cooldown) ? cooldown : 0)
                 const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + PROMPT_WAKE_DELAY_MS : 0
                 const candidates = [maintenanceWake, requested, keysRemain ? Math.max(now + PROMPT_WAKE_DELAY_MS, Number.isFinite(cooldown) ? cooldown : 0) : 0, pendingAt, existingAlarm !== null && existingAlarm > now ? existingAlarm : 0].filter((v) => v > 0)
                 if (candidates.length === 0) {
@@ -4195,20 +4204,38 @@ export class MonitorIngest
                 const requested = Number(this.metaOf("prompt_at"))
                 if (Number.isFinite(requested) && requested <= nowMs) this.setMeta("prompt_at", null)
             })
-            const before = this.db.sql.exec<{ did: string; owed_gen: number; attempts: number; not_before: number }>(
-                "SELECT did, owed_gen, attempts, not_before FROM pending ORDER BY selection_turn, did"
-            ).toArray().map((r) => `${r.did}:${r.owed_gen}:${r.attempts}:${r.not_before}`).join("|")
             const keyFailed = await this.drainKeys()
             const batch = this.settleBatch()
+            let selectedDids: string[] = []
+            let before = ""
             try {
-                await settleDue(this.deps(), batch)
+                await settleDue(this.deps(), batch, undefined, (selected) => {
+                    selectedDids = selected.map((row) => row.did)
+                    before = selected
+                        .map((row) => `${row.did}:${row.rev}:${row.owedGen ?? ""}:${row.attempts}:${row.notBeforeMs}:${row.quiet}`)
+                        .sort()
+                        .join("|")
+                })
             } catch (err) {
                 console.error("monitor: settle failed", err)
             }
-            const afterRows = this.db.sql.exec<{ did: string; owed_gen: number; attempts: number; not_before: number }>(
-                "SELECT did, owed_gen, attempts, not_before FROM pending ORDER BY selection_turn, did"
-            ).toArray()
-            const after = afterRows.map((r) => `${r.did}:${r.owed_gen}:${r.attempts}:${r.not_before}`).join("|")
+            const afterRows = selectedDids.length === 0
+                ? []
+                : this.db.sql.exec<{
+                      did: string
+                      rev: string
+                      owed_gen: number
+                      attempts: number
+                      not_before: number
+                      quiet: number
+                  }>(
+                      `SELECT did, rev, owed_gen, attempts, not_before, quiet FROM pending WHERE did IN (${selectedDids.map(() => "?").join(",")})`,
+                      ...selectedDids
+                  ).toArray()
+            const after = afterRows
+                .map((row) => `${row.did}:${row.rev}:${row.owed_gen}:${row.attempts}:${row.not_before}:${row.quiet === 1}`)
+                .sort()
+                .join("|")
             const pending = this.pendingStateSync(Date.now())
             if (keyFailed || (pending.due > 0 && before === after)) {
                 const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)

@@ -37,6 +37,7 @@ import {
     type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type PendingFetch,
     type PendingFailure,
     type SnapshotEntry,
     type SnapshotEvidence,
@@ -840,15 +841,26 @@ export async function settleDue(
     limit = 32,
     /** Given the cap `retryCapMs` answered for the DID, so a test cannot
      * skip the cap choice. */
-    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs,
+    onSelected?: (pending: readonly PendingFetch[]) => void
 ): Promise<number> {
     const now = deps.nowMs()
     const due = await deps.index.duePending(now, limit)
+    onSelected?.(due)
     let settled = 0
     for (const p of due) {
+        // Legacy adapters may omit owedGen. Capture their fallback before
+        // awaiting the PDS so a newer obligation cannot be deferred for this
+        // failed attempt.
+        let expectedGeneration = p.owedGen ?? null
         try {
+            if (expectedGeneration === null) expectedGeneration = await deps.index.owedGenOf(p.did)
             if (
-                (await settle(deps, p.did, { quiet: p.quiet, attempts: p.attempts, owedGen: p.owedGen })) === "stored"
+                (await settle(deps, p.did, {
+                    quiet: p.quiet,
+                    attempts: p.attempts,
+                    owedGen: expectedGeneration,
+                })) === "stored"
             ) {
                 settled += 1
             }
@@ -863,7 +875,7 @@ export async function settleDue(
                     errorName: err instanceof Error ? err.name : typeof err,
                     message: String(err instanceof Error ? err.message : err),
                     atMs: now,
-                }, p.owedGen ?? (await deps.index.owedGenOf(p.did)))
+                }, expectedGeneration)
             } catch (deferErr) {
                 // The row keeps its `not_before`, so it is due again next
                 // drain; letting this escape would skip the rest of the batch.

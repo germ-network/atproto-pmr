@@ -194,6 +194,23 @@ describe("settle retry backoff", () => {
         expect(h.pending.get(DID)).toMatchObject({ attempts: 0, notBeforeMs: 0 })
     })
 
+    it("captures a legacy adapter generation before a transient fetch", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                h.owe(DID)
+                throw new Error("old fetch failed")
+            },
+        })
+        h.owe(DID)
+        const duePending = h.deps.index.duePending.bind(h.deps.index)
+        h.deps.index.duePending = async (nowMs, limit) =>
+            (await duePending(nowMs, limit)).map(({ owedGen: _owedGen, ...row }) => row)
+
+        await settleDue(h.deps)
+
+        expect(h.pending.get(DID)).toMatchObject({ attempts: 0, notBeforeMs: 0 })
+    })
+
     it("does not defer a newer generation after an older never-held result is unverifiable", async () => {
         let started!: () => void
         let release!: () => void

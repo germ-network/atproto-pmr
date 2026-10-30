@@ -423,6 +423,85 @@ describe("the way in", () => {
         expect(settled.pending[0]?.attempts).toBe(1)
     })
 
+    it("classifies a future retry deadline as a prompt settlement wake", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        let maintenance = 0
+        const did = "did:plc:future-retry"
+        const scheduled = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                reconcileAlarm(): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                connect(): Promise<void>
+                connectPlc(): Promise<void>
+                connectFollow(): Promise<void>
+            }
+            await internal.armWatchdog()
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("retry failure")
+            }
+            internal.connect = async () => { maintenance += 1 }
+            internal.connectPlc = async () => { maintenance += 1 }
+            internal.connectFollow = async () => { maintenance += 1 }
+            await obj.owe(did, "3m1")
+            const retryAt = Date.now() + 60_000
+            await obj.deferPending(did, retryAt, {
+                kind: "threw",
+                errorName: "Error",
+                message: "retry later",
+                atMs: Date.now(),
+            })
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
+            await internal.reconcileAlarm()
+            return {
+                retryAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(scheduled.promptAt).toBe(scheduled.retryAt)
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = 0 WHERE did = ?", did)
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(1)
+        expect(maintenance).toBe(0)
+    })
+
+    it("backs off an unchanged bounded batch even when selection turns rotate", async () => {
+        const stub = freshStub()
+        const originalError = console.error
+        console.error = () => {}
+        try {
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const internal = obj as unknown as {
+                    armWatchdog(): Promise<void>
+                    fetchRecord(did: string): Promise<StubFetched>
+                    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
+                }
+                await internal.armWatchdog()
+                internal.fetchRecord = async () => { throw new Error("network unavailable") }
+                internal.deferPending = async () => { throw new Error("injected defer failure") }
+                for (let n = 0; n < 33; n++) await obj.owe(`did:plc:stalled-${n}`, "3m1")
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+                await obj.ctx.storage.setAlarm(Date.now() + 100)
+            })
+            await runDurableObjectAlarm(stub)
+        } finally {
+            console.error = originalError
+        }
+        const state = await runInDurableObject(stub, (obj: MonitorIngest) => ({
+            cooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'scheduler_cooldown_ms'").one().v),
+            due: obj.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", Date.now()).one().n,
+        }))
+        expect(state.cooldownMs).toBeGreaterThanOrEqual(1_000)
+        expect(state.due).toBe(33)
+    })
+
     it("rotates selected retry turns behind arrivals while preserving retry eligibility", async () => {
         const stub = freshStub()
         const a = "did:plc:quiet-a"
