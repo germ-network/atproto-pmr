@@ -2771,13 +2771,18 @@ describe("PLC export consumer", () => {
     /** Run one alarm with every outbound fetch answered by `answer`; resolves the URLs asked for. */
     async function alarmWithFetch(
         stub: DurableObjectStub<MonitorIngest>,
-        answer: (url: string) => Promise<Response> = () =>
-            Promise.resolve(new Response(null, { status: 200 }))
+        answer: (url: string) => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 })),
+        options: { forceMaintenance?: boolean } = {}
     ): Promise<string[]> {
         const urls: string[] = []
         await runInDurableObject(stub, (obj: MonitorIngest) =>
             (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         )
+        if (options.forceMaintenance) {
+            await runInDurableObject(stub, (obj: MonitorIngest) => {
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'maintenance_at'", String(Date.now() - 1))
+            })
+        }
         const original = globalThis.fetch
         globalThis.fetch = ((input: RequestInfo | URL) => {
             const url = typeof input === "string" ? input : input.toString()
@@ -2931,7 +2936,9 @@ describe("PLC export consumer", () => {
             obj.oweKeyUpdate("did:plc:a", put("zK"), 77)
         )
         await evictDurableObject(stub)
-        const resumed = (await alarmWithFetch(stub)).find((u) => u.startsWith(PLC_URL))
+        const resumed = (await alarmWithFetch(stub, undefined, { forceMaintenance: true })).find((u) =>
+            u.startsWith(PLC_URL)
+        )
         expect(new URL(resumed!).searchParams.get("cursor")).toBe("77")
     })
 
