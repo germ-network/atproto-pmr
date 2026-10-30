@@ -1306,7 +1306,7 @@ export class MonitorIngest
     }
 
     private requestPromptSync(nowMs: number): void {
-        const requested = nowMs + PROMPT_WAKE_DELAY_MS
+        const requested = nowMs + this.promptWakeDelayMs()
         const prior = Number(this.metaOf("prompt_at"))
         const next = Number.isFinite(prior) && prior > 0 ? Math.min(prior, requested) : requested
         if (next !== prior) this.setMeta("prompt_at", String(next))
@@ -4112,6 +4112,11 @@ export class MonitorIngest
         return this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
     }
 
+    private promptWakeDelayMs(): number {
+        const configured = Number(this.env.PROMPT_WAKE_DELAY_MS)
+        return Number.isInteger(configured) && configured > 0 ? configured : PROMPT_WAKE_DELAY_MS
+    }
+
     private setMeta(k: string, v: string | null): void {
         if (v === null) this.db.sql.exec("DELETE FROM meta WHERE k = ?", k)
         else
@@ -4153,7 +4158,9 @@ export class MonitorIngest
             if (this.alarmReconcile === run) this.alarmReconcile = null
             if (this.alarmReconcileAgain) {
                 this.alarmReconcileAgain = false
-                void this.reconcileAlarm()
+                void this.reconcileAlarm().catch((err) => {
+                    console.error("monitor: alarm reconciliation retry failed", err)
+                })
             }
         })
         this.alarmReconcile = run
@@ -4176,7 +4183,7 @@ export class MonitorIngest
                 }
                 if (!Number.isFinite(maintenanceAt) || maintenanceAt <= 0) {
                     maintenanceAt = Number.isFinite(interval) && interval > 0 && existingAlarm !== null
-                        ? existingAlarm > now ? existingAlarm : now + PROMPT_WAKE_DELAY_MS
+                        ? existingAlarm > now ? existingAlarm : now + this.promptWakeDelayMs()
                         : Number.isFinite(interval) && interval > 0 ? now + interval : 0
                     this.setMeta("maintenance_at", maintenanceAt > 0 ? String(maintenanceAt) : null)
                 }
@@ -4185,7 +4192,7 @@ export class MonitorIngest
                 let promptAt = Number(this.metaOf("prompt_at"))
                 const hasImmediateWork = pending.due || keysRemain
                 const settlementAt = hasImmediateWork
-                    ? now + PROMPT_WAKE_DELAY_MS
+                    ? now + this.promptWakeDelayMs()
                     : pending.earliest
                 if (settlementAt !== null) {
                     // A future retry is still a settlement wake. Persist its
@@ -4196,8 +4203,8 @@ export class MonitorIngest
                     this.setMeta("prompt_at", String(promptAt))
                 }
                 const promptDeadline = Number.isFinite(promptAt) && promptAt > 0
-                    ? promptAt > now ? promptAt : now + PROMPT_WAKE_DELAY_MS
-                    : now + PROMPT_WAKE_DELAY_MS
+                    ? promptAt > now ? promptAt : now + this.promptWakeDelayMs()
+                    : now + this.promptWakeDelayMs()
                 const declarationCooldown = this.cooldownUntilSync("declaration")
                 const keyCooldown = this.cooldownUntilSync("key")
                 const pendingAt = pending.due
@@ -4206,7 +4213,7 @@ export class MonitorIngest
                       ? 0
                       : Math.max(pending.earliest, declarationCooldown)
                 const keyAt = keysRemain ? Math.max(promptDeadline, keyCooldown) : 0
-                const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + PROMPT_WAKE_DELAY_MS : 0
+                const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + this.promptWakeDelayMs() : 0
                 const candidates = [
                     maintenanceWake,
                     keyAt,

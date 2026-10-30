@@ -61,6 +61,10 @@ PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 # from the stored cursor; eviction is expected, not exceptional.
 WATCHDOG_INTERVAL_MS = "120000"
 
+# Delay before a prompt settlement/key-update alarm after durable intake.
+# Defaults to 100 ms. Tests use a longer delay and explicitly fire alarms.
+PROMPT_WAKE_DELAY_MS = "100"
+
 # Maximum owed declaration fetches selected per prompt or maintenance wake.
 # Defaults to 32 and is capped at 32; invalid, zero, or negative values use
 # the default. A larger backlog continues in successive prompt alarms, usually

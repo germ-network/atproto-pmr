@@ -179,6 +179,9 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      */
     WATCHDOG_INTERVAL_MS: string
 
+    /** Prompt-alarm delay in milliseconds. Defaults to 100; test config lengthens it to avoid automatic wakes. */
+    PROMPT_WAKE_DELAY_MS?: string
+
     /**
      * Maximum owed declaration fetches selected per prompt or maintenance
      * wake. Defaults to 32 and is capped at 32; invalid, zero, or negative

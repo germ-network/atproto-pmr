@@ -58,10 +58,23 @@ const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 const STUB_VERIFIED = { cid: "bafyreistub", verifiedWith: SIGNING_KEY }
 
 let n = 0
+const testStubs: DurableObjectStub<MonitorIngest>[] = []
 function freshStub(): DurableObjectStub<MonitorIngest> {
     n += 1
-    return testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    const stub = testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    testStubs.push(stub)
+    return stub
 }
+
+afterEach(async () => {
+    for (const stub of testStubs.splice(0)) {
+        try {
+            await runInDurableObject(stub, (obj: MonitorIngest) => obj.ctx.storage.deleteAlarm())
+        } catch {
+            // The alarm may already have run as the test's scheduled wake.
+        }
+    }
+})
 
 /** These alarm tests count fetches; the layout sweep's owed fetches are covered in snapshot-v2-backfill.spec.ts. */
 function skipLayoutSweep(obj: MonitorIngest): void {
@@ -172,6 +185,9 @@ describe("the index", () => {
             // not in-memory) -- arm one so runDurableObjectAlarm below has
             // something to fire on the fresh post-eviction instance.
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            // This checks maintenance reconnect after eviction. Intake's
+            // separate 100 ms prompt alarm could otherwise fire first.
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
         })
 
         await evictDurableObject(stub)
