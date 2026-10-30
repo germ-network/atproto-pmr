@@ -1,5 +1,13 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.4.1
+
+### Patch Changes
+
+- [#95](https://github.com/germ-network/atproto-pmr/pull/95) [`b8b4d62`](https://github.com/germ-network/atproto-pmr/commit/b8b4d6246f95d467702cea9d512998b033812d60) Thanks [@germ-mark](https://github.com/germ-mark)! - Schedule bounded declaration settlement promptly after durable intake, preserve maintenance recovery, and guard failure deferral by the generation captured for each fetch. The SETTLE_BATCH default/cap of 32 applies to owed declarations per prompt wake and ordinary secondary records per maintenance wake; own-block proofs retain their separate budget. Declaration backlogs continue on prompt alarms, while secondary backlogs continue on maintenance wakes. A declaration no-progress cooldown also delays fresh declaration work and maintenance's declaration-settlement step, capped at the watchdog interval or 120 seconds when disabled, while unrelated maintenance and key work remain independent.
+
+  The monitor adds the public `IntakeDecision` value `key-update` for identity events that owe a signing-key-cache update without a declaration fetch. Consumers should handle the new outcome and schedule the wake/cursor work it represents. `MonitorIndex` adapters must return the active pending generation from `owedGenOf`, return `null` when no obligation exists, and make `deferPending` with an expected generation a no-op when it is null or mismatched so a newer obligation cannot be deferred by an older fetch.
+
 ## 0.4.0
 
 ### Minor Changes
