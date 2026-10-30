@@ -150,6 +150,31 @@ describe("pending row bookkeeping", () => {
         })
     })
 
+    it("alarm-owned join and secondary deferral work continue through final reconciliation", async () => {
+        const stub = freshStub()
+        const scheduled = await inObj(stub, async (obj, sql) => {
+            const joined = "did:plc:join-obligation"
+            const deferred = "did:plc:secondary-obligation"
+            await obj.oweJoin(joined, [], await obj.interestEpoch(joined))
+            await secondaryDepsOf(obj).deferToDeclaration(deferred)
+            expect(sql.exec("SELECT 1 FROM meta WHERE k = 'prompt_at'").toArray()).toEqual([])
+
+            await (obj as unknown as { reconcileAlarm(): Promise<void> }).reconcileAlarm()
+            const alarmAt = await obj.ctx.storage.getAlarm()
+            // The assertion covers continuation registration; do not leave a
+            // real 60 s test alarm for Workerd teardown to dispatch.
+            await obj.ctx.storage.deleteAlarm()
+            return {
+                pending: sql.exec<{ did: string }>("SELECT did FROM pending ORDER BY did").toArray().map((r) => r.did),
+                promptAt: Number(sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+                alarmAt,
+            }
+        })
+        expect(scheduled.pending).toEqual(["did:plc:join-obligation", "did:plc:secondary-obligation"])
+        expect(scheduled.promptAt - Date.now()).toBeGreaterThan(50_000)
+        expect(scheduled.alarmAt).toBe(scheduled.promptAt)
+    })
+
     it("a quiet deferral to the declaration does not reset an existing row", async () => {
         await inObj(freshStub(), async (obj, sql) => {
             await backedOff(obj, sql, DID)

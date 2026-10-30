@@ -176,10 +176,25 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * hibernate, so the object is evicted on the platform's own schedule
      * and the alarm is what brings the connection back. Eviction is
      * expected rather than exceptional; every gap is closed by the cursor.
+     * It also caps declaration/key no-progress cooldowns. A declaration
+     * cooldown delays all declaration fetches, including fresh owed work and
+     * the declaration-settlement step of maintenance, up to this interval
+     * (120 seconds if disabled or invalid). Other maintenance and key work
+     * remain independent; a healthy prompt wake still defaults to 100 ms.
      */
     WATCHDOG_INTERVAL_MS: string
 
-    /** How many owed fetches to settle per wake. */
+    /** Prompt-alarm delay in milliseconds. Defaults to 100; test config lengthens it to avoid automatic wakes. */
+    PROMPT_WAKE_DELAY_MS?: string
+
+    /**
+     * Maximum owed declaration fetches per prompt wake and ordinary
+     * secondary-record fetches per maintenance wake. Defaults to 32 and is
+     * capped at 32; invalid, zero, or negative values use the default. A
+     * declaration backlog continues in successive prompt alarms, usually
+     * about 100 ms apart; secondary-record backlog continues on maintenance
+     * wakes. Own-block proofs use their separate OWN_BLOCK_SETTLE_BATCH budget.
+     */
     SETTLE_BATCH: string
 
     /**

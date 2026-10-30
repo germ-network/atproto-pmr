@@ -58,10 +58,23 @@ const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 const STUB_VERIFIED = { cid: "bafyreistub", verifiedWith: SIGNING_KEY }
 
 let n = 0
+const testStubs: DurableObjectStub<MonitorIngest>[] = []
 function freshStub(): DurableObjectStub<MonitorIngest> {
     n += 1
-    return testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    const stub = testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    testStubs.push(stub)
+    return stub
 }
+
+afterEach(async () => {
+    for (const stub of testStubs.splice(0)) {
+        try {
+            await runInDurableObject(stub, (obj: MonitorIngest) => obj.ctx.storage.deleteAlarm())
+        } catch {
+            // The alarm may already have run as the test's scheduled wake.
+        }
+    }
+})
 
 /** These alarm tests count fetches; the layout sweep's owed fetches are covered in snapshot-v2-backfill.spec.ts. */
 function skipLayoutSweep(obj: MonitorIngest): void {
@@ -172,6 +185,9 @@ describe("the index", () => {
             // not in-memory) -- arm one so runDurableObjectAlarm below has
             // something to fire on the fresh post-eviction instance.
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            // This checks maintenance reconnect after eviction. Intake's
+            // separate 100 ms prompt alarm could otherwise fire first.
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
         })
 
         await evictDurableObject(stub)
@@ -377,6 +393,316 @@ describe("settling what is owed", () => {
 })
 
 describe("the way in", () => {
+    it("keeps the production prompt deadline at 100 ms when unset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                env: MonitorEnv
+                requestPromptSync(nowMs: number): void
+            }
+            internal.env = { ...internal.env, PROMPT_WAKE_DELAY_MS: undefined }
+            const requestedAt = Date.now()
+            internal.requestPromptSync(requestedAt)
+            return {
+                requestedAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(result.promptAt).toBe(result.requestedAt + 100)
+    })
+
+    it("migrates a legacy shared cooldown to both lanes so a successful lane can reset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                cooldownUntilSync(lane: "declaration" | "key"): number
+                cooldownDurationSync(lane: "declaration" | "key"): number
+                clearCooldownSync(lane: "declaration" | "key"): void
+            }
+            const until = Date.now() + 60_000
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('scheduler_cooldown', ?), ('scheduler_cooldown_ms', '8000')",
+                String(until)
+            )
+            const declarationUntil = internal.cooldownUntilSync("declaration")
+            const keyUntil = internal.cooldownUntilSync("key")
+            internal.clearCooldownSync("declaration")
+            return {
+                declarationUntil,
+                keyUntil,
+                declarationDuration: internal.cooldownDurationSync("declaration"),
+                keyDuration: internal.cooldownDurationSync("key"),
+                legacyRows: obj.ctx.storage.sql.exec("SELECT 1 FROM meta WHERE k LIKE 'scheduler_cooldown%'").toArray().length,
+            }
+        })
+        expect(result.declarationUntil).toBeGreaterThan(Date.now())
+        expect(result.keyUntil).toBe(result.declarationUntil)
+        expect(result.declarationDuration).toBe(0)
+        expect(result.keyDuration).toBe(8_000)
+        expect(result.legacyRows).toBe(0)
+    })
+
+    it("claims the first timed resume frame before waiting on serialized storage", async () => {
+        const stub = freshStub()
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const state = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                resumeFromUs: number | null
+                checkResumeFrame(frameMs: number | null): Promise<void>
+                serializeStorage<T>(work: () => Promise<T>): Promise<T>
+                startFirehoseRun(nowMs: number): void
+            }
+            internal.resumeFromUs = 1_000_000
+            let started = 0
+            internal.serializeStorage = async (work) => {
+                await blocked
+                return work()
+            }
+            internal.startFirehoseRun = () => { started += 1 }
+            const first = internal.checkResumeFrame(100_000)
+            const claimedAfterFirst = internal.resumeFromUs
+            await internal.checkResumeFrame(200_000)
+            release()
+            await first
+            return { claimedAfterFirst, started }
+        })
+        expect(state.claimedAfterFirst).toBeNull()
+        expect(state.started).toBe(1)
+    })
+
+    it("records a prompt wake at intake and dispatches a bounded settlement before maintenance", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        let maintenance = 0
+        const cursor = String(Date.now() * 1000)
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                onFrame(raw: string): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                connectFollow(): Promise<void>
+            }
+            await internal.armWatchdog()
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("controlled fetch failure")
+            }
+            internal.connectFollow = async () => {
+                maintenance += 1
+            }
+            await internal.onFrame(JSON.stringify({
+                kind: "commit",
+                did: DID,
+                time_us: Number(cursor),
+                commit: { collection: "com.germnetwork.declaration", rkey: "self", operation: "create", rev: "3m1" },
+            }))
+            const alarmAt = await obj.ctx.storage.getAlarm()
+            const promptAt = Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v)
+            const maintenanceAt = Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'maintenance_at'").one().v)
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+            return { alarmAt, promptAt, maintenanceAt }
+        })
+        expect(result.alarmAt).toBe(result.promptAt)
+        expect(result.promptAt).toBeLessThan(result.maintenanceAt)
+        await runDurableObjectAlarm(stub)
+        const settled = await runInDurableObject(stub, async (obj: MonitorIngest) => ({
+            pending: await obj.duePending(Date.now() + 10_000, 10),
+            cursor: await obj.readCursor(),
+        }))
+        expect(fetched).toBe(1)
+        expect(maintenance).toBe(0)
+        expect(settled.cursor).toBe(cursor)
+        expect(settled.pending[0]?.attempts).toBe(1)
+    })
+
+    it("classifies a future retry deadline as a prompt settlement wake", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        let maintenance = 0
+        const did = "did:plc:future-retry"
+        const scheduled = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                reconcileAlarm(): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                connect(): Promise<void>
+                connectPlc(): Promise<void>
+                connectFollow(): Promise<void>
+            }
+            await internal.armWatchdog()
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("retry failure")
+            }
+            internal.connect = async () => { maintenance += 1 }
+            internal.connectPlc = async () => { maintenance += 1 }
+            internal.connectFollow = async () => { maintenance += 1 }
+            await obj.owe(did, "3m1")
+            const retryAt = Date.now() + 60_000
+            await obj.deferPending(did, retryAt, {
+                kind: "threw",
+                errorName: "Error",
+                message: "retry later",
+                atMs: Date.now(),
+            })
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
+            await internal.reconcileAlarm()
+            return {
+                retryAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(scheduled.promptAt).toBe(scheduled.retryAt)
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = 0 WHERE did = ?", did)
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(1)
+        expect(maintenance).toBe(0)
+    })
+
+    it("backs off an unchanged bounded batch even when selection turns rotate", async () => {
+        const stub = freshStub()
+        const originalError = console.error
+        console.error = () => {}
+        try {
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const internal = obj as unknown as {
+                    armWatchdog(): Promise<void>
+                    fetchRecord(did: string): Promise<StubFetched>
+                    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
+                }
+                await internal.armWatchdog()
+                internal.fetchRecord = async () => { throw new Error("network unavailable") }
+                internal.deferPending = async () => { throw new Error("injected defer failure") }
+                for (let n = 0; n < 33; n++) await obj.owe(`did:plc:stalled-${n}`, "3m1")
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+                await obj.ctx.storage.setAlarm(Date.now() + 100)
+            })
+            await runDurableObjectAlarm(stub)
+        } finally {
+            console.error = originalError
+        }
+        const state = await runInDurableObject(stub, (obj: MonitorIngest) => ({
+            cooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'declaration_cooldown_ms'").one().v),
+            keyCooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'key_cooldown_ms'").toArray()[0]?.v ?? "0"),
+            due: obj.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", Date.now()).one().n,
+        }))
+        expect(state.cooldownMs).toBeGreaterThanOrEqual(1_000)
+        expect(state.keyCooldownMs).toBe(0)
+        expect(state.due).toBe(33)
+    })
+
+    it("rotates selected retry turns behind arrivals while preserving retry eligibility", async () => {
+        const stub = freshStub()
+        const a = "did:plc:quiet-a"
+        const b = "did:plc:arrival-b"
+        const c = "did:plc:arrival-c"
+        const order = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.owe(a, "3m1")
+            const first = await obj.duePending(Date.now(), 1)
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = ? WHERE did = ?", Date.now() + 60_000, a)
+            await obj.owe(b, "3m1")
+            const second = await obj.duePending(Date.now(), 1)
+            await obj.owe(c, "3m1")
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = 0 WHERE did = ?", a)
+            const third = await obj.duePending(Date.now(), 1)
+            return [first[0]?.did, second[0]?.did, third[0]?.did]
+        })
+        expect(order).toEqual([a, b, a])
+    })
+
+    it("continues a declaration batch overflow from the durable queue without another frame", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                reconcileAlarm(): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                clearCooldownSync(lane: "declaration" | "key"): void
+            }
+            await internal.armWatchdog()
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('declaration_cooldown_until', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                String(Date.now() + 60_000)
+            )
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("controlled fetch failure")
+            }
+            for (let n = 0; n < 33; n++) await obj.owe(`did:plc:batch-${n}`, "3m1")
+            await internal.reconcileAlarm()
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            internal.clearCooldownSync("declaration")
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(32)
+        const remainingDue = await runInDurableObject(stub, (obj: MonitorIngest) => obj.duePending(Date.now(), 40))
+        expect(remainingDue).toHaveLength(1)
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            ;(obj as unknown as { clearCooldownSync(lane: "declaration" | "key"): void }).clearCooldownSync("declaration")
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(33)
+    })
+
+    it("keeps unrelated intake durable when both prompt scheduling attempts fail, then recovers after eviction", async () => {
+        const stub = freshStub()
+        const firstDid = "did:plc:failed-schedule-a"
+        const secondDid = "did:plc:failed-schedule-b"
+        const eventTimeUs = Date.now() * 1000
+        const originalError = console.error
+        console.error = () => {}
+        try {
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const internal = obj as unknown as {
+                    armWatchdog(): Promise<void>
+                    onFrame(raw: string): Promise<void>
+                }
+                await internal.armWatchdog()
+                const storage = obj.ctx.storage as unknown as {
+                    setAlarm: (at: number) => Promise<void>
+                }
+                const originalSetAlarm = storage.setAlarm.bind(storage)
+                storage.setAlarm = async () => { throw new Error("injected setAlarm failure") }
+                const frame = (did: string, time: number) => JSON.stringify({
+                    kind: "commit",
+                    did,
+                    time_us: time,
+                    commit: { collection: "com.germnetwork.declaration", rkey: "self", operation: "create", rev: "3m1" },
+                })
+                await internal.onFrame(frame(firstDid, eventTimeUs))
+                await internal.onFrame(frame(secondDid, eventTimeUs + 1))
+                storage.setAlarm = originalSetAlarm
+            })
+        } finally {
+            console.error = originalError
+        }
+        await evictDurableObject(stub)
+        const recovered = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            return {
+                cursor: await obj.readCursor(),
+                pending: obj.ctx.storage.sql.exec<{ did: string }>("SELECT did FROM pending ORDER BY did").toArray().map((r) => r.did),
+                alarmAt: await obj.ctx.storage.getAlarm(),
+                maintenanceAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'maintenance_at'").one().v),
+            }
+        })
+        expect(recovered.cursor).toBe(String(eventTimeUs + 1))
+        expect(recovered.pending).toEqual([firstDid, secondDid])
+        expect(recovered.alarmAt).toBeLessThan(recovered.maintenanceAt)
+    })
+
     it("start() arms the alarm, so a deployed object is not inert", async () => {
         // There was no entry point at all: connect armed the alarm and
         // only the alarm called connect. A fresh object never started.
@@ -2627,13 +2953,18 @@ describe("PLC export consumer", () => {
     /** Run one alarm with every outbound fetch answered by `answer`; resolves the URLs asked for. */
     async function alarmWithFetch(
         stub: DurableObjectStub<MonitorIngest>,
-        answer: (url: string) => Promise<Response> = () =>
-            Promise.resolve(new Response(null, { status: 200 }))
+        answer: (url: string) => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 })),
+        options: { forceMaintenance?: boolean } = {}
     ): Promise<string[]> {
         const urls: string[] = []
         await runInDurableObject(stub, (obj: MonitorIngest) =>
             (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         )
+        if (options.forceMaintenance) {
+            await runInDurableObject(stub, (obj: MonitorIngest) => {
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'maintenance_at'", String(Date.now() - 1))
+            })
+        }
         const original = globalThis.fetch
         globalThis.fetch = ((input: RequestInfo | URL) => {
             const url = typeof input === "string" ? input : input.toString()
@@ -2787,7 +3118,9 @@ describe("PLC export consumer", () => {
             obj.oweKeyUpdate("did:plc:a", put("zK"), 77)
         )
         await evictDurableObject(stub)
-        const resumed = (await alarmWithFetch(stub)).find((u) => u.startsWith(PLC_URL))
+        const resumed = (await alarmWithFetch(stub, undefined, { forceMaintenance: true })).find((u) =>
+            u.startsWith(PLC_URL)
+        )
         expect(new URL(resumed!).searchParams.get("cursor")).toBe("77")
     })
 
@@ -3185,7 +3518,12 @@ describe("declaration evidence", () => {
             const outcome = await inEvidenceObj(w, { appView }, (obj) => verify(obj, w.did, fetched(w)))
             expect(outcome).toEqual(base(w))
         }
-        const reasons = warn.mock.calls.map((call) => (call[1] as { reason: string }).reason)
+        const reasons = warn.mock.calls.flatMap(([message, details]) => {
+            const warning = details as { did?: string; reason?: string } | undefined
+            return message === "monitor: declaration evidence unavailable" && warning?.did === w.did
+                ? [warning.reason]
+                : []
+        })
         expect(reasons).toEqual([
             expect.stringMatching(/^AppView unreachable: /),
             expect.stringMatching(/^AppView unreachable: .*down/),

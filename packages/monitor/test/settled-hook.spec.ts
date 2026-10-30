@@ -25,7 +25,8 @@ function harness(opts: {
         revOf: async () => rev,
         ...heldFromEntries(records),
         holderStateOf: async () => (rev === null ? null : "held"),
-        owedGenOf: async () => 1,
+        // These direct settle calls do not model a pending retry row.
+        owedGenOf: async () => null,
         complete: async (_d: string, r: string) => {
             rev = r
             events.push("index:complete")
@@ -38,7 +39,7 @@ function harness(opts: {
         clearPending: async () => void events.push("index:clearPending"),
         markAttempted: async () => {},
         isWatched: async () => true,
-        deferPending: async () => 1,
+        deferPending: async () => null,
     } as unknown as MonitorIndex
     const snapshot = {
         getRecord: async (did: string) => records.get(did) ?? null,
@@ -116,6 +117,7 @@ describe("onSettled", () => {
             recordsOf: async () => [],
             isWatched: async () => true,
             isDeleted: async () => false,
+            // Quiet refresh is not driven by the declaration pending queue.
             owedGenOf: async () => null,
         } as unknown as MonitorIndex
         const ingest: IngestDeps = {

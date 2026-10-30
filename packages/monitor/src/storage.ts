@@ -245,6 +245,8 @@ export interface PendingFetch {
      * DID clears it, so a commit that coalesces into the row still counts.
      */
     quiet: boolean
+    /** Generation captured with this selection; failures may defer only this generation. */
+    owedGen?: number
 }
 
 /** Why a pending fetch was deferred instead of settled. */
@@ -293,9 +295,12 @@ export interface MonitorIndex extends HeldStateIndex {
 
     /**
      * The generation of the obligation owed for `did` now, or null when none
-     * is. Every `intake` and `owe` gives the row a new generation, so a fetch
-     * that reads it before it starts can tell, when it finishes, whether the
-     * obligation it was started for is still the one owed.
+     * is. If a pending row exists, adapters MUST return its current
+     * `owedGen`; null means there is no pending obligation and therefore no
+     * failure may be deferred or reported. Every `intake` and `owe` gives the
+     * row a new generation, so a fetch that reads it before it starts can
+     * tell, when it finishes, whether the obligation it was started for is
+     * still the one owed.
      */
     owedGenOf(did: string): Promise<number | null>
 
@@ -426,9 +431,19 @@ export interface MonitorIndex extends HeldStateIndex {
     /** Retry queue. A fetch that failed is owed until it succeeds. */
     duePending(nowMs: number, limit: number): Promise<PendingFetch[]>
     /** Counts the attempt and keeps `failure` on the row, so an operator can
-     * see why a DID is still owed without searching logs. Answers the row's
-     * attempts after the update, or null when the DID has no pending row. */
-    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
+     * see why a DID is still owed without searching logs. When
+     * `expectedGeneration` is provided, adapters MUST update only that
+     * generation and answer null on a mismatch; null also means there was no
+     * obligation when the fetch began and must be a no-op. Answers the row's
+     * attempts after the update, or null when no matching pending row exists.
+     * Omitting the optional generation retains the legacy unconditional
+     * behavior for callers outside the settle retry path. */
+    deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure,
+        expectedGeneration?: number | null
+    ): Promise<number | null>
 
     /** The indexed rev, for regression detection and duplicate suppression. */
     revOf(did: string): Promise<string | null>

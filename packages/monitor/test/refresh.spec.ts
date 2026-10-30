@@ -152,6 +152,7 @@ function harness(opts: {
             ]
         },
         isDeleted: async (did: string) => deleted.has(did),
+        // Refresh uses its own queue here; these tests do not create a declaration pending row.
         owedGenOf: async () => null,
     } as unknown as MonitorIndex
     const snapshot = {

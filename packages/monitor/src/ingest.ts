@@ -37,6 +37,7 @@ import {
     type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type PendingFetch,
     type PendingFailure,
     type SnapshotEntry,
     type SnapshotEvidence,
@@ -194,13 +195,15 @@ async function deferFailure(
     deps: IngestDeps,
     did: string,
     notBeforeMs: number,
-    failure: PendingFailure
+    failure: PendingFailure,
+    expectedGeneration: number | null
 ): Promise<void> {
     const kept: PendingFailure =
         failure.kind === "threw"
             ? { ...failure, message: truncated(failure.message) }
             : { ...failure, reason: failure.reason === null ? null : truncated(failure.reason) }
-    const attempts = await deps.index.deferPending(did, notBeforeMs, kept)
+    if (expectedGeneration === null) return
+    const attempts = await deps.index.deferPending(did, notBeforeMs, kept, expectedGeneration)
     if (attempts === null) return
     try {
         deps.onSettleFailure?.({ did, attempts, failure: kept, notBeforeMs })
@@ -234,6 +237,11 @@ export interface IngestConfig {
 
 export type IntakeDecision =
     | "ignored"
+    /**
+     * The event needs no declaration fetch, but a durable signing-key update
+     * was owed. Adapters must schedule that work and preserve its cursor.
+     */
+    | "key-update"
     | "duplicate"
     | "accepted"
     /** In the snapshot, and its DID document may have re-keyed. */
@@ -267,10 +275,11 @@ export async function intake(
         // The relay's cached key is dropped for every DID whose document the
         // monitor keeps, declaration or not. After the owe, so a holder that
         // reverifies is watched.
-        if (await deps.index.isWatched(event.did)) {
+        const keyOwed = await deps.index.isWatched(event.did) && deps.keyUpdates !== undefined
+        if (keyOwed) {
             await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
         }
-        return reverify ? "reverify" : "ignored"
+        return reverify ? "reverify" : keyOwed ? "key-update" : "ignored"
     }
 
     const commit: CommitEvent = event
@@ -383,6 +392,8 @@ export interface SettleOptions {
      * nothing is recorded.
      */
     quiet?: boolean
+    /** Generation selected before the fetch; null fences failure deferral if no row existed. */
+    owedGen?: number | null
 }
 
 export async function settle(
@@ -392,7 +403,7 @@ export async function settle(
 ): Promise<SettleOutcome> {
     const quiet = opts.quiet === true
     const epoch = await deps.interest.interestEpoch(did)
-    const gen = await deps.index.owedGenOf(did)
+    const gen = opts.owedGen === undefined ? await deps.index.owedGenOf(did) : opts.owedGen
     const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
@@ -740,7 +751,7 @@ async function settleUnverifiable(
             kind: "unverifiable",
             reason: reason ?? null,
             atMs: deps.nowMs(),
-        })
+        }, gen)
     }
     await pushNewlySeenKey(deps, did, record.signingKey)
 }
@@ -836,15 +847,26 @@ export async function settleDue(
     limit = 32,
     /** Given the cap `retryCapMs` answered for the DID, so a test cannot
      * skip the cap choice. */
-    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs,
+    onSelected?: (pending: readonly PendingFetch[]) => void
 ): Promise<number> {
     const now = deps.nowMs()
     const due = await deps.index.duePending(now, limit)
+    onSelected?.(due)
     let settled = 0
     for (const p of due) {
+        // Legacy adapters may omit owedGen. Capture their fallback before
+        // awaiting the PDS so a newer obligation cannot be deferred for this
+        // failed attempt.
+        let expectedGeneration = p.owedGen ?? null
         try {
+            if (expectedGeneration === null) expectedGeneration = await deps.index.owedGenOf(p.did)
             if (
-                (await settle(deps, p.did, { quiet: p.quiet, attempts: p.attempts })) === "stored"
+                (await settle(deps, p.did, {
+                    quiet: p.quiet,
+                    attempts: p.attempts,
+                    owedGen: expectedGeneration,
+                })) === "stored"
             ) {
                 settled += 1
             }
@@ -859,7 +881,7 @@ export async function settleDue(
                     errorName: err instanceof Error ? err.name : typeof err,
                     message: String(err instanceof Error ? err.message : err),
                     atMs: now,
-                })
+                }, expectedGeneration)
             } catch (deferErr) {
                 // The row keeps its `not_before`, so it is due again next
                 // drain; letting this escape would skip the rest of the batch.

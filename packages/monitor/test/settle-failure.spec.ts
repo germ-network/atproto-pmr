@@ -27,6 +27,7 @@ interface Row {
 /** Only what settle and settleDue touch; the real index is a Durable Object. */
 function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
     const pending = new Map<string, Row>()
+    const generations = new Map<string, number>()
     const revs = new Map<string, string>(held.map((did) => [did, "3m1"]))
     const deferrals: Array<{ did: string; notBeforeMs: number; failure: PendingFailure }> = []
     const attempted: string[] = []
@@ -35,15 +36,15 @@ function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
         duePending: async (nowMs: number) =>
             [...pending.entries()]
                 .filter(([, p]) => p.notBeforeMs <= nowMs)
-                .map(([did, p]) => ({ did, ...p })),
-        deferPending: async (did: string, notBeforeMs: number, failure: PendingFailure) => {
+                .map(([did, p]) => ({ did, ...p, owedGen: generations.get(did) ?? 1 })),
+        deferPending: async (did: string, notBeforeMs: number, failure: PendingFailure, expectedGeneration: number | null) => {
             deferrals.push({ did, notBeforeMs, failure })
             const p = pending.get(did)
-            if (p === undefined) return null
+            if (p === undefined || expectedGeneration !== (generations.get(did) ?? 1)) return null
             pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs, failure })
             return p.attempts + 1
         },
-        owedGenOf: async () => null,
+        owedGenOf: async (did: string) => pending.has(did) ? generations.get(did) ?? 1 : null,
         revOf: async (did: string) => revs.get(did) ?? null,
         holderStateOf: async () => null,
         heldDeclarationOf: async () => null,
@@ -87,8 +88,10 @@ function harness(overrides: Partial<IngestDeps> = {}, held: string[] = []) {
         nowMs: () => NOW,
         ...overrides,
     }
-    const owe = (did: string, attempts = 0, quiet = false) =>
-        void pending.set(did, { rev: "3m2", attempts, notBeforeMs: 0, quiet })
+    const owe = (did: string, attempts = 0, quiet = false) => {
+        generations.set(did, (generations.get(did) ?? 0) + 1)
+        pending.set(did, { rev: "3m2", attempts, notBeforeMs: 0, quiet })
+    }
     return { deps, pending, revs, deferrals, attempted, cleared, owe }
 }
 
@@ -171,6 +174,61 @@ describe("settle retry backoff", () => {
         expect(h.attempted).toEqual([DID])
         expect(events).toEqual([])
     })
+
+    it("does not defer a newer generation after an older transient fetch fails", async () => {
+        let started!: () => void
+        let release!: () => void
+        const hasStarted = new Promise<void>((resolve) => { started = resolve })
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const h = harness({ fetchRecord: async () => {
+            started()
+            await blocked
+            throw new Error("old fetch failed")
+        } })
+        h.owe(DID)
+        const draining = settleDue(h.deps)
+        await hasStarted
+        h.owe(DID)
+        release()
+        await draining
+        expect(h.pending.get(DID)).toMatchObject({ attempts: 0, notBeforeMs: 0 })
+    })
+
+    it("captures a legacy adapter generation before a transient fetch", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                h.owe(DID)
+                throw new Error("old fetch failed")
+            },
+        })
+        h.owe(DID)
+        const duePending = h.deps.index.duePending.bind(h.deps.index)
+        h.deps.index.duePending = async (nowMs, limit) =>
+            (await duePending(nowMs, limit)).map(({ owedGen: _owedGen, ...row }) => row)
+
+        await settleDue(h.deps)
+
+        expect(h.pending.get(DID)).toMatchObject({ attempts: 0, notBeforeMs: 0 })
+    })
+
+    it("does not defer a newer generation after an older never-held result is unverifiable", async () => {
+        let started!: () => void
+        let release!: () => void
+        const hasStarted = new Promise<void>((resolve) => { started = resolve })
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const h = harness({ verify: async () => {
+            started()
+            await blocked
+            return { kind: "unverifiable", reason: "old answer" }
+        } })
+        h.owe(DID)
+        const draining = settleDue(h.deps)
+        await hasStarted
+        h.owe(DID)
+        release()
+        await draining
+        expect(h.pending.get(DID)).toMatchObject({ attempts: 0, notBeforeMs: 0 })
+    })
 })
 
 function spy() {
@@ -234,7 +292,7 @@ describe("settle failure reporting", () => {
         const { events, onSettleFailure } = spy()
         const h = harness({ onSettleFailure, verify: unverifiable })
         expect(await settle(h.deps, DID)).toBe("unverifiable")
-        expect(h.deferrals).toHaveLength(1)
+        expect(h.deferrals).toHaveLength(0)
         expect(events).toEqual([])
     })
 

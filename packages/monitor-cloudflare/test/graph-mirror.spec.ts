@@ -256,10 +256,11 @@ describe("graph mirror", () => {
         await alarm(s)
         await runInDurableObject(s, async (_obj, state) => {
             const at = await state.storage.getAlarm()
-            // The watchdog interval, not a retry the runtime scheduled itself.
+            // The queued declaration work is resumed before the independent watchdog.
             const interval = Number(testEnv.WATCHDOG_INTERVAL_MS)
             expect(at).not.toBeNull()
-            expect(at! - Date.now()).toBeGreaterThan(interval - 30_000)
+            expect(at! - Date.now()).toBeGreaterThan(0)
+            expect(at! - Date.now()).toBeLessThan(interval - 30_000)
         })
         // Nothing was mirrored, so it is still due.
         await inObj(s, async (obj) => {

@@ -30,6 +30,8 @@ INTEREST_POLICY = "everyone"
 JETSTREAM_URL = "https://jetstream.invalid/subscribe"
 PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
 WATCHDOG_INTERVAL_MS = "120000"
+# Keep prompt alarms out of test teardown unless a test explicitly fires one.
+PROMPT_WAKE_DELAY_MS = "60000"
 SETTLE_BATCH = "32"
 # Changing this requires clearing sealed windows + sealedThrough: an
 # absent window below sealedThrough means "empty", and that promise does

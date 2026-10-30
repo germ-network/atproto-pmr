@@ -5,7 +5,7 @@
  */
 import { readSecondary } from "./secondary-read"
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
@@ -35,9 +35,12 @@ const testEnv = env as unknown as MonitorEnv & {
 const VERIFIED = { cid: "bafyreistub", verifiedWith: "zKey" }
 
 let n = 0
+const testStubs: DurableObjectStub<MonitorIngest>[] = []
 const stubOf = (ns: DurableObjectNamespace<MonitorIngest>) => {
     n += 1
-    return ns.get(ns.idFromName(`interest-${n}`))
+    const stub = ns.get(ns.idFromName(`interest-${n}`))
+    testStubs.push(stub)
+    return stub
 }
 /** One alarm with the network stubbed out; the connect stages fail, the rest runs. */
 async function alarm(stub: DurableObjectStub<MonitorIngest>) {
@@ -56,6 +59,16 @@ const everyoneStub = () => stubOf(testEnv.ingest)
 const registeredStub = () => stubOf(testEnv.ingestRegistered)
 const inObj = <R>(stub: DurableObjectStub<MonitorIngest>, fn: (obj: MonitorIngest) => Promise<R>) =>
     runInDurableObject(stub, (obj) => fn(obj as MonitorIngest))
+
+afterEach(async () => {
+    for (const stub of testStubs.splice(0)) {
+        try {
+            await runInDurableObject(stub, (obj) => obj.ctx.storage.deleteAlarm())
+        } catch {
+            // The alarm may already have run as the test's scheduled wake.
+        }
+    }
+})
 
 /** Forget everything the constructor seeded, as if the object predates the allow list. */
 const unseed = (stub: DurableObjectStub<MonitorIngest>) =>
@@ -1495,7 +1508,9 @@ describe("declaration intake by policy", () => {
         const stub = registeredStub()
         const outside = uniqDid()
         const cursor = (obj: MonitorIngest) => obj.readCursor()
-        let now = 1_000_000
+        // Keep scheduled storage alarms in the future relative to Workerd's
+        // real clock while advancing the ignored-cursor interval locally.
+        let now = Date.now()
         const clock = vi.spyOn(Date, "now").mockImplementation(() => now)
         try {
             await inObj(stub, async (obj) => {
@@ -1557,6 +1572,8 @@ describe("documents and key updates follow interest", () => {
         })
         expect(await rows(stub, "SELECT did, kind FROM key_updates")).toEqual([{ did: followee, kind: "delete" }])
         expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+        const promptAt = Number((await rows(stub, "SELECT v FROM meta WHERE k = 'prompt_at'"))[0]?.v)
+        expect(promptAt - Date.now()).toBeGreaterThan(50_000)
     })
     it("a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)", async () => {
         const stub = everyoneStub()
