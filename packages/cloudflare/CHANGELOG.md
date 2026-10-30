@@ -1,5 +1,7 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.4.1
+
 ## 0.4.0
 
 ### Minor Changes
