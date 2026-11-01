@@ -1,0 +1,127 @@
+{
+  "encoding": "RFC 8949 section 4.2.1 deterministic CBOR. $hex denotes a byte string. Request bodies are signed in full with RFC 9421, not standalone COSE signatures. Response locator is the fixture value locator.",
+  "vectors": [
+    {
+      "name": "legacy-request",
+      "kind": "request",
+      "value": {
+        "pse": "https://push.example/mailbox",
+        "psk": {
+          "$hex": "0101010101010101010101010101010101010101010101010101010101010101"
+        },
+        "psi": 1
+      },
+      "hex": "a363707365781c68747470733a2f2f707573682e6578616d706c652f6d61696c626f7863707369016370736b58200101010101010101010101010101010101010101010101010101010101010101"
+    },
+    {
+      "name": "v1-request",
+      "kind": "request",
+      "value": {
+        "pse": "https://push.example/mailbox",
+        "psk": {
+          "$hex": "0101010101010101010101010101010101010101010101010101010101010101"
+        },
+        "psi": 1,
+        "bundle": {
+          "v": 1,
+          "monitor": {
+            "pse": "https://push.example/2",
+            "psk": {
+              "$hex": "0202020202020202020202020202020202020202020202020202020202020202"
+            },
+            "psi": 2
+          }
+        }
+      },
+      "hex": "a463707365781c68747470733a2f2f707573682e6578616d706c652f6d61696c626f7863707369016370736b582001010101010101010101010101010101010101010101010101010101010101016662756e646c65a2617601676d6f6e69746f72a3637073657668747470733a2f2f707573682e6578616d706c652f3263707369026370736b58200202020202020202020202020202020202020202020202020202020202020202"
+    },
+    {
+      "name": "v1-no-monitor-request",
+      "kind": "request",
+      "value": {
+        "bundle": {
+          "v": 1
+        }
+      },
+      "hex": "a16662756e646c65a1617601"
+    },
+    {
+      "name": "unsupported-version-request",
+      "kind": "request",
+      "value": {
+        "bundle": {
+          "v": 2
+        }
+      },
+      "hex": "a16662756e646c65a1617602"
+    },
+    {
+      "name": "legacy-response",
+      "kind": "response",
+      "value": {
+        "l": "locator"
+      },
+      "hex": "a1616c676c6f6361746f72"
+    },
+    {
+      "name": "v1-accepted-response",
+      "kind": "response",
+      "value": {
+        "l": "locator",
+        "bundle": {
+          "v": 1,
+          "monitor": "accepted"
+        }
+      },
+      "hex": "a2616c676c6f6361746f726662756e646c65a2617601676d6f6e69746f72686163636570746564"
+    },
+    {
+      "name": "v1-unresolved-response",
+      "kind": "response",
+      "value": {
+        "l": "locator",
+        "bundle": {
+          "v": 1,
+          "monitor": "unresolved"
+        }
+      },
+      "hex": "a2616c676c6f6361746f726662756e646c65a2617601676d6f6e69746f726a756e7265736f6c766564"
+    },
+    {
+      "name": "v1-unavailable-response",
+      "kind": "response",
+      "value": {
+        "l": "locator",
+        "bundle": {
+          "v": 1,
+          "monitor": "unavailable"
+        }
+      },
+      "hex": "a2616c676c6f6361746f726662756e646c65a2617601676d6f6e69746f726b756e617661696c61626c65"
+    },
+    {
+      "name": "v1-future-response",
+      "kind": "response",
+      "value": {
+        "l": "locator",
+        "bundle": {
+          "v": 1,
+          "monitor": "future"
+        }
+      },
+      "hex": "a2616c676c6f6361746f726662756e646c65a2617601676d6f6e69746f7266667574757265"
+    },
+    {
+      "name": "unknown-version-response",
+      "kind": "response",
+      "value": {
+        "l": "locator",
+        "bundle": {
+          "v": 2,
+          "monitor": "accepted"
+        }
+      },
+      "hex": "a2616c676c6f6361746f726662756e646c65a2617602676d6f6e69746f72686163636570746564"
+    }
+  ]
+}

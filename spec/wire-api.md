@@ -461,11 +461,72 @@ text string), `"paused"` exactly while the registration is paused.
 A relay **MUST** ignore a key it does not recognize in the
 `POST /pmr/v1/registrations` body, so a client can send a newer or
 deployment-specific field to a relay that lacks it. A client therefore MUST
-NOT treat a create-body field as in effect until `GET /pmr/v1/registration`
-reflects it. A field whose absence must be fatal cannot be added to this body:
+NOT treat a create-body field as in effect until its defined acknowledgement
+reflects it (`GET /pmr/v1/registration` unless the extension defines an explicit
+create response acknowledgement). A field whose absence must be fatal cannot be added to this body:
 it needs a capability in the [enabler document](#the-enabler-document) or a
 new endpoint. The rule covers keys a relay does not recognize, never a
 recognized key with the wrong type, which is a `400`.
+
+### Bundled mailbox and monitor registration (v1)
+
+`POST /pmr/v1/registrations` optionally carries a signed CBOR map:
+
+```
+{ existingMailboxFields..., bundle: { v: 1, monitor?: { pse: httpsURL, psk: bytes32, psi: uint8 } } }
+```
+
+Flat mailbox `pse`/`psk`/`psi`, deployment extensions (including `lr`) and
+locator `l` keep their existing meanings. Mailbox and monitor subscriptions
+are separate deliverer capabilities. `bundle` absent preserves the legacy
+response and MUST NOT mutate the monitor. A recognized malformed bundle,
+unsupported version or incomplete subscription returns `400` after authentication
+and before either service writes. Monitor material, when present, requires an
+HTTPS URL, exactly 32 content-key bytes and an integer key ID from 0 through 255.
+Unknown keys are ignored. Body limits and indistinguishable `401` failures remain.
+All fields are covered by the same request signature; no body DID/key overrides
+the challenge subject or declared signing key.
+
+Authenticate once: redeem one anchor nonce, resolve that subject's declared key
+once, and verify the request once. Commit the mailbox first; mailbox failure
+skips the monitor. Then attempt the monitor through an injected authenticated
+internal hook, never a second HTTP request or nonce redemption. Core has no
+monitor dependency. First monitor create uses the verified declared key;
+an existing entry can rebind only when its stored key matches. A different
+stored key cannot be overwritten under current PDS authority. Standalone
+monitor old-key DELETE/rotation rules remain. Mailbox replacement or deletion
+never deletes monitor state.
+
+After mailbox commit the `201` body retains `l` and acknowledges:
+
+```
+{ l: nonemptyLocator, bundle: { v: 1, monitor: "accepted" | "unresolved" | "unavailable" } }
+```
+
+- `accepted`: monitor put completed. This does not prove push delivery, ingest
+  settlement or receive readiness.
+- `unresolved`: monitor attempt failed, including key mismatch, load or put
+  failure. The response MUST NOT expose a detailed diagnosis, old key or raw
+  store error, and MUST preserve the mailbox receipt.
+- `unavailable`: monitor material was omitted or this deployment has no monitor
+  hook. No monitor mutation was attempted.
+
+No cross-store transaction, rollback, durable pending protocol or stronger
+consistency is implied. In particular the monitor store's documented KV
+stale-read window still applies. A lost response is ambiguous; retry with the
+same subscription/key material and a fresh challenge. A pending put cannot be
+acknowledged as accepted before it completes.
+
+For clients, a legacy `201` with valid `l` grants mailbox acceptance and means
+monitor unsupported; do not retry unchanged capability indefinitely. A malformed
+or unknown-version bundle response with valid `l` preserves mailbox acceptance
+but leaves monitor unresolved. Unknown outcomes never mean accepted. An invalid
+locator or non-`201` grants no new mailbox acceptance. Devices without monitor
+material can register the mailbox. No automatic standalone fallback is implied.
+
+[Deterministic CBOR vectors](vectors/registration-bundle.json) provide legacy,
+v1 request and all response outcomes. Hex is the executable fixture; diagnostic
+values explain its contents without requiring a TypeScript serializer.
 
 ### Grants — the core capability
 

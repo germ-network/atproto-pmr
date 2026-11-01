@@ -97,9 +97,31 @@ export interface CommittedRegistration {
 
 export class RegistrationFieldError extends Error {}
 
+// This brand is private: only the authenticated create path mints this context.
+const authenticatedRegistration = Symbol("authenticated registration")
+
+/** Authority supplied only to a trusted, deployment-injected bundle hook. */
+export interface AuthenticatedRegistration {
+    readonly [authenticatedRegistration]: true
+    readonly did: string
+    /** Raw Ed25519 key verified against the signed request. */
+    readonly anchorKey: Uint8Array
+    readonly nowSeconds: number
+}
+
+export type RegistrationSubscription = NonNullable<RegistrationFields["pushSubscription"]>
+export type RegistrationMonitorOutcome = "accepted" | "unresolved" | "unavailable"
+export type RegistrationMonitorHook = (
+    auth: AuthenticatedRegistration,
+    subscription: RegistrationSubscription
+) => Promise<"accepted" | "unresolved">
+
 export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     registrationExtension?: RegistrationExtension
+    /** Trusted composition seam. Called only after authenticated validation and
+     * mailbox commit; no endpoint accepts caller-supplied verified authority. */
+    registrationMonitor?: RegistrationMonitorHook
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
     /**
@@ -329,6 +351,32 @@ export async function handleRegistrationCreate(
         }
     }
 
+    let bundle: { monitor?: RegistrationSubscription } | undefined
+    if (decodedBody.has("bundle")) {
+        try {
+            const raw = decodedBody.get("bundle")
+            if (!(raw instanceof Map) || raw.get("v") !== 1) throw new Error()
+            bundle = {}
+            if (raw.has("monitor")) {
+                const monitor = raw.get("monitor")
+                if (!(monitor instanceof Map)) throw new Error()
+                const endpoint = monitor.get("pse")
+                const contentKey = monitor.get("psk")
+                const keyId = monitor.get("psi")
+                if (
+                    typeof endpoint !== "string" ||
+                    new URL(endpoint).protocol !== "https:" ||
+                    !(contentKey instanceof Uint8Array) || contentKey.byteLength !== 32 ||
+                    typeof keyId !== "number" || !Number.isInteger(keyId) ||
+                    keyId < 0 || keyId > 255
+                ) throw new Error()
+                bundle.monitor = { endpoint, contentKey, keyId }
+            }
+        } catch {
+            return new Response("Malformed body", { status: 400 })
+        }
+    }
+
     // Replaced whole on every create, so a key the body omits is withdrawn.
     if (deps.registrationExtension !== undefined) {
         try {
@@ -397,7 +445,27 @@ export async function handleRegistrationCreate(
         ext: fields.ext ?? {},
     })
 
-    return cbor([["l", locator]], 201)
+    if (bundle === undefined) return cbor([["l", locator]], 201)
+
+    let outcome: RegistrationMonitorOutcome = "unavailable"
+    if (bundle.monitor !== undefined && deps.registrationMonitor !== undefined) {
+        try {
+            const result = await deps.registrationMonitor({
+                [authenticatedRegistration]: true,
+                did,
+                anchorKey: anchorKey.slice(),
+                nowSeconds: deps.nowSeconds,
+            }, bundle.monitor)
+            // A bad adapter must never manufacture acceptance or leak a diagnosis.
+            outcome = result === "accepted" ? "accepted" : "unresolved"
+        } catch {
+            outcome = "unresolved"
+        }
+    }
+    return cbor([
+        ["l", locator],
+        ["bundle", new Map<string, CoseValue>([["v", 1], ["monitor", outcome]])],
+    ], 201)
 }
 
 /** The extension's read keys, minus any that would shadow the core ones. */

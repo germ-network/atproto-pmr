@@ -217,6 +217,7 @@ export { handleDigest, type DigestEndpointDeps } from "./digest-endpoint"
 // The registration surface: own-DID push.
 export type { MonitorRegistration, MonitorRegistrationStore } from "./registration"
 export {
+    monitorRegistrationHook,
     handleMonitorRegistrationCreate,
     handleMonitorRegistrationDelete,
     type MonitorRegistrationDeps,

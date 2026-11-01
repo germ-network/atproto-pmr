@@ -43,3 +43,14 @@ also stops if keygen or the thumbprint disagrees with RFC 9964 Figure 7, if
 the SubjectPublicKeyInfo header is not the RFC 9881 §2 ML-DSA-65 header, or
 if OpenSSL's verify results differ from what each vector declares. A
 mismatch is a finding to investigate, never a reason to edit a vector.
+
+## Registration bundle v1
+
+`registration-bundle.json` contains deterministic CBOR body hex for legacy and
+bundled registration requests, a request without monitor material, unsupported
+request version, legacy response, each v1 monitor outcome, unknown outcome and
+unknown response version. `$hex` diagnostic objects denote byte strings.
+The hex was produced independently of the TypeScript encoder; the monitor
+bundle test decodes and re-encodes every fixture and executes the request
+fixtures against the authenticated handler. Request signatures cover the whole
+body through RFC 9421; these are body vectors, not signed HTTP transcripts.
