@@ -1,5 +1,13 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.5.1
+
+### Patch Changes
+
+- [#100](https://github.com/germ-network/atproto-pmr/pull/100) [`896a548`](https://github.com/germ-network/atproto-pmr/commit/896a5480d7b66f0766a5cda236152198ac852b8c) Thanks [@germ-mark](https://github.com/germ-mark)! - Do not schedule expiry alarms for zero-expiry pair-proof watermarks. Later blocked, discarded or duplicate puts preserve anti-rollback state without scheduling an invalid alarm or breaking the Durable Object input gate; live proof expiry and bounded scans remain unchanged.
+
+- [#100](https://github.com/germ-network/atproto-pmr/pull/100) [`ba3af11`](https://github.com/germ-network/atproto-pmr/commit/ba3af11c66a49b14a2a5d7da42b993dc6243925c) Thanks [@germ-mark](https://github.com/germ-mark)! - Keep the latest verified declaration revision/CID/key watermark separately from the selected pair-mailbox proof. Same-key declaration edits retain one CAR and the existing generation while repeated valid puts succeed. Reject stale/equivocal observations and interpret existing rows conservatively without discarding watermark or replay state.
+
 ## 0.5.0
 
 ### Minor Changes
