@@ -114,7 +114,9 @@ export interface PairMailboxEvidence {
     expiresAt: number
 }
 
-/** Small anti-rollback watermark retained after the selected proof expires. */
+/** Metadata identifying the selected proof and pair generation. Adapters keep
+ * the latest verified revision/CID/key watermark separately when a same-key
+ * edit retains an older selected proof, including after its bytes expire. */
 export interface PairMailboxMetadata {
     senderDID: PairMailboxKey
     anchorKey: Uint8Array

@@ -156,7 +156,11 @@ interface GrantRow {
     closed: boolean
 }
 
-type StoredPairEvidence = StoredPairMailboxEvidence
+type StoredPairEvidence = StoredPairMailboxEvidence & {
+    /** Latest independently verified declaration, distinct from the selected
+     * proof kept across same-key edits. Optional for pre-patch rows. */
+    watermark?: Pick<PairMailboxEvidence, "revision" | "declarationCID" | "anchorKey">
+}
 
 /**
  * How many recently-accepted nonces a mailbox key remembers.
@@ -624,10 +628,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return this.ctx.blockConcurrencyWhile(async () => {
             const evidenceKey = pairEvidenceKey(key)
             const prior = await this.db.get<StoredPairEvidence>(evidenceKey)
-            if (prior !== undefined && (
-                evidence.revision < prior.revision ||
-                (evidence.revision === prior.revision &&
-                    (evidence.declarationCID !== prior.declarationCID || !sameBytes(evidence.anchorKey, prior.anchorKey)))
+            // Legacy rows have only the original tuple. Fall back to it
+            // conservatively: never guess an equal-revision CID that an old
+            // same-key edit failed to retain. A newer revision can recover.
+            const watermark = prior?.watermark ?? prior
+            if (watermark !== undefined && (
+                evidence.revision < watermark.revision ||
+                (evidence.revision === watermark.revision &&
+                    (evidence.declarationCID !== watermark.declarationCID || !sameBytes(evidence.anchorKey, watermark.anchorKey)))
             )) return { generationChanged: false, recycledMessageIds: [], rejected: "staleEvidence" }
 
             const mailboxExisted = (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
@@ -651,11 +659,17 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             } else {
                 // A declaration edit is not a new mailbox generation. Retain
                 // one selected proof rather than archiving each revision.
-                selected = { ...prior, revision: evidence.revision }
+                selected = { ...prior }
             }
             if (selected.car.byteLength > 0 && selected.expiresAt <= nowSeconds) {
                 await this.clearPairProof(key)
                 selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
+            }
+
+            selected.watermark = {
+                revision: evidence.revision,
+                declarationCID: evidence.declarationCID,
+                anchorKey: evidence.anchorKey,
             }
 
             // Pool-only first contact gets no revision row unless its proof

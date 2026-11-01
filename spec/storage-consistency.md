@@ -163,10 +163,21 @@ does not fit the remaining proof budget, the message is still accepted without
 retained pool refs. Blocked, refused, discarded, duplicate, and exhausted
 outcomes MUST NOT retain proof bytes or expose a mailbox descriptor. The proof
 expires with the accepted message-body retention period.
-A small revision/key watermark may remain for a live provisioned mailbox to
-prevent a stale resolver result from rolling the key back. A same-anchor-key
-declaration edit keeps that generation and selected evidence; it MUST NOT
-create per-message or per-revision proof rows.
+A small latest-observed revision/CID/key watermark may remain for a live
+provisioned mailbox to prevent a stale resolver result from rolling the key
+back. This tuple is independent of the selected proof's CID and revision:
+a same-anchor-key declaration edit advances the watermark while keeping that
+generation and selected evidence. Repeated puts under the edited declaration
+remain valid; equal-revision different CID/key evidence remains refused. This
+MUST NOT create per-message or per-revision proof rows or additional CAR history.
+
+The Cloudflare adapter lazily adds the separate watermark to the same stored
+row. A pre-patch row without it uses its existing revision/CID/key tuple as the
+conservative floor. If an old same-key edit lost its latest CID, the adapter
+cannot safely infer that missing value: an equal-revision different-CID put
+stays refused until a strictly newer independently verified declaration
+establishes the watermark. Existing generation, selected proof and replay
+state are preserved during this recovery.
 A confirmed different anchor key allocates a new opaque generation and
 removes undelivered queue and pool refs for that sender. The nonce set MUST
 survive key rotation so a key changed back cannot replay an old nonce. It MUST
