@@ -1,5 +1,11 @@
 # @germ-network/atproto-pmr-monitor
 
+## 0.5.0
+
+### Minor Changes
+
+- [#98](https://github.com/germ-network/atproto-pmr/pull/98) [`8f8cc72`](https://github.com/germ-network/atproto-pmr/commit/8f8cc729723b3b56d7dd7c52481045e3a45d713c) Thanks [@germ-mark](https://github.com/germ-mark)! - Support signed mailbox/monitor registration bundles with mailbox-first partial acknowledgements and a stored-key-preserving monitor composition hook. Bound the post-mailbox monitor wait to a configurable five seconds, retain late attempts through a deployment lifetime hook, and return unresolved on expiry. Legacy registration and independent monitor lifetimes remain unchanged.
+
 ## 0.4.1
 
 ### Patch Changes
