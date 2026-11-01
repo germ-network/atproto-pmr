@@ -1,6 +1,6 @@
 /**
- * The public read routes answer every caller identically, leave nothing a
- * cache could reveal, never reach a PDS on the response path, and serve held
+ * The public record read answers every caller identically, leaves nothing a
+ * cache could reveal, never reaches a PDS on the response path, and serves held
  * bytes unchanged.
  */
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -9,24 +9,16 @@ import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
 import {
     decodeRecordReadResponse,
     dedupedRecheck,
-    decodeGraphReadResponse,
-    encodeGraphReadResponse,
     encodeRecordReadResponse,
-    handleGraphRead,
     handleRecordRead,
-    type GraphReadDeps,
-    projectGraph,
     type RecordReadDeps,
 } from "../src/device-read"
-import type { FollowEdge } from "../src/follow-edges"
 import {
-    GRAPH_EDGE_KEYS,
-    GRAPH_READ_KEYS,
     RECORD_READ_KEYS,
-    type GraphReadResponse,
     type RecordReadResponse,
 } from "../src/read-api"
 import { SNAPSHOT_MAX_AGE_MS, type StoredRecordSnapshot } from "../src/snapshot-read"
+import { verifyRecordProof } from "../src/repo-proof"
 import { buildRepoCar, makeKey } from "./fixtures/repo-car"
 
 const DID = "did:plc:alice1234567890123456789012"
@@ -53,13 +45,15 @@ function setup(
         serves?: boolean
         watched?: RecordReadDeps["watched"]
         declaration?: boolean
+        /** The record's path, when not the default `COLLECTION/RKEY`. */
+        at?: { collection: string; rkey: string }
         commitDid?: string
         /** Ingest's rev/cid metadata; null models an entry stored without it. */
         metadata?: null
     } = {}
 ) {
-    const collection = options.declaration ? DECLARATION_COLLECTION_NSID : COLLECTION
-    const rkey = options.declaration ? "self" : RKEY
+    const collection = options.at?.collection ?? (options.declaration ? DECLARATION_COLLECTION_NSID : COLLECTION)
+    const rkey = options.at?.rkey ?? (options.declaration ? "self" : RKEY)
     const key = makeKey()
     const repo = buildRepoCar({
         did: DID,
@@ -468,185 +462,93 @@ describe("record read codec", () => {
     })
 })
 
-describe("projectGraph", () => {
-    const ME = "did:plc:me"
-    const A = "did:plc:a"
-    const B = "did:plc:b"
-    const edge = (follower: string, subject: string, rkey: string): FollowEdge => ({
-        follower,
-        subject,
-        rkey,
-    })
+describe("handleRecordRead — a registered owner's own block records", () => {
+    const BLOCK = "app.bsky.graph.block"
+    const BLOCK_RKEY = "3kblockrkeyaa"
+    const BLOCK_PATH = `${BLOCK}/${BLOCK_RKEY}`
+    const BLOCKED = "did:plc:bob12345678901234567890123"
+    const BLOCK_URL = `/pmr/v1/records/${DID}/${BLOCK}/${BLOCK_RKEY}`
 
-    it("following and followers carry each edge's other party and follow rkey", () => {
-        const out = projectGraph(ME, [edge(ME, A, "r1")], [edge(B, ME, "r2")])
-        expect(out).toEqual({
-            did: ME,
-            following: [{ did: A, rkey: "r1", mutual: false }],
-            followers: [{ did: B, rkey: "r2", mutual: false }],
-        })
-    })
-
-    it("an edge is mutual iff a reverse edge is present", () => {
-        const out = projectGraph(
-            ME,
-            [edge(ME, A, "r1"), edge(ME, B, "r2")],
-            [edge(A, ME, "r3")]
-        )
-        expect(out.following).toEqual([
-            { did: A, rkey: "r1", mutual: true },
-            { did: B, rkey: "r2", mutual: false },
-        ])
-        expect(out.followers).toEqual([{ did: A, rkey: "r3", mutual: true }])
-    })
-
-    it("two follow records of the same pair are two edges", () => {
-        const out = projectGraph(ME, [edge(ME, A, "r1"), edge(ME, A, "r2")], [])
-        expect(out.following).toEqual([
-            { did: A, rkey: "r1", mutual: false },
-            { did: A, rkey: "r2", mutual: false },
-        ])
-    })
-
-    it("edges are sorted by did then rkey, so equal inputs encode to equal bytes", () => {
-        const edges = [edge(ME, B, "r2"), edge(ME, A, "r9"), edge(ME, A, "r1"), edge(ME, B, "r1")]
-        const inbound = edges.map((e) => edge(e.subject, ME, e.rkey))
-        const forward = projectGraph(ME, edges, inbound)
-        const reversed = projectGraph(ME, [...edges].reverse(), [...inbound].reverse())
-        expect(forward.followers.map((e) => `${e.did}/${e.rkey}`)).toEqual([
-            `${A}/r1`,
-            `${A}/r9`,
-            `${B}/r1`,
-            `${B}/r2`,
-        ])
-        expect(forward.following.map((e) => `${e.did}/${e.rkey}`)).toEqual([
-            `${A}/r1`,
-            `${A}/r9`,
-            `${B}/r1`,
-            `${B}/r2`,
-        ])
-        expect(reversed).toEqual(forward)
-    })
-})
-
-describe("graph read", () => {
-    const GRAPH_DID = "did:plc:me"
-    const projection: GraphReadResponse = {
-        did: GRAPH_DID,
-        following: [{ did: "did:plc:a", rkey: "r1", mutual: true }],
-        followers: [
-            { did: "did:plc:a", rkey: "r3", mutual: true },
-            { did: "did:plc:b", rkey: "r2", mutual: false },
-        ],
-    }
-    const deps = (held: GraphReadResponse | null, asked: string[] = []): GraphReadDeps => ({
-        projections: {
-            get: async (did) => {
-                asked.push(did)
-                return held
+    function blockSetup(
+        options: {
+            records?: Record<string, unknown>
+            snapshot?: null
+            metadata?: null
+            servesOwnBlocks?: RecordReadDeps["servesOwnBlocks"] | null
+        } = {}
+    ) {
+        const s = setup({
+            records: options.records ?? {
+                [BLOCK_PATH]: { $type: BLOCK, subject: BLOCKED, createdAt: "2026-01-01T00:00:00.000Z" },
             },
-        },
-    })
-    const graphGet = (did: string, headers: Record<string, string> = {}) =>
-        get(`/pmr/v1/graph/${did}`, headers)
-
-    it("serves the held projection as a GraphReadResponse with cache-control no-store", async () => {
-        const asked: string[] = []
-        const res = await handleGraphRead(graphGet(GRAPH_DID), deps(projection, asked))
-        expect(res.status).toBe(200)
-        expect(res.headers.get("cache-control")).toBe("no-store")
-        expect(res.headers.get("content-type")).toBe("application/cbor")
-        expect(res.headers.get("etag")).toBeNull()
-        expect(decodeGraphReadResponse(new Uint8Array(await res.arrayBuffer()))).toEqual(projection)
-        expect(asked).toEqual([GRAPH_DID])
-    })
-
-    it("an escaped DID segment reaches the store decoded", async () => {
-        const asked: string[] = []
-        await handleGraphRead(graphGet("did%3Aplc%3Ame"), deps(projection, asked))
-        expect(asked).toEqual([GRAPH_DID])
-    })
-
-    it("a DID with no projection (not served) is 404", async () => {
-        const res = await handleGraphRead(graphGet(GRAPH_DID), deps(null))
-        expect(res.status).toBe(404)
-        expect(res.headers.get("cache-control")).toBe("no-store")
-    })
-
-    it("a malformed path is 400 and never reaches the store", async () => {
-        const asked: string[] = []
-        for (const path of [
-            "/pmr/v1/graph",
-            "/pmr/v1/graph/not-a-did",
-            `/pmr/v1/graph/${GRAPH_DID}/x`,
-            "/pmr/v1/graph/%E0%A4%A",
-        ]) {
-            const res = await handleGraphRead(get(path), deps(projection, asked))
-            expect(res.status).toBe(400)
+            snapshot: options.snapshot,
+            metadata: options.metadata,
+            at: { collection: BLOCK, rkey: BLOCK_RKEY },
+            watched: [],
+        })
+        if (options.servesOwnBlocks !== null) {
+            s.deps.servesOwnBlocks = options.servesOwnBlocks ?? (async () => true)
         }
-        expect(asked).toEqual([])
-    })
+        const original = s.deps.records.get
+        s.deps.records.get = async (did, c, r) =>
+            c === BLOCK ? await original(did, c, r) : null
+        return s
+    }
 
-    it("answers identically whatever headers or credentials the request carries", async () => {
-        const plain = await handleGraphRead(graphGet(GRAPH_DID), deps(projection))
-        const decorated = await handleGraphRead(
-            graphGet(GRAPH_DID, {
-                authorization: "Bearer x",
-                signature: "sig1=:AAAA:",
-                "if-none-match": '"anything"',
-                cookie: "a=b",
-            }),
-            deps(projection)
-        )
-        expect(decorated.status).toBe(plain.status)
-        expect([...decorated.headers]).toEqual([...plain.headers])
-        expect(new Uint8Array(await decorated.arrayBuffer())).toEqual(
-            new Uint8Array(await plain.arrayBuffer())
-        )
-    })
-
-    it("the codec round-trips and ignores unknown keys", () => {
-        expect(decodeGraphReadResponse(encodeGraphReadResponse(projection))).toEqual(projection)
-        const withUnknown = encodeCose(
-            new Map<string, CoseValue>([
-                [GRAPH_READ_KEYS.did, GRAPH_DID],
-                [
-                    GRAPH_READ_KEYS.following,
-                    [
-                        new Map<string, CoseValue>([
-                            [GRAPH_EDGE_KEYS.did, "did:plc:a"],
-                            [GRAPH_EDGE_KEYS.rkey, "r1"],
-                            [GRAPH_EDGE_KEYS.mutual, false],
-                            ["zz", 1],
-                        ]),
-                    ],
-                ],
-                [GRAPH_READ_KEYS.followers, []],
-                ["zz", "extra"],
-            ])
-        )
-        expect(decodeGraphReadResponse(withUnknown)).toEqual({
-            did: GRAPH_DID,
-            following: [{ did: "did:plc:a", rkey: "r1", mutual: false }],
-            followers: [],
+    it("serves a registered owner's held block record as found with its proof CAR", async () => {
+        const { deps, repo } = blockSetup()
+        const res = await handleRecordRead(get(BLOCK_URL), deps)
+        const body = decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer()))
+        expect(body).toMatchObject({
+            found: true,
+            car: repo.car,
+            cid: repo.recordCids[BLOCK_PATH],
         })
     })
 
-    it("decode rejects a body missing a required field", () => {
-        const noFollowers = encodeCose(
-            new Map<string, CoseValue>([
-                [GRAPH_READ_KEYS.did, GRAPH_DID],
-                [GRAPH_READ_KEYS.following, []],
-            ])
-        )
-        expect(() => decodeGraphReadResponse(noFollowers)).toThrow()
-        const badEdge = encodeCose(
-            new Map<string, CoseValue>([
-                [GRAPH_READ_KEYS.did, GRAPH_DID],
-                [GRAPH_READ_KEYS.following, [new Map<string, CoseValue>([[GRAPH_EDGE_KEYS.did, "x"]])]],
-                [GRAPH_READ_KEYS.followers, []],
-            ])
-        )
-        expect(() => decodeGraphReadResponse(badEdge)).toThrow()
+    it("the served CAR verifies against the owner's signing key and names the blocked DID as subject", async () => {
+        const { deps, repo } = blockSetup()
+        const res = await handleRecordRead(get(BLOCK_URL), deps)
+        const body = decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer()))
+        if (!body.found) throw new Error("expected found")
+        const verified = verifyRecordProof(body.car, {
+            did: DID,
+            signingKey: repo.key.multikey,
+            collection: BLOCK,
+            rkey: BLOCK_RKEY,
+        })
+        expect((verified.record as { subject: string }).subject).toBe(BLOCKED)
+    })
+
+    it("a block record of a DID that is served but not a registered owner reads not-watched", async () => {
+        const { deps } = blockSetup({ servesOwnBlocks: async () => false })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-watched" })
+    })
+
+    it("every block read is not-watched when the deployment does not wire servesOwnBlocks", async () => {
+        const { deps } = blockSetup({ servesOwnBlocks: null })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-watched" })
+    })
+
+    it("a block proof held under a rotated-away key reads unverifiable", async () => {
+        const { deps } = blockSetup()
+        deps.signingKeys = {
+            keysFor: async (dids) =>
+                new Map(dids.map((d) => [d, { kind: "trusted", key: makeKey().multikey } as const])),
+        }
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "unverifiable" })
+    })
+
+    it("a block rkey with nothing held reads not-held", async () => {
+        const { deps } = blockSetup({ snapshot: null })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-held" })
+    })
+
+    it("a held CAR proving a block absent reads not-held", async () => {
+        const { deps } = blockSetup({
+            records: { [`${BLOCK}/other`]: { $type: BLOCK, subject: BLOCKED } },
+            metadata: null,
+        })
+        expect(await miss(BLOCK_URL, deps)).toMatchObject({ code: "not-held" })
     })
 })

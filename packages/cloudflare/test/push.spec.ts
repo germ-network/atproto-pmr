@@ -475,3 +475,27 @@ describe("deliverPush via pool provisioning", () => {
         expect(fetchCalled).toBe(false)
     })
 })
+
+describe("push while paused", () => {
+    it("a registration paused by the declaration watch is still pushed to", async () => {
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await withSubscription(stub, {
+            endpoint: "https://push.example/sub/paused",
+            contentKey: new Uint8Array(32).fill(1),
+            keyId: 1,
+        })
+        await inPMR(stub, (pmr) => pmr.writeWatchState({ paused: true, lastCheckAt: 0 }))
+        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
+        let fetchCalled = false
+        vi.stubGlobal("fetch", async () => {
+            fetchCalled = true
+            return new Response(null, { status: 201 })
+        })
+
+        await inPMR(stub, (pmr) =>
+            pmr.deliverPush("did:plc:sender", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]))
+        )
+        expect(fetchCalled).toBe(true)
+    })
+})

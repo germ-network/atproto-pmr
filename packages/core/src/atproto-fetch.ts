@@ -68,10 +68,10 @@ const MAX_RESPONSE_BYTES = 64 * 1024
  * terminal state counts.
  *
  * `permanent` separates two shapes of terminal state a caller may need to
- * treat differently: an outcome with no path back short of the subject
- * republishing from scratch (a deleted record, a fully gone repo), versus
- * a reversible state (an account takedown/suspension/deactivation) that
- * may later resolve on its own. A caller that does not need the
+ * treat differently: an outcome with no path back at that identity (a
+ * repo that no longer exists), versus a state that may later resolve on
+ * its own (an account takedown/suspension/deactivation, or a record the
+ * account can publish again). A caller that does not need the
  * distinction may treat both alike.
  */
 export class RecordNotFoundError extends Error {
@@ -162,6 +162,8 @@ export async function guardedFetchJSON(
         permanentErrorNames?: readonly string[]
         /** Body cap in bytes; the default suits a DID document. */
         maxBytes?: number
+        /** Request cache mode for freshness-sensitive callers. */
+        cache?: "no-store"
     } = {}
 ): Promise<unknown> {
     let parsed: URL
@@ -191,12 +193,14 @@ export async function guardedFetchJSON(
             // injects a mock fetchImpl that never validates the option at
             // all. The refusal happens explicitly below instead.
             redirect: "manual",
+            ...(options.cache ? { cache: options.cache } : {}),
             headers: { accept: "application/did+ld+json,application/json" },
         })
         if (isRedirect(response)) {
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
+            let xrpcName: string | null = null
             if (
                 options.terminalErrorNames !== undefined ||
                 options.terminalMessagePrefixes !== undefined
@@ -204,6 +208,7 @@ export async function guardedFetchJSON(
                 // Read the failing body ONCE and test both signals against
                 // it — the stream cannot be consumed twice.
                 const err = await tryReadXrpcError(response)
+                xrpcName = err.error
                 if (
                     options.terminalErrorNames !== undefined &&
                     err.error !== null &&
@@ -228,7 +233,7 @@ export async function guardedFetchJSON(
                     throw new RecordNotFoundError(err.message, true)
                 }
             }
-            throw new Error(`endpoint answered ${response.status}`)
+            throw new Error(answeredMessage(response.status, xrpcName))
         }
         const text = await readCapped(response, options.maxBytes ?? MAX_RESPONSE_BYTES)
         return JSON.parse(text) as unknown
@@ -288,6 +293,11 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
         offset += c.byteLength
     }
     return new TextDecoder().decode(joined)
+}
+
+/** Names the XRPC error where the body carried one, so a log line says why. */
+function answeredMessage(status: number, xrpcName: string | null): string {
+    return xrpcName === null ? `endpoint answered ${status}` : `endpoint answered ${status} ${xrpcName}`
 }
 
 /**
@@ -377,8 +387,9 @@ export async function guardedFetchBytes(
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
+            let name: string | null = null
             if (options.terminalErrorNames !== undefined) {
-                const name = await tryReadXrpcErrorName(response)
+                name = await tryReadXrpcErrorName(response)
                 if (name !== null && options.terminalErrorNames.includes(name)) {
                     const permanent =
                         options.permanentErrorNames === undefined ||
@@ -386,7 +397,7 @@ export async function guardedFetchBytes(
                     throw new RecordNotFoundError(name, permanent, name)
                 }
             }
-            throw new Error(`endpoint answered ${response.status}`)
+            throw new Error(answeredMessage(response.status, name))
         }
         return await readCappedBytes(response, options.maxBytes ?? MAX_CAR_BYTES)
     } finally {
@@ -454,8 +465,9 @@ export async function guardedFetchStream(
             throw new Error("refusing a redirect")
         }
         if (!response.ok) {
+            let name: string | null = null
             if (options.terminalErrorNames !== undefined) {
-                const name = await tryReadXrpcErrorName(response)
+                name = await tryReadXrpcErrorName(response)
                 if (name !== null && options.terminalErrorNames.includes(name)) {
                     const permanent =
                         options.permanentErrorNames === undefined ||
@@ -463,7 +475,7 @@ export async function guardedFetchStream(
                     throw new RecordNotFoundError(name, permanent, name)
                 }
             }
-            throw new Error(`endpoint answered ${response.status}`)
+            throw new Error(answeredMessage(response.status, name))
         }
     } catch (error) {
         clearTimeout(timer)
@@ -760,7 +772,7 @@ export function cachedSigningKeyResolver(deps: {
  *     Guessing either way means fetching the wrong URL, so this refuses
  *     rather than resolve a DID differently from the rest of the network.
  */
-function didWebDocumentURL(did: string): string {
+export function didWebDocumentURL(did: string): string {
     const parts = did.slice("did:web:".length).split(":").map(decodeURIComponent)
     if (parts.length !== 1 || parts[0].length === 0) {
         throw new Error(`unsupported did:web form: ${did}`)

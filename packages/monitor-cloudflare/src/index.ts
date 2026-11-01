@@ -40,6 +40,31 @@
  * stored copy current, and a `fetchRecord` not built on `fetchRecordCar`
  * must return the document it resolved as `didDocument`.
  *
+ * **Operator status.** `MonitorIngest` also answers two read-only Durable
+ * Object RPC methods, `ingestStatus()` and `pendingDetail(did)` (shapes in
+ * `MonitorIngestStatus` and `MonitorPendingDetail` from
+ * `@germ-network/atproto-pmr-monitor`). The first is aggregate and names no
+ * owed or held DID: whether the baseline backfill finished, how many fetches are owed
+ * (declarations, and separately secondary records), how many are due, how long the oldest
+ * has waited, and how many held declarations the index has. The second says why one DID is still owed (its
+ * attempts, next try and last failure) or that the monitor never owed or held
+ * it. Call them over the binding, or from a route of your own behind
+ * authentication; they are not part of the monitor's public surface and must
+ * stay off its public paths.
+ *
+ *     const status = await env.ingest.get(env.ingest.idFromName(MONITOR_NAME)).ingestStatus()
+ *
+ * Every failed settle also logs one `monitor: settle deferred` line carrying
+ * the DID, attempts, error or reason, and next try; a failed secondary settle
+ * logs `monitor: secondary settle deferred` with the collection and rkey too.
+ * A DID the refresh pass fails on logs `monitor: refresh did failed` with the
+ * DID and error, and a snapshot whose metadata had to be trimmed under KV's
+ * cap logs `monitor: snapshot metadata trimmed`, or `monitor: snapshot metadata
+ * over cap after trim` when even that leaves it too large to store.
+ * With `MONITOR_HOSTNAME` set, a declaration stored without summary evidence
+ * logs `monitor: declaration evidence unavailable` with the DID and reason
+ * (for a deployment `fetchRecord`, most often a missing `didDocument`).
+ *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain
  * Worker, so the community view scales and caches like the public data it
@@ -63,11 +88,19 @@ export {
     kvDeclarationSnapshots,
     kvRecordSnapshots,
     kvSummaryIndexReader,
+    kvMessagingKeyFirstSeenMany,
+    kvDeclaredKeyPage,
+    type DeclaredKeyRecord,
 } from "./snapshot-store"
-export { kvGraphProjections } from "./graph-projection-store"
 export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./did-document-store"
 export { kvSigningKeyCache } from "./signing-key-store"
+export { kvFirehoseCoverage } from "./firehose-coverage-store"
 export { d1FollowEdgeStore } from "./follow-edge-store"
-export { d1GraphChangeLog } from "./graph-change-log"
+export { d1BlockEdgeStore } from "./block-edge-store"
+export { d1SenderGraphReader } from "./sender-graph-reader"
+export { d1AdmissionSource } from "./admission-source"
+export type { D1Reader } from "./block-edge-store"
 export { d1InterestReader } from "./interest-reader"
 export type { MonitorEnv } from "./env"
+
+export { d1PermissionRecencyReader } from "./permission-recency-reader"

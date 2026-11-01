@@ -5,16 +5,14 @@
  */
 import { describe, expect, it } from "vitest"
 import {
-    GRAPH_EDGE_KEYS,
-    GRAPH_READ_KEYS,
+    OWN_BLOCK_KEYS,
     RECORD_READ_KEYS,
 } from "../src/read-api"
 
 describe("read API wire keys", () => {
     it.each([
         ["RECORD_READ_KEYS", RECORD_READ_KEYS],
-        ["GRAPH_READ_KEYS", GRAPH_READ_KEYS],
-        ["GRAPH_EDGE_KEYS", GRAPH_EDGE_KEYS],
+        ["OWN_BLOCK_KEYS", OWN_BLOCK_KEYS],
     ])("%s gives every field a distinct key", (_, keys) => {
         const values = Object.values(keys)
         expect(new Set(values).size).toBe(values.length)

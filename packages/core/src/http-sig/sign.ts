@@ -1,8 +1,13 @@
 import { ed25519 } from "@noble/curves/ed25519.js"
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { parseSignatureInput } from "./structured-fields.js"
 import { toResponseBody } from "../util.js"
-import { buildSignatureBase, DEFAULT_LABEL } from "./verify.js"
+import {
+    buildSignatureBase,
+    DEFAULT_LABEL,
+    type RequestSignatureAlg,
+} from "./verify.js"
 
 /**
  * The client half of RFC 9421, for tests and for client implementers.
@@ -14,14 +19,23 @@ import { buildSignatureBase, DEFAULT_LABEL } from "./verify.js"
  * check their own signer against.
  */
 
-export interface SignOptions {
+export type SignOptions = SignOptionsBase &
+    (
+        | {
+              /** A raw Ed25519 secret key. */
+              secretKey: Uint8Array
+              key?: never
+          }
+        | { key: SigningKey; secretKey?: never }
+    )
+
+interface SignOptionsBase {
     method: string
     url: string
     /** Server-issued challenge, carried in the `nonce` parameter. */
     nonce: string
     /** RFC 9679 thumbprint of the signing key. */
     keyid: string
-    secretKey: Uint8Array
     body?: Uint8Array
     created?: number
     label?: string
@@ -29,12 +43,38 @@ export interface SignOptions {
     components?: string[]
 }
 
+/**
+ * An ML-DSA-65 key is its 32-byte seed, the only private form RFC 9964 §4
+ * allows. Signing is hedged; `deterministic` (all-zero per-signature
+ * randomness) exists only so published vectors can be regenerated and
+ * reproduced by another implementation. The context is always empty
+ * (RFC 9964 §5), so there is deliberately no way to sign under another.
+ */
+export type SigningKey =
+    | { alg: Extract<RequestSignatureAlg, "ed25519">; secretKey: Uint8Array }
+    | {
+          alg: Extract<RequestSignatureAlg, "ml-dsa-65">
+          seed: Uint8Array
+          deterministic?: true
+      }
+
 export interface SignedRequestParts {
     headers: Record<string, string>
     base: string
 }
 
 export function signRequest(opts: SignOptions): SignedRequestParts {
+    let key: SigningKey
+    if (opts.key !== undefined && opts.secretKey === undefined) {
+        key = opts.key
+    } else if (opts.secretKey !== undefined && opts.key === undefined) {
+        key = { alg: "ed25519", secretKey: opts.secretKey }
+    } else {
+        throw new Error("signRequest: pass exactly one of key and secretKey")
+    }
+    if (key.alg === "ml-dsa-65" && key.seed.byteLength !== 32) {
+        throw new Error("signRequest: an ML-DSA-65 key is its 32-byte seed")
+    }
     const label = opts.label ?? DEFAULT_LABEL
     const hasBody = opts.body !== undefined && opts.body.byteLength > 0
     const hasQuery = new URL(opts.url).search !== ""
@@ -58,7 +98,7 @@ export function signRequest(opts: SignOptions): SignedRequestParts {
         `nonce="${opts.nonce}"`,
         ...(opts.created !== undefined ? [`created=${opts.created}`] : []),
         `keyid="${opts.keyid}"`,
-        `alg="ed25519"`,
+        `alg="${key.alg}"`,
     ].join(";")
     const inner = `(${components.map((c) => `"${c}"`).join(" ")})`
     const signatureInput = `${label}=${inner};${params}`
@@ -74,10 +114,14 @@ export function signRequest(opts: SignOptions): SignedRequestParts {
     const entry = parseSignatureInput(signatureInput).get(label)!
     const base = buildSignatureBase(request, entry)
 
-    const signature = ed25519.sign(
-        new TextEncoder().encode(base),
-        opts.secretKey
-    )
+    const message = new TextEncoder().encode(base)
+    const signature =
+        key.alg === "ml-dsa-65"
+            ? ml_dsa65.sign(message, ml_dsa65.keygen(key.seed).secretKey, {
+                  context: new Uint8Array(0),
+                  extraEntropy: key.deterministic ? false : undefined,
+              })
+            : ed25519.sign(message, key.secretKey)
     return {
         headers: {
             ...headers,

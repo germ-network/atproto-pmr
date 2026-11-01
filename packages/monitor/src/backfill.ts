@@ -17,7 +17,12 @@
  */
 
 import type { ListReposPage } from "./list-repos"
-import type { BackfillProgress, MonitorIndex } from "./storage"
+import type {
+    BackfillProgress,
+    EvidenceBackfillProgress,
+    MonitorIndex,
+    SnapshotLayoutBackfillProgress,
+} from "./storage"
 
 export interface BackfillDeps {
     index: MonitorIndex
@@ -65,4 +70,72 @@ export async function sweepBackfill(deps: BackfillDeps): Promise<SweepBackfillRe
     await deps.index.setBackfillProgress(next)
 
     return { discovered, done: next.done }
+}
+
+/**
+ * Force a fresh fetch/verification for each already-indexed declaration
+ * once, a page per call. A declaration already owed keeps its backoff:
+ * the fetch it is owed will carry the evidence.
+ */
+export async function sweepEvidenceRefresh(deps: {
+    index: MonitorIndex
+    limit: number
+}): Promise<SweepBackfillResult> {
+    // Called through `index`, not destructured: an implementation's
+    // methods may need their `this`.
+    const index = deps.index
+    if (
+        !index.evidenceBackfillPage ||
+        !index.readEvidenceBackfillProgress ||
+        !index.setEvidenceBackfillProgress ||
+        !index.oweEvidenceRefresh
+    ) {
+        return { discovered: 0, done: true }
+    }
+    const progress: EvidenceBackfillProgress = await index.readEvidenceBackfillProgress()
+    if (progress.done) return { discovered: 0, done: true }
+
+    const page = await index.evidenceBackfillPage(progress.cursor, Math.max(1, deps.limit))
+    for (const record of page) await index.oweEvidenceRefresh(record.did, record.rev)
+
+    const next: EvidenceBackfillProgress =
+        page.length < Math.max(1, deps.limit)
+            ? { done: true }
+            : { done: false, cursor: page.at(-1)!.did }
+    await index.setEvidenceBackfillProgress(next)
+    return { discovered: page.length, done: next.done }
+}
+
+/**
+ * Re-store every indexed record in the current snapshot layout, a page per
+ * call: each is owed a fetch from its PDS, so the ingest object never reads
+ * a stored snapshot to convert it.
+ */
+export async function sweepSnapshotLayout(deps: {
+    index: MonitorIndex
+    limit: number
+}): Promise<SweepBackfillResult> {
+    const index = deps.index
+    if (
+        !index.snapshotLayoutBackfillPage ||
+        !index.readSnapshotLayoutBackfillProgress ||
+        !index.setSnapshotLayoutBackfillProgress ||
+        !index.oweSnapshotLayoutRefresh
+    ) {
+        return { discovered: 0, done: true }
+    }
+    const progress: SnapshotLayoutBackfillProgress = await index.readSnapshotLayoutBackfillProgress()
+    if (progress.done) return { discovered: 0, done: true }
+
+    const limit = Math.max(1, deps.limit)
+    const page = await index.snapshotLayoutBackfillPage(progress.cursor, limit)
+    for (const record of page) await index.oweSnapshotLayoutRefresh(record)
+
+    const last = page.at(-1)
+    const next: SnapshotLayoutBackfillProgress =
+        page.length < limit || last === undefined
+            ? { done: true }
+            : { done: false, cursor: { did: last.did, collection: last.collection, rkey: last.rkey } }
+    await index.setSnapshotLayoutBackfillProgress(next)
+    return { discovered: page.length, done: next.done }
 }

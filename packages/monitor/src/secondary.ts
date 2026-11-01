@@ -7,16 +7,26 @@
  */
 import { RecordNotFoundError, type WatchedRecord } from "@germ-network/atproto-pmr-core"
 import type { CommitEvent } from "./jetstream"
-import { recordFetchedDocument, type FetchedRecord, type VerifyOutcome } from "./ingest"
+import {
+    recordFetchedDocument,
+    retryCapFor,
+    settleRetryBackoffMs,
+    truncated,
+    type FetchedRecord,
+    type SettleFailureEvent,
+    type VerifyOutcome,
+} from "./ingest"
 import {
     compareRev,
     type Cursor,
     type DidDocumentSink,
     type InterestIndex,
+    type PendingFailure,
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryIndex,
     type SecondaryIntakeIndex,
+    type SecondaryLane,
     type SecondarySnapshotStore,
 } from "./storage"
 
@@ -34,7 +44,16 @@ export interface SecondaryDeps {
      */
     deferToDeclaration(did: string): Promise<void>
     didDocuments?: DidDocumentSink
+    /** As `IngestDeps.retryCapMs`: a pending row takes the DID out of refresh too. */
+    retryCapMs?(did: string): Promise<number>
+    /** As `IngestDeps.onSettleFailure`, for each secondary deferral. */
+    onSettleFailure?(event: SecondarySettleFailureEvent): void
     nowMs(): number
+}
+
+export interface SecondarySettleFailureEvent extends SettleFailureEvent {
+    collection: string
+    rkey: string
 }
 
 /** Which secondaries a monitor keeps. Commits on any other record are ignored. */
@@ -163,21 +182,84 @@ async function stillOwedUnder(deps: SecondaryDeps, did: string, epoch: number): 
     )
 }
 
-/** Drain the owed secondaries, with the declaration path's backoff. */
+/**
+ * Defers `owed` and tells `onSettleFailure` once, with exactly what was
+ * stored. A row that is already gone counts nothing, so reports nothing. A
+ * failing hook never costs the deferral.
+ */
+async function deferFailure(
+    deps: SecondaryDeps,
+    owed: PendingRecordFetch,
+    backoffMs: (attempts: number, capMs: number) => number,
+    now: number,
+    failure: PendingFailure
+): Promise<void> {
+    const notBeforeMs = now + backoffMs(owed.attempts, await retryCapFor(deps, owed.did))
+    const attempts = await deps.index.deferSecondary(owed, notBeforeMs, failure)
+    if (attempts === null) return
+    try {
+        deps.onSettleFailure?.({
+            did: owed.did,
+            collection: owed.collection,
+            rkey: owed.rkey,
+            attempts,
+            failure,
+            notBeforeMs,
+        })
+    } catch {}
+}
+
+/**
+ * Drain the owed secondaries, with the declaration path's backoff and cap.
+ * One record's failure, or a failure to record it, never costs the rest of
+ * the batch.
+ */
 export async function settleSecondaryDue(
     deps: SecondaryDeps,
     limit = 32,
-    backoffMs = (attempts: number) => Math.min(2 ** attempts, 64) * 1000
+    /** Given the cap `retryCapMs` answered for the DID. */
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs,
+    lane: SecondaryLane = "records"
 ): Promise<number> {
     const now = deps.nowMs()
-    const due = await deps.index.dueSecondaries(now, limit)
+    const due = await deps.index.dueSecondaries(now, limit, lane)
     let settled = 0
     for (const owed of due) {
         try {
             if ((await settleSecondary(deps, owed)) === "stored") settled += 1
-        } catch {
-            await deps.index.deferSecondary(owed, now + backoffMs(owed.attempts))
+        } catch (err) {
+            try {
+                await deferFailure(deps, owed, backoffMs, now, {
+                    kind: "threw",
+                    errorName: err instanceof Error ? err.name : typeof err,
+                    message: truncated(String(err instanceof Error ? err.message : err)),
+                    atMs: now,
+                })
+            } catch {}
         }
     }
     return settled
+}
+
+/** Per-alarm budget of the `own-blocks` lane (`OWN_BLOCK_SETTLE_BATCH`). */
+export const OWN_BLOCK_SETTLE_BATCH = 16
+
+/**
+ * Deletes the held block proofs of owners no longer registered, store first
+ * and index second, at most `limit`. One proof's failure never costs the
+ * rest. Returns how many were disposed.
+ */
+export async function disposeStrayOwnBlockProofs(
+    deps: Pick<SecondaryDeps, "index" | "snapshot">,
+    limit: number
+): Promise<number> {
+    let disposed = 0
+    for (const ref of await deps.index.strayOwnBlockProofs(limit)) {
+        try {
+            await deps.snapshot.deleteSecondary(ref)
+            await deps.index.forgetStrayOwnBlockProof(ref)
+            disposed++
+        } catch {}
+    }
+    return disposed
 }

@@ -179,6 +179,21 @@ describe("guardedFetchJSON", () => {
         await expect(rejection).rejects.not.toBeInstanceOf(RecordNotFoundError)
     })
 
+    it("a non-terminal XRPC error names itself in the thrown message", async () => {
+        const fetchImpl = (async () =>
+            new Response(JSON.stringify({ error: "InvalidRequest" }), { status: 400 })) as typeof fetch
+        const options = { terminalErrorNames: ["RecordNotFound"] }
+        await expect(guardedFetchJSON(URL_, fetchImpl, options)).rejects.toThrow(
+            "endpoint answered 400 InvalidRequest"
+        )
+        await expect(guardedFetchBytes(URL_, fetchImpl, options)).rejects.toThrow(
+            "endpoint answered 400 InvalidRequest"
+        )
+        await expect(
+            guardedFetchStream(URL_, fetchImpl, { ...options, timeoutMs: 1000, maxBytes: 1000 })
+        ).rejects.toThrow("endpoint answered 400 InvalidRequest")
+    })
+
     it("a terminal XRPC error stays generic when terminalErrorNames is omitted -- opt-in only", async () => {
         const fetchImpl = (async () =>
             new Response(JSON.stringify({ error: "RecordNotFound" }), { status: 404 })) as typeof fetch

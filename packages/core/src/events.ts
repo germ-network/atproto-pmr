@@ -1,6 +1,8 @@
 import { decodeCoseSequence, encodeCose, type CoseValue } from "./cose/cbor.js"
 import type { GrantLifecycle } from "./config.js"
 import { asMailboxKey } from "./mailbox-key.js"
+import type { BlockEdgeStore } from "./block-edges.js"
+import { syncOwnerBlocks } from "./block-sync.js"
 import type { BodyStore, MessageRef, PMRStore } from "./storage.js"
 
 /**
@@ -65,10 +67,17 @@ export function decodeFrame(bytes: Uint8Array): DecodedFrame {
 }
 
 /**
+ * Keys an entry extension may never use: the entry's own vocabulary, plus the
+ * push payload's type key `t`, which is merged into the same map.
+ */
+export const RESERVED_ENTRY_KEYS: ReadonlySet<string> = new Set(["k", "id", "m", "sd", "dc", "t"])
+
+/**
  * A queued message's field vocabulary, pair or grant mailbox alike — the
  * socket does not distinguish them, matching `openMailboxes`. `sd`/`dc`
  * (the relay's verification hint) are present only when the ref carries
- * one, which pair mailboxes do and grant mailboxes never do.
+ * one, which pair mailboxes do and grant mailboxes never do. A ref's `ext`
+ * rides with the hint, minus any key in `RESERVED_ENTRY_KEYS`.
  *
  * Shared with the REST catch-up route (`owner/endpoints.ts`'s
  * `handleMessagesList`), which reuses these exact keys unwrapped in a
@@ -90,6 +99,11 @@ export function messageEntryFields(
     if (ref.hint !== undefined && typeof ref.hint.declarationCID === "string") {
         entries.push(["sd", ref.hint.senderDID])
         entries.push(["dc", ref.hint.declarationCID])
+        if (ref.ext !== undefined) {
+            for (const [key, value] of Object.entries(ref.ext)) {
+                if (!RESERVED_ENTRY_KEYS.has(key)) entries.push([key, value])
+            }
+        }
     }
     if (ref.pairGeneration !== undefined) entries.push(["g", ref.pairGeneration])
     return new Map(entries)
@@ -224,6 +238,8 @@ export function decodeAckFrame(bytes: Uint8Array): AckPayload {
 export interface EventsDeps {
     store: PMRStore
     bodies: BodyStore
+    /** The owner's Bsky blocks, mirrored before a drain delivers anything (`syncOwnerBlocks`). */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
 }
 
 /** Implementation-defined, like every other limit in this package. */
@@ -235,6 +251,9 @@ const DEFAULT_DRAIN_PAGE_SIZE = 50
  * there is one), then `#caughtUp` — always last, always sent, so the
  * client has an unconditional signal that backlog is over even when the
  * pool is empty.
+ *
+ * When `deps.blocks` is set the owner's Bsky blocks are mirrored first, so a
+ * newly blocked sender's queue is cleared before it is read.
  *
  * `#capabilities` leads because it frames how to read everything after it:
  * a client that does not yet know grants are draining cannot tell "nothing
@@ -256,6 +275,15 @@ export async function drainBacklog(
     pageSize: number = DEFAULT_DRAIN_PAGE_SIZE
 ): Promise<void> {
     send(encodeCapabilitiesFrame(capabilities))
+
+    if (deps.blocks !== undefined) {
+        // The owner is the registration this store holds; a failed load only
+        // skips the sync.
+        const owner = await deps.store.load().catch(() => null)
+        if (owner !== null) {
+            await syncOwnerBlocks(deps.store, owner.did, deps.blocks)
+        }
+    }
 
     let cursor: string | null = null
     do {

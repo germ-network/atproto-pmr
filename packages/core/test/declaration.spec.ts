@@ -9,7 +9,7 @@
  * never a test to update.
  */
 import { describe, expect, it } from "vitest"
-import { resolveDeclaration, resolveDeclarationWithRev } from "../src/declaration"
+import { declarationAnchorKeyOf, messagingKeyFingerprint, normalizeMessagingKeyFingerprint, resolveDeclaration, resolveDeclarationWithRev } from "../src/declaration"
 
 const DID_PLC = "did:plc:abcdefghijklmnopqrstuvwx"
 const DID_WEB = "did:web:example.com"
@@ -581,5 +581,18 @@ describe("resolveDeclarationWithRev (the watch's rev-carrying resolve)", () => {
         const { resolution, headRev } = await resolveDeclarationWithRev(DID_PLC, fetchImpl)
         expect(resolution.found).toBe(false)
         expect(headRev).toBeNull()
+    })
+})
+
+
+describe("messaging-key fingerprint normalization", () => {
+    it("normalizes prior raw COSE hex structurally and leaves canonical digests unchanged", () => {
+        const key = declarationAnchorKeyOf({ currentKey: Uint8Array.of(3, ...new Uint8Array(32).fill(17)) })!
+        const raw = [...key].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+        const canonical = messagingKeyFingerprint(key)
+        expect(normalizeMessagingKeyFingerprint(raw)).toBe(canonical)
+        expect(normalizeMessagingKeyFingerprint(raw.toUpperCase())).toBe(canonical)
+        expect(normalizeMessagingKeyFingerprint(canonical)).toBe(canonical)
+        expect(normalizeMessagingKeyFingerprint("ff".repeat(key.length))).toBe("ff".repeat(key.length))
     })
 })

@@ -19,6 +19,10 @@ new_sqlite_classes = ["MonitorIngest"]
 [vars]
 # The collection carrying the published key.
 MONITOR_COLLECTION = "com.germnetwork.declaration"
+# Stable logical identity used in evidence records. Lowercase IDNA hostname, without a port.
+MONITOR_HOSTNAME = "monitor.example.org"
+# AppView used to independently confirm a PDS-fetched declaration CID.
+APP_VIEW_URL = "https://public.api.bsky.app"
 
 # Who the monitor keeps records for. `registered` (the default) is registered
 # users plus the DIDs they follow, and needs the `pmrDirectory` binding below;
@@ -54,12 +58,28 @@ PLC_EXPORT_STREAM_URL = "https://plc.directory/export/stream"
 
 # An outbound socket does not hibernate, so this object is evicted on the
 # platform's schedule whatever this value is. The alarm is what reconnects
-# from the stored cursor; eviction is expected, not exceptional.
+# from the stored cursor; eviction is expected, not exceptional. This also
+# caps declaration/key no-progress cooldowns. A declaration cooldown can delay
+# fresh declarations and maintenance's declaration-settlement step, but other
+# maintenance and key work stay independent. The cap is 120 s if disabled.
 WATCHDOG_INTERVAL_MS = "120000"
 
-# Owed fetches settled per wake. A failed fetch stays owed with backoff:
-# the stream will not redeliver it.
+# Delay before a prompt settlement/key-update alarm after durable intake.
+# Defaults to 100 ms. Tests use a longer delay and explicitly fire alarms.
+PROMPT_WAKE_DELAY_MS = "100"
+
+# Maximum owed declaration fetches per prompt wake and ordinary secondary-record
+# fetches per maintenance wake. Own-block proofs use OWN_BLOCK_SETTLE_BATCH.
+# Defaults to 32 and is capped at 32; invalid, zero, or negative values use
+# the default. Declaration backlogs continue in successive prompt alarms,
+# usually about 100 ms apart; secondary backlogs continue on maintenance wakes.
+# A failed fetch stays owed with backoff: the stream will not redeliver it.
 SETTLE_BATCH = "32"
+# Registered owners' block-record proofs settled per wake, on their own
+# budget so a large owner's backfill never delays the fetches above. At the
+# watchdog interval above, 16 per wake backfills 20,000 blocks in about 42
+# hours; until then an unheld block reads not-held.
+OWN_BLOCK_SETTLE_BATCH = "16"
 # Changing this requires clearing sealed windows + sealedThrough: an
 # absent window below sealedThrough means "empty", and that promise does
 # not survive a granularity change.
@@ -96,9 +116,11 @@ REFRESH_STALE_AFTER_MS = "3600000"
 FOLLOW_BACKFILL_REPOS = "4"
 FOLLOW_LISTING_STATEMENT_RESERVE = "400"
 MAX_FOLLOWS = "20000"
+MAX_BLOCKS = "20000"
 FOLLOW_MAX_REPO_BYTES = "33554432"
 FOLLOW_FETCH_TIMEOUT_MS = "30000"
 JETSTREAM_LOOKBACK_MS = "129600000"
+JETSTREAM_RESUME_TOLERANCE_MS = "60000"
 FOLLOW_RELIST_AFTER_MS = "604800000"
 
 # The relay's directory of registered DIDs (bare <did> keys), read only: the
@@ -125,8 +147,9 @@ FOLLOW_RELIST_AFTER_MS = "604800000"
 	binding = "registrations"
 	id = "PROVISION_BEFORE_DEPLOY"
 
-# The follow-edge index, written only by MonitorIngest and read by the graph
-# routes. Required: the object fails at startup without it. Apply the
+# The follow-edge index, written only by MonitorIngest and read by its owner
+# graph and block RPCs and, through `d1InterestReader`, by read routes.
+# Required: the object fails at startup without it. Apply the
 # migrations before deploying. migrations_dir is relative to this file; from
 # the npm package, point it at
 # node_modules/@germ-network/atproto-pmr-monitor-cloudflare/migrations.

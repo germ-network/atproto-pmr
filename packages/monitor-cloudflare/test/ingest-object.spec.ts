@@ -16,10 +16,14 @@ import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
     binaryToBase64URL,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
     RecordNotFoundError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
+    verifyPlcLog,
     type CachedDidDocument,
     type DidDocument,
+    type PlcLogEntry,
 } from "@germ-network/atproto-pmr-core"
 import {
     decodeDigestWindows,
@@ -27,14 +31,17 @@ import {
     mightHaveChanged,
     sealDueWindows,
     intakePlcEvent,
+    settle,
     settleDue,
     sweepBackfill,
     FETCH_AS_OF_SKEW_MS,
     type FetchedRecord,
     type IngestDeps,
     type PlcExportEvent,
+    type VerifyOutcome,
 } from "@germ-network/atproto-pmr-monitor"
-import { buildRepoCar, makeKey } from "../../core/test/fixtures/repo-car"
+import { logEntry, signedOperation, syntheticPlcChain } from "../../core/test/fixtures/plc-chain"
+import { buildRepoCar, makeKey, type TestKey } from "../../core/test/fixtures/repo-car"
 import { kvMonitorRegistrationStore } from "../src/registration-store"
 import { DIGEST_MARKER_KEY, kvDeclarationSnapshots, kvSnapshotStore } from "../src/snapshot-store"
 import { canonicalDidDocumentJson, kvDidDocuments, kvPlcCoverage } from "../src/did-document-store"
@@ -51,9 +58,29 @@ const SIGNING_KEY = "zQ3shXjHeiBuRCKmM3rH6dHDW95NPMPsQC2z1eK7cyJmnhqfw"
 const STUB_VERIFIED = { cid: "bafyreistub", verifiedWith: SIGNING_KEY }
 
 let n = 0
+const testStubs: DurableObjectStub<MonitorIngest>[] = []
 function freshStub(): DurableObjectStub<MonitorIngest> {
     n += 1
-    return testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    const stub = testEnv.ingest.get(testEnv.ingest.idFromName(`ingest-${n}`))
+    testStubs.push(stub)
+    return stub
+}
+
+afterEach(async () => {
+    for (const stub of testStubs.splice(0)) {
+        try {
+            await runInDurableObject(stub, (obj: MonitorIngest) => obj.ctx.storage.deleteAlarm())
+        } catch {
+            // The alarm may already have run as the test's scheduled wake.
+        }
+    }
+})
+
+/** These alarm tests count fetches; the layout sweep's owed fetches are covered in snapshot-v2-backfill.spec.ts. */
+function skipLayoutSweep(obj: MonitorIngest): void {
+    obj.ctx.storage.sql.exec(
+        "INSERT INTO meta (k, v) VALUES ('snapshot_v2_backfill', '{\"done\":true}') ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+    )
 }
 
 /** Reach in to drive the ingest object with a stubbed authoritative fetch. */
@@ -158,6 +185,9 @@ describe("the index", () => {
             // not in-memory) -- arm one so runDurableObjectAlarm below has
             // something to fire on the fresh post-eviction instance.
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            // This checks maintenance reconnect after eviction. Intake's
+            // separate 100 ms prompt alarm could otherwise fire first.
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
         })
 
         await evictDurableObject(stub)
@@ -348,7 +378,12 @@ describe("settling what is owed", () => {
         const stub = freshStub()
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.intake({ did: DID, rev: "3m1" }, "100")
-            await obj.deferPending(DID, Date.now() + 10 ** 6)
+            await obj.deferPending(DID, Date.now() + 10 ** 6, {
+                kind: "threw",
+                errorName: "Error",
+                message: "held back",
+                atMs: Date.now(),
+            })
         })
         const dueNow = await runInDurableObject(stub, (obj: MonitorIngest) =>
             obj.duePending(Date.now(), 10)
@@ -358,6 +393,316 @@ describe("settling what is owed", () => {
 })
 
 describe("the way in", () => {
+    it("keeps the production prompt deadline at 100 ms when unset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                env: MonitorEnv
+                requestPromptSync(nowMs: number): void
+            }
+            internal.env = { ...internal.env, PROMPT_WAKE_DELAY_MS: undefined }
+            const requestedAt = Date.now()
+            internal.requestPromptSync(requestedAt)
+            return {
+                requestedAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(result.promptAt).toBe(result.requestedAt + 100)
+    })
+
+    it("migrates a legacy shared cooldown to both lanes so a successful lane can reset", async () => {
+        const stub = freshStub()
+        const result = await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                cooldownUntilSync(lane: "declaration" | "key"): number
+                cooldownDurationSync(lane: "declaration" | "key"): number
+                clearCooldownSync(lane: "declaration" | "key"): void
+            }
+            const until = Date.now() + 60_000
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('scheduler_cooldown', ?), ('scheduler_cooldown_ms', '8000')",
+                String(until)
+            )
+            const declarationUntil = internal.cooldownUntilSync("declaration")
+            const keyUntil = internal.cooldownUntilSync("key")
+            internal.clearCooldownSync("declaration")
+            return {
+                declarationUntil,
+                keyUntil,
+                declarationDuration: internal.cooldownDurationSync("declaration"),
+                keyDuration: internal.cooldownDurationSync("key"),
+                legacyRows: obj.ctx.storage.sql.exec("SELECT 1 FROM meta WHERE k LIKE 'scheduler_cooldown%'").toArray().length,
+            }
+        })
+        expect(result.declarationUntil).toBeGreaterThan(Date.now())
+        expect(result.keyUntil).toBe(result.declarationUntil)
+        expect(result.declarationDuration).toBe(0)
+        expect(result.keyDuration).toBe(8_000)
+        expect(result.legacyRows).toBe(0)
+    })
+
+    it("claims the first timed resume frame before waiting on serialized storage", async () => {
+        const stub = freshStub()
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const state = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                resumeFromUs: number | null
+                checkResumeFrame(frameMs: number | null): Promise<void>
+                serializeStorage<T>(work: () => Promise<T>): Promise<T>
+                startFirehoseRun(nowMs: number): void
+            }
+            internal.resumeFromUs = 1_000_000
+            let started = 0
+            internal.serializeStorage = async (work) => {
+                await blocked
+                return work()
+            }
+            internal.startFirehoseRun = () => { started += 1 }
+            const first = internal.checkResumeFrame(100_000)
+            const claimedAfterFirst = internal.resumeFromUs
+            await internal.checkResumeFrame(200_000)
+            release()
+            await first
+            return { claimedAfterFirst, started }
+        })
+        expect(state.claimedAfterFirst).toBeNull()
+        expect(state.started).toBe(1)
+    })
+
+    it("records a prompt wake at intake and dispatches a bounded settlement before maintenance", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        let maintenance = 0
+        const cursor = String(Date.now() * 1000)
+        const result = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                onFrame(raw: string): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                connectFollow(): Promise<void>
+            }
+            await internal.armWatchdog()
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("controlled fetch failure")
+            }
+            internal.connectFollow = async () => {
+                maintenance += 1
+            }
+            await internal.onFrame(JSON.stringify({
+                kind: "commit",
+                did: DID,
+                time_us: Number(cursor),
+                commit: { collection: "com.germnetwork.declaration", rkey: "self", operation: "create", rev: "3m1" },
+            }))
+            const alarmAt = await obj.ctx.storage.getAlarm()
+            const promptAt = Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v)
+            const maintenanceAt = Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'maintenance_at'").one().v)
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+            return { alarmAt, promptAt, maintenanceAt }
+        })
+        expect(result.alarmAt).toBe(result.promptAt)
+        expect(result.promptAt).toBeLessThan(result.maintenanceAt)
+        await runDurableObjectAlarm(stub)
+        const settled = await runInDurableObject(stub, async (obj: MonitorIngest) => ({
+            pending: await obj.duePending(Date.now() + 10_000, 10),
+            cursor: await obj.readCursor(),
+        }))
+        expect(fetched).toBe(1)
+        expect(maintenance).toBe(0)
+        expect(settled.cursor).toBe(cursor)
+        expect(settled.pending[0]?.attempts).toBe(1)
+    })
+
+    it("classifies a future retry deadline as a prompt settlement wake", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        let maintenance = 0
+        const did = "did:plc:future-retry"
+        const scheduled = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                reconcileAlarm(): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                connect(): Promise<void>
+                connectPlc(): Promise<void>
+                connectFollow(): Promise<void>
+            }
+            await internal.armWatchdog()
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("retry failure")
+            }
+            internal.connect = async () => { maintenance += 1 }
+            internal.connectPlc = async () => { maintenance += 1 }
+            internal.connectFollow = async () => { maintenance += 1 }
+            await obj.owe(did, "3m1")
+            const retryAt = Date.now() + 60_000
+            await obj.deferPending(did, retryAt, {
+                kind: "threw",
+                errorName: "Error",
+                message: "retry later",
+                atMs: Date.now(),
+            })
+            obj.ctx.storage.sql.exec("DELETE FROM meta WHERE k = 'prompt_at'")
+            await internal.reconcileAlarm()
+            return {
+                retryAt,
+                promptAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'prompt_at'").one().v),
+            }
+        })
+        expect(scheduled.promptAt).toBe(scheduled.retryAt)
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = 0 WHERE did = ?", did)
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(1)
+        expect(maintenance).toBe(0)
+    })
+
+    it("backs off an unchanged bounded batch even when selection turns rotate", async () => {
+        const stub = freshStub()
+        const originalError = console.error
+        console.error = () => {}
+        try {
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const internal = obj as unknown as {
+                    armWatchdog(): Promise<void>
+                    fetchRecord(did: string): Promise<StubFetched>
+                    deferPending(did: string, notBeforeMs: number, failure: PendingFailure): Promise<number | null>
+                }
+                await internal.armWatchdog()
+                internal.fetchRecord = async () => { throw new Error("network unavailable") }
+                internal.deferPending = async () => { throw new Error("injected defer failure") }
+                for (let n = 0; n < 33; n++) await obj.owe(`did:plc:stalled-${n}`, "3m1")
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+                await obj.ctx.storage.setAlarm(Date.now() + 100)
+            })
+            await runDurableObjectAlarm(stub)
+        } finally {
+            console.error = originalError
+        }
+        const state = await runInDurableObject(stub, (obj: MonitorIngest) => ({
+            cooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'declaration_cooldown_ms'").one().v),
+            keyCooldownMs: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'key_cooldown_ms'").toArray()[0]?.v ?? "0"),
+            due: obj.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pending WHERE not_before <= ?", Date.now()).one().n,
+        }))
+        expect(state.cooldownMs).toBeGreaterThanOrEqual(1_000)
+        expect(state.keyCooldownMs).toBe(0)
+        expect(state.due).toBe(33)
+    })
+
+    it("rotates selected retry turns behind arrivals while preserving retry eligibility", async () => {
+        const stub = freshStub()
+        const a = "did:plc:quiet-a"
+        const b = "did:plc:arrival-b"
+        const c = "did:plc:arrival-c"
+        const order = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.owe(a, "3m1")
+            const first = await obj.duePending(Date.now(), 1)
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = ? WHERE did = ?", Date.now() + 60_000, a)
+            await obj.owe(b, "3m1")
+            const second = await obj.duePending(Date.now(), 1)
+            await obj.owe(c, "3m1")
+            obj.ctx.storage.sql.exec("UPDATE pending SET not_before = 0 WHERE did = ?", a)
+            const third = await obj.duePending(Date.now(), 1)
+            return [first[0]?.did, second[0]?.did, third[0]?.did]
+        })
+        expect(order).toEqual([a, b, a])
+    })
+
+    it("continues a declaration batch overflow from the durable queue without another frame", async () => {
+        const stub = freshStub()
+        let fetched = 0
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const internal = obj as unknown as {
+                armWatchdog(): Promise<void>
+                reconcileAlarm(): Promise<void>
+                fetchRecord(did: string): Promise<StubFetched>
+                clearCooldownSync(lane: "declaration" | "key"): void
+            }
+            await internal.armWatchdog()
+            obj.ctx.storage.sql.exec(
+                "INSERT INTO meta (k, v) VALUES ('declaration_cooldown_until', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                String(Date.now() + 60_000)
+            )
+            internal.fetchRecord = async () => {
+                fetched += 1
+                throw new Error("controlled fetch failure")
+            }
+            for (let n = 0; n < 33; n++) await obj.owe(`did:plc:batch-${n}`, "3m1")
+            await internal.reconcileAlarm()
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            internal.clearCooldownSync("declaration")
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(32)
+        const remainingDue = await runInDurableObject(stub, (obj: MonitorIngest) => obj.duePending(Date.now(), 40))
+        expect(remainingDue).toHaveLength(1)
+
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'prompt_at'", String(Date.now() - 1))
+            ;(obj as unknown as { clearCooldownSync(lane: "declaration" | "key"): void }).clearCooldownSync("declaration")
+            await obj.ctx.storage.setAlarm(Date.now() + 100)
+        })
+        await runDurableObjectAlarm(stub)
+        expect(fetched).toBe(33)
+    })
+
+    it("keeps unrelated intake durable when both prompt scheduling attempts fail, then recovers after eviction", async () => {
+        const stub = freshStub()
+        const firstDid = "did:plc:failed-schedule-a"
+        const secondDid = "did:plc:failed-schedule-b"
+        const eventTimeUs = Date.now() * 1000
+        const originalError = console.error
+        console.error = () => {}
+        try {
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const internal = obj as unknown as {
+                    armWatchdog(): Promise<void>
+                    onFrame(raw: string): Promise<void>
+                }
+                await internal.armWatchdog()
+                const storage = obj.ctx.storage as unknown as {
+                    setAlarm: (at: number) => Promise<void>
+                }
+                const originalSetAlarm = storage.setAlarm.bind(storage)
+                storage.setAlarm = async () => { throw new Error("injected setAlarm failure") }
+                const frame = (did: string, time: number) => JSON.stringify({
+                    kind: "commit",
+                    did,
+                    time_us: time,
+                    commit: { collection: "com.germnetwork.declaration", rkey: "self", operation: "create", rev: "3m1" },
+                })
+                await internal.onFrame(frame(firstDid, eventTimeUs))
+                await internal.onFrame(frame(secondDid, eventTimeUs + 1))
+                storage.setAlarm = originalSetAlarm
+            })
+        } finally {
+            console.error = originalError
+        }
+        await evictDurableObject(stub)
+        const recovered = await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
+            return {
+                cursor: await obj.readCursor(),
+                pending: obj.ctx.storage.sql.exec<{ did: string }>("SELECT did FROM pending ORDER BY did").toArray().map((r) => r.did),
+                alarmAt: await obj.ctx.storage.getAlarm(),
+                maintenanceAt: Number(obj.ctx.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'maintenance_at'").one().v),
+            }
+        })
+        expect(recovered.cursor).toBe(String(eventTimeUs + 1))
+        expect(recovered.pending).toEqual([firstDid, secondDid])
+        expect(recovered.alarmAt).toBeLessThan(recovered.maintenanceAt)
+    })
+
     it("start() arms the alarm, so a deployed object is not inert", async () => {
         // There was no entry point at all: connect armed the alarm and
         // only the alarm called connect. A fresh object never started.
@@ -1063,6 +1408,7 @@ describe("snapshot refresh", () => {
         const log: string[] = []
         const old = Date.now() - 3 * HOUR
         await inMonitorObj(stub, async (obj) => {
+            skipLayoutSweep(obj)
             const o = obj as unknown as {
                 fetchRecord: (did: string) => Promise<StubFetched>
                 verifyRecord: IngestDeps["verify"]
@@ -1086,7 +1432,7 @@ describe("snapshot refresh", () => {
             }
             await obj.complete("did:plc:refresh-b", "3m1", old, STUB_VERIFIED)
             await kvSnapshotStore(testEnv).putRecord("did:plc:refresh-b", entry("3m1", old))
-            await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, "1")
+            await obj.intake({ did: "did:plc:refresh-a", rev: "3m2" }, String(Date.now() * 1000))
             await (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         })
 
@@ -1710,6 +2056,7 @@ describe("wiring stored DID documents into the monitor", () => {
         const stub = freshStub()
         const log: string[] = []
         await inMonitorObj(stub, async (obj) => {
+            skipLayoutSweep(obj)
             const o = obj as unknown as {
                 publishDidDocuments: (limit: number) => Promise<unknown>
                 windowMembers: (w: number) => Promise<string[]>
@@ -2606,13 +2953,18 @@ describe("PLC export consumer", () => {
     /** Run one alarm with every outbound fetch answered by `answer`; resolves the URLs asked for. */
     async function alarmWithFetch(
         stub: DurableObjectStub<MonitorIngest>,
-        answer: (url: string) => Promise<Response> = () =>
-            Promise.resolve(new Response(null, { status: 200 }))
+        answer: (url: string) => Promise<Response> = () => Promise.resolve(new Response(null, { status: 200 })),
+        options: { forceMaintenance?: boolean } = {}
     ): Promise<string[]> {
         const urls: string[] = []
         await runInDurableObject(stub, (obj: MonitorIngest) =>
             (obj as unknown as { armWatchdog(): Promise<void> }).armWatchdog()
         )
+        if (options.forceMaintenance) {
+            await runInDurableObject(stub, (obj: MonitorIngest) => {
+                obj.ctx.storage.sql.exec("UPDATE meta SET v = ? WHERE k = 'maintenance_at'", String(Date.now() - 1))
+            })
+        }
         const original = globalThis.fetch
         globalThis.fetch = ((input: RequestInfo | URL) => {
             const url = typeof input === "string" ? input : input.toString()
@@ -2766,7 +3118,9 @@ describe("PLC export consumer", () => {
             obj.oweKeyUpdate("did:plc:a", put("zK"), 77)
         )
         await evictDurableObject(stub)
-        const resumed = (await alarmWithFetch(stub)).find((u) => u.startsWith(PLC_URL))
+        const resumed = (await alarmWithFetch(stub, undefined, { forceMaintenance: true })).find((u) =>
+            u.startsWith(PLC_URL)
+        )
         expect(new URL(resumed!).searchParams.get("cursor")).toBe("77")
     })
 
@@ -2885,6 +3239,11 @@ describe("verifying a fetched record", () => {
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
             cid: repo.recordCids[`${COLLECTION}/self`],
+            commitCid: expect.any(String),
+            collection: COLLECTION,
+            rkey: "self",
+            messagingKeyFingerprint: null,
+            anchorKey: null,
         })
     })
 
@@ -2894,6 +3253,7 @@ describe("verifying a fetched record", () => {
             kind: "verified-absent",
             key: key.multikey,
             rev: "3kaaaaaaaaaaa",
+            commitCid: expect.any(String),
         })
     })
 
@@ -2903,12 +3263,12 @@ describe("verifying a fetched record", () => {
             key,
             records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
         })
-        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toEqual({ kind: "unverifiable" })
-        expect(await verifyRecord(fetched(repo.car, null))).toEqual({ kind: "unverifiable" })
+        expect(await verifyRecord(fetched(repo.car, makeKey().multikey))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(new Uint8Array([1, 2, 3])))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
+        expect(await verifyRecord(fetched(repo.car, null))).toMatchObject({ kind: "unverifiable", reason: expect.any(String) })
     })
 
-    it("the snapshot store round-trips verifiedWith, cid and seenKey", async () => {
+    it("the snapshot store round-trips verifiedWith, cid, source and signingKey", async () => {
         const store = kvSnapshotStore(testEnv)
         await store.putRecord("did:plc:meta", {
             rev: "3m1",
@@ -2918,13 +3278,557 @@ describe("verifying a fetched record", () => {
             signingKey: SIGNING_KEY,
             verifiedWith: SIGNING_KEY,
             cid: "bafyreimeta",
-            seenKey: "zQ3shSeen",
         })
         expect(await store.getRecord("did:plc:meta")).toMatchObject({
             verifiedWith: SIGNING_KEY,
             cid: "bafyreimeta",
-            seenKey: "zQ3shSeen",
+            source: PDS,
+            signingKey: SIGNING_KEY,
         })
+    })
+})
+
+describe("declaration evidence", () => {
+    const COLLECTION = testEnv.MONITOR_COLLECTION
+    const HOSTNAME = "monitor.example.org"
+    const APP_VIEW_PATH = "/xrpc/com.atproto.repo.getRecord"
+    const didKey = (key: TestKey) => `did:key:${key.multikey}`
+
+    /** A did:plc whose genesis renders the document the PDS was resolved through. */
+    function custodyWorld(rev?: string) {
+        const chain = syntheticPlcChain()
+        const repo = buildRepoCar({
+            did: chain.did,
+            key: chain.signing,
+            rev,
+            records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+        })
+        return {
+            chain,
+            did: chain.did,
+            repo,
+            recordCid: repo.recordCids[`${COLLECTION}/self`]!,
+            document: verifyPlcLog(chain.did, [chain.g])!,
+            entries: [chain.g] as PlcLogEntry[],
+        }
+    }
+
+    /**
+     * The same, with a validly signed head that renders no document (two
+     * verification methods): the chain still proves custody of it.
+     */
+    function unrenderableWorld() {
+        const w = custodyWorld()
+        const head = logEntry(
+            signedOperation(w.chain.rotation, {
+                type: "plc_operation",
+                rotationKeys: [didKey(w.chain.rotation)],
+                verificationMethods: { atproto: didKey(w.chain.signing), other: didKey(makeKey()) },
+                alsoKnownAs: ["at://b.test"],
+                services: {
+                    atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://b.example" },
+                },
+                prev: w.chain.g.cid,
+            })
+        )
+        return { ...w, head, entries: [w.chain.g, head] }
+    }
+
+    /**
+     * The same, with a middle operation no rotation key of the genesis
+     * signed, so the full chain fails, under a head its predecessor's keys
+     * did sign: only the current-key cross-check can name it.
+     */
+    function currentKeyWorld() {
+        const w = custodyWorld()
+        const mid = logEntry(
+            signedOperation(makeKey(), {
+                type: "plc_operation",
+                rotationKeys: [didKey(w.chain.rotation)],
+                verificationMethods: { atproto: didKey(w.chain.signing) },
+                alsoKnownAs: ["at://b.test"],
+                services: {
+                    atproto_pds: { type: "AtprotoPersonalDataServer", endpoint: "https://b.example" },
+                },
+                prev: w.chain.g.cid,
+            })
+        )
+        const head = w.chain.next(mid.cid, "c")
+        return { ...w, head, entries: [w.chain.g, mid, head] }
+    }
+
+    type World = ReturnType<typeof custodyWorld>
+
+    const auditLog = (w: World) =>
+        Response.json(
+            w.entries.map((e) => ({
+                did: w.did,
+                cid: e.cid,
+                operation: e.operation,
+                nullified: e.nullified,
+                createdAt: new Date(e.createdAtMs).toISOString(),
+            }))
+        )
+
+    const fetched = (w: World, extra: Partial<FetchedRecord> = {}): FetchedRecord => ({
+        car: w.repo.car,
+        source: PDS,
+        signingKey: w.chain.signing.multikey,
+        didDocument: { document: w.document, fetchedAtMs: Date.now() },
+        attemptStartedAtMs: Date.now(),
+        ...extra,
+    })
+
+    const base = (w: World): VerifyOutcome => ({
+        kind: "verified",
+        key: w.chain.signing.multikey,
+        rev: "3kaaaaaaaaaaa",
+        cid: w.recordCid,
+        commitCid: expect.any(String),
+        collection: COLLECTION,
+        rkey: "self",
+        messagingKeyFingerprint: null,
+        anchorKey: null,
+    })
+
+    const appViewServes = (w: World, cid = w.recordCid) => () =>
+        Response.json({ uri: `at://${w.did}/${COLLECTION}/self`, cid })
+
+    /**
+     * Run `fn` in a fresh object with `MONITOR_HOSTNAME` set (unless
+     * `hostname` is null), the PLC directory serving `w`'s log (unless
+     * `plc` says otherwise), and the AppView answering `appView`; every
+     * requested URL is recorded.
+     */
+    async function inEvidenceObj<R>(
+        w: World,
+        options: {
+            appView?: () => Response | Promise<Response>
+            plc?: () => Response | Promise<Response>
+            hostname?: string | null
+            stub?: DurableObjectStub<MonitorIngest>
+        },
+        fn: (obj: MonitorIngest, state: DurableObjectState, requested: string[]) => Promise<R>
+    ): Promise<R> {
+        const requested: string[] = []
+        const original = globalThis.fetch
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            const url = new URL(input instanceof Request ? input.url : input.toString())
+            requested.push(url.href)
+            if (url.hostname === "plc.directory") return (options.plc ?? (() => auditLog(w)))()
+            if (url.pathname === APP_VIEW_PATH && options.appView) return options.appView()
+            return new Response(null, { status: 404 })
+        }) as typeof fetch
+        try {
+            return await runInDurableObject(options.stub ?? freshStub(), async (obj: MonitorIngest, state) => {
+                const o = obj as unknown as { env: MonitorEnv }
+                const hostname = options.hostname === undefined ? HOSTNAME : options.hostname
+                o.env = { ...o.env, MONITOR_HOSTNAME: hostname ?? undefined }
+                return fn(obj, state, requested)
+            })
+        } finally {
+            globalThis.fetch = original
+        }
+    }
+
+    const verify = (obj: MonitorIngest, did: string, record: FetchedRecord) =>
+        (
+            obj as unknown as {
+                verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+            }
+        ).verifyRecord(did, record)
+
+    afterEach(() => {
+        vi.restoreAllMocks()
+    })
+
+    it("a verified PLC log rendering the fetched key is custody-chain evidence, with no AppView read", async () => {
+        const w = custodyWorld()
+        const { outcome, requested } = await inEvidenceObj(w, {}, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "custody-chain",
+            authority: { method: "plc", operationCid: w.chain.g.cid },
+            monitor: HOSTNAME,
+        })
+        expect(requested.some((u) => new URL(u).pathname === APP_VIEW_PATH)).toBe(false)
+    })
+
+    it("a log rendering another key is no custody evidence", async () => {
+        const w = custodyWorld()
+        const other = makeKey()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const outcome = await inEvidenceObj(w, { appView: appViewServes(w) }, (obj) =>
+            verify(obj, w.did, {
+                ...fetched(w),
+                car: buildRepoCar({
+                    did: w.did,
+                    key: other,
+                    records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 1 } },
+                }).car,
+                signingKey: other.multikey,
+            })
+        )
+        expect(outcome).toEqual({ ...base(w), key: other.multikey })
+        expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+            did: w.did,
+            reason: "PLC current-key operation unverified",
+        })
+    })
+
+    it("a verified chain whose head renders no document is custody-chain evidence, with no AppView read", async () => {
+        const w = unrenderableWorld()
+        const { outcome, requested } = await inEvidenceObj(w, {}, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "custody-chain",
+            authority: { method: "plc", operationCid: w.head.cid },
+            monitor: HOSTNAME,
+        })
+        expect(requested.some((url) => url.includes(APP_VIEW_PATH))).toBe(false)
+    })
+
+    it("a head whose chain fails the full proof, confirmed by the AppView, is current-key cross-check evidence naming it", async () => {
+        const w = currentKeyWorld()
+        const outcome = await inEvidenceObj(w, { appView: appViewServes(w) }, (obj) =>
+            verify(obj, w.did, fetched(w))
+        )
+        expect(outcome).toMatchObject({
+            ...base(w),
+            assurance: "current-key-cross-check",
+            authority: { method: "plc", operationCid: w.head.cid },
+            monitor: HOSTNAME,
+        })
+    })
+
+    it("an AppView 5xx, a failed AppView fetch, or a CID mismatch leaves the declaration verified without evidence", async () => {
+        const w = currentKeyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (const appView of [
+            () => new Response("unavailable", { status: 503 }),
+            () => Promise.reject(new Error("down")),
+            appViewServes(w, "bafyreiother"),
+        ]) {
+            const outcome = await inEvidenceObj(w, { appView }, (obj) => verify(obj, w.did, fetched(w)))
+            expect(outcome).toEqual(base(w))
+        }
+        const reasons = warn.mock.calls.flatMap(([message, details]) => {
+            const warning = details as { did?: string; reason?: string } | undefined
+            return message === "monitor: declaration evidence unavailable" && warning?.did === w.did
+                ? [warning.reason]
+                : []
+        })
+        expect(reasons).toEqual([
+            expect.stringMatching(/^AppView unreachable: /),
+            expect.stringMatching(/^AppView unreachable: .*down/),
+            "AppView did not confirm",
+        ])
+    })
+
+    it("an unreachable PLC directory leaves the declaration verified without evidence", async () => {
+        const w = currentKeyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const outcome = await inEvidenceObj(
+            w,
+            { appView: appViewServes(w), plc: () => new Response(null, { status: 502 }) },
+            (obj) => verify(obj, w.did, fetched(w))
+        )
+        expect(outcome).toEqual(base(w))
+        expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+            did: w.did,
+            reason: expect.any(String),
+        })
+    })
+
+    it("a stale fetched document or a fetch with no attempt start is no evidence", async () => {
+        const w = custodyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        for (const extra of [
+            { didDocument: { document: w.document, fetchedAtMs: Date.now() - 60_000 } },
+            { attemptStartedAtMs: undefined },
+            { didDocument: undefined },
+        ]) {
+            expect(await inEvidenceObj(w, {}, (obj) => verify(obj, w.did, fetched(w, extra)))).toEqual(base(w))
+        }
+        expect(warn.mock.calls.map((call) => (call[1] as { reason: string }).reason)).toEqual([
+            "stale DID document",
+            "no fetch attempt start",
+            "no fetched DID document",
+        ])
+    })
+
+    it("without MONITOR_HOSTNAME nothing is fetched and nothing is logged", async () => {
+        const w = custodyWorld()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const { outcome, requested } = await inEvidenceObj(w, { hostname: null }, async (obj, _state, requested) => ({
+            outcome: await verify(obj, w.did, fetched(w)),
+            requested,
+        }))
+        expect(outcome).toEqual(base(w))
+        expect(requested).toEqual([])
+        expect(warn).not.toHaveBeenCalled()
+    })
+
+    describe("through deps() with a deployment fetchRecord", () => {
+        const override = (obj: MonitorIngest, record: () => FetchedRecord) => {
+            ;(obj as unknown as { fetchRecord: (did: string) => Promise<FetchedRecord> }).fetchRecord =
+                async () => record()
+        }
+        const depsOf = (obj: MonitorIngest) => (obj as unknown as { deps(): IngestDeps }).deps()
+        const anchorRows = (state: DurableObjectState, did: string) =>
+            state.storage.sql
+                .exec<{ kind: string }>("SELECT kind FROM evidence_anchors WHERE did = ? ORDER BY kind", did)
+                .toArray()
+                .map((r) => r.kind)
+
+        it("stores evidence for a fetch that stamps no attempt start, and keeps one commit row per DID", async () => {
+            const w = custodyWorld()
+            const stub = freshStub()
+            const { first, rows } = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                return {
+                    first: (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence,
+                    rows: anchorRows(state, w.did),
+                }
+            })
+            expect(first).toMatchObject({
+                did: w.did,
+                recordCid: w.recordCid,
+                commitCid: expect.any(String),
+                assurance: "custody-chain",
+                monitor: HOSTNAME,
+            })
+            expect(rows).toEqual(["anchor", "commit"])
+
+            // A later commit supersedes the first commit's row; the anchor is the same one.
+            const advanced = buildRepoCar({
+                did: w.did,
+                key: w.chain.signing,
+                rev: "3kaaaaaaaaaab",
+                records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 2 } },
+            })
+            const { second, after } = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { car: advanced.car, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaab" }, "c2")
+                await settle(depsOf(obj), w.did)
+                return {
+                    second: (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence,
+                    after: anchorRows(state, w.did),
+                }
+            })
+            expect(second).toMatchObject({ rev: "3kaaaaaaaaaab", anchorFirstObservedAtMs: first!.anchorFirstObservedAtMs })
+            expect(second!.commitCid).not.toBe(first!.commitCid)
+            expect(after).toEqual(["anchor", "commit"])
+        })
+
+        it("a fetch with no DID document logs why and stores the declaration without evidence", async () => {
+            const w = custodyWorld()
+            const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+            const stored = await inEvidenceObj(w, {}, async (obj) => {
+                override(obj, () => fetched(w, { didDocument: undefined, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                return kvSnapshotStore(testEnv).getRecord(w.did)
+            })
+            expect(stored).toMatchObject({ rev: "3kaaaaaaaaaaa", cid: w.recordCid, evidence: null })
+            expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
+                did: w.did,
+                reason: "no fetched DID document",
+            })
+        })
+
+        it("anchors kept before rows were keyed by DID migrate in place and survive an unchanged settle", async () => {
+            const w = custodyWorld()
+            const stub = freshStub()
+            const stale = JSON.stringify(["commit", { did: w.did, commitCid: "bafStale" }])
+            const first = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaaa" }, "c1")
+                await settle(depsOf(obj), w.did)
+                // Rewrite the table in its earlier shape: identity and time only.
+                const held = state.storage.sql
+                    .exec<{ identity: string; first_observed_at: number }>(
+                        "SELECT identity, first_observed_at FROM evidence_anchors"
+                    )
+                    .toArray()
+                state.storage.sql.exec("DROP TABLE evidence_anchors")
+                state.storage.sql.exec(
+                    "CREATE TABLE evidence_anchors (identity TEXT PRIMARY KEY, first_observed_at INTEGER NOT NULL)"
+                )
+                for (const row of [...held, { identity: stale, first_observed_at: 1 }, { identity: "not json", first_observed_at: 1 }]) {
+                    state.storage.sql.exec(
+                        "INSERT INTO evidence_anchors (identity, first_observed_at) VALUES (?, ?)",
+                        row.identity,
+                        row.first_observed_at
+                    )
+                }
+                await obj.setEvidenceBackfillProgress({ done: true, cursor: null })
+                return (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence!
+            })
+            await evictDurableObject(stub)
+
+            const migrated = await inEvidenceObj(w, { stub }, async (obj, state) => {
+                const rows = anchorRows(state, w.did)
+                const progress = await obj.readEvidenceBackfillProgress()
+                // A sweep-style refetch at the indexed rev: an unchanged settle.
+                override(obj, () => fetched(w, { attemptStartedAtMs: undefined }))
+                await obj.oweEvidenceRefresh(w.did, "3kaaaaaaaaaaa")
+                await settle(depsOf(obj), w.did)
+                return { rows, progress, after: anchorRows(state, w.did) }
+            })
+            expect(migrated.rows).toEqual(["anchor", "commit"])
+            expect(migrated.progress).toEqual({ done: true, cursor: null })
+            expect(migrated.after).toEqual(["anchor", "commit"])
+
+            await new Promise((resolve) => setTimeout(resolve, 5))
+            const advanced = buildRepoCar({
+                did: w.did,
+                key: w.chain.signing,
+                rev: "3kaaaaaaaaaab",
+                records: { [`${COLLECTION}/self`]: { $type: COLLECTION, n: 2 } },
+            })
+            const second = await inEvidenceObj(w, { stub }, async (obj) => {
+                override(obj, () => fetched(w, { car: advanced.car, attemptStartedAtMs: undefined }))
+                await obj.intake({ did: w.did, rev: "3kaaaaaaaaaab" }, "c2")
+                await settle(depsOf(obj), w.did)
+                return (await kvSnapshotStore(testEnv).getRecord(w.did))!.evidence!
+            })
+            expect(second.rev).toBe("3kaaaaaaaaaab")
+            expect(second.anchorFirstObservedAtMs).toBe(first.anchorFirstObservedAtMs)
+        })
+    })
+})
+
+describe("evidence anchors and the evidence sweep", () => {
+    const anchorRows = (stub: DurableObjectStub<MonitorIngest>, did: string) =>
+        runInDurableObject(stub, (_obj, state) =>
+            state.storage.sql
+                .exec<{ identity: string; kind: string }>(
+                    "SELECT identity, kind FROM evidence_anchors WHERE did = ? ORDER BY kind, identity",
+                    did
+                )
+                .toArray()
+                .map((r) => `${r.kind}:${r.identity}`)
+        )
+    const retain = (stub: DurableObjectStub<MonitorIngest>, did: string, commit: string, anchor: string, at = 1) =>
+        runInDurableObject(stub, (obj: MonitorIngest) =>
+            obj.retainEvidenceAnchors(did, [
+                { kind: "commit", identity: `${did}/${commit}`, firstObservedAtMs: at },
+                { kind: "anchor", identity: `${did}/${anchor}`, firstObservedAtMs: at },
+            ])
+        )
+
+    it("a new commit supersedes the DID's commit row and leaves other DIDs alone", async () => {
+        const stub = freshStub()
+        await retain(stub, "did:plc:other", "c1", "a1")
+        await retain(stub, DID, "c1", "a1")
+        await retain(stub, DID, "c2", "a1", 2)
+        expect(await anchorRows(stub, DID)).toEqual([`anchor:${DID}/a1`, `commit:${DID}/c2`])
+        expect(await anchorRows(stub, "did:plc:other")).toEqual([
+            "anchor:did:plc:other/a1",
+            "commit:did:plc:other/c1",
+        ])
+        // Reused, not rewritten.
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getEvidenceAnchor(`${DID}/a1`))).toBe(1)
+    })
+
+    it("keeps the newest 16 anchors per DID, and a reappearing one keeps its first observation", async () => {
+        const stub = freshStub()
+        for (let i = 0; i < 17; i++) await retain(stub, DID, `c${i}`, `a${i}`, 100 + i)
+        let anchors = (await anchorRows(stub, DID)).filter((r) => r.startsWith("anchor:"))
+        expect(anchors).toHaveLength(16)
+        expect(anchors).not.toContain(`anchor:${DID}/a0`)
+        expect(anchors).toContain(`anchor:${DID}/a16`)
+        // The oldest kept anchor comes back as current.
+        await retain(stub, DID, "c17", "a1", 200)
+        anchors = (await anchorRows(stub, DID)).filter((r) => r.startsWith("anchor:"))
+        expect(anchors).toHaveLength(16)
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getEvidenceAnchor(`${DID}/a1`))).toBe(101)
+    })
+
+    it("a leave forgets the DID's anchors", async () => {
+        const stub = freshStub()
+        await retain(stub, DID, "c1", "a1")
+        await retain(stub, "did:plc:other", "c1", "a1")
+        await runInDurableObject(stub, (obj: MonitorIngest) => obj.forgetLeft(DID))
+        expect(await anchorRows(stub, DID)).toEqual([])
+        expect(await anchorRows(stub, "did:plc:other")).toHaveLength(2)
+    })
+
+    const pendingRow = (state: DurableObjectState, did: string) =>
+        state.storage.sql
+            .exec<{ rev: string; attempts: number; not_before: number; quiet: number; owed_gen: number }>(
+                "SELECT rev, attempts, not_before, quiet, owed_gen FROM pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+
+    it("oweEvidenceRefresh owes an un-owed DID and leaves an owed row's backoff, quiet flag and generation", async () => {
+        const stub = freshStub()
+        const rows = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            await obj.owe("did:plc:backoff", "3m1")
+            await obj.deferPending("did:plc:backoff", Date.now() + 60_000, {
+                kind: "threw",
+                errorName: "Error",
+                message: "down",
+                atMs: Date.now(),
+            })
+            state.storage.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) VALUES (?, '', 0, 0, 1, ?)",
+                "did:plc:quiet",
+                Date.now()
+            )
+            const before = [pendingRow(state, "did:plc:backoff"), pendingRow(state, "did:plc:quiet")]
+            await obj.oweEvidenceRefresh("did:plc:backoff", "3m2")
+            await obj.oweEvidenceRefresh("did:plc:quiet", "3m2")
+            await obj.oweEvidenceRefresh("did:plc:fresh", "3m2")
+            return {
+                before,
+                after: [pendingRow(state, "did:plc:backoff"), pendingRow(state, "did:plc:quiet")],
+                fresh: pendingRow(state, "did:plc:fresh"),
+            }
+        })
+        expect(rows.before[0]).toMatchObject({ attempts: 1, quiet: 0 })
+        expect(rows.before[1]).toMatchObject({ quiet: 1 })
+        expect(rows.after).toEqual(rows.before)
+        expect(rows.fresh).toMatchObject({ rev: "3m2", attempts: 0, not_before: 0, quiet: 0 })
+    })
+
+    const sweep = (obj: MonitorIngest) =>
+        (obj as unknown as { sweepEvidenceRefreshIfConfigured(): Promise<void> }).sweepEvidenceRefreshIfConfigured()
+    const metaOf = (state: DurableObjectState, k: string) =>
+        state.storage.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
+
+    it("the evidence sweep waits for MONITOR_HOSTNAME, then owes each held declaration once", async () => {
+        const stub = freshStub()
+        const did = "did:plc:held-before-evidence"
+        const unset = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            await obj.complete(did, "3m1", Date.now(), STUB_VERIFIED)
+            await sweep(obj)
+            return { meta: metaOf(state, "evidence_backfill"), pending: pendingRow(state, did) }
+        })
+        expect(unset).toEqual({ meta: undefined, pending: undefined })
+
+        const set = await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            const o = obj as unknown as { env: MonitorEnv }
+            o.env = { ...o.env, MONITOR_HOSTNAME: "monitor.example.org" }
+            await sweep(obj)
+            const first = { meta: metaOf(state, "evidence_backfill"), pending: pendingRow(state, did) }
+            await obj.clearPending(did)
+            await sweep(obj)
+            return { first, again: pendingRow(state, did) }
+        })
+        expect(set.first.pending).toMatchObject({ rev: "3m1", attempts: 0 })
+        expect(JSON.parse(set.first.meta!)).toEqual({ done: true })
+        expect(set.again).toBeUndefined()
     })
 })
 
@@ -3042,7 +3946,7 @@ describe("record index and holder state", () => {
         expect(await heldAt()).toEqual([{ held_at: 5_000 }])
     })
 
-    it("a seeded held DID that refresh finds gone becomes gone-reversible, quietly; a deleted one stays permanent", async () => {
+    it("a seeded held DID that refresh finds gone becomes gone-reversible, quietly; so does a deleted one, which loses its mark", async () => {
         const stub = freshStub()
         await runInDurableObject(stub, (_obj, state) => {
             state.storage.sql.exec("INSERT INTO revs (did, rev, observed_at) VALUES ('did:plc:a', '3m1', 1), ('did:plc:b', '3m1', 1)")
@@ -3060,7 +3964,7 @@ describe("record index and holder state", () => {
                 window: await obj.windowMembers(0),
             }
         })
-        expect(out).toEqual({ a: "gone-reversible", b: "gone-permanent", window: [] })
+        expect(out).toEqual({ a: "gone-reversible", b: "gone-reversible", window: [] })
     })
 
     it("deleting the declaration leaves the DID's other collections' records", async () => {
@@ -3084,7 +3988,7 @@ describe("record index and holder state", () => {
         ).toEqual(["app.bsky.actor.profile"])
     })
 
-    it("a permanent answer for a deleted DID stays gone-permanent", async () => {
+    it("a reversible answer for a deleted DID lifts the mark", async () => {
         const stub = freshStub()
         await runInDurableObject(stub, async (obj: MonitorIngest) => {
             await obj.complete(DID, "3m1", Date.now(), verified())
@@ -3092,8 +3996,186 @@ describe("record index and holder state", () => {
             await obj.completeDeletion(DID, Date.now(), false)
         })
         expect(await runInDurableObject(stub, (o: MonitorIngest) => o.holderStateOf(DID))).toBe(
-            "gone-permanent"
+            "gone-reversible"
         )
-        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(true)
+        expect(await runInDurableObject(stub, (o: MonitorIngest) => o.isDeleted(DID))).toBe(false)
+    })
+})
+
+describe("messaging_key_history with verified declaration CARs", () => {
+    async function lifecycle(legacy: boolean) {
+        const stub = freshStub()
+        const did = `did:web:messaging-history-${n}.example`
+        const signer = makeKey()
+        const keys = [1, 2].map((value) => Uint8Array.of(3, ...new Uint8Array(32).fill(value)))
+        const repos = [0, 0, 1, 0, 1].map((key, i) => buildRepoCar({
+            did, key: signer, rev: `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`,
+            records: { "com.germnetwork.declaration/self": { currentKey: keys[key] } },
+        }))
+        const snapshots = kvSnapshotStore(testEnv)
+        if (legacy) {
+            // Real pre-tracker KV snapshot: no fingerprint or first-seen metadata.
+            await snapshots.putRecord(did, {
+                car: repos[0]!.car, rev: "3kaaaaaaaaaaa", observedAtMs: 100,
+                source: PDS, signingKey: signer.multikey, verifiedWith: signer.multikey,
+                cid: repos[0]!.recordCids["com.germnetwork.declaration/self"]!,
+            })
+        }
+        const seen: Array<number | null | undefined> = []
+        for (let i = legacy ? 1 : 0; i < repos.length; i++) {
+            const repo = repos[i]!
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                const deps: IngestDeps = {
+                    index: obj, snapshot: snapshots,
+                    fetchRecord: async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey }),
+                    // Exercise the actual verifier: a raw-hex fingerprint here
+                    // must fail the legacy same-key assertion below.
+                    verify: (did, record) => (obj as unknown as {
+                        verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+                    }).verifyRecord(did, record),
+                    interest: { inInterest: async () => true, interestEpoch: async () => 0 },
+                    nowMs: () => (i + 1) * 1000,
+                }
+                await obj.owe(did, `3kaaaaaaaaaa${String.fromCharCode(97 + i)}`)
+                expect(await settle(deps, did)).toBe("stored")
+            })
+            seen.push((await snapshots.getRecord(did))!.messagingKeyFirstSeenAtMs)
+        }
+        expect(seen).toEqual(legacy ? [null, 3000, null, 3000] : [null, null, 3000, null, 3000])
+        const rows = await runInDurableObject(stub, (_obj, state) => state.storage.sql.exec<{
+            fingerprint: string; first_seen_at: number | null; record_cid: string; commit_cid: string; rev: string; verified_with: string
+        }>("SELECT * FROM messaging_key_history WHERE did = ? AND length(fingerprint) = 64 ORDER BY first_seen_at", did).toArray())
+        expect(rows).toHaveLength(2)
+        expect(rows.map((row) => row.fingerprint.length)).toEqual([64, 64])
+        expect(rows.map((row) => row.first_seen_at)).toEqual([null, 3000])
+        expect(rows[1]).toMatchObject({
+            record_cid: repos[2]!.recordCids["com.germnetwork.declaration/self"],
+            rev: "3kaaaaaaaaaac", verified_with: signer.multikey,
+        })
+        expect(rows[1]!.commit_cid).toBeTruthy()
+        // Forget only this DID, alongside evidence, under the full-interest policy.
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            await obj.retainMessagingKeyFirstSeen("did:web:other-history.example", {
+                fingerprint: "other", firstSeenAtMs: null, recordCid: null, commitCid: null, rev: null, verifiedWith: null,
+            })
+            await obj.forgetLeft(did)
+            expect(await obj.getMessagingKeyHistory(did, rows[0]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory(did, rows[1]!.fingerprint)).toBeNull()
+            expect(await obj.getMessagingKeyHistory("did:web:other-history.example", "other")).not.toBeNull()
+        })
+    }
+
+    it("preserves the first unknown sentinel and the original observed rotation time", async () => lifecycle(false))
+    it("keeps an unrotated legacy key unknown and remembers it when it returns", async () => lifecycle(true))
+})
+
+
+describe("messaging-key fingerprint upgrade and rollback aliases", () => {
+    const identity = (value: number) => {
+        const currentKey = Uint8Array.of(3, ...new Uint8Array(32).fill(value))
+        const key = declarationAnchorKeyOf({ currentKey })!
+        return {
+            currentKey, canonical: messagingKeyFingerprint(key),
+            raw: [...key].map((b) => b.toString(16).padStart(2, "0")).join(""),
+        }
+    }
+
+    it.each([null, 1234])("preserves prior raw-hex history and provenance (%s) through forward/rollback/forward", async (firstSeenAtMs) => {
+        const stub = freshStub()
+        const did = `did:web:history-upgrade-${n}.example`
+        const signer = makeKey()
+        const snapshots = kvSnapshotStore(testEnv)
+        const a = identity(10)
+        const b = identity(11)
+        const c = identity(12)
+        const provenance = { recordCid: "original-record", commitCid: "original-commit", rev: "original-rev", verifiedWith: "original-signer" }
+        const seedOldWriter = async (key: ReturnType<typeof identity>, time: number | null, rev: string) => {
+            const repo = buildRepoCar({ did, key: signer, rev,
+                records: { "com.germnetwork.declaration/self": { currentKey: key.currentKey } } })
+            await snapshots.putRecord(did, { car: repo.car, rev, observedAtMs: 9999,
+                source: PDS, signingKey: signer.multikey, verifiedWith: signer.multikey,
+                cid: repo.recordCids["com.germnetwork.declaration/self"]!,
+                messagingKeyFirstSeenAtMs: time })
+            // Seed the exact prior revision's format, bypassing new migration helpers.
+            await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+                state.storage.sql.exec(
+                    "INSERT INTO messaging_key_history VALUES (?, ?, ?, ?, ?, ?, ?)", did, key.raw, time,
+                    provenance.recordCid, provenance.commitCid, provenance.rev, provenance.verifiedWith)
+                await obj.complete(did, rev, 9999, {
+                    cid: repo.recordCids["com.germnetwork.declaration/self"]!,
+                    verifiedWith: signer.multikey,
+                    commitCid: null,
+                    anchorKey: null,
+                    messagingKeyFingerprint: key.canonical,
+                    messagingKeyFirstSeenAtMs: time,
+                })
+            })
+        }
+        const observe = async (key: ReturnType<typeof identity>, rev: string, now: number) => {
+            const repo = buildRepoCar({ did, key: signer, rev,
+                records: { "com.germnetwork.declaration/self": { currentKey: key.currentKey } } })
+            await runInDurableObject(stub, async (obj: MonitorIngest) => {
+                await obj.owe(did, rev)
+                expect(await settle({ index: obj, snapshot: snapshots,
+                    fetchRecord: async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey }),
+                    verify: (did, record) => (obj as unknown as {
+                        verifyRecord(did: string, record: FetchedRecord): Promise<VerifyOutcome>
+                    }).verifyRecord(did, record),
+                    interest: { inInterest: async () => true, interestEpoch: async () => 0 }, nowMs: () => now,
+                }, did)).toBe("stored")
+            })
+            const held = await runInDurableObject(stub, (obj: MonitorIngest) => obj.heldDeclarationOf(did))
+            return { ...(await snapshots.getRecord(did))!, messagingKeyFingerprint: held?.messagingKeyFingerprint }
+        }
+        await seedOldWriter(a, firstSeenAtMs, "3kaaaaaaaaaaa")
+        const upgraded = await observe(a, "3kaaaaaaaaaab", 20000)
+        expect(upgraded.messagingKeyFirstSeenAtMs).toBe(firstSeenAtMs)
+        expect(upgraded.messagingKeyFingerprint).toBe(a.canonical)
+        expect(await runInDurableObject(stub, (obj: MonitorIngest) => obj.getMessagingKeyHistory(did, a.canonical)))
+            .toEqual({ fingerprint: a.canonical, firstSeenAtMs, ...provenance })
+        // New rotations also retain raw aliases, so the prior writer can find
+        // them after rollback despite the newer snapshot's canonical metadata.
+        expect((await observe(b, "3kaaaaaaaaaac", 30000)).messagingKeyFirstSeenAtMs).toBe(30000)
+        expect(await runInDurableObject(stub, (_obj, state) => state.storage.sql.exec<{ first_seen_at: number }>(
+            "SELECT first_seen_at FROM messaging_key_history WHERE did = ? AND fingerprint = ?", did, b.raw
+        ).toArray()[0]?.first_seen_at)).toBe(30000)
+        // A rolled-back writer can add another raw-only history/snapshot;
+        // the next forward settle must preserve its observation and provenance.
+        await seedOldWriter(c, 40000, "3kaaaaaaaaaad")
+        expect((await observe(c, "3kaaaaaaaaaae", 50000)).messagingKeyFirstSeenAtMs).toBe(40000)
+        expect((await observe(a, "3kaaaaaaaaaaf", 60000)).messagingKeyFirstSeenAtMs).toBe(firstSeenAtMs)
+        expect((await observe(b, "3kaaaaaaaaaag", 70000)).messagingKeyFirstSeenAtMs).toBe(30000)
+    })
+
+    it("keeps an unknown sentinel over a conflicting timestamp with its original provenance", async () => {
+        const stub = freshStub()
+        const a = identity(13)
+        const did = "did:web:history-conflict.example"
+        await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            // The original bug could leave SHA unknown plus raw timestamp rows.
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, NULL, 'unknown-record', 'unknown-commit', 'unknown-rev', 'unknown-signer')", did, a.canonical)
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 9999, 'false-record', 'false-commit', 'false-rev', 'false-signer')", did, a.raw)
+            const expected = { fingerprint: a.canonical, firstSeenAtMs: null,
+                recordCid: "unknown-record", commitCid: "unknown-commit", rev: "unknown-rev", verifiedWith: "unknown-signer" }
+            expect(await obj.getMessagingKeyHistory(did, a.canonical)).toEqual(expected)
+            expect(await obj.getMessagingKeyHistory(did, a.raw)).toEqual(expected)
+            expect(state.storage.sql.exec<{ first_seen_at: number | null }>(
+                "SELECT first_seen_at FROM messaging_key_history WHERE did = ?", did
+            ).toArray().map((row) => row.first_seen_at)).toEqual([null, null])
+        })
+    })
+
+    it("keeps the earliest tracked observation and its provenance when aliases disagree", async () => {
+        const stub = freshStub()
+        const a = identity(14)
+        await runInDurableObject(stub, async (obj: MonitorIngest, state) => {
+            const did = "did:web:history-earliest.example"
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 100, 'earliest-record', 'earliest-commit', 'earliest-rev', 'earliest-signer')", did, a.raw)
+            state.storage.sql.exec("INSERT INTO messaging_key_history VALUES (?, ?, 200, 'later-record', 'later-commit', 'later-rev', 'later-signer')", did, a.canonical)
+            expect(await obj.getMessagingKeyHistory(did, a.canonical)).toEqual({
+                fingerprint: a.canonical, firstSeenAtMs: 100, recordCid: "earliest-record",
+                commitCid: "earliest-commit", rev: "earliest-rev", verifiedWith: "earliest-signer",
+            })
+        })
     })
 })

@@ -1,5 +1,11 @@
+import type { BlockEdgeStore } from "../block-edges.js"
+import { syncOwnerBlocks } from "../block-sync.js"
 import { redeemChallenge } from "../challenge.js"
-import { encodeOkpEd25519Key, parseOkpEd25519Key } from "../cose/key.js"
+import {
+    encodeOkpEd25519Key,
+    parseOkpEd25519Key,
+    thumbprintOkpEd25519,
+} from "../cose/key.js"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../cose/cbor.js"
 import { messageEntryFields } from "../events.js"
 import { deriveGrantAddress } from "../grant.js"
@@ -11,18 +17,22 @@ import { bytesEqual } from "../watch.js"
 import type {
     BodyStore,
     Directory,
+    ExtensionFields,
+    Locator,
     PairMailboxKey,
     RegistrationFields,
 } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import {
     buildSummaryIndex,
+    SummaryOwnerReadError,
     encodeSummaryDelta,
     readSummaryPage,
     SUMMARY_PAGE_RECORDS,
     type SummaryDelta,
     type SummaryPageDeps,
 } from "../summary.js"
+import { summaryCoverageAtMs, type SummaryCoverageDeps } from "../firehose-coverage.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
 import {
     authenticateOwner,
@@ -52,10 +62,51 @@ import {
 
 const OWNER_BODY_MAX_BYTES = 16 * 1024
 
+/**
+ * Deployment-defined registration fields. Absent, registration behaves and
+ * encodes exactly as the specification alone describes.
+ */
+export interface RegistrationExtension {
+    /**
+     * Reads the deployment's keys from a create body (an empty map when the
+     * body is empty). Called on every create; the result replaces whatever
+     * was stored, so `{}` withdraws. Unknown keys are ignored; a recognized
+     * key of the wrong type throws `RegistrationFieldError`, answered `400`.
+     */
+    parseCreateFields(body: ReadonlyMap<number | string, CoseValue>): ExtensionFields
+    /**
+     * After the registration and its fields are written, before the `201`.
+     * A throw fails the request; create is idempotent, so the client retries.
+     */
+    onCommitted?(registration: CommittedRegistration): Promise<void>
+    /**
+     * Extra `GET /pmr/v1/registration` keys. Async so an echo can confirm the
+     * deployment's own state, not just the stored fields. Cannot shadow `did`,
+     * `st` or `ps`.
+     */
+    readFields?(registration: RegistrationFields): Promise<ReadonlyArray<readonly [string, CoseValue]>>
+}
+
+export interface CommittedRegistration {
+    did: string
+    locator: Locator
+    /** `COSE_Key` blob, as stored. */
+    anchorKey: Uint8Array
+    ext: ExtensionFields
+}
+
+export class RegistrationFieldError extends Error {}
+
 export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
+    registrationExtension?: RegistrationExtension
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
+    /**
+     * The owner's Bsky blocks, mirrored (`syncOwnerBlocks`) before the
+     * message catch-up's first page and the pool listing.
+     */
+    blocks?: Pick<BlockEdgeStore, "ownBlocks">
     /**
      * Supplied to amortize the mint: every authenticated response carries a
      * fresh challenge, so a client pays the mint round trip only on its
@@ -212,6 +263,15 @@ export async function handleRegistrationCreate(
     })
     if (!verified.valid) return new Response(null, { status: 401 })
 
+    // Refused before any side effect: a deregistered anchor never registers
+    // again. Terminal, so no Retry-After. Checked only after the signature
+    // verifies, so just the declared key's holder learns the anchor is
+    // tombstoned; the challenge is already spent, and the refusal never
+    // amortizes into a registration.
+    if (await deps.directory.isTombstoned(did, thumbprintOkpEd25519({ x: anchorKey }))) {
+        return new Response(null, { status: 409 })
+    }
+
     const fields: RegistrationFields = {
         did,
         // Self-describing on the way in, so nothing downstream has to know
@@ -225,9 +285,11 @@ export async function handleRegistrationCreate(
     // answers 400 rather than being silently dropped, since a client typo
     // would otherwise produce a registration that looks fine and never
     // receives a push.
+    let decodedBody: ReadonlyMap<number | string, CoseValue> = new Map()
     if (body !== null && body.byteLength > 0) {
         try {
             const map = decodeCoseMap(body)
+            decodedBody = map
             const endpoint = map.get("pse")
             const contentKey = map.get("psk")
             const keyId = map.get("psi")
@@ -267,6 +329,18 @@ export async function handleRegistrationCreate(
         }
     }
 
+    // Replaced whole on every create, so a key the body omits is withdrawn.
+    if (deps.registrationExtension !== undefined) {
+        try {
+            fields.ext = deps.registrationExtension.parseCreateFields(decodedBody)
+        } catch (e) {
+            if (e instanceof RegistrationFieldError) {
+                return new Response("Malformed body", { status: 400 })
+            }
+            throw e
+        }
+    }
+
     // Deactivate + replace (GER-2448/GER-2449): a re-registration whose declared
     // key DIFFERS from the one currently stored is NOT a continuity rotation — no
     // proof ties the new key to the old (continuity proofs are GER-2447, deferred).
@@ -277,9 +351,10 @@ export async function handleRegistrationCreate(
     // only DoS (fresh empty registration), never takeover of the prior contents, is
     // reachable by whoever controls the declaration. The continuity path that KEEPS
     // the registration is gated on GER-2447. `directory.delete` now tears down the
-    // prior registration's DO storage too (deregistration and replace alike) — only
-    // its global grant-address routing rows are left, lapsing on their own KV TTL;
-    // until then an old grant address routes dead 202 mail to the now-torn-down DO.
+    // prior registration's DO storage too (deregistration and replace alike), and
+    // drops its global grant-address routing rows best-effort; a row it misses
+    // lapses on its own KV TTL, and until then routes dead 202 mail to the
+    // now-torn-down DO.
     // Same-key re-registration stays an idempotent in-place refresh (below). Brief
     // non-atomicity is acceptable: between the delete and create's re-put the DID
     // resolves to null, so a concurrent owner
@@ -312,9 +387,29 @@ export async function handleRegistrationCreate(
         ...(fields.pushSubscription !== undefined
             ? { pushSubscription: fields.pushSubscription }
             : {}),
+        ...(fields.ext !== undefined ? { ext: fields.ext } : {}),
+    })
+
+    await deps.registrationExtension?.onCommitted?.({
+        did,
+        locator,
+        anchorKey: fields.anchorKey,
+        ext: fields.ext ?? {},
     })
 
     return cbor([["l", locator]], 201)
+}
+
+/** The extension's read keys, minus any that would shadow the core ones. */
+async function extraFields(
+    deps: OwnerDeps,
+    reg: RegistrationFields
+): Promise<Array<[string, CoseValue]>> {
+    if (deps.registrationExtension?.readFields === undefined) return []
+    const core = new Set(["did", "st", "ps"])
+    return (await deps.registrationExtension.readFields(reg))
+        .filter(([key]) => !core.has(key))
+        .map(([key, value]): [string, CoseValue] => [key, value])
 }
 
 /** `GET /pmr/v1/registration` — read own. */
@@ -327,13 +422,15 @@ export async function handleRegistrationRead(
 
     const reg = await a.auth.store.load()
     if (reg === null) return new Response(null, { status: 404 })
+    const watch = await a.auth.store.readWatchState()
     return amortize(
         cbor([
         ["did", reg.did],
-        ["la", reg.lastActive],
+        ["st", watch.paused ? "paused" : "active"],
         // The subscription's endpoint and content key are never echoed
         // back; only whether one exists.
         ["ps", reg.pushSubscription !== undefined],
+        ...(await extraFields(deps, reg)),
         ]),
         a.auth.did,
         deps
@@ -348,16 +445,27 @@ export async function handleRegistrationDelete(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    await deps.directory.delete(a.auth.did)
-    // Idempotent: deleting an already-deleted registration succeeds, so a
-    // retry inside the challenge TTL is safe. No next-challenge here — the
-    // registration this one would be bound to no longer exists.
+    const reg = await a.auth.store.load()
+    let thumbprint: Uint8Array | null = null
+    try {
+        if (reg !== null) thumbprint = thumbprintOkpEd25519(parseOkpEd25519Key(reg.anchorKey))
+    } catch {
+        // An unparseable stored key names no anchor to tombstone.
+    }
+    if (thumbprint !== null) await deps.directory.deregister(a.auth.did, thumbprint)
+    // Idempotent: deregistering an already-deregistered registration
+    // succeeds, so a retry inside the challenge TTL is safe. No
+    // next-challenge here — the registration this one would be bound to no
+    // longer exists.
     return new Response(null, { status: 204 })
 }
 
 // MARK: - Blocks
 
-/** `GET /pmr/v1/blocks` — list blocked sender DIDs. */
+/**
+ * `GET /pmr/v1/blocks` — every blocked sender in `b`, and in `bs` those whose
+ * block mirrors a Bsky block and the device has not taken over or lifted.
+ */
 export async function handleBlocksList(
     request: Request,
     deps: OwnerDeps
@@ -365,7 +473,8 @@ export async function handleBlocksList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
     const dids = await a.auth.store.listBlocked()
-    return amortize(cbor([["b", dids]]), a.auth.did, deps)
+    const bsky = await a.auth.store.listBskyBlocked()
+    return amortize(cbor([["b", dids], ["bs", bsky]]), a.auth.did, deps)
 }
 
 /**
@@ -390,7 +499,7 @@ export async function handleBlockSet(
         return new Response("Not a DID", { status: 400 })
     }
     if (blocked) {
-        await a.auth.store.block(senderDID, deps.nowSeconds)
+        await a.auth.store.block(senderDID, deps.nowSeconds, "device")
     } else {
         await a.auth.store.unblock(senderDID)
     }
@@ -401,7 +510,10 @@ export async function handleBlockSet(
 
 // MARK: - Pool
 
-/** `GET /pmr/v1/pool` — DIDs only, never bodies. */
+/**
+ * `GET /pmr/v1/pool` — DIDs only, never bodies. An entry the relay judged
+ * carries `v` (`no` | `unknown`) and `r` (reason codes).
+ */
 export async function handlePoolList(
     request: Request,
     deps: OwnerDeps
@@ -409,6 +521,7 @@ export async function handlePoolList(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
+    await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
     const senders = await a.auth.store.poolSenders()
     return amortize(
         cbor([
@@ -418,6 +531,12 @@ export async function handlePoolList(
                 (s) => new Map<string, CoseValue>([
                     ["did", s.did],
                     ["n", s.count],
+                    ...(s.verdict !== undefined
+                        ? ([
+                              ["v", s.verdict.verdict],
+                              ["r", [...s.verdict.why]],
+                          ] as [string, CoseValue][])
+                        : []),
                 ])
             ),
         ],
@@ -722,6 +841,11 @@ export async function handleMessagesList(
     if (!a.ok) return a.response
 
     const cursor = new URL(request.url).searchParams.get("cursor")
+    // Once per catch-up, before anything is delivered; later pages read what
+    // the first page left.
+    if (cursor === null || cursor === "") {
+        await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
+    }
     const page = await a.auth.store.openMailboxes(cursor, deps.catchUpPageMailboxes)
 
     const ms: CoseValue[] = []
@@ -862,8 +986,12 @@ export async function handleMessagesAcks(
  * changed since the named state, that token is returned again and re-stored as
  * most recent, so polling devices do not push each other's states out; a page
  * read since a token that left `more` set takes over that token's slot, so a
- * paged sync holds one. `409` with `Retry-After` when the owner has no
- * projection yet. Never requests a re-check.
+ * paged sync holds one. `409` with `Retry-After` when the owner's graph is
+ * not served yet, and `503` with `Retry-After` when their graph, blocks or
+ * contacts' graph facts cannot be read; either leaves the held state as it was. The summary
+ * carries the owner's own block list, null when unchanged, and the owner's
+ * can-message verdict for each contact whose verdict changed, and the
+ * contacts that no longer have one. Never requests a re-check.
  */
 export async function handleSummaryRead(
     request: Request,
@@ -878,7 +1006,25 @@ export async function handleSummaryRead(
     if (!a.ok) return a.response
     const { did, store } = a.auth
 
-    const built = await buildSummaryIndex(did, deps)
+    // Before the index and any CAR, so nothing served is older than `w` claims.
+    const coverage = await readSummaryCoverage(deps)
+    let built
+    try {
+        built = await buildSummaryIndex(did, deps, coverage.lagging)
+    } catch (error) {
+        if (!(error instanceof SummaryOwnerReadError)) throw error
+        return amortize(
+            new Response(null, {
+                status: 503,
+                headers: {
+                    "Retry-After": String(SUMMARY_RETRY_AFTER_SECONDS),
+                    "cache-control": "no-store",
+                },
+            }),
+            did,
+            deps
+        )
+    }
     if (!built) {
         return amortize(
             new Response(null, {
@@ -904,9 +1050,11 @@ export async function handleSummaryRead(
     const unchanged =
         base !== null &&
         !page.full &&
-        page.graph === null &&
+        page.ownBlocks === null &&
         page.records.length === 0 &&
         page.removed.length === 0 &&
+        page.verdicts.length === 0 &&
+        page.droppedVerdicts.length === 0 &&
         !page.more
 
     const token = unchanged ? since! : binaryToBase64URL(deps.randomBytes(SUMMARY_TOKEN_BYTES))
@@ -917,7 +1065,13 @@ export async function handleSummaryRead(
         !unchanged && base?.more === true ? since! : undefined
     )
 
-    const delta: SummaryDelta = { token, ...page, truncated: built.truncated }
+    const delta: SummaryDelta = {
+        token,
+        ...page,
+        truncated: built.truncated,
+        coveredThroughMs: coverage.coveredThroughMs,
+        lagging: built.lagging,
+    }
     return amortize(
         new Response(toResponseBody(encodeSummaryDelta(delta)), {
             status: 200,
@@ -926,6 +1080,24 @@ export async function handleSummaryRead(
         did,
         deps
     )
+}
+
+/** A watermark that cannot be read is no coverage, never a failed summary. */
+async function readSummaryCoverage(
+    deps: SummaryCoverageDeps
+): Promise<{ coveredThroughMs: number | null; lagging: readonly string[] }> {
+    try {
+        const [firehose, plc] = await Promise.all([
+            deps.getFirehoseCoverage(),
+            deps.getPlcCoverage(),
+        ])
+        return {
+            coveredThroughMs: summaryCoverageAtMs(firehose, plc),
+            lagging: firehose?.lagging ?? [],
+        }
+    } catch {
+        return { coveredThroughMs: null, lagging: [] }
+    }
 }
 
 const SUMMARY_RETRY_AFTER_SECONDS = 60

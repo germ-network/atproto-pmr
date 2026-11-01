@@ -8,9 +8,11 @@
  * whose fetch failed. The cursor guarantees coverage only if the pending
  * set covers the gap between "seen" and "stored".
  */
+import { heldFromEntries } from "./held-from-entries"
 import { describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import { decodeEvent, type CommitEvent } from "../src/jetstream"
+import { pdsAnswering } from "./pds-answering"
 import { intake, settle, settleDue, type IngestDeps } from "../src/ingest"
 import {
     compareObservations,
@@ -46,6 +48,17 @@ function commit(rev: string, collection = COLLECTION): CommitEvent {
     return e
 }
 
+const storedEntry = (overrides: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
+    rev: "3m1",
+    car: new Uint8Array([1]),
+    observedAtMs: 500_000,
+    source: PDS,
+    signingKey: SIGNING_KEY,
+    verifiedWith: SIGNING_KEY,
+    cid: CID,
+    ...overrides,
+})
+
 /** In-memory stand-ins; the real ones are one DO and one KV namespace. */
 function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const { rev: fetchedRev = "3m2", ...depOverrides } = overrides
@@ -61,10 +74,16 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
     const members = new Map<number, Set<string>>()
     const deleted = new Set<string>()
     const quietDeletions: string[] = []
+    const causes: Array<string | undefined> = []
     const quietCompletions: string[] = []
     let marker: DigestMarker | null = null
     let backfillProgress: BackfillProgress = { done: false, cursor: null }
 
+    const fingerprints = new Map<string, string>()
+    const noteFingerprint = (did: string, verified: { messagingKeyFingerprint: string | null }) => {
+        if (verified.messagingKeyFingerprint === null) fingerprints.delete(did)
+        else fingerprints.set(did, verified.messagingKeyFingerprint)
+    }
     const addToWindow = (did: string, observedAtMs: number) => {
         const w = Math.floor(observedAtMs / 600_000)
         const set = members.get(w) ?? new Set<string>()
@@ -81,12 +100,14 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         complete: async (did, rev, observedAtMs, verified) => {
             completed.push(verified)
+            noteFingerprint(did, verified)
             revs.set(did, rev)
             addToWindow(did, observedAtMs)
             pending.delete(did)
             deleted.delete(did)
         },
-        completeDeletion: async (did, observedAtMs, permanent, quiet) => {
+        completeDeletion: async (did, observedAtMs, permanent, quiet, cause) => {
+            causes.push(cause)
             if (permanent) deleted.add(did)
             if (quiet !== true) addToWindow(did, observedAtMs)
             else quietDeletions.push(did)
@@ -94,6 +115,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         },
         completeQuietly: async (did, rev, _at, verified) => {
             completed.push(verified)
+            noteFingerprint(did, verified)
             revs.set(did, rev)
             quietCompletions.push(did)
             pending.delete(did)
@@ -106,12 +128,16 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
                 .map(([did, p]) => ({ did, ...p })),
         deferPending: async (did, notBeforeMs) => {
             const p = pending.get(did)
-            if (p !== undefined) pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
+            if (p === undefined) return null
+            pending.set(did, { ...p, attempts: p.attempts + 1, notBeforeMs })
+            return p.attempts + 1
         },
         revOf: async (did) => revs.get(did) ?? null,
         recordsOf: async () => [],
         holderStateOf: async () => null,
+        ...heldFromEntries(records, new Map(), fingerprints),
         owe: async (did, rev) => void pending.set(did, { rev, attempts: 0, notBeforeMs: 0, quiet: false }),
+        owedGenOf: async (did) => (pending.has(did) ? 1 : null),
         clearPending: async (did) => void pending.delete(did),
         markAttempted: async (did, at) => void attempted.set(did, at),
         isWatched: async (did) =>
@@ -148,7 +174,7 @@ function harness(overrides: Partial<IngestDeps> & { rev?: string } = {}) {
         nowMs: () => 1_000_000,
         ...depOverrides,
     }
-    return { deps, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
+    return { deps, causes, quietDeletions, quietCompletions, revs, pending, attempted, completed, records, members, deleted, windows, marker: () => marker }
 }
 
 describe("intake by policy", () => {
@@ -324,6 +350,42 @@ describe("settle", () => {
         })
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(onChange).not.toHaveBeenCalled()
+    })
+
+    it("re-retains evidence anchors on every settle and keeps their first-observed times", async () => {
+        const h = harness({
+            verify: async (_did, record) => ({
+                kind: "verified",
+                key: record.signingKey!,
+                rev: "3m2",
+                cid: CID,
+                collection: COLLECTION,
+                rkey: "self",
+                commitCid: "bafCommit",
+                authority: { method: "plc", operationCid: "bafOperation" },
+                assurance: "custody-chain",
+                monitor: "monitor.example.org",
+            }),
+        })
+        const anchors = new Map<string, number>()
+        const getEvidenceAnchor = vi.fn(async (identity: string) => anchors.get(identity) ?? null)
+        const retainEvidenceAnchors = vi.fn(async (_did: string, rows: readonly { identity: string; firstObservedAtMs: number }[]) => {
+            for (const row of rows) if (!anchors.has(row.identity)) anchors.set(row.identity, row.firstObservedAtMs)
+        })
+        Object.assign(h.deps.index, { getEvidenceAnchor, retainEvidenceAnchors })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(retainEvidenceAnchors).toHaveBeenCalledTimes(1)
+        const stored = h.records.get(DID)!.evidence
+        expect(stored).toMatchObject({ rev: "3m2", commitFirstObservedAtMs: 1_000_000 })
+
+        getEvidenceAnchor.mockClear()
+        retainEvidenceAnchors.mockClear()
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(retainEvidenceAnchors).toHaveBeenCalledTimes(1)
+        expect(h.records.get(DID)!.evidence).toEqual(stored)
     })
 
     it("does not treat an unresolved signing key as a rotation", async () => {
@@ -527,6 +589,7 @@ describe("settle", () => {
 
         expect(await settle(h.deps, DID)).toBe("deleted")
         expect(h.records.has(DID)).toBe(false)
+        expect(h.causes).toEqual(["repo"])
         expect(onDelete).toHaveBeenCalledWith(DID)
         expect(await h.deps.index.windowMembers(0)).toContain(DID)
         expect(await h.deps.index.isDeleted(DID)).toBe(false)
@@ -834,12 +897,12 @@ describe("identity events and the signing-key cache", () => {
 
     // The relay's cached key must be dropped for every DID whose document the
     // monitor keeps, not only for the ones holding a declaration.
-    it("an identity event for a watched DID with no declaration owes a key update, returns ignored and leaves pending unchanged", async () => {
+    it("an identity event for a watched DID with no declaration signals key-only work and leaves pending unchanged", async () => {
         const { owed, keyUpdates } = withKeyUpdates()
         const h = harness({ keyUpdates })
         const entry = { rev: "3m1", attempts: 2, notBeforeMs: 5, quiet: false }
         h.pending.set(DID, entry)
-        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("ignored")
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe("key-update")
         expect(owed).toEqual([{ did: DID, update: { kind: "delete" }, plcSeq: undefined }])
         expect(h.pending.get(DID)).toEqual(entry)
     })
@@ -868,17 +931,6 @@ describe("settle verifies at ingest", () => {
     const unverifiable = async () => ({ kind: "unverifiable" as const })
     const stale = () => vi.fn(async () => {})
     const sink = () => ({ recordDidDocument: vi.fn(async () => {}), markDidDocumentStale: stale() })
-    const storedEntry = (overrides: Partial<SnapshotEntry> = {}): SnapshotEntry => ({
-        rev: "3m1",
-        car: new Uint8Array([1]),
-        observedAtMs: 500_000,
-        source: PDS,
-        signingKey: SIGNING_KEY,
-        verifiedWith: SIGNING_KEY,
-        cid: CID,
-        ...overrides,
-    })
-
     it("verified CAR is stored with the signed commit rev, key and cid", async () => {
         const h = harness({
             rev: "3m5",
@@ -891,7 +943,9 @@ describe("settle verifies at ingest", () => {
             cid: "bafyreisigned",
         })
         expect(h.revs.get(DID)).toBe("3m5")
-        expect(h.completed).toEqual([{ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }])
+        expect(h.completed).toEqual([
+            expect.objectContaining({ cid: "bafyreisigned", verifiedWith: SIGNING_KEY }),
+        ])
     })
 
     it("verified exclusion proof at a current rev disposes the snapshot reversibly", async () => {
@@ -906,6 +960,19 @@ describe("settle verifies at ingest", () => {
         expect(h.records.has(DID)).toBe(false)
         expect(h.deleted.has(DID)).toBe(false)
         expect(onDelete).toHaveBeenCalledWith(DID)
+        expect(h.causes).toEqual(["record"])
+    })
+
+    it("a bare RecordNotFound is unproven and records the repo cause", async () => {
+        const h = harness({
+            fetchRecord: async () => {
+                throw new RecordNotFoundError("RecordNotFound", false)
+            },
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.causes).toEqual(["repo"])
     })
 
     it("older exclusion proof does not delete a newer record", async () => {
@@ -999,7 +1066,7 @@ describe("settle verifies at ingest", () => {
         await settle(h.deps, DID)
         expect(onChange).toHaveBeenCalledTimes(1)
         expect(onChange).toHaveBeenCalledWith(DID, "3m1")
-        expect(h.records.get(DID)?.seenKey).toBe(ROTATED_KEY)
+        expect((await h.deps.index.heldDeclarationOf(DID))?.seenKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)?.rev).toBe("3m1")
     })
 
@@ -1050,5 +1117,158 @@ describe("settle verifies at ingest", () => {
         expect(verify.mock.calls[0]![1].signingKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)).toMatchObject({ verifiedWith: ROTATED_KEY })
         expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+    })
+})
+
+describe("settle on a reversible not-found", () => {
+    const pdsFails = (name: string) => pdsAnswering(name, COLLECTION)
+
+    it("a held DID answered RecordNotFound is recorded non-permanent, cause repo, and not marked deleted", async () => {
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound") })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(false)
+        expect(h.causes).toEqual(["repo"])
+        expect(h.records.has(DID)).toBe(false)
+    })
+
+    it("a held DID answered RepoNotFound is still marked deleted", async () => {
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound") })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(true)
+    })
+
+    const windowed = (h: ReturnType<typeof harness>) => [...h.members.values()].flatMap((m) => [...m])
+    const goneReversibly = (h: ReturnType<typeof harness>) => {
+        h.revs.set(DID, "3m1")
+        h.deps.index.holderStateOf = async () => "gone-reversible"
+    }
+
+    it("an identity event for a DID gone reversibly by RecordNotFound re-asks it with no second window entry and no onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        goneReversibly(h)
+        const id = { kind: "identity" as const, did: DID, seq: 1, timeMs: null, active: null, status: null }
+        expect(await intake(h.deps, { collection: COLLECTION, policy: "everyone" }, id, "c1")).toBe(
+            "reverify"
+        )
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(h.quietDeletions).toEqual([DID])
+    })
+
+    it("a not-found that hardens a reversibly gone DID to permanent is still announced", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound"), onDelete })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(h.deleted.has(DID)).toBe(true)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
+    it("a verified absence for a DID already gone re-confirms it with no window entry and no onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({
+            onDelete,
+            verify: async () => ({ kind: "verified-absent", key: SIGNING_KEY, rev: "3m2" }),
+        })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("deleted")
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+    })
+
+    it("the first sighting of a deletion is still a window entry and onDelete", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        h.deps.index.holderStateOf = async () => "held"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
+    it("a repeated permanent answer for a DID already marked deleted stays quiet", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RepoNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.deleted.add(DID)
+        h.deps.index.holderStateOf = async () => "gone-permanent"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([])
+        expect(onDelete).not.toHaveBeenCalled()
+        expect(h.quietDeletions).toEqual([DID])
+    })
+
+    it("a deletion whose earlier recording failed is announced on retry", async () => {
+        const onDelete = vi.fn(async () => {})
+        const h = harness({ fetchRecord: pdsFails("RecordNotFound"), onDelete })
+        h.revs.set(DID, "3m1")
+        h.deps.index.holderStateOf = async () => "held"
+        await settle(h.deps, DID)
+        expect(windowed(h)).toEqual([DID])
+        expect(onDelete).toHaveBeenCalledTimes(1)
+    })
+
+    it("a DID stored again after being gone fires onChange even at the rev it was last indexed at", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({ onChange, rev: "3m1" })
+        goneReversibly(h)
+        expect(await settle(h.deps, DID)).toBe("stored")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+
+        const quiet = vi.fn(async () => {})
+        const held = harness({ onChange: quiet, rev: "3m1" })
+        held.revs.set(DID, "3m1")
+        held.deps.index.holderStateOf = async () => "held"
+        await settle(held.deps, DID)
+        expect(quiet).not.toHaveBeenCalled()
+    })
+})
+
+describe("declaration messaging-key history", () => {
+    it("retains first unknown and tracked rotation observations when keys return", async () => {
+        const { messagingKeyFingerprint, declarationAnchorKeyOf } = await import("@germ-network/atproto-pmr-core")
+        const { buildRepoCar, makeKey } = await import("../../core/test/fixtures/repo-car")
+        const history = new Map<string, import("../src/storage").MessagingKeyHistoryRow>()
+        const h = harness()
+        h.deps.index.getMessagingKeyHistory = async (_did, fingerprint) => history.get(fingerprint) ?? null
+        h.deps.index.retainMessagingKeyFirstSeen = async (_did, row) => {
+            if (!history.has(row.fingerprint)) history.set(row.fingerprint, row)
+        }
+        const signer = makeKey()
+        const key = (value: number) => Uint8Array.of(3, ...new Uint8Array(32).fill(value))
+        const fingerprint = (value: number) => messagingKeyFingerprint(declarationAnchorKeyOf({ currentKey: key(value) })!)
+        let step = 0
+        const observe = async (value: number) => {
+            step++
+            const rev = `3kaaaaaaaaaa${String.fromCharCode(96 + step)}`
+            const repo = buildRepoCar({ did: DID, key: signer, rev,
+                records: { [`${COLLECTION}/self`]: { currentKey: key(value) } } })
+            h.deps.fetchRecord = async () => ({ car: repo.car, source: PDS, signingKey: signer.multikey })
+            h.deps.verify = async () => ({ kind: "verified", rev, key: signer.multikey,
+                cid: repo.recordCids[`${COLLECTION}/self`]!, collection: COLLECTION, rkey: "self",
+                commitCid: `commit-${step}`, messagingKeyFingerprint: fingerprint(value) })
+            h.deps.nowMs = () => step * 1000
+            await h.deps.index.owe(DID, rev)
+            expect(await settle(h.deps, DID)).toBe("stored")
+            return h.records.get(DID)!
+        }
+        expect((await observe(1)).messagingKeyFirstSeenAtMs).toBeNull()
+        expect(history.get(fingerprint(1))?.firstSeenAtMs).toBeNull()
+        const rotated = await observe(2)
+        expect(rotated.messagingKeyFirstSeenAtMs).toBe(2000)
+        expect(history.get(fingerprint(2))).toEqual({ fingerprint: fingerprint(2), firstSeenAtMs: 2000,
+            recordCid: rotated.cid, commitCid: "commit-2", rev: rotated.rev, verifiedWith: signer.multikey })
+        expect(history.get(fingerprint(1))?.firstSeenAtMs).toBeNull()
+        expect((await observe(1)).messagingKeyFirstSeenAtMs).toBeNull()
+        expect((await observe(2)).messagingKeyFirstSeenAtMs).toBe(2000)
+        expect(history.size).toBe(2)
     })
 })

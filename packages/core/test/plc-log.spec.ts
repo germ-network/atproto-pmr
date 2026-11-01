@@ -8,6 +8,7 @@ import {
     appendPlcLogEntry,
     parsePlcAuditLog,
     PlcLogError,
+    verifyPlcCurrentKeyOperation,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,
@@ -361,5 +362,47 @@ describe("appendPlcLogEntry", () => {
         const tomb = entry(signed(rotation, { type: "plc_tombstone", prev: g.cid }))
         const after = entry(signed(rotation, body([rotation], makeKey(), tomb.cid, "n")))
         expect(appendPlcLogEntry(logOf([g, tomb]), after)).toBeNull()
+    })
+})
+
+describe("verifyPlcCurrentKeyOperation", () => {
+    it("a genesis-only log names the genesis when it authorizes the key", () => {
+        const { did, g, signing } = chain()
+        expect(verifyPlcCurrentKeyOperation(did, [g], signing.multikey)).toBe(g.cid)
+    })
+
+    it("a genesis-only log authorizing another key, or for another DID, returns null", () => {
+        const { did, g, signing } = chain()
+        expect(verifyPlcCurrentKeyOperation(did, [g], makeKey().multikey)).toBeNull()
+        expect(verifyPlcCurrentKeyOperation(chain().did, [g], signing.multikey)).toBeNull()
+    })
+
+    it("a genesis not signed by its own rotation keys returns null", () => {
+        const { signing, recovery, rotation } = chain()
+        const op = signed(makeKey(), body([recovery, rotation], signing, null))
+        expect(verifyPlcCurrentKeyOperation(didOf(op), [entry(op)], signing.multikey)).toBeNull()
+    })
+
+    it("a genesis whose cid is not its operation's own returns null", () => {
+        const { did, g, signing } = chain()
+        expect(verifyPlcCurrentKeyOperation(did, [{ ...g, cid: otherCid(g.cid) }], signing.multikey)).toBeNull()
+    })
+
+    it("a legacy create genesis is verified in its own format", () => {
+        const [genesis] = entriesOf(legacyFixture)
+        const key = String(genesis!.operation.signingKey).slice("did:key:".length)
+        expect(verifyPlcCurrentKeyOperation(legacyFixture.did, [genesis!], key)).toBe(genesis!.cid)
+    })
+
+    it("a later head names its own operation, linked to and signed under the one before", () => {
+        const { did, g, second, signing } = chain()
+        expect(verifyPlcCurrentKeyOperation(did, [g, second], signing.multikey)).toBe(second.cid)
+        expect(verifyPlcCurrentKeyOperation(did, [g, { ...second, cid: otherCid(second.cid) }], signing.multikey)).toBeNull()
+    })
+
+    it("an empty or wholly nullified log returns null", () => {
+        const { did, g, signing } = chain()
+        expect(verifyPlcCurrentKeyOperation(did, [], signing.multikey)).toBeNull()
+        expect(verifyPlcCurrentKeyOperation(did, [{ ...g, nullified: true }], signing.multikey)).toBeNull()
     })
 })

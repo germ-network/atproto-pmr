@@ -1,18 +1,20 @@
 import { DurableObject } from "cloudflare:workers"
+import { DECLARATION_COLLECTION_NSID } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
     compareRev,
     decodeEvent,
     fetchRecordCar,
     decodePlcExportFrame,
-    drainKeyUpdates,
     drainPlcLogs,
     FETCH_AS_OF_SKEW_MS,
     intake,
     intakePlcEvent,
+    followEventListingDid,
     routeFollowEvent,
     listReposByCollection,
     plcCursorAfterClose,
+    BLOCK_COLLECTION_NSID,
     FOLLOW_COLLECTION_NSID,
     fetchHeadRev,
     pushDeclarationChange,
@@ -20,14 +22,23 @@ import {
     refreshDue,
     sealDueWindows,
     settleDue,
+    disposeStrayOwnBlockProofs,
+    OWN_BLOCK_SETTLE_BATCH,
     settleSecondaryDue,
     sweepBackfill,
+    sweepEvidenceRefresh,
+    sweepSnapshotLayout,
     windowOf,
     type BackfillProgress,
+    type EvidenceAnchorRow,
+    type MessagingKeyHistoryRow,
+    type EvidenceBackfillProgress,
     type DidDocumentSink,
     type Cursor,
+    type MonitorEvent,
     type FetchedRecord,
     type HeadRev,
+    type GoneCause,
     type HolderState,
     type IndexedRecord,
     type IngestDeps,
@@ -35,30 +46,39 @@ import {
     type InterestIndex,
     type InterestTransition,
     type FollowStreamIndex,
+    type EdgeCollection,
     type NewEdgeOp,
     type OwedRecord,
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryDeps,
     type SecondaryIndex,
+    type SecondaryLane,
     type SecondaryIntakeIndex,
     type SecondaryIntakeOutcome,
     type SecondaryWriteAnswer,
     type KeyUpdateIndex,
     type MonitorIndex,
+    type FollowFrameFailures,
+    type MonitorIngestStatus,
+    type MonitorIngestStatusRequest,
+    type MonitorPendingDetail,
     type OwedKeyUpdate,
+    PENDING_ATTEMPT_BUCKETS,
+    type PendingSummary,
+    SETTLE_RETRY_CAP_MS,
+    type PendingFailure,
     type PendingFetch,
     type RefreshIndex,
     type SigningKeyUpdate,
     type VerifiedWrite,
+    type VerifiedDeclarationWrite,
+    type HeldDeclarationState,
+    type SnapshotLayoutBackfillProgress,
     type VerifyOutcome,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
-    runGraphProjector,
-    type GraphProjectorIndex,
-    type MirroredGraphStanding,
     type PlcLogIndex,
-    type ProjectorCursor,
     type GraphMirrorRow,
     type GraphMirrorTransition,
     type MirrorReconcileCursor,
@@ -70,7 +90,7 @@ import {
     type FetchedRepo,
     type ResolvedPds,
     type FollowPage,
-    type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingQueueReason,
@@ -81,43 +101,69 @@ import {
     flushEdgeOps,
     flushLimit,
     followGapExceeded,
-    listFollowRecords,
+    listEdgeRecords,
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     reconcileOwnerFollowers,
+    computeFirehoseCoverage,
+    isResumeJump,
+    isStaleCursor,
+    streamTimeUs,
     relistStale,
     runListings,
 } from "@germ-network/atproto-pmr-monitor"
 import type {
+    OwedStreamEvent,
+    SettledDeclaration,
     FollowBackfillConfig,
     FollowBackfillDeps,
     ListingProgress,
     StatementBudget,
 } from "@germ-network/atproto-pmr-monitor"
+import { d1BlockEdgeStore, d1BlockEdgeWriter } from "./block-edge-store"
 import { d1FollowEdgeStore, d1FollowEdgeWriter, statementBudget } from "./follow-edge-store"
-import { d1GraphChangeLog } from "./graph-change-log"
-import { kvGraphProjections } from "./graph-projection-store"
 import {
     DEFAULT_MAX_MST_NODES,
     appendPlcLogEntry,
     fetchDidDocument,
     fetchPlcAuditLog,
+    guardedFetchJSON,
+    parsePlcAuditLog,
     pdsResolutionFromDocument,
+    PlcLogError,
     RepoProofError,
     STORED_DID_DOCUMENT_MAX_AGE_MS,
     verifyPlcLog,
+    verifyPlcCurrentKeyOperation,
     verifyRecordProofOutcome,
-    verifyRepoCollection,
+    verifyRepoCollections,
+    type BlockEdge,
     type DidDocument,
+    type EvidenceAssurance,
+    type EvidenceAuthorityIdentity,
     type InterestPolicy,
     type MonitorRegistrationNotify,
+    type MonitorOwnBlocksRequest,
+    type MonitorOwnGraphRequest,
+    type OwnerGraph,
+    ownerGraph,
     type MonitorRecheckRequest,
+    type MonitorVerifiedAnchorRequest,
+    type VerifiedAnchorObservation,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
+    readRecordFromCar,
     type PlcLog,
     type PlcLogEntry,
+    didWebDocumentURL,
+    FIREHOSE_COVERAGE_MAX_LAG_MS,
+    FIREHOSE_LAGGING_CAP,
+    KV_VISIBILITY_MS,
+    type FirehoseCoverage,
     type PlcCoverage,
-    type RepoCollectionExpectation,
-    type VerifiedCollection,
+    type RepoCollectionsExpectation,
+    type VerifiedCollections,
     type WatchedRecord,
 } from "@germ-network/atproto-pmr-core"
 import {
@@ -128,12 +174,19 @@ import {
 } from "./did-document-store"
 import { interestPolicy as policyFromEnv, monitorCollections, type MonitorEnv } from "./env"
 import { monitorWebPushSender } from "./push-sender"
+import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
+
+/** On a conflict an owed row keeps the earlier stream stamp; a row owed by no stream event takes the new one. */
+const KEEP_EARLIER_STAMP =
+    "owed_since_us = CASE WHEN pending.owed_since_us IS NULL THEN excluded.owed_since_us " +
+    "WHEN excluded.owed_since_us IS NULL THEN pending.owed_since_us " +
+    "ELSE MIN(pending.owed_since_us, excluded.owed_since_us) END"
 
 /** DIDs the refresh queue covers; `policy` names the bound parameter holding the interest policy. */
 const refreshCandidates = (policy: string) =>
@@ -152,6 +205,9 @@ const CONNECT_TIMEOUT_MS = 5_000
 /** KV puts one alarm may spend on stored DID documents. */
 const DID_DOCUMENT_PUBLISH_BATCH = 64
 const PLC_LOG_PUBLISH_BATCH = 64
+const EVIDENCE_FRESHNESS_MS = 30_000
+/** Distinct authority-and-key anchors kept per DID for reuse when one reappears. */
+const EVIDENCE_ANCHOR_HISTORY = 16
 
 type PublishRow = {
     did: string
@@ -162,6 +218,8 @@ type PublishRow = {
 
 /** Owed key updates applied per drain. */
 const KEY_DRAIN_BATCH = 64
+const PROMPT_WAKE_DELAY_MS = 100
+const MAX_SETTLE_BATCH = 32
 
 /**
  * Longest the PLC cursor goes unpersisted while the stream runs. A lost
@@ -172,12 +230,20 @@ const PLC_CURSOR_PERSIST_MS = 5_000
 /** How often ignored declaration-stream events move the persisted cursor. */
 const IGNORED_CURSOR_PERSIST_MS = 5_000
 
+function hexOf(bytes: Uint8Array): string {
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")
+}
+
+function bytesOfHex(hex: string): Uint8Array {
+    return Uint8Array.from(hex.match(/../g) ?? [], (h) => Number.parseInt(h, 16))
+}
+
 /** How often the registered set is re-listed from the directory. */
 const RECONCILE_INTERVAL_MS = 86_400_000
 /** How often the D1 graph mirror is checked against the single writer's state, both ways. */
 const GRAPH_RECONCILE_INTERVAL_MS = 86_400_000
 /** D1 statements the writer spends per mirrored DID. */
-const MIRROR_STATEMENTS_PER_DID = 10
+const MIRROR_STATEMENTS_PER_DID = 5
 const RECOUNT_DRAIN_BATCH = 1000
 const OWNER_RECONCILE_BATCH = 200
 /** `listRecords` pages all listings together take per alarm. */
@@ -190,6 +256,8 @@ const STALE_RELIST_PER_ALARM = 200
 const FOLLOW_TIMEOUTS_BEFORE_PAGED = 3
 /** Consecutive permanent-class failures after which a listing is unlistable. */
 const FOLLOW_UNLISTABLE_AFTER = 5
+/** Characters of a failed follow frame's stack that are logged. */
+const FOLLOW_FRAME_FAILURE_STACK_CHARS = 2_000
 const LISTING_RETRY_BASE_MS = 60_000
 const LISTING_RETRY_MAX_MS = 86_400_000
 
@@ -218,6 +286,7 @@ interface QueueSqlRow extends Record<string, SqlStorageValue> {
     progress_kind: string | null
     progress_gen: number | null
     progress_phase: string | null
+    progress_collection: EdgeCollection | null
     progress_cursor: string | null
     progress_pds: string | null
     progress_began_at: number | null
@@ -238,6 +307,7 @@ const queuedListing = (r: QueueSqlRow): QueuedListing => ({
                   kind: r.progress_kind,
                   gen: r.progress_gen,
                   phase: r.progress_phase,
+                  collection: r.progress_collection ?? "follow",
                   cursor: r.progress_cursor,
                   pds: r.progress_pds,
                   beganAtMs: r.progress_began_at,
@@ -318,12 +388,15 @@ export class MonitorIngest
         ListingIndex,
         EdgeOpsIndex,
         GraphMirrorIndex,
-        GraphProjectorIndex,
         PlcLogIndex,
         OwnerFollowedIndex,
         RecountQueueIndex,
         MonitorRegistrationNotify,
-        MonitorRecheckRequest
+        MonitorRecheckRequest,
+        MonitorVerifiedAnchorRequest,
+        MonitorOwnBlocksRequest,
+        MonitorOwnGraphRequest,
+        MonitorIngestStatusRequest
 {
     private readonly db: DurableObjectStorage
     private socket: WebSocket | null = null
@@ -347,8 +420,16 @@ export class MonitorIngest
     private plcRunPersisted = false
     /** What `plc:coverage` last claimed in this run. */
     private plcCoveredThroughMs: number | null = null
-    private draining: Promise<void> | null = null
-    private drainAgain = false
+    private draining: Promise<boolean> | null = null
+    private storageQueue: Promise<void> = Promise.resolve()
+    private alarmPass: Promise<void> | null = null
+    private alarmReconcile: Promise<void> | null = null
+    private alarmReconcileAgain = false
+    /** The cursor this connection resumed from, until its first timed frame has been checked. */
+    private resumeFromUs: number | null = null
+    /** The evidence sweep finished, so later alarms skip even its progress read. */
+    private evidenceRefreshDone = false
+    private snapshotLayoutDone = false
 
     constructor(ctx: DurableObjectState, env: MonitorEnv) {
         super(ctx, env)
@@ -364,7 +445,13 @@ export class MonitorIngest
                     did TEXT PRIMARY KEY,
                     rev TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    not_before INTEGER NOT NULL DEFAULT 0
+                    not_before INTEGER NOT NULL DEFAULT 0,
+                    selection_turn INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS applied_recent (
+                    did TEXT PRIMARY KEY,
+                    owed_since_us INTEGER NOT NULL,
+                    applied_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS meta (
                     k TEXT PRIMARY KEY,
@@ -404,6 +491,23 @@ export class MonitorIngest
                     verified_with TEXT NOT NULL,
                     PRIMARY KEY (did, collection, rkey)
                 );
+                CREATE INDEX IF NOT EXISTS records_by_collection ON records (collection, did);
+                CREATE TABLE IF NOT EXISTS evidence_anchors (
+                    identity TEXT PRIMARY KEY,
+                    did TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')),
+                    first_observed_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messaging_key_history (
+                    did TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    first_seen_at INTEGER,
+                    record_cid TEXT,
+                    commit_cid TEXT,
+                    rev TEXT,
+                    verified_with TEXT,
+                    PRIMARY KEY (did, fingerprint)
+                );
                 CREATE TABLE IF NOT EXISTS holder_state (
                     did TEXT PRIMARY KEY,
                     state TEXT NOT NULL CHECK (state IN ('held', 'gone-reversible', 'gone-permanent')),
@@ -425,8 +529,11 @@ export class MonitorIngest
                     attempts INTEGER NOT NULL DEFAULT 0,
                     not_before INTEGER NOT NULL DEFAULT 0,
                     epoch INTEGER NOT NULL DEFAULT 0,
+                    owed_at INTEGER,
+                    last_failure TEXT,
                     PRIMARY KEY (did, collection, rkey)
                 );
+                CREATE INDEX IF NOT EXISTS rec_pending_by_collection ON rec_pending (collection, did);
                 CREATE TABLE IF NOT EXISTS reg_state (
                     did TEXT PRIMARY KEY,
                     registered_at INTEGER NOT NULL DEFAULT 0,
@@ -446,7 +553,8 @@ export class MonitorIngest
                     rkey TEXT NOT NULL,
                     subject TEXT,
                     rev TEXT NOT NULL,
-                    cursor TEXT NOT NULL
+                    cursor TEXT NOT NULL,
+                    collection TEXT NOT NULL DEFAULT 'follow'
                 );
                 CREATE TABLE IF NOT EXISTS listing_requeue (
                     did TEXT PRIMARY KEY,
@@ -460,6 +568,7 @@ export class MonitorIngest
                     progress_kind TEXT,
                     progress_gen INTEGER,
                     progress_phase TEXT,
+                    progress_collection TEXT,
                     progress_cursor TEXT,
                     progress_pds TEXT,
                     progress_began_at INTEGER,
@@ -469,9 +578,10 @@ export class MonitorIngest
                 CREATE INDEX IF NOT EXISTS listings_by_listed_at ON listings (listed_at);
                 CREATE TABLE IF NOT EXISTS listing_stage (
                     did TEXT NOT NULL,
+                    collection TEXT NOT NULL,
                     rkey TEXT NOT NULL,
                     subject TEXT NOT NULL,
-                    PRIMARY KEY (did, rkey)
+                    PRIMARY KEY (did, collection, rkey)
                 );
                 CREATE TABLE IF NOT EXISTS recount_queue (
                     did TEXT PRIMARY KEY,
@@ -504,6 +614,14 @@ export class MonitorIngest
                     requested_at INTEGER NOT NULL
                 );
             `)
+            this.ensureRecordsWriterState()
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('holder_state') WHERE name = 'cause'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE holder_state ADD COLUMN cause TEXT")
+            }
             if (
                 this.db.sql
                     .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'quiet'")
@@ -511,6 +629,134 @@ export class MonitorIngest
             ) {
                 this.db.sql.exec("ALTER TABLE pending ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0")
             }
+            // Rows owed before these columns existed keep NULL: their first
+            // owed time and failure are unknown.
+            for (const table of ["pending", "rec_pending"]) {
+                for (const column of ["owed_at INTEGER", "last_failure TEXT"]) {
+                    if (
+                        this.db.sql
+                            .exec(
+                                `SELECT 1 FROM pragma_table_info('${table}') WHERE name = ?`,
+                                column.split(" ")[0]
+                            )
+                            .toArray().length === 0
+                    ) {
+                        this.db.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column}`)
+                    }
+                }
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_gen'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(
+                    "ALTER TABLE pending ADD COLUMN owed_gen INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'owed_since_us'")
+                    .toArray().length === 0
+            ) {
+                // Rows owed before stamps existed lag at once.
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN owed_since_us INTEGER")
+                this.db.sql.exec("UPDATE pending SET owed_since_us = 0")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('pending') WHERE name = 'selection_turn'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE pending ADD COLUMN selection_turn INTEGER NOT NULL DEFAULT 0")
+            }
+            this.db.sql.exec("CREATE INDEX IF NOT EXISTS pending_by_turn ON pending (selection_turn, did, not_before)")
+            this.db.sql.exec("CREATE INDEX IF NOT EXISTS pending_by_not_before ON pending (not_before, selection_turn, did)")
+            // Explicitly assigned turns are the fairness path for current
+            // writes. The trigger is a compatibility fallback for legacy
+            // migrations and secondary write paths that still insert 0.
+            this.db.sql.exec(`
+                CREATE TRIGGER IF NOT EXISTS pending_assign_turn
+                AFTER INSERT ON pending WHEN NEW.selection_turn = 0
+                BEGIN
+                    INSERT INTO meta (k, v) VALUES ('selection_clock', '1')
+                    ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT);
+                    UPDATE pending SET selection_turn = CAST(
+                        (SELECT v FROM meta WHERE k = 'selection_clock') AS INTEGER
+                    ) WHERE did = NEW.did;
+                END
+            `)
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('listing_stage') WHERE name = 'collection'")
+                    .toArray().length === 0
+            ) {
+                // Staged rows predate block listings, and their primary key
+                // cannot gain a column: restart each listing from its queue row,
+                // since a drain over emptied staging would sweep every older
+                // edge. No await separates these writes, so they commit together.
+                this.db.sql.exec("DROP TABLE listing_stage")
+                this.db.sql.exec(
+                    "CREATE TABLE listing_stage (did TEXT NOT NULL, collection TEXT NOT NULL, " +
+                        "rkey TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (did, collection, rkey))"
+                )
+                this.db.sql.exec(
+                    "UPDATE listings SET progress_kind = NULL, progress_gen = NULL, progress_phase = NULL, " +
+                        "progress_cursor = NULL, progress_pds = NULL, progress_began_at = NULL, progress_pages = 0"
+                )
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('listings') WHERE name = 'progress_collection'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE listings ADD COLUMN progress_collection TEXT")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('edge_ops') WHERE name = 'collection'")
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec("ALTER TABLE edge_ops ADD COLUMN collection TEXT NOT NULL DEFAULT 'follow'")
+            }
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('evidence_anchors') WHERE name = 'did'")
+                    .toArray().length === 0
+            ) {
+                // Rows from before anchors were kept per DID carry their DID
+                // and kind in the identity JSON (`["commit", {did, ...}]` or
+                // `["anchor", did, key, authority]`), so they move across in
+                // place: a held snapshot's evidence keeps its rows.
+                // Each DID's superseded commit rows go as the store would
+                // have pruned them; its anchor rows are pruned on its next
+                // retain. No await separates these writes.
+                this.db.sql.exec("ALTER TABLE evidence_anchors RENAME TO evidence_anchors_unkeyed")
+                this.db.sql.exec(
+                    "CREATE TABLE evidence_anchors (identity TEXT PRIMARY KEY, did TEXT NOT NULL, " +
+                        "kind TEXT NOT NULL CHECK (kind IN ('commit', 'anchor')), first_observed_at INTEGER NOT NULL)"
+                )
+                this.db.sql.exec(
+                    "INSERT INTO evidence_anchors (identity, did, kind, first_observed_at) " +
+                        "SELECT identity, did, kind, first_observed_at FROM (" +
+                        "SELECT identity, first_observed_at, json_extract(identity, '$[0]') AS kind, " +
+                        "CASE json_extract(identity, '$[0]') " +
+                        "WHEN 'commit' THEN json_extract(identity, '$[1].did') " +
+                        "ELSE json_extract(identity, '$[1]') END AS did " +
+                        "FROM evidence_anchors_unkeyed WHERE json_valid(identity)) " +
+                        "WHERE kind IN ('commit', 'anchor') AND typeof(did) = 'text'"
+                )
+                this.db.sql.exec("DROP TABLE evidence_anchors_unkeyed")
+                this.db.sql.exec(
+                    "DELETE FROM evidence_anchors WHERE kind = 'commit' AND identity NOT IN (" +
+                        "SELECT identity FROM (SELECT identity, ROW_NUMBER() OVER (" +
+                        "PARTITION BY did ORDER BY first_observed_at DESC, identity) AS n " +
+                        "FROM evidence_anchors WHERE kind = 'commit') WHERE n = 1)"
+                )
+            }
+            this.db.sql.exec(
+                "CREATE INDEX IF NOT EXISTS evidence_anchors_by_did ON evidence_anchors (did, kind, first_observed_at)"
+            )
             for (const column of [
                 "attempts",
                 "not_before",
@@ -537,6 +783,29 @@ export class MonitorIngest
             this.seedInterest()
             this.seedListings()
             this.seedPlcLogs()
+            this.seedDeletedReowe()
+        })
+    }
+
+    /**
+     * Once: every DID marked deleted before a reversible answer could lift
+     * the mark is owed a fresh fetch, so one that came back is found. The
+     * mark stays until that settle decides it: a live record, or a reversible
+     * answer, lifts it; a permanent one keeps it. The rows wait out
+     * `not_before` so live owes go first, and are loud: a returning
+     * declaration is announced like any other.
+     */
+    private seedDeletedReowe(): void {
+        if (this.metaOf("deleted_reowed") !== undefined) return
+        this.ctx.storage.transactionSync(() => {
+            const nowMs = Date.now()
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                    "SELECT did, '', 0, ?1, 0, ?1 FROM deleted WHERE true " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0",
+                nowMs
+            )
+            this.setMeta("deleted_reowed", "1")
         })
     }
 
@@ -625,6 +894,25 @@ export class MonitorIngest
         return row !== undefined
     }
 
+    /**
+     * `isWatched` without the pending clause: a settle's own pending row is
+     * still present while it decides, and is not a reason to keep a document.
+     */
+    private watchedSansPendingSync(did: string): boolean {
+        return (
+            this.db.sql
+                .exec(
+                    "SELECT 1 AS n WHERE (EXISTS (SELECT 1 FROM interest WHERE did = ?1 AND member = 1) " +
+                        "OR (?2 = 'registered' AND (EXISTS (SELECT 1 FROM revs WHERE did = ?1) " +
+                        "OR EXISTS (SELECT 1 FROM records WHERE did = ?1)))) " +
+                        "AND NOT EXISTS (SELECT 1 FROM deleted WHERE did = ?1)",
+                    did,
+                    this.interestPolicy()
+                )
+                .toArray().length > 0
+        )
+    }
+
     /** Replaces any update already owed for `did`, and bumps its version. */
     async oweKeyUpdate(
         did: string,
@@ -634,19 +922,22 @@ export class MonitorIngest
     ): Promise<void> {
         // Load the stored cursor first so the max below cannot start from nothing.
         if (plcSeq !== undefined) await this.readPlcCursor()
-        this.db.sql.exec(
-            "INSERT INTO key_updates (did, kind, key, as_of, version) VALUES (?, ?, ?, ?, 1) " +
-                "ON CONFLICT(did) DO UPDATE SET kind = excluded.kind, key = excluded.key, " +
-                "as_of = excluded.as_of, version = key_updates.version + 1",
-            did,
-            update.kind,
-            update.kind === "put" ? update.key : null,
-            update.kind === "put" ? update.asOfMs : null
-        )
-        if (plcSeq !== undefined) {
-            this.raisePlcCursor(plcSeq, createdAtMs)
-            this.persistPlcCursor()
-        }
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO key_updates (did, kind, key, as_of, version) VALUES (?, ?, ?, ?, 1) " +
+                    "ON CONFLICT(did) DO UPDATE SET kind = excluded.kind, key = excluded.key, " +
+                    "as_of = excluded.as_of, version = key_updates.version + 1",
+                did,
+                update.kind,
+                update.kind === "put" ? update.key : null,
+                update.kind === "put" ? update.asOfMs : null
+            )
+            this.requestPromptSync(Date.now())
+            if (plcSeq !== undefined) {
+                this.raisePlcCursor(plcSeq, createdAtMs)
+                this.persistPlcCursor()
+            }
+        })
     }
 
     async dueKeyUpdates(limit: number): Promise<OwedKeyUpdate[]> {
@@ -912,6 +1203,30 @@ export class MonitorIngest
         await this.env.records.put(PLC_COVERAGE_KEY, JSON.stringify(coverage))
     }
 
+    /**
+     * Publish `firehose:coverage`: the stream cursor held back by what is
+     * still owed, as one value. The run starts when this first runs; a gap
+     * starts a new one.
+     */
+    async publishFirehoseCoverage(nowMs: number = Date.now()): Promise<FirehoseCoverage> {
+        const cursor = this.metaOf("cursor")
+        const cursorUs = cursor === undefined ? 0 : streamTimeUs(cursor)
+        if (this.metaOf("firehose_since") === undefined) {
+            this.setMeta("firehose_since", String(nowMs))
+        }
+        const coverage = computeFirehoseCoverage({
+            cursorUs: cursorUs > 0 ? cursorUs : null,
+            owed: await this.owedStreamEvents(nowMs),
+            continuousSinceMs: Number(this.metaOf("firehose_since")),
+            nowMs,
+            maxLagMs: FIREHOSE_COVERAGE_MAX_LAG_MS,
+            kvVisibilityMs: KV_VISIBILITY_MS,
+            laggingCap: FIREHOSE_LAGGING_CAP,
+        })
+        await this.env.records.put(FIREHOSE_COVERAGE_KEY, JSON.stringify(coverage))
+        return coverage
+    }
+
     // ---- MonitorIndex -----------------------------------------------------
 
     async readCursor(): Promise<Cursor | null> {
@@ -935,45 +1250,157 @@ export class MonitorIngest
         event: { did: string; rev: string },
         cursor: Cursor
     ): Promise<IntakeOutcome> {
-        const known = this.db.sql
-            .exec<{ rev: string }>("SELECT rev FROM revs WHERE did = ?", event.did)
-            .toArray()[0]
-        if (known?.rev === event.rev) {
-            // Still advance: this event is accounted for.
+        return this.ctx.storage.transactionSync(() => {
+            const known = this.db.sql
+                .exec<{ rev: string }>("SELECT rev FROM revs WHERE did = ?", event.did)
+                .toArray()[0]
+            if (known?.rev === event.rev) {
+                // Still advance: this event is accounted for.
+                this.db.sql.exec(
+                    "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
+                        "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    cursor
+                )
+                return { outcome: "duplicate" }
+            }
+            // A new event is news about the DID: it ends any retry backoff.
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                    "VALUES (?, ?, 0, 0, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                    `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                event.did,
+                event.rev,
+                this.nextOweGen(),
+                streamTimeUs(cursor),
+                Date.now(),
+                this.nextSelectionTurnSync()
+            )
+            this.requestPromptSync(Date.now())
             this.db.sql.exec(
                 "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
                     "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 cursor
             )
-            return { outcome: "duplicate" }
-        }
-        this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
-            event.did,
-            event.rev
-        )
-        this.db.sql.exec(
-            "INSERT INTO meta (k, v) VALUES ('cursor', ?) " +
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            cursor
-        )
-        return { outcome: "accepted" }
+            return { outcome: "accepted" }
+        })
     }
 
-    /** Owe a fetch the dedupe check would otherwise suppress. */
-    async owe(did: string, rev: string): Promise<void> {
+    /**
+     * Owe a fetch the dedupe check would otherwise suppress. Persists prompt
+     * intent for callers; socket intake also reconciles the alarm after commit.
+     */
+    async owe(did: string, rev: string, owedSinceUs?: number): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                    "VALUES (?, ?, 0, 0, ?, ?, ?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0, " +
+                    `attempts = 0, not_before = 0, owed_gen = excluded.owed_gen, ${KEEP_EARLIER_STAMP}`,
+                did,
+                rev,
+                this.nextOweGen(),
+                owedSinceUs ?? null,
+                Date.now(),
+                this.nextSelectionTurnSync()
+            )
+            this.requestPromptSync(Date.now())
+        })
+    }
+
+    private requestPromptSync(nowMs: number): void {
+        const requested = nowMs + this.promptWakeDelayMs()
+        const prior = Number(this.metaOf("prompt_at"))
+        const next = Number.isFinite(prior) && prior > 0 ? Math.min(prior, requested) : requested
+        if (next !== prior) this.setMeta("prompt_at", String(next))
+    }
+
+    private nextSelectionTurnSync(): number {
         this.db.sql.exec(
-            "INSERT INTO pending (did, rev, attempts, not_before) VALUES (?, ?, 0, 0) " +
-                "ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, quiet = 0",
-            did,
-            rev
+            "INSERT INTO meta (k, v) VALUES ('selection_clock', '1') " +
+                "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)"
         )
+        return Number(this.metaOf("selection_clock") ?? 1)
+    }
+
+    /**
+     * A counter shared by every row, so a generation is never reused after
+     * a row is deleted and owed again.
+     */
+    private nextOweGen(): number {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('owe_seq', '1') " +
+                "ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)"
+        )
+        return Number(
+            this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'owe_seq'").one().v
+        )
+    }
+
+    async owedGenOf(did: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ owed_gen: number }>("SELECT owed_gen FROM pending WHERE did = ?", did)
+            .toArray()[0]
+        return row?.owed_gen ?? null
+    }
+
+    /** The generation clause of a discharge: unconditional, or only the generation fetched for. */
+    private dischargePending(did: string, gen: number | null | undefined, quietOnly = false): void {
+        if (gen === null) return
+        const where =
+            (gen === undefined ? "did = ?1" : "did = ?1 AND owed_gen = ?2") +
+            (quietOnly ? " AND quiet = 1" : "")
+        const args = gen === undefined ? [did] : [did, gen]
+        const appliedAt = Date.now()
+        // The stamp outlives the row for the KV visibility window: the record
+        // this discharge stored may not yet be readable everywhere.
+        this.db.sql.exec(
+            "INSERT INTO applied_recent (did, owed_since_us, applied_at) " +
+                `SELECT did, owed_since_us, ${appliedAt} FROM pending ` +
+                `WHERE ${where} AND owed_since_us IS NOT NULL ` +
+                "ON CONFLICT(did) DO UPDATE SET " +
+                "owed_since_us = MIN(applied_recent.owed_since_us, excluded.owed_since_us), " +
+                "applied_at = excluded.applied_at",
+            ...args
+        )
+        this.db.sql.exec(`DELETE FROM pending WHERE ${where}`, ...args)
+    }
+
+    /**
+     * Stream-owed events and recently applied fetches of the DIDs the monitor
+     * holds or held, for the coverage watermark; prunes applied fetches past
+     * the visibility window on the way. A gone DID counts: its deletion is a
+     * KV write with the same window. A DID never held serves nothing, so its
+     * stamp is left out.
+     */
+    async owedStreamEvents(nowMs: number): Promise<OwedStreamEvent[]> {
+        this.db.sql.exec(
+            "DELETE FROM applied_recent WHERE applied_at <= ?",
+            nowMs - KV_VISIBILITY_MS
+        )
+        const held = "did IN (SELECT did FROM holder_state)"
+        const owed = this.db.sql
+            .exec<{ did: string; owed_since_us: number }>(
+                `SELECT did, owed_since_us FROM pending WHERE owed_since_us IS NOT NULL AND ${held}`
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, owedSinceUs: r.owed_since_us, appliedAtMs: null }))
+        const applied = this.db.sql
+            .exec<{ did: string; owed_since_us: number; applied_at: number }>(
+                `SELECT did, owed_since_us, applied_at FROM applied_recent WHERE ${held}`
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                owedSinceUs: r.owed_since_us,
+                appliedAtMs: r.applied_at,
+            }))
+        return [...owed, ...applied]
     }
 
     /** Discharge an obligation without indexing: a terminal, unstorable answer. */
-    async clearPending(did: string): Promise<void> {
-        this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+    async clearPending(did: string, gen?: number | null): Promise<void> {
+        this.dischargePending(did, gen)
     }
 
     /**
@@ -1135,6 +1562,70 @@ export class MonitorIngest
             }))
     }
 
+    /**
+     * The writer's state for a held declaration; rows held before these
+     * columns existed keep NULL until their next settle.
+     */
+    private ensureRecordsWriterState(): void {
+        for (const column of [
+            "commit_cid TEXT",
+            "anchor_key TEXT",
+            "messaging_key_fingerprint TEXT",
+            "messaging_key_first_seen_at INTEGER",
+            "seen_key TEXT",
+        ]) {
+            if (
+                this.db.sql
+                    .exec("SELECT 1 FROM pragma_table_info('records') WHERE name = ?", column.split(" ")[0])
+                    .toArray().length === 0
+            ) {
+                this.db.sql.exec(`ALTER TABLE records ADD COLUMN ${column}`)
+            }
+        }
+    }
+
+    async heldDeclarationOf(did: string): Promise<HeldDeclarationState | null> {
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                cid: string
+                verified_with: string
+                commit_cid: string | null
+                anchor_key: string | null
+                messaging_key_fingerprint: string | null
+                messaging_key_first_seen_at: number | null
+                seen_key: string | null
+            }>(
+                "SELECT r.rev, r.cid, r.verified_with, r.commit_cid, r.anchor_key, " +
+                    "r.messaging_key_fingerprint, r.messaging_key_first_seen_at, r.seen_key " +
+                    "FROM records r JOIN holder_state h ON h.did = r.did " +
+                    "WHERE r.did = ? AND r.collection = ? AND r.rkey = 'self' AND h.state = 'held'",
+                did,
+                this.env.MONITOR_COLLECTION
+            )
+            .toArray()[0]
+        if (row === undefined) return null
+        return {
+            rev: row.rev,
+            cid: row.cid,
+            verifiedWith: row.verified_with,
+            commitCid: row.commit_cid,
+            anchorKey: row.anchor_key === null ? null : bytesOfHex(row.anchor_key),
+            messagingKeyFingerprint: row.messaging_key_fingerprint,
+            messagingKeyFirstSeenAtMs: row.messaging_key_first_seen_at,
+            seenKey: row.seen_key,
+        }
+    }
+
+    async recordSeenKey(did: string, key: string): Promise<void> {
+        this.db.sql.exec(
+            "UPDATE records SET seen_key = ? WHERE did = ? AND collection = ? AND rkey = 'self'",
+            key,
+            did,
+            this.env.MONITOR_COLLECTION
+        )
+    }
+
     async holderStateOf(did: string): Promise<HolderState | null> {
         const row = this.db.sql
             .exec<{ state: HolderState }>("SELECT state FROM holder_state WHERE did = ?", did)
@@ -1147,7 +1638,7 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite
     ): void {
         const ownedBefore = this.ownsSync(did)
         this.db.sql.exec(
@@ -1158,21 +1649,30 @@ export class MonitorIngest
             observedAtMs
         )
         this.db.sql.exec(
-            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
-                "VALUES (?, ?, 'self', ?, ?, ?) " +
+            "INSERT INTO records (did, collection, rkey, rev, cid, verified_with, commit_cid, " +
+                "anchor_key, messaging_key_fingerprint, messaging_key_first_seen_at) " +
+                "VALUES (?, ?, 'self', ?, ?, ?, ?, ?, ?, ?) " +
                 "ON CONFLICT(did, collection, rkey) DO UPDATE SET rev = excluded.rev, " +
-                "cid = excluded.cid, verified_with = excluded.verified_with",
+                "cid = excluded.cid, verified_with = excluded.verified_with, " +
+                "commit_cid = excluded.commit_cid, anchor_key = excluded.anchor_key, " +
+                "messaging_key_fingerprint = excluded.messaging_key_fingerprint, " +
+                "messaging_key_first_seen_at = excluded.messaging_key_first_seen_at, " +
+                "seen_key = CASE WHEN verified_with = excluded.verified_with THEN seen_key ELSE NULL END",
             did,
             this.env.MONITOR_COLLECTION,
             rev,
             verified.cid,
-            verified.verifiedWith
+            verified.verifiedWith,
+            verified.commitCid ?? null,
+            verified.anchorKey == null ? null : hexOf(verified.anchorKey),
+            verified.messagingKeyFingerprint ?? null,
+            verified.messagingKeyFirstSeenAtMs ?? null
         )
         // Only a transition into held restarts `held_at`. A permanently deleted
         // DID is not re-marked here: refresh never visits one.
         this.db.sql.exec(
             "INSERT INTO holder_state (did, state, held_at) VALUES (?1, 'held', ?2) " +
-                "ON CONFLICT(did) DO UPDATE SET state = 'held', " +
+                "ON CONFLICT(did) DO UPDATE SET state = 'held', cause = NULL, " +
                 "held_at = CASE WHEN state = 'held' THEN held_at ELSE ?2 END",
             did,
             observedAtMs
@@ -1182,25 +1682,59 @@ export class MonitorIngest
 
     /**
      * A refresh found `did` reversibly gone with nothing left to dispose of:
-     * re-assert the state with no digest entry and no push. Stays
-     * gone-permanent for a DID with a `deleted` row.
+     * re-assert the state with no digest entry and no push. A `deleted` row
+     * from an earlier permanent answer is lifted: `deleted` means the last
+     * answer was permanent.
      */
-    async markGoneReversible(did: string): Promise<void> {
-        this.ctx.storage.transactionSync(() => this.setGoneState(did, false))
+    async markGoneReversible(did: string, cause: GoneCause): Promise<void> {
+        this.ctx.storage.transactionSync(() => this.setGoneState(did, false, cause))
     }
 
-    private setGoneState(did: string, permanent: boolean): void {
+    private setGoneState(did: string, permanent: boolean, cause: GoneCause): void {
         const ownedBefore = this.ownsSync(did)
-        // A DID already permanently gone stays so under a reversible answer.
+        const lifted =
+            !permanent &&
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ? RETURNING did", did).toArray()
+                .length > 0
         this.db.sql.exec(
-            "INSERT INTO holder_state (did, state) VALUES (?1, ?2) " +
-                "ON CONFLICT(did) DO UPDATE SET state = CASE " +
-                "WHEN EXISTS (SELECT 1 FROM deleted WHERE did = ?1) THEN 'gone-permanent' " +
-                "ELSE excluded.state END",
+            "INSERT INTO holder_state (did, state, cause) VALUES (?1, ?2, ?3) " +
+                "ON CONFLICT(did) DO UPDATE SET state = excluded.state, cause = excluded.cause",
             did,
-            permanent ? "gone-permanent" : "gone-reversible"
+            permanent ? "gone-permanent" : "gone-reversible",
+            cause
         )
         this.reevaluateInterest(did, Date.now(), ownedBefore)
+        if (lifted) this.afterMarkLifted(did)
+    }
+
+    /** Drops `did`'s `deleted` mark, if it has one, and undoes what the mark kept. */
+    private liftDeletedSync(did: string): void {
+        const lifted =
+            this.db.sql.exec("DELETE FROM deleted WHERE did = ? RETURNING did", did).toArray()
+                .length > 0
+        if (lifted) this.afterMarkLifted(did)
+    }
+
+    /**
+     * `did` was permanently gone and no longer is. Its stored DID document was
+     * kept current only because it was deleted: an unwatched DID's is now
+     * marked stale, as a leave would. A watched did:plc is owed
+     * its PLC log again, which the permanent answer dropped.
+     */
+    private afterMarkLifted(did: string): void {
+        const nowMs = Date.now()
+        if (!this.watchedSansPendingSync(did)) {
+            if (this.didDocumentRow(did) !== undefined) this.markDidDocumentStaleSync(did, nowMs)
+            return
+        }
+        if (did.startsWith("did:plc:")) {
+            this.db.sql.exec(
+                "INSERT INTO plc_logs (did, owed_at) VALUES (?, ?) " +
+                    "ON CONFLICT(did) DO UPDATE SET owed_at = COALESCE(owed_at, excluded.owed_at)",
+                did,
+                nowMs
+            )
+        }
     }
 
     /**
@@ -1220,7 +1754,8 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
@@ -1230,8 +1765,8 @@ export class MonitorIngest
                 windowOf(observedAtMs, this.digestWidthMs()),
                 did
             )
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
-            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+            this.dischargePending(did, gen)
+            this.liftDeletedSync(did)
         })
     }
 
@@ -1249,7 +1784,9 @@ export class MonitorIngest
         did: string,
         observedAtMs: number,
         permanent: boolean,
-        quiet = false
+        quiet = false,
+        cause: GoneCause = "repo",
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             if (permanent) {
@@ -1261,7 +1798,7 @@ export class MonitorIngest
                 )
                 this.dropPlcLogSync(did)
             }
-            this.setGoneState(did, permanent)
+            this.setGoneState(did, permanent, cause)
             // Only the declaration goes: other collections' snapshots outlive it.
             this.db.sql.exec(
                 "DELETE FROM records WHERE did = ? AND collection = ?",
@@ -1276,7 +1813,7 @@ export class MonitorIngest
                     did
                 )
             }
-            this.db.sql.exec("DELETE FROM pending WHERE did = ?", did)
+            this.dischargePending(did, gen)
         })
     }
 
@@ -1328,30 +1865,443 @@ export class MonitorIngest
         )
     }
 
-    async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
+    async getEvidenceAnchor(identity: string): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ first_observed_at: number }>(
+                "SELECT first_observed_at FROM evidence_anchors WHERE identity = ?",
+                identity
+            )
+            .toArray()[0]
+        return row?.first_observed_at ?? null
+    }
+
+    /**
+     * The DID's other commit rows go: only the newest commit can reappear.
+     * Anchor rows stay, since an authority and key can come back (a PLC
+     * fork restoring an operation, a did:web key rotated back), but only the
+     * newest `EVIDENCE_ANCHOR_HISTORY` of them; one dropped only reads
+     * younger.
+     */
+    async retainEvidenceAnchors(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            for (const row of rows) {
+                this.db.sql.exec(
+                    "INSERT OR IGNORE INTO evidence_anchors (identity, did, kind, first_observed_at) VALUES (?, ?, ?, ?)",
+                    row.identity,
+                    did,
+                    row.kind,
+                    row.firstObservedAtMs
+                )
+            }
+            const commit = rows.find((row) => row.kind === "commit")
+            if (commit !== undefined) {
+                this.db.sql.exec(
+                    "DELETE FROM evidence_anchors WHERE did = ? AND kind = 'commit' AND identity <> ?",
+                    did,
+                    commit.identity
+                )
+            }
+            const anchor = rows.find((row) => row.kind === "anchor")
+            this.db.sql.exec(
+                "DELETE FROM evidence_anchors WHERE did = ?1 AND kind = 'anchor' AND identity IS NOT ?2 " +
+                    "AND identity NOT IN (SELECT identity FROM evidence_anchors WHERE did = ?1 " +
+                    "AND kind = 'anchor' ORDER BY (identity = ?2) DESC, first_observed_at DESC, identity LIMIT ?3)",
+                did,
+                anchor?.identity ?? null,
+                EVIDENCE_ANCHOR_HISTORY
+            )
+        })
+    }
+
+    async getMessagingKeyHistory(
+        did: string,
+        fingerprint: string,
+        legacyFingerprint?: string
+    ): Promise<MessagingKeyHistoryRow | null> {
+        return this.reconcileMessagingKeyHistory(did, fingerprint, legacyFingerprint)
+    }
+
+    async retainMessagingKeyFirstSeen(
+        did: string,
+        row: MessagingKeyHistoryRow,
+        legacyFingerprint?: string
+    ): Promise<void> {
+        this.reconcileMessagingKeyHistory(did, row.fingerprint, legacyFingerprint, row)
+    }
+
+    /**
+     * Lazy, atomic migration of the prior raw-COSE hex identity. Keep aliases
+     * for older writers: rollback must find both unknown and tracked keys.
+     * An unknown sentinel wins a conflict; otherwise retain the earliest
+     * observation together with that observation's complete provenance.
+     */
+    private reconcileMessagingKeyHistory(
+        did: string,
+        fingerprint: string,
+        legacyFingerprint?: string,
+        incoming?: MessagingKeyHistoryRow
+    ): MessagingKeyHistoryRow | null {
+        const canonical = normalizeMessagingKeyFingerprint(fingerprint)
+        return this.ctx.storage.transactionSync(() => {
+            const candidates = this.db.sql.exec<{
+                fingerprint: string; first_seen_at: number | null; record_cid: string | null
+                commit_cid: string | null; rev: string | null; verified_with: string | null
+            }>(
+                "SELECT fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with " +
+                "FROM messaging_key_history WHERE did = ? AND (fingerprint = ? OR length(fingerprint) > 64) " +
+                "ORDER BY fingerprint",
+                did, canonical
+            ).toArray().filter((row) => normalizeMessagingKeyFingerprint(row.fingerprint) === canonical)
+            const aliases = new Set([canonical, ...candidates.map((row) => row.fingerprint)])
+            for (const alias of [fingerprint, legacyFingerprint]) {
+                if (alias !== undefined && normalizeMessagingKeyFingerprint(alias) === canonical) aliases.add(alias)
+            }
+            const rows: MessagingKeyHistoryRow[] = candidates.map((row) => ({
+                fingerprint: canonical, firstSeenAtMs: row.first_seen_at,
+                recordCid: row.record_cid, commitCid: row.commit_cid,
+                rev: row.rev, verifiedWith: row.verified_with,
+            }))
+            if (incoming !== undefined) rows.push({ ...incoming, fingerprint: canonical })
+            const first = rows.reduce<MessagingKeyHistoryRow | null>((prior, row) => {
+                if (prior === null) return row
+                if (prior.firstSeenAtMs === null) return prior
+                if (row.firstSeenAtMs === null || row.firstSeenAtMs < prior.firstSeenAtMs) return row
+                return prior
+            }, null)
+            if (first === null) return null
+            for (const alias of aliases) {
+                const prior = candidates.find((row) => row.fingerprint === alias)
+                if (prior !== undefined && prior.first_seen_at === first.firstSeenAtMs &&
+                    prior.record_cid === first.recordCid && prior.commit_cid === first.commitCid &&
+                    prior.rev === first.rev && prior.verified_with === first.verifiedWith) continue
+                this.db.sql.exec(
+                    "INSERT INTO messaging_key_history " +
+                    "(did, fingerprint, first_seen_at, record_cid, commit_cid, rev, verified_with) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(did, fingerprint) DO UPDATE SET " +
+                    "first_seen_at = excluded.first_seen_at, record_cid = excluded.record_cid, " +
+                    "commit_cid = excluded.commit_cid, rev = excluded.rev, verified_with = excluded.verified_with",
+                    did, alias, first.firstSeenAtMs, first.recordCid, first.commitCid, first.rev, first.verifiedWith
+                )
+            }
+            return first
+        })
+    }
+
+    async evidenceBackfillPage(afterDid: string | null, limit: number): Promise<IndexedRecord[]> {
         return this.db.sql
-            .exec<{ did: string; rev: string; attempts: number; not_before: number; quiet: number }>(
-                "SELECT did, rev, attempts, not_before, quiet FROM pending " +
-                    "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
-                nowMs,
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>(
+                "SELECT did, collection, rkey, rev, cid, verified_with FROM records " +
+                    "WHERE collection = ? AND rkey = 'self' AND (? IS NULL OR did > ?) " +
+                    "ORDER BY did LIMIT ?",
+                this.env.MONITOR_COLLECTION,
+                afterDid,
+                afterDid,
                 limit
             )
             .toArray()
             .map((r) => ({
                 did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async readEvidenceBackfillProgress(): Promise<EvidenceBackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'evidence_backfill'")
+            .toArray()[0]
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as EvidenceBackfillProgress
+    }
+
+    async setEvidenceBackfillProgress(progress: EvidenceBackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('evidence_backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
+    async snapshotLayoutBackfillPage(after: RecordRef | null, limit: number): Promise<IndexedRecord[]> {
+        return this.db.sql
+            .exec<{
+                did: string
+                collection: string
+                rkey: string
+                rev: string
+                cid: string
+                verified_with: string
+            }>(
+                "SELECT did, collection, rkey, rev, cid, verified_with FROM records " +
+                    "WHERE (?1 IS NULL OR (did, collection, rkey) > (?1, ?2, ?3)) " +
+                    "ORDER BY did, collection, rkey LIMIT ?4",
+                after?.did ?? null,
+                after?.collection ?? null,
+                after?.rkey ?? null,
+                limit
+            )
+            .toArray()
+            .map((r) => ({
+                did: r.did,
+                collection: r.collection,
+                rkey: r.rkey,
+                rev: r.rev,
+                cid: r.cid,
+                verifiedWith: r.verified_with,
+            }))
+    }
+
+    async readSnapshotLayoutBackfillProgress(): Promise<SnapshotLayoutBackfillProgress> {
+        const row = this.db.sql
+            .exec<{ v: string }>("SELECT v FROM meta WHERE k = 'snapshot_v2_backfill'")
+            .toArray()[0]
+        if (row === undefined) return { done: false, cursor: null }
+        return JSON.parse(row.v) as SnapshotLayoutBackfillProgress
+    }
+
+    async setSnapshotLayoutBackfillProgress(progress: SnapshotLayoutBackfillProgress): Promise<void> {
+        this.db.sql.exec(
+            "INSERT INTO meta (k, v) VALUES ('snapshot_v2_backfill', ?) " +
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            JSON.stringify(progress)
+        )
+    }
+
+    async oweSnapshotLayoutRefresh(record: IndexedRecord): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            if (record.collection === this.env.MONITOR_COLLECTION && record.rkey === "self") {
+                const held = this.db.sql
+                    .exec("SELECT 1 FROM holder_state WHERE did = ? AND state = 'held'", record.did)
+                    .toArray()
+                if (held.length > 0) this.oweEvidenceRefreshSync(record.did, record.rev)
+                return
+            }
+            const interest = this.db.sql
+                .exec<{ epoch: number; registered: number }>(
+                    "SELECT epoch, registered FROM interest WHERE did = ? AND member = 1",
+                    record.did
+                )
+                .toArray()[0]
+            if (interest === undefined) return
+            if (record.collection === BLOCK_COLLECTION_NSID && interest.registered !== 1) return
+            this.db.sql.exec(
+                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(did, collection, rkey) DO NOTHING",
+                record.did,
+                record.collection,
+                record.rkey,
+                record.rev,
+                interest.epoch,
+                Date.now()
+            )
+        })
+    }
+
+    /** `owe` for the evidence sweep, where a row already owed is left as it is. */
+    async oweEvidenceRefresh(did: string, rev: string): Promise<void> {
+        this.oweEvidenceRefreshSync(did, rev)
+    }
+
+    private oweEvidenceRefreshSync(did: string, rev: string): void {
+        this.db.sql.exec(
+            "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at, selection_turn) " +
+                "VALUES (?, ?, 0, 0, ?, NULL, ?, ?) ON CONFLICT(did) DO NOTHING",
+            did,
+            rev,
+            this.nextOweGen(),
+            Date.now(),
+            this.nextSelectionTurnSync()
+        )
+    }
+
+    async duePending(nowMs: number, limit: number): Promise<PendingFetch[]> {
+        const bounded = Math.max(1, Math.min(MAX_SETTLE_BATCH, Math.floor(limit) || MAX_SETTLE_BATCH))
+        return this.ctx.storage.transactionSync(() => {
+            const rows = this.db.sql
+                .exec<{ did: string; rev: string; attempts: number; not_before: number; quiet: number; owed_gen: number }>(
+                    "SELECT did, rev, attempts, not_before, quiet, owed_gen FROM pending " +
+                        "WHERE not_before <= ? ORDER BY selection_turn, did LIMIT ?",
+                    nowMs,
+                    bounded
+                )
+                .toArray()
+            const result = rows.map((r) => ({
+                did: r.did,
                 rev: r.rev,
                 attempts: r.attempts,
                 notBeforeMs: r.not_before,
                 quiet: r.quiet === 1,
+                owedGen: r.owed_gen,
             }))
+            for (const row of rows) {
+                this.db.sql.exec(
+                    "UPDATE pending SET selection_turn = ? WHERE did = ? AND owed_gen = ?",
+                    this.nextSelectionTurnSync(), row.did, row.owed_gen
+                )
+            }
+            return result
+        })
     }
 
-    async deferPending(did: string, notBeforeMs: number): Promise<void> {
-        this.db.sql.exec(
-            "UPDATE pending SET attempts = attempts + 1, not_before = ? WHERE did = ?",
-            notBeforeMs,
-            did
+    async deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure,
+        expectedGeneration?: number | null
+    ): Promise<number | null> {
+        if (expectedGeneration === null) return null
+        const generation = expectedGeneration ?? await this.owedGenOf(did)
+        if (generation === null) return null
+        const row = this.db.sql
+            .exec<{ attempts: number }>(
+                "UPDATE pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
+                    "WHERE did = ? AND owed_gen = ? RETURNING attempts",
+                notBeforeMs,
+                JSON.stringify(failure),
+                did,
+                generation
+            )
+            .toArray()[0]
+        return row?.attempts ?? null
+    }
+
+    /** Counts over one owed table; names no DID. */
+    private pendingSummarySync(table: "pending" | "rec_pending", now: number): PendingSummary {
+        const bucket =
+            "CASE " +
+            [...PENDING_ATTEMPT_BUCKETS]
+                .reverse()
+                .map((bound) => `WHEN attempts >= ${bound} THEN ${bound}`)
+                .join(" ") +
+            " END"
+        const total = this.db.sql
+            .exec<{
+                count: number
+                due: number
+                max_attempts: number
+                oldest: number | null
+                unknown: number
+                threw: number
+                unverifiable: number
+            }>(
+                "SELECT COUNT(*) AS count, " +
+                    "COALESCE(SUM(not_before <= ?), 0) AS due, " +
+                    "COALESCE(MAX(attempts), 0) AS max_attempts, " +
+                    "MIN(owed_at) AS oldest, " +
+                    "COALESCE(SUM(owed_at IS NULL), 0) AS unknown, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'threw'), 0) AS threw, " +
+                    "COALESCE(SUM(json_extract(last_failure, '$.kind') = 'unverifiable'), 0) AS unverifiable " +
+                    `FROM ${table}`,
+                now
+            )
+            .one()
+        const counts = new Map(
+            this.db.sql
+                .exec<{ bound: number; n: number }>(
+                    `SELECT ${bucket} AS bound, COUNT(*) AS n FROM ${table} GROUP BY bound`
+                )
+                .toArray()
+                .map((r) => [r.bound, r.n])
         )
+        return {
+            count: total.count,
+            due: total.due,
+            maxAttempts: total.max_attempts,
+            attempts: PENDING_ATTEMPT_BUCKETS.map((atLeast) => ({
+                atLeast,
+                count: counts.get(atLeast) ?? 0,
+            })),
+            oldestOwedAtMs: total.oldest,
+            owedAtUnknown: total.unknown,
+            lastFailure: {
+                threw: total.threw,
+                unverifiable: total.unverifiable,
+                none: total.count - total.threw - total.unverifiable,
+            },
+        }
+    }
+
+    /** Aggregate ingest progress for an operator; names no owed or held DID. */
+    async ingestStatus(): Promise<MonitorIngestStatus> {
+        const now = Date.now()
+        const held = this.db.sql
+            .exec<{ n: number }>("SELECT COUNT(*) AS n FROM holder_state WHERE state = 'held'")
+            .one().n
+        return {
+            asOfMs: now,
+            backfill: await this.readBackfillProgress(),
+            pending: this.pendingSummarySync("pending", now),
+            secondaryPending: this.pendingSummarySync("rec_pending", now),
+            heldDeclarations: held,
+            gonePermanent: this.db.sql
+                .exec<{ n: number }>(
+                    "SELECT COUNT(*) AS n FROM holder_state WHERE state = 'gone-permanent'"
+                )
+                .one().n,
+            followFrameFailures: this.followFrameFailuresSync(),
+        }
+    }
+
+    /** Kept in `meta` under `follow_frame_failures`, as JSON. */
+    private followFrameFailuresSync(): FollowFrameFailures {
+        const v = this.metaOf("follow_frame_failures")
+        return v === undefined
+            ? { count: 0, lastAtMs: null, lastErrorName: null }
+            : (JSON.parse(v) as FollowFrameFailures)
+    }
+
+    private noteFollowFrameFailureSync(name: string, atMs: number): void {
+        this.ctx.storage.transactionSync(() => {
+            const { count } = this.followFrameFailuresSync()
+            const next: FollowFrameFailures = { count: count + 1, lastAtMs: atMs, lastErrorName: name }
+            this.setMeta("follow_frame_failures", JSON.stringify(next))
+        })
+    }
+
+    /** What the ingest index holds for one DID, including why it is still owed. */
+    async pendingDetail(did: string): Promise<MonitorPendingDetail> {
+        const row = this.db.sql
+            .exec<{
+                rev: string
+                attempts: number
+                not_before: number
+                quiet: number
+                owed_at: number | null
+                last_failure: string | null
+            }>(
+                "SELECT rev, attempts, not_before, quiet, owed_at, last_failure FROM pending WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        return {
+            did,
+            pending:
+                row === undefined
+                    ? null
+                    : {
+                          rev: row.rev,
+                          attempts: row.attempts,
+                          notBeforeMs: row.not_before,
+                          quiet: row.quiet !== 0,
+                          owedAtMs: row.owed_at,
+                          lastFailure:
+                              row.last_failure === null
+                                  ? null
+                                  : (JSON.parse(row.last_failure) as PendingFailure),
+                      },
+            holderState: await this.holderStateOf(did),
+            indexedRev: await this.revOf(did),
+        }
     }
 
     async revOf(did: string): Promise<string | null> {
@@ -1432,6 +2382,49 @@ export class MonitorIngest
         })
     }
 
+    /**
+     * `MonitorOwnBlocksRequest`: the owner's own blocks, read from D1 outside
+     * the alarm's statement budget. A D1 failure throws.
+     */
+    async ownBlocks(did: string): Promise<BlockEdge[] | null> {
+        return d1BlockEdgeStore(this.env.graph!).ownBlocks(did)
+    }
+
+    /**
+     * `MonitorOwnGraphRequest`: the owner's graph from the follow-edge index,
+     * read from D1 outside the alarm's statement budget. A D1 failure throws.
+     */
+    async ownGraph(did: string): Promise<OwnerGraph | null> {
+        const edges = await d1FollowEdgeStore(this.env.graph!).ownEdges(did)
+        return edges === null ? null : ownerGraph(did, edges.following, edges.followers)
+    }
+
+    /**
+     * The anchor the stored, verified declaration names. Only an exclusion
+     * proof from a live repo is `absent`; a repo-level reversible state
+     * (deactivated, taken down, suspended) and an unproven `RecordNotFound`
+     * are `unknown`, since only a verified absence may retire a registration.
+     * Reads through the ingest object, as `ownBlocks` does.
+     */
+    async verifiedAnchorOf(did: string): Promise<VerifiedAnchorObservation> {
+        const unknown = { state: "unknown" } as const
+        const holder = this.db.sql
+            .exec<{ state: HolderState; cause: GoneCause | null }>(
+                "SELECT state, cause FROM holder_state WHERE did = ?",
+                did
+            )
+            .toArray()[0]
+        if (holder === undefined) return unknown
+        if (holder.state === "gone-reversible") {
+            return holder.cause === "record" ? { state: "absent" } : unknown
+        }
+        if (holder.state !== "held") return unknown
+
+        const held = await this.heldDeclarationOf(did)
+        if (held === null || held.anchorKey === null) return unknown
+        return { state: "present", anchorKey: held.anchorKey }
+    }
+
     async requestRefresh(did: string, requestedAtMs: number): Promise<void> {
         // A repeat keeps the earliest time, so steady requests neither jump the
         // queue nor extend the request's one-day lifetime.
@@ -1472,14 +2465,15 @@ export class MonitorIngest
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite,
+        gen?: number | null
     ): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.writeVerified(did, rev, observedAtMs, verified)
             // A live record again: the join obligation and any deletion mark
             // are spent, but a commit's obligation is still owed.
-            this.db.sql.exec("DELETE FROM pending WHERE did = ? AND quiet = 1", did)
-            this.db.sql.exec("DELETE FROM deleted WHERE did = ?", did)
+            this.dischargePending(did, gen, true)
+            this.liftDeletedSync(did)
         })
     }
 
@@ -1862,53 +2856,6 @@ export class MonitorIngest
         return { published, remaining }
     }
 
-    // ---- GraphProjectorIndex ----------------------------------------------
-
-    async projectorCursor(): Promise<ProjectorCursor | null> {
-        const stored = this.metaOf("graph_projector_cursor")
-        if (stored === undefined) return null
-        try {
-            const cursor = JSON.parse(stored) as ProjectorCursor | null
-            return cursor?.kind === "tail" || cursor?.kind === "rebuild" ? cursor : null
-        } catch {
-            // A corrupt cursor rebuilds rather than wedging the projector.
-            return null
-        }
-    }
-
-    async setProjectorCursor(cursor: ProjectorCursor): Promise<void> {
-        this.setMeta("graph_projector_cursor", JSON.stringify(cursor))
-    }
-
-    async mirroredGraphStanding(did: string): Promise<MirroredGraphStanding> {
-        const row = this.db.sql
-            .exec<{ owner: number; inflight: number }>(
-                "SELECT owner, inflight FROM graph_mirrored WHERE did = ?",
-                did
-            )
-            .toArray()[0]
-        if (row === undefined) return "not-served"
-        if (row.inflight === 1) return "in-flight"
-        return row.owner === 1 ? "served" : "not-served"
-    }
-
-    async servedGraphsMirrored(
-        cursor: string | null,
-        limit: number
-    ): Promise<{ dids: string[]; cursor: string | null }> {
-        const dids = this.db.sql
-            .exec<{ did: string }>(
-                "SELECT did FROM graph_mirrored WHERE (owner = 1 OR inflight = 1) " +
-                    "AND (?1 IS NULL OR did > ?1) ORDER BY did LIMIT ?2",
-                cursor,
-                limit + 1
-            )
-            .toArray()
-            .map((r) => r.did)
-        const page = dids.slice(0, limit)
-        return { dids: page, cursor: dids.length > limit ? page[page.length - 1]! : null }
-    }
-
     async isGraphOwner(did: string): Promise<boolean> {
         if (this.interestPolicy() === "registered") return this.isRegistered(did)
         return this.holderStateSync(did) === "held"
@@ -1920,6 +2867,7 @@ export class MonitorIngest
 
     private setRegisteredSync(did: string, registered: boolean, atMs: number): void {
         const ownedBefore = this.ownsSync(did)
+        const registeredBefore = this.registeredSync(did)
         this.db.sql.exec(
             "INSERT INTO interest (did, registered) VALUES (?1, ?2) " +
                 "ON CONFLICT(did) DO UPDATE SET registered = ?2",
@@ -1927,6 +2875,11 @@ export class MonitorIngest
             registered ? 1 : 0
         )
         this.reevaluateInterest(did, atMs, ownedBefore)
+        // Under `everyone` a registration does not change who owns a graph,
+        // so the owner's block records still need their listing.
+        if (registered && !registeredBefore && this.ownsSync(did)) {
+            this.queueListingSync(did, atMs, "ownership")
+        }
     }
 
     async setOwnerFollowers(did: string, count: number, atMs: number): Promise<void> {
@@ -1964,6 +2917,11 @@ export class MonitorIngest
         )
     }
 
+    /**
+     * Add quiet join obligations while applying an interest transition in an
+     * alarm. It does not arm a prompt itself; that alarm's final reconciliation
+     * schedules any declaration still pending after the bounded settle pass.
+     */
     async oweJoin(did: string, records: readonly WatchedRecord[], epoch: number): Promise<void> {
         if ((await this.interestEpoch(did)) !== epoch) return
         this.ctx.storage.transactionSync(() => {
@@ -1973,9 +2931,10 @@ export class MonitorIngest
                 this.db.sql.exec("SELECT 1 FROM deleted WHERE did = ?", did).toArray().length > 0
             if (!indexed && !deleted) {
                 this.db.sql.exec(
-                    "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                        "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                    did
+                    "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                        "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                    did,
+                    Date.now()
                 )
             }
             if (did.startsWith("did:plc:") && !deleted) {
@@ -1988,14 +2947,15 @@ export class MonitorIngest
             }
             for (const r of records) {
                 this.db.sql.exec(
-                    "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) " +
+                    "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
                         "VALUES (?1, ?2, ?3, COALESCE((SELECT rev FROM records " +
-                        "WHERE did = ?1 AND collection = ?2 AND rkey = ?3), ''), ?4) " +
+                        "WHERE did = ?1 AND collection = ?2 AND rkey = ?3), ''), ?4, ?5) " +
                         "ON CONFLICT(did, collection, rkey) DO UPDATE SET epoch = ?4",
                     did,
                     r.collection,
                     r.rkey,
-                    epoch
+                    epoch,
+                    Date.now()
                 )
             }
         })
@@ -2003,7 +2963,7 @@ export class MonitorIngest
 
     async forgetLeft(did: string): Promise<void> {
         this.ctx.storage.transactionSync(() => {
-            for (const table of ["records", "rec_pending", "checks", "refresh_requests"]) {
+            for (const table of ["records", "rec_pending", "checks", "refresh_requests", "evidence_anchors", "messaging_key_history"]) {
                 this.db.sql.exec(`DELETE FROM ${table} WHERE did = ?`, did)
             }
             this.dropPlcLogSync(did)
@@ -2017,7 +2977,11 @@ export class MonitorIngest
 
     // ---- SecondaryIndex ---------------------------------------------------
 
-    async dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]> {
+    async dueSecondaries(
+        nowMs: number,
+        limit: number,
+        lane: SecondaryLane = "records"
+    ): Promise<PendingRecordFetch[]> {
         return this.db.sql
             .exec<{
                 did: string
@@ -2029,8 +2993,10 @@ export class MonitorIngest
                 epoch: number
             }>(
                 "SELECT did, collection, rkey, rev, attempts, not_before, epoch FROM rec_pending " +
-                    "WHERE not_before <= ? ORDER BY not_before LIMIT ?",
+                    `WHERE not_before <= ? AND collection ${lane === "records" ? "!=" : "="} ? ` +
+                    "ORDER BY not_before LIMIT ?",
                 nowMs,
+                BLOCK_COLLECTION_NSID,
                 limit
             )
             .toArray()
@@ -2045,15 +3011,23 @@ export class MonitorIngest
             }))
     }
 
-    async deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void> {
-        this.db.sql.exec(
-            "UPDATE rec_pending SET attempts = attempts + 1, not_before = ? " +
-                "WHERE did = ? AND collection = ? AND rkey = ?",
-            notBeforeMs,
-            ref.did,
-            ref.collection,
-            ref.rkey
-        )
+    async deferSecondary(
+        ref: RecordRef,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null> {
+        const row = this.db.sql
+            .exec<{ attempts: number }>(
+                "UPDATE rec_pending SET attempts = attempts + 1, not_before = ?, last_failure = ? " +
+                    "WHERE did = ? AND collection = ? AND rkey = ? RETURNING attempts",
+                notBeforeMs,
+                JSON.stringify(failure),
+                ref.did,
+                ref.collection,
+                ref.rkey
+            )
+            .toArray()[0]
+        return row?.attempts ?? null
     }
 
     async clearSecondary(ref: RecordRef, owedRev: string): Promise<void> {
@@ -2069,7 +3043,7 @@ export class MonitorIngest
     ): Promise<SecondaryWriteAnswer | "stored"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
-            if (refusal !== null) return refusal
+            if (refusal !== null) return this.refuseSecondary(ref, refusal, owedRev)
             this.db.sql.exec(
                 "INSERT INTO records (did, collection, rkey, rev, cid, verified_with) " +
                     "VALUES (?, ?, ?, ?, ?, ?) " +
@@ -2095,7 +3069,7 @@ export class MonitorIngest
     ): Promise<SecondaryWriteAnswer | "disposed"> {
         return this.ctx.storage.transactionSync(() => {
             const refusal = this.secondaryRefusal(ref, rev, epoch)
-            if (refusal !== null) return refusal
+            if (refusal !== null) return this.refuseSecondary(ref, refusal, owedRev)
             this.db.sql.exec(
                 "DELETE FROM records WHERE did = ? AND collection = ? AND rkey = ?",
                 ref.did,
@@ -2107,7 +3081,64 @@ export class MonitorIngest
         })
     }
 
-    /** `left` if the DID is out of the interest epoch it was owed under; `older` if a newer rev is indexed. */
+    async strayOwnBlockProofs(limit: number): Promise<RecordRef[]> {
+        return this.db.sql
+            .exec<{ did: string; collection: string; rkey: string }>(
+                "SELECT did, collection, rkey FROM (" +
+                    "SELECT did, collection, rkey FROM records WHERE collection = ?1 " +
+                    "UNION SELECT did, collection, rkey FROM rec_pending WHERE collection = ?1" +
+                    ") b WHERE NOT EXISTS (SELECT 1 FROM interest i WHERE i.did = b.did AND i.registered = 1) " +
+                    "LIMIT ?2",
+                BLOCK_COLLECTION_NSID,
+                limit
+            )
+            .toArray()
+            .map((r) => ({ did: r.did, collection: r.collection, rkey: r.rkey }))
+    }
+
+    async forgetStrayOwnBlockProof(ref: RecordRef): Promise<void> {
+        this.ctx.storage.transactionSync(() => {
+            this.db.sql.exec(
+                "DELETE FROM records WHERE did = ? AND collection = ? AND rkey = ?",
+                ref.did,
+                ref.collection,
+                ref.rkey
+            )
+            const interest = this.db.sql
+                .exec<{ epoch: number }>(
+                    "SELECT epoch FROM interest WHERE did = ? AND registered = 1",
+                    ref.did
+                )
+                .toArray()[0]
+            if (interest === undefined) {
+                this.db.sql.exec(
+                    "DELETE FROM rec_pending WHERE did = ? AND collection = ? AND rkey = ?",
+                    ref.did,
+                    ref.collection,
+                    ref.rkey
+                )
+                return
+            }
+            this.oweSecondarySync({ ...ref, rev: "" }, interest.epoch)
+        })
+    }
+
+    /**
+     * A block proof of an owner no longer registered is not retried: the DID
+     * may still be a member, so no leave would sweep its row.
+     */
+    private refuseSecondary(
+        ref: RecordRef,
+        refusal: SecondaryWriteAnswer,
+        owedRev: string
+    ): SecondaryWriteAnswer {
+        if (refusal === "left" && ref.collection === BLOCK_COLLECTION_NSID) {
+            this.clearSecondarySync(ref, owedRev)
+        }
+        return refusal
+    }
+
+    /** `left` if the DID is out of the interest epoch it was owed under, or a block ref of a DID no longer registered; `older` if a newer rev is indexed. */
     private secondaryRefusal(ref: RecordRef, rev: string, epoch: number): SecondaryWriteAnswer | null {
         const interest = this.db.sql
             .exec<{ member: number; epoch: number }>(
@@ -2116,6 +3147,7 @@ export class MonitorIngest
             )
             .toArray()[0]
         if (interest === undefined || interest.member !== 1 || interest.epoch !== epoch) return "left"
+        if (ref.collection === BLOCK_COLLECTION_NSID && !this.registeredSync(ref.did)) return "left"
         const indexed = this.secondaryRevSync(ref)
         if (indexed !== null && compareRev(indexed, rev) === "regressed") return "older"
         return null
@@ -2176,19 +3208,25 @@ export class MonitorIngest
             if (this.secondaryRevSync(owed) === owed.rev) {
                 return { outcome: "duplicate" as const }
             }
-            this.db.sql.exec(
-                "INSERT INTO rec_pending (did, collection, rkey, rev, epoch) VALUES (?, ?, ?, ?, ?) " +
-                    "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
-                    "rev = excluded.rev, epoch = excluded.epoch",
-                owed.did,
-                owed.collection,
-                owed.rkey,
-                owed.rev,
-                interest.epoch
-            )
+            this.oweSecondarySync(owed, interest.epoch)
             this.raiseFollowCursor(cursor)
             return { outcome: "accepted" as const }
         })
+    }
+
+    private oweSecondarySync(owed: OwedRecord, epoch: number): void {
+        this.db.sql.exec(
+            "INSERT INTO rec_pending (did, collection, rkey, rev, epoch, owed_at) " +
+                "VALUES (?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT(did, collection, rkey) DO UPDATE SET " +
+                "rev = excluded.rev, epoch = excluded.epoch, attempts = 0, not_before = 0",
+            owed.did,
+            owed.collection,
+            owed.rkey,
+            owed.rev,
+            epoch,
+            Date.now()
+        )
     }
 
     // ---- FollowStreamIndex ------------------------------------------------
@@ -2209,18 +3247,28 @@ export class MonitorIngest
     }
 
     /** Logged only: nothing reads `edge_ops` until the edge index exists. */
-    async logEdgeOp(op: NewEdgeOp, cursor: Cursor): Promise<void> {
+    async logEdgeOp(op: NewEdgeOp, cursor: Cursor, ownBlockProof?: OwedRecord): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
-                "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor) " +
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO edge_ops (kind, follower, rkey, subject, rev, cursor, collection) " +
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 op.kind,
                 op.follower,
                 op.rkey,
                 op.kind === "create" ? op.subject : null,
                 op.rev,
-                op.cursor
+                op.cursor,
+                op.collection
             )
+            if (ownBlockProof) {
+                const interest = this.db.sql
+                    .exec<{ epoch: number }>(
+                        "SELECT epoch FROM interest WHERE did = ? AND member = 1",
+                        ownBlockProof.did
+                    )
+                    .toArray()[0]
+                if (interest) this.oweSecondarySync(ownBlockProof, interest.epoch)
+            }
             this.raiseFollowCursor(cursor)
         })
     }
@@ -2283,7 +3331,8 @@ export class MonitorIngest
             .exec<QueueSqlRow>(
                 "SELECT q.did AS did, q.attempts, q.not_before, q.timeouts, q.permanent_failures, " +
                     "COALESCE(l.paged, 0) AS paged, l.progress_kind, l.progress_gen, " +
-                    "l.progress_phase, l.progress_cursor, l.progress_pds, l.progress_began_at, l.progress_pages " +
+                    "l.progress_phase, l.progress_collection, l.progress_cursor, l.progress_pds, " +
+                    "l.progress_began_at, l.progress_pages " +
                     "FROM listing_requeue q LEFT JOIN listings l ON l.did = q.did " +
                     "WHERE q.unlistable = 0 AND q.not_before <= ?1 " +
                     "ORDER BY l.progress_kind IS NULL, q.low_priority, " +
@@ -2345,10 +3394,11 @@ export class MonitorIngest
             }
             this.db.sql.exec(
                 "INSERT INTO listings (did, progress_kind, progress_gen, progress_phase, " +
-                    "progress_cursor, progress_pds, progress_began_at, progress_pages, last_kind) " +
-                    "VALUES (?1, ?2, ?3, 'fetch', NULL, ?4, ?5, 0, ?2) " +
+                    "progress_collection, progress_cursor, progress_pds, progress_began_at, " +
+                    "progress_pages, last_kind) " +
+                    "VALUES (?1, ?2, ?3, 'fetch', 'follow', NULL, ?4, ?5, 0, ?2) " +
                     "ON CONFLICT(did) DO UPDATE SET progress_kind = ?2, progress_gen = ?3, " +
-                    "progress_phase = 'fetch', progress_cursor = NULL, progress_pds = ?4, " +
+                    "progress_phase = 'fetch', progress_collection = 'follow', progress_cursor = NULL, progress_pds = ?4, " +
                     "progress_began_at = ?5, progress_pages = 0, last_kind = ?2",
                 did,
                 kind,
@@ -2405,44 +3455,53 @@ export class MonitorIngest
     async stageRows(
         did: string,
         gen: number,
-        rows: readonly FollowRecord[],
-        fetchCursor: string | null,
+        rows: readonly StagedRow[],
+        fetch: { collection: EdgeCollection; cursor: string | null },
         done: boolean
     ): Promise<boolean> {
         return this.ctx.storage.transactionSync(() => {
             if (!this.progressIsSync(did, gen)) return false
             for (const r of rows) {
                 this.db.sql.exec(
-                    "INSERT INTO listing_stage (did, rkey, subject) VALUES (?1, ?2, ?3) " +
-                        "ON CONFLICT(did, rkey) DO UPDATE SET subject = ?3",
+                    "INSERT INTO listing_stage (did, collection, rkey, subject) VALUES (?1, ?2, ?3, ?4) " +
+                        "ON CONFLICT(did, collection, rkey) DO UPDATE SET subject = ?4",
                     did,
+                    r.collection,
                     r.rkey,
                     r.subject
                 )
             }
             this.db.sql.exec(
-                "UPDATE listings SET progress_pages = progress_pages + 1 " +
-                    "WHERE did = ? AND progress_kind <> 'owner-repo'",
-                did
+                "UPDATE listings SET progress_pages = CASE WHEN COALESCE(progress_collection, 'follow') = ?2 " +
+                    "THEN progress_pages + 1 ELSE 0 END " +
+                    "WHERE did = ?1 AND progress_kind <> 'owner-repo'",
+                did,
+                fetch.collection
             )
             this.db.sql.exec(
                 done
-                    ? "UPDATE listings SET progress_phase = 'drain', progress_cursor = NULL WHERE did = ?"
-                    : "UPDATE listings SET progress_cursor = ?2 WHERE did = ?1",
-                ...(done ? [did] : [did, fetchCursor])
+                    ? "UPDATE listings SET progress_phase = 'drain', progress_collection = ?2, " +
+                          "progress_cursor = NULL WHERE did = ?1"
+                    : "UPDATE listings SET progress_collection = ?2, progress_cursor = ?3 WHERE did = ?1",
+                ...(done ? [did, fetch.collection] : [did, fetch.collection, fetch.cursor])
             )
             this.commitStepSync(did)
             return true
         })
     }
 
-    async stagedRows(did: string, after: string | null, limit: number): Promise<FollowRecord[]> {
+    async stagedRows(
+        did: string,
+        after: { collection: EdgeCollection; rkey: string } | null,
+        limit: number
+    ): Promise<StagedRow[]> {
         return this.db.sql
-            .exec<{ rkey: string; subject: string }>(
-                "SELECT rkey, subject FROM listing_stage WHERE did = ?1 AND (?2 IS NULL OR rkey > ?2) " +
-                    "ORDER BY rkey LIMIT ?3",
+            .exec<{ collection: EdgeCollection; rkey: string; subject: string }>(
+                "SELECT collection, rkey, subject FROM listing_stage WHERE did = ?1 AND " +
+                    "(?2 IS NULL OR (collection, rkey) > (?2, ?3)) ORDER BY collection, rkey LIMIT ?4",
                 did,
-                after,
+                after?.collection ?? null,
+                after?.rkey ?? null,
                 limit
             )
             .toArray()
@@ -2451,12 +3510,17 @@ export class MonitorIngest
     async saveDrainProgress(
         did: string,
         gen: number,
-        cursor: string,
+        cursor: { collection: EdgeCollection; rkey: string },
         subjects: readonly string[]
     ): Promise<boolean> {
         return this.ctx.storage.transactionSync(() => {
             if (!this.progressIsSync(did, gen)) return false
-            this.db.sql.exec("UPDATE listings SET progress_cursor = ? WHERE did = ?", cursor, did)
+            this.db.sql.exec(
+                "UPDATE listings SET progress_collection = ?, progress_cursor = ? WHERE did = ?",
+                cursor.collection,
+                cursor.rkey,
+                did
+            )
             this.commitStepSync(did)
             this.queueRecountSync(subjects, Date.now())
             return true
@@ -2481,7 +3545,8 @@ export class MonitorIngest
     private clearProgressSync(did: string): void {
         this.db.sql.exec(
             "UPDATE listings SET progress_kind = NULL, progress_gen = NULL, progress_phase = NULL, " +
-                "progress_cursor = NULL, progress_pds = NULL, progress_began_at = NULL, progress_pages = 0 WHERE did = ?",
+                "progress_collection = NULL, progress_cursor = NULL, progress_pds = NULL, " +
+                "progress_began_at = NULL, progress_pages = 0 WHERE did = ?",
             did
         )
         this.db.sql.exec("DELETE FROM listing_stage WHERE did = ?", did)
@@ -2531,10 +3596,36 @@ export class MonitorIngest
                     done.beganAtMs
                 )
             }
+            if (ownerKind && this.registeredSync(did)) this.oweOwnBlockProofsSync(did)
             this.clearProgressSync(did)
             this.queueRecountSync(done.subjects, done.nowMs)
             return true
         })
+    }
+
+    /**
+     * Owes a proof fetch of every block the finished listing staged that is
+     * not held, and of every held block it no longer lists. A block the
+     * stream already touched may be owed again; the fetch is idempotent.
+     */
+    private oweOwnBlockProofsSync(did: string): void {
+        const epoch = this.db.sql
+            .exec<{ epoch: number }>("SELECT epoch FROM interest WHERE did = ?", did)
+            .toArray()[0]?.epoch
+        if (epoch === undefined) return
+        const rkeys = this.db.sql
+            .exec<{ rkey: string }>(
+                "SELECT rkey FROM listing_stage WHERE did = ?1 AND collection = 'block' " +
+                    "AND rkey NOT IN (SELECT rkey FROM records WHERE did = ?1 AND collection = ?2) " +
+                    "UNION SELECT rkey FROM records WHERE did = ?1 AND collection = ?2 " +
+                    "AND rkey NOT IN (SELECT rkey FROM listing_stage WHERE did = ?1 AND collection = 'block')",
+                did,
+                BLOCK_COLLECTION_NSID
+            )
+            .toArray()
+        for (const { rkey } of rkeys) {
+            this.oweSecondarySync({ did, collection: BLOCK_COLLECTION_NSID, rkey, rev: "" }, epoch)
+        }
     }
 
     private registeredSync(did: string): boolean {
@@ -2559,7 +3650,7 @@ export class MonitorIngest
                 "SELECT DISTINCT s.subject AS did FROM listing_stage s " +
                     "JOIN interest i ON i.did = s.subject AND i.member = 1 " +
                     "LEFT JOIN holder_state h ON h.did = s.subject " +
-                    "WHERE s.did = ?1 AND s.subject <> ?1 AND " +
+                    "WHERE s.did = ?1 AND s.collection = 'follow' AND s.subject <> ?1 AND " +
                     (everyone ? "COALESCE(h.state, '') <> 'held'" : "i.registered = 0"),
                 owner
             )
@@ -2680,7 +3771,7 @@ export class MonitorIngest
             atMs,
             row.began + 1
         )
-        if (reason !== "ownership") this.clearProgressSync(did)
+        if (reason !== "ownership" && reason !== "lost-frame") this.clearProgressSync(did)
     }
 
     async queueAllListings(atMs: number, reason: "upgrade" | "gap"): Promise<number> {
@@ -2749,8 +3840,9 @@ export class MonitorIngest
                 subject: string | null
                 rev: string
                 cursor: string
+                collection: EdgeCollection
             }>(
-                "SELECT seq, kind, follower, rkey, subject, rev, cursor FROM edge_ops " +
+                "SELECT seq, kind, follower, rkey, subject, rev, cursor, collection FROM edge_ops " +
                     "ORDER BY seq LIMIT ?",
                 limit
             )
@@ -2759,6 +3851,7 @@ export class MonitorIngest
                 r.kind === "create"
                     ? {
                           seq: r.seq,
+                          collection: r.collection,
                           kind: "create" as const,
                           follower: r.follower,
                           rkey: r.rkey,
@@ -2768,6 +3861,7 @@ export class MonitorIngest
                       }
                     : {
                           seq: r.seq,
+                          collection: r.collection,
                           kind: "delete" as const,
                           follower: r.follower,
                           rkey: r.rkey,
@@ -2780,8 +3874,8 @@ export class MonitorIngest
     async dropEdgeOps(throughSeq: number, subjects: readonly string[]): Promise<void> {
         this.ctx.storage.transactionSync(() => {
             this.db.sql.exec(
-                "DELETE FROM listing_stage WHERE (did, rkey) IN " +
-                    "(SELECT follower, rkey FROM edge_ops WHERE seq <= ?)",
+                "DELETE FROM listing_stage WHERE (did, collection, rkey) IN " +
+                    "(SELECT follower, collection, rkey FROM edge_ops WHERE seq <= ?)",
                 throughSeq
             )
             this.db.sql.exec("DELETE FROM edge_ops WHERE seq <= ?", throughSeq)
@@ -2922,14 +4016,15 @@ export class MonitorIngest
     }
 
     /**
-     * The graph mirror, edge-log flush, re-count drain, graph projector,
-     * change-log prune and the daily reconciles, sharing one D1 statement budget. Each runs
+     * The graph mirror, edge-log flush, re-count drain and the daily
+     * reconciles, sharing one D1 statement budget. Each runs
      * alone: a D1 outage costs neither the other steps nor the alarm's
      * re-arm.
      */
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
         const edges = d1FollowEdgeWriter(this.env.graph!, budget)
+        const blocks = d1BlockEdgeWriter(this.env.graph!, budget)
         const deps = { index: this, listings: this, edges, nowMs: () => Date.now(), budget }
         const owners = { edges, interest: this, nowMs: deps.nowMs }
         const reserve = this.listingReserve()
@@ -2961,34 +4056,13 @@ export class MonitorIngest
                 "edge flush",
                 () =>
                     flushEdgeOps(
-                        { ops: this, edges, budget, interest: this },
+                        { ops: this, edges, blocks, budget, interest: this },
                         flushLimit(Math.floor((budget.remaining * 3) / 4))
                     ),
             ],
             [
                 "recount drain",
                 () => drainRecounts({ ...owners, queue: this, budget }, RECOUNT_DRAIN_BATCH),
-            ],
-            [
-                "graph projector",
-                () =>
-                    runGraphProjector(
-                        {
-                            index: this,
-                            changes: d1GraphChangeLog(this.env.graph!),
-                            edges: d1FollowEdgeStore(this.env.graph!),
-                            projections: kvGraphProjections(this.env),
-                            budget,
-                        },
-                        // Each DID costs a KV write; they share the alarm's 1,000 KV
-                        // operations with the DID-document publish, coverage and
-                        // snapshot writes.
-                        this.envInt(this.env.GRAPH_PROJECTOR_BATCH, 200)
-                    ),
-            ],
-            [
-                "graph change prune",
-                () => pruneGraphChanges(deps, this.envInt(this.env.GRAPH_PRUNE_BATCH, 1000)),
             ],
             ["graph reconcile", () => this.reconcileGraph(deps)],
             [
@@ -3014,6 +4088,7 @@ export class MonitorIngest
             listRecordsInProgress: LISTRECORDS_IN_PROGRESS,
             statementReserve: this.listingReserve(),
             maxFollows: this.envInt(this.env.MAX_FOLLOWS, 20_000),
+            maxBlocks: this.envInt(this.env.MAX_BLOCKS, 20_000),
             maxRepoBytes: this.envInt(this.env.FOLLOW_MAX_REPO_BYTES, 33_554_432),
             maxMstNodes: DEFAULT_MAX_MST_NODES,
             pagesPerAlarm: LISTING_PAGES_PER_ALARM,
@@ -3031,17 +4106,23 @@ export class MonitorIngest
             index: this,
             didDocuments: this,
             edges,
+            blocks: d1BlockEdgeWriter(this.env.graph!, budget),
             budget,
             fetchRepo: (did) => this.fetchRepo(did),
             verifyRepo: (car, expected) => this.verifyRepo(car, expected),
             resolvePds: (did) => this.resolvePds(did),
-            listFollows: (pds, did, cursor) => this.listFollows(pds, did, cursor),
+            listRecords: (pds, did, collection, cursor) => this.listRecords(pds, did, collection, cursor),
             nowMs: () => Date.now(),
         }
     }
 
     private metaOf(k: string): string | undefined {
         return this.db.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v
+    }
+
+    private promptWakeDelayMs(): number {
+        const configured = Number(this.env.PROMPT_WAKE_DELAY_MS)
+        return Number.isInteger(configured) && configured > 0 ? configured : PROMPT_WAKE_DELAY_MS
     }
 
     private setMeta(k: string, v: string | null): void {
@@ -3052,6 +4133,242 @@ export class MonitorIngest
                 k,
                 v
             )
+    }
+
+    private serializeStorage<T>(work: () => Promise<T>): Promise<T> {
+        const run = this.storageQueue.then(work, work)
+        this.storageQueue = run.then(() => undefined, () => undefined)
+        return run
+    }
+
+    private pendingStateSync(nowMs: number): { due: boolean; earliest: number | null } {
+        const due = this.db.sql.exec(
+            "SELECT 1 FROM pending WHERE not_before <= ? LIMIT 1", nowMs
+        ).toArray().length > 0
+        const earliest = this.db.sql.exec<{ at: number }>(
+            "SELECT not_before AS at FROM pending WHERE not_before > ? ORDER BY not_before LIMIT 1",
+            nowMs
+        ).toArray()[0]?.at ?? null
+        return { due, earliest }
+    }
+
+    private async reconcileAlarm(): Promise<void> {
+        if (this.alarmReconcile !== null) {
+            this.alarmReconcileAgain = true
+            return this.alarmReconcile
+        }
+        const run = (async () => {
+            do {
+                this.alarmReconcileAgain = false
+                await this.reconcileAlarmOnce()
+            } while (this.alarmReconcileAgain)
+        })().finally(() => {
+            if (this.alarmReconcile === run) this.alarmReconcile = null
+            if (this.alarmReconcileAgain) {
+                this.alarmReconcileAgain = false
+                void this.reconcileAlarm().catch((err) => {
+                    console.error("monitor: alarm reconciliation retry failed", err)
+                })
+            }
+        })
+        this.alarmReconcile = run
+        return run
+    }
+
+    private async reconcileAlarmOnce(): Promise<void> {
+        await this.serializeStorage(async () => {
+            const now = Date.now()
+            const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+            const existingAlarm = await this.db.getAlarm()
+            await this.db.transaction(async () => {
+                let maintenanceAt = Number(this.metaOf("maintenance_at"))
+                if (!Number.isFinite(interval) || interval <= 0) {
+                    maintenanceAt = 0
+                    this.setMeta("maintenance_at", null)
+                    this.setMeta("maintenance_disabled", "1")
+                } else {
+                    this.setMeta("maintenance_disabled", null)
+                }
+                if (!Number.isFinite(maintenanceAt) || maintenanceAt <= 0) {
+                    maintenanceAt = Number.isFinite(interval) && interval > 0 && existingAlarm !== null
+                        ? existingAlarm > now ? existingAlarm : now + this.promptWakeDelayMs()
+                        : Number.isFinite(interval) && interval > 0 ? now + interval : 0
+                    this.setMeta("maintenance_at", maintenanceAt > 0 ? String(maintenanceAt) : null)
+                }
+                const pending = this.pendingStateSync(now)
+                const keysRemain = this.db.sql.exec("SELECT 1 FROM key_updates LIMIT 1").toArray().length > 0
+                let promptAt = Number(this.metaOf("prompt_at"))
+                const hasImmediateWork = pending.due || keysRemain
+                const settlementAt = hasImmediateWork
+                    ? now + this.promptWakeDelayMs()
+                    : pending.earliest
+                if (settlementAt !== null) {
+                    // A future retry is still a settlement wake. Persist its
+                    // reason so alarm() does not mistake it for maintenance.
+                    promptAt = Number.isFinite(promptAt) && promptAt > 0
+                        ? Math.min(promptAt, settlementAt)
+                        : settlementAt
+                    this.setMeta("prompt_at", String(promptAt))
+                }
+                const promptDeadline = Number.isFinite(promptAt) && promptAt > 0
+                    ? promptAt > now ? promptAt : now + this.promptWakeDelayMs()
+                    : now + this.promptWakeDelayMs()
+                const declarationCooldown = this.cooldownUntilSync("declaration")
+                const keyCooldown = this.cooldownUntilSync("key")
+                const pendingAt = pending.due
+                    ? Math.max(promptDeadline, declarationCooldown)
+                    : pending.earliest === null
+                      ? 0
+                      : Math.max(pending.earliest, declarationCooldown)
+                const keyAt = keysRemain ? Math.max(promptDeadline, keyCooldown) : 0
+                const maintenanceWake = maintenanceAt > now ? maintenanceAt : maintenanceAt > 0 ? now + this.promptWakeDelayMs() : 0
+                const candidates = [
+                    maintenanceWake,
+                    keyAt,
+                    pendingAt,
+                    existingAlarm !== null && existingAlarm > now ? existingAlarm : 0,
+                ].filter((value) => value > 0)
+                if (candidates.length === 0) {
+                    if (existingAlarm !== null) await this.db.deleteAlarm()
+                    return
+                }
+                const nextAlarm = Math.min(...candidates)
+                if (nextAlarm !== existingAlarm) await this.db.setAlarm(nextAlarm)
+            })
+        })
+    }
+
+    private cooldownUntilSync(lane: "declaration" | "key"): number {
+        this.migrateLegacyCooldownSync()
+        const laneUntil = Number(this.metaOf(`${lane}_cooldown_until`))
+        return Number.isFinite(laneUntil) && laneUntil > 0 ? laneUntil : 0
+    }
+
+    private cooldownDurationSync(lane: "declaration" | "key"): number {
+        this.migrateLegacyCooldownSync()
+        const laneDuration = Number(this.metaOf(`${lane}_cooldown_ms`))
+        return Number.isFinite(laneDuration) && laneDuration > 0 ? laneDuration : 0
+    }
+
+    /** Copy the pre-lane shared cooldown to both independent lanes exactly once. */
+    private migrateLegacyCooldownSync(): void {
+        const legacyUntilValue = this.metaOf("scheduler_cooldown")
+        const legacyDurationValue = this.metaOf("scheduler_cooldown_ms")
+        if (legacyUntilValue === undefined && legacyDurationValue === undefined) return
+        const legacyUntil = Number(legacyUntilValue)
+        const legacyDuration = Number(legacyDurationValue)
+        if (Number.isFinite(legacyUntil) && legacyUntil > 0) {
+            for (const lane of ["declaration", "key"] as const) {
+                const laneUntil = Number(this.metaOf(`${lane}_cooldown_until`))
+                if (!Number.isFinite(laneUntil) || laneUntil <= 0) {
+                    this.setMeta(`${lane}_cooldown_until`, String(legacyUntil))
+                }
+            }
+        }
+        if (Number.isFinite(legacyDuration) && legacyDuration > 0) {
+            for (const lane of ["declaration", "key"] as const) {
+                const laneDuration = Number(this.metaOf(`${lane}_cooldown_ms`))
+                if (!Number.isFinite(laneDuration) || laneDuration <= 0) {
+                    this.setMeta(`${lane}_cooldown_ms`, String(legacyDuration))
+                }
+            }
+        }
+        if (legacyUntilValue !== undefined) this.setMeta("scheduler_cooldown", null)
+        if (legacyDurationValue !== undefined) this.setMeta("scheduler_cooldown_ms", null)
+    }
+
+    private recordCooldownSync(lane: "declaration" | "key", nowMs: number): void {
+        const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
+        const cap = Number.isFinite(interval) && interval > 0 ? interval : 120_000
+        const prior = this.cooldownDurationSync(lane)
+        const next = prior > 0 ? Math.min(prior * 2, cap) : Math.min(1_000, cap)
+        this.setMeta(`${lane}_cooldown_ms`, String(next))
+        this.setMeta(`${lane}_cooldown_until`, String(nowMs + next))
+    }
+
+    private clearCooldownSync(lane: "declaration" | "key"): void {
+        this.setMeta(`${lane}_cooldown_ms`, "0")
+        this.setMeta(`${lane}_cooldown_until`, null)
+    }
+
+    private async requestPromptWakeBestEffort(): Promise<void> {
+        try {
+            await this.reconcileAlarm()
+        } catch (err) {
+            // The durable pending/key row and prompt intent are already committed.
+            // The watchdog or a later start repairs this scheduling gap.
+            console.error("monitor: prompt alarm scheduling failed", err)
+        }
+    }
+
+    private async runPromptPass(nowMs: number): Promise<void> {
+        if (this.alarmPass !== null) return this.alarmPass
+        this.alarmPass = (async () => {
+            await this.db.transaction(async () => {
+                const requested = Number(this.metaOf("prompt_at"))
+                if (Number.isFinite(requested) && requested <= nowMs) this.setMeta("prompt_at", null)
+            })
+            const now = Date.now()
+            if (this.cooldownUntilSync("key") <= now) {
+                if (await this.drainKeys()) this.recordCooldownSync("key", Date.now())
+                else this.clearCooldownSync("key")
+            }
+            await this.settleDeclarationBatch()
+        })().finally(async () => {
+            this.alarmPass = null
+            await this.reconcileAlarm()
+        })
+        return this.alarmPass
+    }
+
+    /** One bounded declaration dispatch with its own cooldown and progress accounting. */
+    private async settleDeclarationBatch(): Promise<void> {
+        const now = Date.now()
+        if (this.cooldownUntilSync("declaration") > now) return
+
+        const batch = this.settleBatch()
+        let selectedDids: string[] = []
+        let before = ""
+        try {
+            await settleDue(this.deps(), batch, undefined, (selected) => {
+                selectedDids = selected.map((row) => row.did)
+                before = selected
+                    .map((row) => `${row.did}:${row.rev}:${row.owedGen ?? ""}:${row.attempts}:${row.notBeforeMs}:${row.quiet}`)
+                    .sort()
+                    .join("|")
+            })
+        } catch (err) {
+            console.error("monitor: settle failed", err)
+        }
+        const afterRows = selectedDids.length === 0
+            ? []
+            : this.db.sql.exec<{
+                  did: string
+                  rev: string
+                  owed_gen: number
+                  attempts: number
+                  not_before: number
+                  quiet: number
+              }>(
+                  `SELECT did, rev, owed_gen, attempts, not_before, quiet FROM pending WHERE did IN (${selectedDids.map(() => "?").join(",")})`,
+                  ...selectedDids
+              ).toArray()
+        const after = afterRows
+            .map((row) => `${row.did}:${row.rev}:${row.owed_gen}:${row.attempts}:${row.not_before}:${row.quiet === 1}`)
+            .sort()
+            .join("|")
+        const pending = this.pendingStateSync(Date.now())
+        if (pending.due && before === after) this.recordCooldownSync("declaration", Date.now())
+        else this.clearCooldownSync("declaration")
+    }
+
+    private settleBatch(): number {
+        // Shared by declarations and ordinary secondary records. The own-block
+        // proof lane has its own separate OWN_BLOCK_SETTLE_BATCH budget.
+        const configured = Number(this.env.SETTLE_BATCH)
+        return Number.isInteger(configured) && configured > 0
+            ? Math.min(MAX_SETTLE_BATCH, configured)
+            : MAX_SETTLE_BATCH
     }
 
     /** One page of the daily re-count of owner-followed DIDs; the cursor persists until a pass completes. */
@@ -3187,23 +4504,132 @@ export class MonitorIngest
         return this.verifyAt({ did, collection: this.env.MONITOR_COLLECTION, rkey: "self" }, record)
     }
 
-    private verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
-        if (record.signingKey === null) return Promise.resolve({ kind: "unverifiable" })
+    private async verifyAt(ref: RecordRef, record: FetchedRecord): Promise<VerifyOutcome> {
+        if (record.signingKey === null) {
+            return { kind: "unverifiable", reason: "no #atproto signing key" }
+        }
+        let outcome: ReturnType<typeof verifyRecordProofOutcome>
         try {
-            const outcome = verifyRecordProofOutcome(record.car, {
+            outcome = verifyRecordProofOutcome(record.car, {
                 did: ref.did,
                 signingKey: record.signingKey,
                 collection: ref.collection,
                 rkey: ref.rkey,
             })
-            return Promise.resolve(
-                outcome.kind === "present"
-                    ? { kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid }
-                    : { kind: "verified-absent", key: record.signingKey, rev: outcome.rev }
-            )
         } catch (err) {
-            if (err instanceof RepoProofError) return Promise.resolve({ kind: "unverifiable" })
+            if (err instanceof RepoProofError) {
+                return { kind: "unverifiable", reason: err.message }
+            }
             throw err
+        }
+        if (outcome.kind === "absent") {
+            return { kind: "verified-absent", key: record.signingKey, rev: outcome.rev, commitCid: outcome.commitCid }
+        }
+        const base: VerifyOutcome = {
+            kind: "verified", key: record.signingKey, rev: outcome.rev, cid: outcome.cid,
+            commitCid: outcome.commitCid, collection: ref.collection, rkey: ref.rkey,
+            ...(ref.collection === DECLARATION_COLLECTION_NSID && ref.rkey === "self"
+                ? (() => {
+                      const currentKey = declarationAnchorKeyOf(outcome.record)
+                      return currentKey === null
+                          ? { messagingKeyFingerprint: null, anchorKey: null }
+                          : { messagingKeyFingerprint: messagingKeyFingerprint(currentKey), anchorKey: currentKey }
+                  })()
+                : {}),
+        }
+        if (ref.collection !== this.env.MONITOR_COLLECTION || ref.rkey !== "self") return base
+        const monitor = normalizeMonitorHostname(this.env.MONITOR_HOSTNAME)
+        // Evidence enrichment is optional. A valid PDS proof remains a
+        // servable declaration when external corroboration or monitor
+        // provenance is unavailable, whatever the reason, so nothing here
+        // may turn it unverifiable; the summary then reports evidence as
+        // explicitly unavailable.
+        if (!monitor) return base
+        let evidence: DeclarationEvidence
+        try {
+            evidence = await this.declarationEvidence(ref.did, record, record.signingKey, outcome.commitCid)
+        } catch (err) {
+            evidence = { kind: "unavailable", reason: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }
+        }
+        if (evidence.kind === "unavailable") {
+            console.warn("monitor: declaration evidence unavailable", { did: ref.did, reason: evidence.reason })
+            return base
+        }
+        return { ...base, assurance: evidence.assurance, authority: evidence.authority, monitor }
+    }
+
+    private async declarationEvidence(
+        did: string,
+        record: FetchedRecord,
+        signingKey: string,
+        commitCid: string
+    ): Promise<DeclarationEvidence> {
+        const started = record.attemptStartedAtMs
+        const doc = record.didDocument
+        if (started === undefined) return unavailable("no fetch attempt start")
+        if (!doc) return unavailable("no fetched DID document")
+        if (doc.document.id !== did) return unavailable("DID document for another DID")
+        const now = Date.now()
+        if (doc.fetchedAtMs < started - EVIDENCE_FRESHNESS_MS || now - doc.fetchedAtMs > EVIDENCE_FRESHNESS_MS) {
+            return unavailable("stale DID document")
+        }
+        if (now < started || now - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+        let plcEntries: PlcLogEntry[] | null = null
+        if (did.startsWith("did:plc:")) {
+            try {
+                const entries = parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
+                if (entries) {
+                    plcEntries = entries
+                    const current = [...entries].reverse().find((entry) => !entry.nullified)!
+                    if (plcCustodyAuthorizes(did, entries, signingKey) &&
+                        extractSigningMethodId(doc.document, did, signingKey) !== null) {
+                        if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+                        return { kind: "available", assurance: "custody-chain", authority: { method: "plc", operationCid: current.cid } }
+                    }
+                }
+            } catch { /* A failed full-chain proof may use the separately checked current-key seed. */ }
+        }
+        const confirmed = await this.appViewConfirms(did, record, commitCid)
+        if (confirmed !== true) return unavailable(confirmed)
+        if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+        if (did.startsWith("did:plc:")) {
+            // PLC current-key evidence names the verified fresh operation when available.
+            const entries = plcEntries ?? parsePlcAuditLog(did, await fetchPlcAuditLog(did, fetch))
+            const operationCid = entries ? verifyPlcCurrentKeyOperation(did, entries, signingKey) : null
+            if (!operationCid || extractSigningMethodId(doc.document, did, signingKey) === null) {
+                return unavailable("PLC current-key operation unverified")
+            }
+            if (Date.now() - started > EVIDENCE_FRESHNESS_MS) return unavailable("seed attempt exceeded 30s")
+            return { kind: "available", assurance: "current-key-cross-check", authority: { method: "plc", operationCid } }
+        }
+        if (did.startsWith("did:web:")) {
+            const authority = await didWebAuthority(did, doc.document, signingKey)
+            return authority
+                ? { kind: "available", assurance: "current-key-cross-check", authority }
+                : unavailable("did:web authority unavailable")
+        }
+        return unavailable("unsupported DID method")
+    }
+
+    /** `true` when the AppView serves this exact record, else why not. Never throws. */
+    private async appViewConfirms(did: string, record: FetchedRecord, commitCid: string): Promise<true | string> {
+        try {
+            const parsed = readRecordFromCar(record.car, this.env.MONITOR_COLLECTION, "self")
+            if (!parsed || parsed.did !== did || parsed.commitCid !== commitCid) return "AppView did not confirm"
+            const origin = (this.env.APP_VIEW_URL || "https://public.api.bsky.app").replace(/\/$/, "")
+            const url = new URL(`${origin}/xrpc/com.atproto.repo.getRecord`)
+            if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+                return "AppView URL unusable"
+            }
+            url.searchParams.set("repo", did)
+            url.searchParams.set("collection", this.env.MONITOR_COLLECTION)
+            url.searchParams.set("rkey", "self")
+            const value = await guardedFetchJSON(url.href, fetch, { maxBytes: 64 * 1024, cache: "no-store" }) as { uri?: unknown; cid?: unknown }
+            return value.uri === `at://${did}/${this.env.MONITOR_COLLECTION}/self` && value.cid === parsed.cid
+                ? true
+                : "AppView did not confirm"
+        } catch (err) {
+            return `AppView unreachable: ${err instanceof Error ? err.message : String(err)}`
         }
     }
 
@@ -3235,14 +4661,14 @@ export class MonitorIngest
     }
 
     /**
-     * Core `verifyRepoCollection` under the repo byte and MST node caps.
+     * Core `verifyRepoCollections` under the repo byte and MST node caps.
      * Protected so a test can stand in for placeholder CARs.
      */
     protected verifyRepo(
         car: AsyncIterable<Uint8Array>,
-        expected: RepoCollectionExpectation
-    ): Promise<VerifiedCollection> {
-        return verifyRepoCollection(car, expected)
+        expected: RepoCollectionsExpectation
+    ): Promise<VerifiedCollections> {
+        return verifyRepoCollections(car, expected)
     }
 
     /**
@@ -3259,11 +4685,16 @@ export class MonitorIngest
     }
 
     /**
-     * One `listRecords` page of `did`'s follows at `pds` after rkey `cursor`,
-     * for a mutual or paged owner listing (`listFollowRecords`).
+     * One `listRecords` page of `did`'s follows or blocks at `pds` after rkey
+     * `cursor`, for a mutual or paged owner listing (`listEdgeRecords`).
      */
-    protected listFollows(pds: string, did: string, cursor: string | null): Promise<FollowPage> {
-        return listFollowRecords(did, cursor, { pds })
+    protected listRecords(
+        pds: string,
+        did: string,
+        collection: EdgeCollection,
+        cursor: string | null
+    ): Promise<FollowPage> {
+        return listEdgeRecords(did, collection, cursor, { pds })
     }
 
     /**
@@ -3293,6 +4724,14 @@ export class MonitorIngest
      */
     protected onChange(did: string, _rev: string): Promise<void> {
         this.notifyRegistration(did)
+        return Promise.resolve()
+    }
+
+    /**
+     * Every stored or disposed declaration, after its discharge; see
+     * `IngestDeps.onSettled`. No-op by default.
+     */
+    protected onSettled(_did: string, _settled: SettledDeclaration | null): Promise<void> {
         return Promise.resolve()
     }
 
@@ -3375,14 +4814,48 @@ export class MonitorIngest
         }
     }
 
+    /**
+     * A pending row takes a DID out of the refresh schedule, so a retry never
+     * waits longer than refresh would have.
+     */
+    private async retryCapMs(did: string): Promise<number> {
+        if ((await this.revOf(did)) !== null) {
+            return this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000)
+        }
+        if (await this.inInterest(did)) {
+            return this.envInt(this.env.REFRESH_NONHOLDER_STALE_AFTER_MS, 86_400_000)
+        }
+        return SETTLE_RETRY_CAP_MS
+    }
+
     private deps(): IngestDeps {
         return {
             index: this,
             snapshot: kvSnapshotStore(this.env),
-            fetchRecord: (did) => this.fetchRecord(did),
+            // A deployment's `fetchRecord` need not stamp its attempt start;
+            // evidence needs one, so a start taken before the whole call
+            // (its own DID and PDS reads included) stands in — earlier than
+            // the true start, so it can only make evidence less fresh.
+            fetchRecord: async (did) => {
+                const attemptStartedAtMs = Date.now()
+                const record = await this.fetchRecord(did)
+                return record.attemptStartedAtMs === undefined ? { ...record, attemptStartedAtMs } : record
+            },
             verify: (did, record) => this.verifyRecord(did, record),
             unverifiableRetryMs: this.envInt(this.env.REFRESH_STALE_AFTER_MS, 3_600_000),
+            retryCapMs: (did) => this.retryCapMs(did),
+            onSettleFailure: ({ did, attempts, failure, notBeforeMs }) =>
+                console.warn("monitor: settle deferred", {
+                    did,
+                    attempts,
+                    kind: failure.kind,
+                    ...(failure.kind === "threw"
+                        ? { error: `${failure.errorName}: ${failure.message}` }
+                        : { reason: failure.reason }),
+                    notBefore: new Date(notBeforeMs).toISOString(),
+                }),
             onChange: (did, rev) => this.onChange(did, rev),
+            onSettled: (did, settled) => this.onSettled(did, settled),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),
             // The export stream is authoritative for did:plc, and a PDS's
@@ -3425,20 +4898,37 @@ export class MonitorIngest
             snapshot: kvSnapshotStore(this.env),
             fetchRecord: (ref) => this.fetchRecordAt(ref),
             verify: (ref, record) => this.verifyRecordAt(ref, record),
-            // Owed quietly for a DID never held, which no one is waiting to hear about.
+            // Alarm-owned secondary settlement can owe a quiet declaration.
+            // Held DIDs use owe(), which persists prompt intent. For a never-held
+            // DID this inserts directly; the maintenance alarm's final
+            // reconciliation schedules any row left after its bounded settle.
             deferToDeclaration: async (did) => {
                 const held = await this.revOf(did)
                 if (held === null) {
                     this.db.sql.exec(
-                        "INSERT INTO pending (did, rev, attempts, not_before, quiet) " +
-                            "VALUES (?, '', 0, 0, 1) ON CONFLICT(did) DO NOTHING",
-                        did
+                        "INSERT INTO pending (did, rev, attempts, not_before, quiet, owed_at) " +
+                            "VALUES (?, '', 0, 0, 1, ?) ON CONFLICT(did) DO NOTHING",
+                        did,
+                        Date.now()
                     )
                     return
                 }
                 await this.owe(did, held)
             },
             didDocuments: this,
+            retryCapMs: (did) => this.retryCapMs(did),
+            onSettleFailure: ({ did, collection, rkey, attempts, failure, notBeforeMs }) =>
+                console.warn("monitor: secondary settle deferred", {
+                    did,
+                    collection,
+                    rkey,
+                    attempts,
+                    kind: failure.kind,
+                    ...(failure.kind === "threw"
+                        ? { error: `${failure.errorName}: ${failure.message}` }
+                        : { reason: failure.reason }),
+                    notBefore: new Date(notBeforeMs).toISOString(),
+                }),
             nowMs: () => Date.now(),
         }
     }
@@ -3486,6 +4976,8 @@ export class MonitorIngest
     async connect(): Promise<void> {
         if (this.socket !== null) return
         const cursor = await this.readCursor()
+        this.resumeFromUs = null
+        if (cursor !== null) await this.checkStaleCursor(cursor, Date.now())
         const url = new URL(this.env.JETSTREAM_URL)
         url.searchParams.set("collections", this.env.MONITOR_COLLECTION)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
@@ -3505,8 +4997,68 @@ export class MonitorIngest
     }
 
     /**
+     * A cursor older than the replay window cannot resume without losing
+     * events: start a new coverage run and owe every served declaration. Every
+     * connect attempt with such a cursor does, since a holder fetched while the
+     * stream stays down lost its events too; owing again keeps the earlier
+     * stamps. Otherwise the next frame is checked for a jump past it, which
+     * relies on identity and account events keeping the cursor moving on a
+     * quiet collection.
+     */
+    private async checkStaleCursor(cursor: string, nowMs: number): Promise<void> {
+        const cursorUs = streamTimeUs(cursor)
+        if (cursorUs === 0) return
+        const lookbackMs = this.envInt(this.env.JETSTREAM_LOOKBACK_MS, 129_600_000)
+        if (!isStaleCursor(cursorUs, nowMs, lookbackMs)) {
+            this.resumeFromUs = cursorUs
+            return
+        }
+        await this.serializeStorage(async () => this.startFirehoseRun(nowMs))
+    }
+
+    /**
+     * After a resume, a first frame well past the cursor means the stream
+     * skipped events.
+     */
+    private async checkResumeFrame(frameMs: number | null): Promise<void> {
+        if (this.resumeFromUs === null || frameMs === null) return
+        const cursorUs = this.resumeFromUs
+        // Claim the first timed frame before awaiting storage. Socket message
+        // handlers can overlap while the storage queue is blocked; later
+        // frames must not independently decide the same resume gap.
+        this.resumeFromUs = null
+        const toleranceMs = this.envInt(this.env.JETSTREAM_RESUME_TOLERANCE_MS, 60_000)
+        if (isResumeJump(cursorUs, frameMs * 1000, toleranceMs)) {
+            await this.serializeStorage(async () => this.startFirehoseRun(Date.now()))
+        }
+    }
+
+    /**
+     * A new unbroken run begins at `nowMs`, and every served declaration is
+     * owed a fetch stamped just before it, so coverage stays null until each
+     * has been fetched or has become lagging. A DID held as gone is not
+     * served and is not owed: re-owing it would fire its deletion again.
+     */
+    private startFirehoseRun(nowMs: number): void {
+        this.ctx.storage.transactionSync(() => {
+            this.setMeta("firehose_since", String(nowMs))
+            this.db.sql.exec(
+                "INSERT INTO pending (did, rev, attempts, not_before, owed_gen, owed_since_us, owed_at) " +
+                    "SELECT did, rev, 0, 0, ?1, ?2, ?4 FROM records WHERE collection = ?3 " +
+                    "ON CONFLICT(did) DO UPDATE SET quiet = 0, owed_gen = excluded.owed_gen, " +
+                    KEEP_EARLIER_STAMP,
+                this.nextOweGen(),
+                (nowMs - 1) * 1000,
+                this.env.MONITOR_COLLECTION,
+                nowMs
+            )
+            this.requestPromptSync(nowMs)
+        })
+    }
+
+    /**
      * Open the follow/profile stream: a second Jetstream socket on
-     * `collections` = the follow collection plus the secondaries'
+     * `collections` = the follow and block collections plus the secondaries'
      * collections, with no `dids`, from `meta.follow_cursor` (µs), or the tip
      * on first run. `meta.last_connected_at` is the last time the socket was
      * known open: written when it opens and refreshed while it stays open, at
@@ -3522,9 +5074,10 @@ export class MonitorIngest
         const url = new URL(this.env.JETSTREAM_URL)
         const collections = [
             FOLLOW_COLLECTION_NSID,
+            BLOCK_COLLECTION_NSID,
             ...new Set(monitorCollections(this.env).map((r) => r.collection)),
         ]
-        url.searchParams.set("collections", collections.join(","))
+        for (const nsid of collections) url.searchParams.append("collections", nsid)
         if (cursor !== null) url.searchParams.set("cursor", cursor)
 
         const ws = await this.upgrade(url, "jetstream follow stream")
@@ -3597,7 +5150,12 @@ export class MonitorIngest
             clearTimeout(timer)
         }
         const ws = response.webSocket
-        if (ws === null) throw new Error(`${what} did not upgrade`)
+        if (ws === null) {
+            const body = await response.text().catch(() => "")
+            throw new Error(
+                `${what} did not upgrade: HTTP ${response.status} ${body.slice(0, 200)} (${url.search})`
+            )
+        }
         ws.accept()
         return ws
     }
@@ -3615,7 +5173,10 @@ export class MonitorIngest
         const next = this.plcChain.then(async () => {
             const event = decodePlcExportFrame(raw)
             if (event === null) return
-            if ((await intakePlcEvent(this, event, this, this)) === "owed") this.kickDrain()
+            const outcome = await this.serializeStorage(() => intakePlcEvent(this, event, this, this))
+            if (outcome === "owed") {
+                await this.requestPromptWakeBestEffort()
+            }
         })
         this.plcChain = next.catch((err) => {
             console.error("monitor: plc frame failed", err)
@@ -3654,33 +5215,35 @@ export class MonitorIngest
         if (this.plcSocket === ws) this.plcSocket = null
     }
 
-    private kickDrain(): void {
-        void this.drainKeys()
-    }
-
     /**
-     * Apply owed key updates to the cache. Single-flight (a call during a
-     * drain makes it run once more), and never throws:
-     * a failure leaves the updates owed for the next alarm.
+     * Apply one bounded key batch. Remaining rows are continued by a durable
+     * prompt alarm, so continuous stream intake cannot create an unbounded pass.
      */
-    private drainKeys(): Promise<void> {
+    private drainKeys(): Promise<boolean> {
         if (this.draining !== null) {
-            // Owed after the running drain read its batch: go again, rather
-            // than leave it for the next alarm.
-            this.drainAgain = true
             return this.draining
         }
         this.draining = (async () => {
             try {
-                do {
-                    this.drainAgain = false
-                    await drainKeyUpdates(
-                        { index: this, cache: kvSigningKeyCache(this.env), nowMs: () => Date.now() },
-                        KEY_DRAIN_BATCH
-                    )
-                } while (this.drainAgain)
+                const due = await this.dueKeyUpdates(KEY_DRAIN_BATCH)
+                const cache = kvSigningKeyCache(this.env)
+                for (const { did, update, version } of due) {
+                    try {
+                        if (update.kind === "put") {
+                            await cache.put(did, { key: update.key, fetchedAtMs: Math.min(update.asOfMs, Date.now()) })
+                        } else {
+                            await cache.delete(did)
+                        }
+                    } catch (err) {
+                        console.error("monitor: key drain failed", err)
+                        return true
+                    }
+                    await this.clearKeyUpdate(did, version)
+                }
+                return false
             } catch (err) {
                 console.error("monitor: key drain failed", err)
+                return true
             } finally {
                 this.draining = null
             }
@@ -3696,6 +5259,7 @@ export class MonitorIngest
     private async onFrame(raw: string): Promise<void> {
         const event = decodeEvent(raw)
         if (event === null) return
+        await this.checkResumeFrame(event.timeMs)
         // A frame without a parseable time still carries a DID worth
         // looking at; only the cursor is unknown, so hold the last one
         // rather than discard the event. Replaying a little on resume is
@@ -3704,14 +5268,18 @@ export class MonitorIngest
             event.timeMs === null
                 ? await this.readCursor()
                 : String(Math.round(event.timeMs * 1000))
-        const decision = await intake(
+        const decision = await this.serializeStorage(() => intake(
             this.deps(),
             { collection: this.env.MONITOR_COLLECTION, policy: this.interestPolicy() },
             event,
             cursor ?? ""
-        )
-        if (decision === "reverify") this.kickDrain()
-        if (decision === "ignored" && cursor !== null && cursor !== "") this.advanceIgnoredCursor(cursor)
+        ))
+        if (decision === "accepted" || decision === "reverify" || decision === "key-update") {
+            await this.requestPromptWakeBestEffort()
+        }
+        if ((decision === "ignored" || decision === "key-update") && cursor !== null && cursor !== "") {
+            this.advanceIgnoredCursor(cursor)
+        }
     }
 
     /**
@@ -3719,11 +5287,13 @@ export class MonitorIngest
      * synchronous write with the cursor; nothing is awaited on the network.
      */
     private async onFollowFrame(raw: string): Promise<void> {
+        let event: MonitorEvent | null = null
+        let cursor: Cursor | null = null
         try {
             this.markFollowOpen()
-            const event = decodeEvent(raw)
+            event = decodeEvent(raw)
             if (event === null) return
-            const cursor =
+            cursor =
                 event.timeMs === null
                     ? await this.readFollowCursor()
                     : String(Math.round(event.timeMs * 1000))
@@ -3733,7 +5303,63 @@ export class MonitorIngest
                 cursor ?? ""
             )
         } catch (err) {
-            console.error("monitor: follow frame failed", err)
+            await this.recoverFollowFrame(err, event, cursor)
+        }
+    }
+
+    /**
+     * A frame that threw is never retried and never holds the cursor: a later
+     * frame raises it past this one. Each step is isolated so a failure in one
+     * cannot stop the next or escape into the read loop.
+     */
+    private async recoverFollowFrame(
+        err: unknown,
+        event: MonitorEvent | null,
+        cursor: Cursor | null
+    ): Promise<void> {
+        try {
+            console.error("monitor: follow frame failed", {
+                name: err instanceof Error ? err.name : typeof err,
+                message: err instanceof Error ? err.message : String(err),
+                stack:
+                    err instanceof Error ? err.stack?.slice(0, FOLLOW_FRAME_FAILURE_STACK_CHARS) : undefined,
+                kind: event?.kind ?? null,
+                did: event?.did ?? null,
+                cursor,
+                ...(event?.kind === "commit"
+                    ? { collection: event.collection, operation: event.operation, rkey: event.rkey }
+                    : {}),
+            })
+        } catch {
+            // Logging must not stop the relisting.
+        }
+        try {
+            this.noteFollowFrameFailureSync(
+                err instanceof Error ? err.name : typeof err,
+                Date.now()
+            )
+        } catch (countErr) {
+            try {
+                console.error("monitor: follow frame failure count failed", countErr)
+            } catch {
+                // Counting must not stop the relisting.
+            }
+        }
+        if (event === null) return
+        const did = followEventListingDid(event)
+        if (did === null) return
+        try {
+            if (await this.inInterest(did)) await this.queueListing(did, Date.now(), "lost-frame")
+        } catch (relistErr) {
+            try {
+                console.error("monitor: follow frame relist failed", {
+                    did,
+                    name: relistErr instanceof Error ? relistErr.name : typeof relistErr,
+                    message: relistErr instanceof Error ? relistErr.message : String(relistErr),
+                })
+            } catch {
+                // Nothing the recovery does may escape into the read loop.
+            }
         }
     }
 
@@ -3766,12 +5392,22 @@ export class MonitorIngest
     }
 
     protected async armWatchdog(): Promise<void> {
-        const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
-        if (!Number.isFinite(interval) || interval <= 0) return
-        const existing = await this.db.getAlarm()
-        if (needsRearm(existing, Date.now())) {
-            await this.db.setAlarm(Date.now() + interval)
-        }
+        await this.reconcileAlarm()
+    }
+
+    /**
+     * One page of the one-time evidence sweep, which owes a fresh fetch for
+     * every held declaration so it gains summary evidence. Only with
+     * `MONITOR_HOSTNAME` set, since without it no fetch could produce
+     * evidence: the sweep then starts once it is set.
+     */
+    private async sweepEvidenceRefreshIfConfigured(): Promise<void> {
+        if (this.evidenceRefreshDone || normalizeMonitorHostname(this.env.MONITOR_HOSTNAME) === null) return
+        const { done } = await sweepEvidenceRefresh({
+            index: this,
+            limit: this.envInt(this.env.SETTLE_BATCH, 32),
+        })
+        this.evidenceRefreshDone = done
     }
 
     /**
@@ -3781,9 +5417,24 @@ export class MonitorIngest
      * and a silently dropped DID, since the stream will not redeliver.
      */
     async alarm(): Promise<void> {
+        const now = Date.now()
+        const maintenanceAt = Number(this.metaOf("maintenance_at"))
+        const promptAt = Number(this.metaOf("prompt_at"))
+        const maintenanceDue = Number.isFinite(maintenanceAt) && maintenanceAt > 0 && maintenanceAt <= now
+        const promptDue = Number.isFinite(promptAt) && promptAt > 0 && promptAt <= now
+        if (!maintenanceDue && promptDue) {
+            await this.runPromptPass(now)
+            return
+        }
+        if (promptDue) {
+            // This maintenance pass owns both reasons that were due at entry.
+            // A later intake writes a fresh prompt request after this commit.
+            this.ctx.storage.transactionSync(() => this.setMeta("prompt_at", null))
+        }
         try {
             if (this.socket === null) await this.connect()
         } finally {
+          try {
             try {
                 await this.connectPlc()
             } catch (err) {
@@ -3796,7 +5447,10 @@ export class MonitorIngest
             }
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
-            await this.drainKeys()
+            if (this.cooldownUntilSync("key") <= Date.now()) {
+                if (await this.drainKeys()) this.recordCooldownSync("key", Date.now())
+                else this.clearCooldownSync("key")
+            }
             try {
                 this.persistPlcCursor()
             } catch (err) {
@@ -3852,6 +5506,7 @@ export class MonitorIngest
                                 secondaries: monitorCollections(this.env),
                                 didDocuments: this,
                                 nowMs: () => Date.now(),
+                                onSettled: (did, settled) => this.onSettled(did, settled),
                             },
                             this.envInt(this.env.INTEREST_BATCH, 64)
                         ),
@@ -3884,8 +5539,28 @@ export class MonitorIngest
                     console.error("monitor: backfill sweep failed", err)
                 }
             }
-            const batch = Number.parseInt(this.env.SETTLE_BATCH, 10)
-            await settleDue(this.deps(), Number.isFinite(batch) ? batch : 32)
+            try {
+                if (!this.snapshotLayoutDone) {
+                    const { done } = await sweepSnapshotLayout({
+                        index: this,
+                        limit: this.envInt(this.env.SETTLE_BATCH, 32),
+                    })
+                    this.snapshotLayoutDone = done
+                }
+            } catch (err) {
+                console.error("monitor: snapshot layout sweep failed", err)
+            }
+            try {
+                await this.sweepEvidenceRefreshIfConfigured()
+            } catch (err) {
+                console.error("monitor: evidence refresh sweep failed", err)
+            }
+            try {
+                await this.settleDeclarationBatch()
+            } catch (err) {
+                console.error("monitor: settle failed", err)
+            }
+            const batch = this.settleBatch()
             try {
                 await settleSecondaryDue(
                     this.secondaryDeps(),
@@ -3893,6 +5568,29 @@ export class MonitorIngest
                 )
             } catch (err) {
                 console.error("monitor: secondary settle failed", err)
+            }
+            try {
+                await settleSecondaryDue(
+                    this.secondaryDeps(),
+                    this.envInt(this.env.OWN_BLOCK_SETTLE_BATCH, OWN_BLOCK_SETTLE_BATCH),
+                    undefined,
+                    "own-blocks"
+                )
+            } catch (err) {
+                console.error("monitor: own-block settle failed", err)
+            }
+            try {
+                await disposeStrayOwnBlockProofs(
+                    this.secondaryDeps(),
+                    Number.isFinite(batch) ? batch : 32
+                )
+            } catch (err) {
+                console.error("monitor: own-block disposal failed", err)
+            }
+            try {
+                await this.publishFirehoseCoverage()
+            } catch (err) {
+                console.error("monitor: firehose coverage publish failed", err)
             }
             // After settling (a just-stored snapshot is not yet due) and
             // before sealing (a change it finds lands in a window that has
@@ -3941,10 +5639,73 @@ export class MonitorIngest
             } catch (err) {
                 console.error("monitor: graph steps failed", err)
             }
+          } finally {
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
             if (Number.isFinite(interval) && interval > 0) {
-                await this.db.setAlarm(Date.now() + interval)
+                this.setMeta("maintenance_at", String(Date.now() + interval))
             }
+            await this.reconcileAlarm()
+          }
         }
     }
+}
+
+/** What a declaration's evidence enrichment found: evidence, or why there is none. */
+type DeclarationEvidence =
+    | { kind: "available"; authority: EvidenceAuthorityIdentity; assurance: EvidenceAssurance }
+    | { kind: "unavailable"; reason: string }
+
+const unavailable = (reason: string): DeclarationEvidence => ({ kind: "unavailable", reason })
+
+/** The longest DNS name; bounds the monitor name every stored evidence carries. */
+const MONITOR_HOSTNAME_MAX_CHARS = 253
+
+export function normalizeMonitorHostname(value: string | undefined): string | null {
+    if (!value || value.includes(":") || value.includes("/") || value.includes("@")) return null
+    try {
+        const parsed = new URL(`https://${value}`)
+        if (parsed.port || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") return null
+        const hostname = parsed.hostname.replace(/\.$/, "").toLowerCase()
+        return hostname.length > 0 && hostname.length <= MONITOR_HOSTNAME_MAX_CHARS ? hostname : null
+    } catch { return null }
+}
+
+/**
+ * Whether `did`'s log verifies from genesis to head and the head authorizes
+ * `signingKey`. A head that verifies but renders no document this module
+ * supports (an extra verification method or service) still proves custody,
+ * so its own `atproto` method is checked instead. The rendered document
+ * carries the key as bare multibase, as the fetched one does; the
+ * operation's own `did:key:` form never equals it. Never throws.
+ */
+function plcCustodyAuthorizes(did: string, entries: readonly PlcLogEntry[], signingKey: string): boolean {
+    let rendered: DidDocument | null
+    try {
+        rendered = verifyPlcLog(did, entries)
+    } catch (err) {
+        return err instanceof PlcLogError && err.kind === "unrenderable" &&
+            verifyPlcCurrentKeyOperation(did, entries, signingKey) !== null
+    }
+    return rendered !== null && extractSigningMethodId(rendered, did, signingKey) !== null
+}
+
+function extractSigningMethodId(document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] }, did: string, key: string): string | null {
+    const method = document.verificationMethod?.find((item) =>
+        (item.id === "#atproto" || item.id === `${did}#atproto`) && item.publicKeyMultibase === key
+    )
+    return method?.id ?? null
+}
+
+async function didWebAuthority(
+    did: string,
+    document: { verificationMethod?: { id: string; publicKeyMultibase?: string }[] },
+    key: string
+): Promise<EvidenceAuthorityIdentity | null> {
+    if (!did.startsWith("did:web:")) return null
+    const verificationMethodId = extractSigningMethodId(document, did, key)
+    if (!verificationMethodId) return null
+    const method = document.verificationMethod!.find((item) => item.id === verificationMethodId)!
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(method.publicKeyMultibase!))
+    const fingerprint = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+    return { method: "web", documentUrl: new URL(didWebDocumentURL(did)).href, verificationMethodId, keyFingerprint: `sha256:${fingerprint}` }
 }

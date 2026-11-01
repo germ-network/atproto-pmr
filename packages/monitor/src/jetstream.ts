@@ -35,7 +35,7 @@ export interface CommitEvent {
     seq: number | null
     timeMs: number | null
     /**
-     * A follow record's `subject` DID, from the commit's record body. Null
+     * A follow or block record's `subject` DID, from the commit's record body. Null
      * when the record carries none (a delete, or a malformed record).
      */
     subject: string | null

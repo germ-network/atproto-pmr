@@ -18,12 +18,15 @@ import {
     recordWatchedDocument,
     withdrawFetchedDocument,
     settle,
+    raiseSettled,
     settleDeletion,
+    prepareSnapshotEvidence,
+    retainSnapshotEvidence,
     type IngestDeps,
 } from "./ingest"
 import type { HeadRev } from "./fetch-record"
 import { settleSecondary, type SecondaryDeps } from "./secondary"
-import { compareRev, type VerifiedWrite } from "./storage"
+import { compareRev, type GoneCause, type VerifiedDeclarationWrite } from "./storage"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
 export interface SnapshotCheck {
@@ -66,14 +69,14 @@ export interface RefreshIndex {
      * The declaration is reversibly gone and already disposed of: re-assert
      * that state, with no digest-window entry and no push.
      */
-    markGoneReversible(did: string): Promise<void>
+    markGoneReversible(did: string, cause: GoneCause): Promise<void>
 
     /** Advance the rev index without a digest-window entry. */
     completeQuietly(
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite
     ): Promise<void>
 }
 
@@ -158,8 +161,9 @@ export async function refreshDue(
         let outcome: RefreshOutcome
         try {
             outcome = await refreshOne(deps, did, opts.nowMs)
-        } catch {
+        } catch (err) {
             outcome = "failed"
+            console.warn("monitor: refresh did failed", { did, error: String(err) })
             await deps.refreshIndex.markAttempted(did, opts.nowMs).catch(() => {})
         }
         outcomes[outcome] += 1
@@ -182,7 +186,7 @@ async function refreshOne(
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
         // A repo that does not answer a head read is gone, whatever the name.
-        return disposeGone(deps, did, err.permanent, true, nowMs)
+        return disposeGone(deps, did, err.permanent, true, nowMs, "repo")
     }
 
     // A DID that never held a declaration has none to fetch: the declaration
@@ -235,7 +239,7 @@ async function refreshDeclaration(
     } catch (err) {
         if (!(err instanceof RecordNotFoundError)) throw err
         return {
-            outcome: await disposeGone(deps, did, err.permanent, repoLevel(err), nowMs),
+            outcome: await disposeGone(deps, did, err.permanent, repoLevel(err), nowMs, "repo"),
             repoGone: repoLevel(err),
         }
     }
@@ -251,7 +255,7 @@ async function refreshDeclaration(
     if (verified.kind === "verified-absent") {
         // A 200 with an exclusion proof: the repo is alive and the record is
         // gone. Reversible, because the account may publish it again.
-        const outcome = await disposeGone(deps, did, false, false, nowMs)
+        const outcome = await disposeGone(deps, did, false, false, nowMs, "record")
         // A document stored for a DID this left unwatched would be trusted
         // with nothing following it. Unguarded on purpose: a failed check is
         // not "unwatched", and the caller marks the DID attempted.
@@ -262,17 +266,12 @@ async function refreshDeclaration(
     }
     const incoming = readRecordFromCar(fetched.car, deps.collection, deps.rkey)
 
-    const previous = await ingest.snapshot.getRecord(did)
-    const previousRecord =
-        previous === null
-            ? null
-            : readRecordFromCar(previous.car, deps.collection, deps.rkey)
-    const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-    const rekeyed = previousKey !== null && previousKey !== verified.key
+    const previous = await ingest.index.heldDeclarationOf(did)
+    const rekeyed = previous !== null && previous.verifiedWith !== verified.key
     const quiet =
-        previousRecord !== null &&
+        previous !== null &&
         incoming !== null &&
-        previousRecord.cid === incoming.cid &&
+        previous.cid === incoming.cid &&
         !rekeyed &&
         compareRev(indexed, verified.rev) !== "regressed"
     if (!quiet) {
@@ -282,19 +281,45 @@ async function refreshDeclaration(
         return { outcome: "changed", repoGone: false }
     }
 
+    const evidence = await prepareSnapshotEvidence(ingest.index, did, verified, nowMs)
+
+    if (evidence !== null) await retainSnapshotEvidence(ingest.index, evidence)
+    const messagingKeyFingerprint =
+        verified.messagingKeyFingerprint === undefined
+            ? (previous?.messagingKeyFingerprint ?? null)
+            : verified.messagingKeyFingerprint
+    const messagingKeyFirstSeenAtMs = await (async () => {
+        if (verified.messagingKeyFingerprint === undefined) {
+            return previous?.messagingKeyFirstSeenAtMs ?? null
+        }
+        if (verified.messagingKeyFingerprint === null) return null
+        const history = await ingest.index.getMessagingKeyHistory?.(did, verified.messagingKeyFingerprint)
+        if (history !== null && history !== undefined) return history.firstSeenAtMs
+        return previous?.messagingKeyFingerprint === verified.messagingKeyFingerprint
+            ? (previous.messagingKeyFirstSeenAtMs ?? null)
+            : null
+    })()
     await ingest.snapshot.putRecord(did, {
         rev: verified.rev,
+        commitCid: verified.commitCid ?? null,
         car: fetched.car,
         observedAtMs: nowMs,
         source: fetched.source,
         signingKey: verified.key,
         verifiedWith: verified.key,
         cid: verified.cid,
+        evidence,
+        messagingKeyFirstSeenAtMs,
     })
     await deps.refreshIndex.completeQuietly(did, verified.rev, nowMs, {
         cid: verified.cid,
         verifiedWith: verified.key,
+        commitCid: verified.commitCid ?? null,
+        anchorKey: verified.anchorKey ?? null,
+        messagingKeyFingerprint,
+        messagingKeyFirstSeenAtMs,
     })
+    await raiseSettled(ingest, did, { rev: verified.rev, cid: verified.cid, car: fetched.car })
     await confirm(deps, did, verified.rev, nowMs)
     return { outcome: "advanced-quiet", repoGone: false }
 }
@@ -372,7 +397,8 @@ async function disposeGone(
     did: string,
     permanent: boolean,
     repoWide: boolean,
-    nowMs: number
+    nowMs: number,
+    cause: GoneCause
 ): Promise<RefreshOutcome> {
     const { ingest } = deps
     if ((await ingest.index.revOf(did)) === null) {
@@ -381,18 +407,18 @@ async function disposeGone(
         return "deleted"
     }
     let outcome: RefreshOutcome
-    if ((await ingest.snapshot.getRecord(did)) === null) {
+    if ((await ingest.index.heldDeclarationOf(did)) === null) {
         // An earlier reversible answer can harden into a permanent one.
         if (permanent && !(await ingest.index.isDeleted(did))) {
-            await settleDeletion(ingest, did, true)
+            await settleDeletion(ingest, did, true, false, cause)
             outcome = "deleted"
         } else {
-            if (!permanent) await deps.refreshIndex.markGoneReversible(did)
+            if (!permanent) await deps.refreshIndex.markGoneReversible(did, cause)
             await deps.refreshIndex.markChecked(did, nowMs)
             outcome = "confirmed"
         }
     } else {
-        await settleDeletion(ingest, did, permanent)
+        await settleDeletion(ingest, did, permanent, false, cause)
         outcome = "deleted"
     }
     if (repoWide) await ingest.secondaries?.dispose(did)

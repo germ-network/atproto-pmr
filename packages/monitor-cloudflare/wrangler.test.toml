@@ -30,6 +30,8 @@ INTEREST_POLICY = "everyone"
 JETSTREAM_URL = "https://jetstream.invalid/subscribe"
 PLC_EXPORT_STREAM_URL = "https://plc.invalid/export/stream"
 WATCHDOG_INTERVAL_MS = "120000"
+# Keep prompt alarms out of test teardown unless a test explicitly fires one.
+PROMPT_WAKE_DELAY_MS = "60000"
 SETTLE_BATCH = "32"
 # Changing this requires clearing sealed windows + sealedThrough: an
 # absent window below sealedThrough means "empty", and that promise does
@@ -59,6 +61,7 @@ REFRESH_STALE_AFTER_MS = "3600000"
 FOLLOW_BACKFILL_REPOS = "4"
 FOLLOW_LISTING_STATEMENT_RESERVE = "400"
 MAX_FOLLOWS = "20000"
+MAX_BLOCKS = "20000"
 FOLLOW_MAX_REPO_BYTES = "33554432"
 FOLLOW_FETCH_TIMEOUT_MS = "30000"
 JETSTREAM_LOOKBACK_MS = "129600000"

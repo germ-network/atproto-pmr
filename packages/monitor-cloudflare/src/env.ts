@@ -37,6 +37,11 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     /** The collection carrying the published key. */
     MONITOR_COLLECTION: string
 
+    /** Stable public hostname identifying this evidence monitor (lowercase IDNA, no port). */
+    MONITOR_HOSTNAME?: string
+    /** AppView XRPC origin used by current-key cross-check evidence. */
+    APP_VIEW_URL?: string
+
     /**
      * The singleton records kept beside the declaration for every DID in
      * interest, as comma-separated `<nsid>/<rkey>` (core
@@ -70,8 +75,8 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
 
     /**
      * The follow-edge index (D1, schema in `migrations/`): written only by
-     * this object, read by the graph routes through `d1FollowEdgeStore`,
-     * `d1GraphChangeLog` and `d1InterestReader`. Required: the object fails
+     * this object, read through `d1FollowEdgeStore` and
+     * `d1InterestReader`. Required: the object fails
      * at startup without it, as it does for `pmrDirectory` under `registered`.
      */
     graph?: D1Database
@@ -80,8 +85,6 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     GRAPH_STATEMENT_BUDGET?: string
     /** DIDs mirrored to D1 per alarm, default 50. */
     GRAPH_MIRROR_BATCH?: string
-    /** DIDs the graph projector writes per alarm, default 200 (each a KV write). */
-    GRAPH_PROJECTOR_BATCH?: string
     /**
      * did:plc logs fetched from the directory per alarm, default 20, one after
      * another at up to five seconds each: keep the product well inside the
@@ -90,8 +93,6 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * within plc.directory's limits.
      */
     PLC_LOG_DRAIN_BATCH?: string
-    /** `graph_changes` rows pruned per alarm, default 1000. */
-    GRAPH_PRUNE_BATCH?: string
     /** DIDs checked per page of the daily mirror reconcile, default 25. */
     GRAPH_RECONCILE_BATCH?: string
 
@@ -118,6 +119,13 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
     MAX_FOLLOWS?: string
 
     /**
+     * Block records the verifying getRepo walk holds before it refuses and the
+     * owner is listed by `listRecords` pages instead, default 20_000; also
+     * where a mutual listing stops reading blocks.
+     */
+    MAX_BLOCKS?: string
+
+    /**
      * CAR bytes past which an owner is listed by `listRecords` pages across
      * alarms instead of one verified getRepo, default 33_554_432 (32 MiB).
      * Bounds what the verifying walk retains in the isolate; raise it only
@@ -134,6 +142,14 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * listing.
      */
     JETSTREAM_LOOKBACK_MS?: string
+
+    /**
+     * How far (ms) past the resume cursor the declaration stream's first frame
+     * may be before the stream is treated as having skipped events, default
+     * one minute. Such a gap starts a new coverage run and owes every served
+     * declaration.
+     */
+    JETSTREAM_RESUME_TOLERANCE_MS?: string
 
     /** A listing older than this (ms) is re-queued, default 7 days. */
     FOLLOW_RELIST_AFTER_MS?: string
@@ -160,11 +176,33 @@ export interface MonitorEnv<TIngest extends MonitorIngest = MonitorIngest> {
      * hibernate, so the object is evicted on the platform's own schedule
      * and the alarm is what brings the connection back. Eviction is
      * expected rather than exceptional; every gap is closed by the cursor.
+     * It also caps declaration/key no-progress cooldowns. A declaration
+     * cooldown delays all declaration fetches, including fresh owed work and
+     * the declaration-settlement step of maintenance, up to this interval
+     * (120 seconds if disabled or invalid). Other maintenance and key work
+     * remain independent; a healthy prompt wake still defaults to 100 ms.
      */
     WATCHDOG_INTERVAL_MS: string
 
-    /** How many owed fetches to settle per wake. */
+    /** Prompt-alarm delay in milliseconds. Defaults to 100; test config lengthens it to avoid automatic wakes. */
+    PROMPT_WAKE_DELAY_MS?: string
+
+    /**
+     * Maximum owed declaration fetches per prompt wake and ordinary
+     * secondary-record fetches per maintenance wake. Defaults to 32 and is
+     * capped at 32; invalid, zero, or negative values use the default. A
+     * declaration backlog continues in successive prompt alarms, usually
+     * about 100 ms apart; secondary-record backlog continues on maintenance
+     * wakes. Own-block proofs use their separate OWN_BLOCK_SETTLE_BATCH budget.
+     */
     SETTLE_BATCH: string
+
+    /**
+     * How many registered owners' block-record proofs to settle per wake, on
+     * their own budget so a large backfill never delays `SETTLE_BATCH`.
+     * Unset: 16.
+     */
+    OWN_BLOCK_SETTLE_BATCH?: string
 
     /**
      * Bytes of filter a digest response carries before deferring the rest

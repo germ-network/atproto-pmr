@@ -24,9 +24,12 @@ export type {
     MailboxKey,
     MailboxSnapshot,
     MessageId,
+    ExtensionFields,
+    ExtensionValue,
     MessageRef,
     MonitorRegistrationNotify,
     MonitorRecheckRequest,
+    MonitorVerifiedAnchorRequest,
     Nonce,
     OpenMailboxesPage,
     PairAppendResult,
@@ -35,12 +38,17 @@ export type {
     PMRStore,
     PoolAppendResult,
     PoolSender,
+    ReceiveResult,
+    BlockSource,
     RegistrationFields,
     ResolvedAddress,
     StoredPairMailboxEvidence,
     VerificationHint,
     WatchState,
+    VerifiedAnchorObservation,
 } from "./storage"
+
+export { applyVerifiedAnchorObservation } from "./registration-lifecycle"
 
 // The own-DID declaration watch — pause-not-teardown decision logic.
 export {
@@ -101,10 +109,12 @@ export {
     BODY_COMPONENT,
     DEFAULT_LABEL,
     REQUIRED_COMPONENTS,
+    requestSignatureAlg,
+    type RequestSignatureAlg,
     type VerifyInput,
     type VerifyOutcome as RequestVerifyOutcome,
 } from "./http-sig/verify.js"
-export { signRequest, type SignOptions } from "./http-sig/sign.js"
+export { signRequest, type SignOptions, type SigningKey } from "./http-sig/sign.js"
 export {
     parseSignature,
     parseSignatureInput,
@@ -157,8 +167,25 @@ export {
     handleRegistrationRead,
     type GrantConfig,
     type MessagesConfig,
+    RegistrationFieldError,
+    type CommittedRegistration,
     type OwnerDeps,
+    type RegistrationExtension,
 } from "./owner/endpoints.js"
+
+// Receive-time admission and the Bsky block mirror.
+export {
+    ADMISSION_DEADLINE_MS,
+    ADMISSION_UNAVAILABLE,
+    admissionOf,
+    admissionOrUnavailable,
+    POLICY_NOT_ENABLED,
+    RECIPIENT_NOT_HELD,
+    type Admission,
+    type AdmissionSource,
+    type PoolVerdict,
+} from "./admission"
+export { syncOwnerBlocks } from "./block-sync"
 
 // The pair-put endpoint.
 export {
@@ -166,6 +193,14 @@ export {
     DECLARATION_RETRY_AFTER_SECONDS,
     type PairPutDeps,
 } from "./pair-put"
+
+// Storing a put whose sender was authenticated by other means.
+export {
+    ingestAuthenticatedPut,
+    type AuthenticatedPut,
+    type AuthenticatedPutDeps,
+    type AuthenticatedPutOutcome,
+} from "./authenticated-put"
 
 // The grant-put endpoint.
 export { handleGrantPut, type GrantPutDeps } from "./grant-put"
@@ -179,6 +214,7 @@ export {
     encodeCapabilitiesFrame,
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
+    RESERVED_ENTRY_KEYS,
     encodePoolFrame,
     encodePairGenerationFrame,
     handleAckFrame,
@@ -198,9 +234,18 @@ export {
     type VerifyOutcome,
 } from "./cose/sign1"
 export {
+    encodeAkpMlDsa65Key,
+    encodeCosePublicKey,
     encodeOkpEd25519Key,
+    ML_DSA_65_PUBLIC_KEY_BYTES,
+    parseAkpMlDsa65Key,
+    parseCosePublicKey,
     parseOkpEd25519Key,
+    thumbprintAkpMlDsa65,
+    thumbprintCosePublicKey,
     thumbprintOkpEd25519,
+    type AkpMlDsa65Key,
+    type CosePublicKey,
     type OkpEd25519Key,
 } from "./cose/key"
 export {
@@ -214,6 +259,9 @@ export {
 // Declaration resolution and content addressing.
 export {
     DECLARATION_COLLECTION_NSID,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
     resolveDeclaration,
     resolveDeclarationWithRev,
     snapshotDeclarationResolver,
@@ -234,6 +282,7 @@ export {
     resolvePDSEndpoint,
     resolveSigningKey,
     fetchDidDocument,
+    didWebDocumentURL,
     fetchPlcAuditLog,
     pdsResolutionFromDocument,
     extractSigningKey,
@@ -309,7 +358,10 @@ export {
     type RepoCollectionErrorCode,
     type RetainedBlocks,
     type RepoCollectionExpectation,
+    type RepoCollectionsExpectation,
     type VerifiedCollection,
+    type VerifiedCollections,
+    verifyRepoCollections,
 } from "./repo-collection"
 
 // The stored DID document a key monitor keeps per watched DID.
@@ -321,6 +373,14 @@ export {
     type PlcCoverage,
     type StoredSigningKeyResolverDeps,
 } from "./did-document"
+export {
+    FIREHOSE_COVERAGE_MAX_LAG_MS,
+    FIREHOSE_LAGGING_CAP,
+    summaryCoverageAtMs,
+    KV_VISIBILITY_MS,
+    type FirehoseCoverage,
+    type SummaryCoverageDeps,
+} from "./firehose-coverage"
 
 // A verified read of one record from a third party's snapshot (24 h rule included).
 export {
@@ -334,11 +394,32 @@ export {
 } from "./snapshot-read"
 
 // The proxy cache's stores, what a monitor watches, and the device read API's bodies.
-export { type FollowEdge, type FollowEdgeStore } from "./follow-edges"
+export { FOLLOW_COLLECTION_NSID, type FollowEdge, type FollowEdgeStore } from "./follow-edges"
 export {
-    type GraphChangeLog,
-    type GraphChangeReason,
-    type GraphChangeRow,
+    BLOCK_COLLECTION_NSID,
+    type BlockEdge,
+    type BlockEdgeStore,
+    type MonitorOwnBlocksRequest,
+} from "./block-edges"
+export {
+    ownerGraph,
+    followRkeyAtMs,
+    type MonitorOwnGraphRequest,
+    type OwnerGraph,
+    type OwnerGraphEdge,
+} from "./owner-graph"
+export {
+    permissionRecencyAtMs,
+    PERMISSION_RECENCY_CBOR_KEY,
+    type PermissionRecencyAtMs,
+    type PermissionRecencyInputs,
+    type CanMessageRecencyResult,
+    type HeldSummaryRecencyVerdict,
+    type OwnerGraphRecencyEdge,
+    type OwnerGraphWithRecency,
+    type HeldOwnerRecencySummary,
+} from "./permission-recency"
+export {
     type InterestReader,
 } from "./graph"
 export {
@@ -358,34 +439,26 @@ export {
     type WatchedRecord,
 } from "./watched"
 export {
-    GRAPH_EDGE_KEYS,
-    GRAPH_READ_KEYS,
+    OWN_BLOCK_KEYS,
     RECORD_READ_KEYS,
-    type GraphEdge,
-    type GraphReadResponse,
+    type OwnBlock,
     type RecordReadMiss,
     type RecordReadResponse,
 } from "./read-api"
 
-// The device read API: public record and graph reads, and the owner's summary.
+// The device read API: the public record read, and the owner's summary.
 export {
-    decodeGraphReadResponse,
     decodeRecordReadResponse,
     dedupedRecheck,
-    encodeGraphReadResponse,
     encodeRecordReadResponse,
-    handleGraphRead,
     handleRecordRead,
-    projectGraph,
-    type GraphProjectionStore,
-    type GraphProjectionWriter,
-    type GraphReadDeps,
     type RecordReadDeps,
 } from "./device-read"
 export {
     appendPlcLogEntry,
     parsePlcAuditLog,
     PlcLogError,
+    verifyPlcCurrentKeyOperation,
     verifyPlcLog,
     type PlcLog,
     type PlcLogEntry,
@@ -412,8 +485,13 @@ export {
     buildSummaryIndex,
     readSummaryPage,
     summaryContacts,
+    SummaryOwnerReadError,
     SUMMARY_MAX_RECORDS,
     SUMMARY_PAGE_RECORDS,
+    CLOCK_DISCONTINUITY_HOLD_MS,
+    CLOCK_DISCONTINUITY_THRESHOLD_MS,
+    wallClockMonitor,
+    type WallClockMonitor,
     type SummaryHeldEntry,
     type SummaryIndexReader,
     type SummaryPageDeps,
@@ -429,3 +507,43 @@ export {
     type SummaryRecord,
     type SummaryRecordRef,
 } from "./summary"
+export type {
+    DeclarationEvidenceIdentity,
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
+    SummaryEvidence,
+} from "./summary-evidence-contract"
+export {
+    CAN_MESSAGE_KEYS,
+    canMessageFromCose,
+    canMessageToCose,
+    computeCanMessage,
+    computeCanMessageMany,
+    declaredPoliciesOf,
+    decodeCanMessageVerdict,
+    encodeCanMessageVerdict,
+    evaluateCanMessage,
+    handleCanMessageRead,
+    snapshotPolicySource,
+    type AllowPolicy,
+    type CanMessageFacts,
+    type CanMessageNoReason,
+    type CanMessageDeps,
+    type CanMessageUnknownReason,
+    type CanMessageVerdict,
+    type DeclaredPolicies,
+    type PairFact,
+    type RecipientGraphFacts,
+    type SenderGraphReader,
+    type PolicySource,
+    type SnapshotPolicySourceDeps,
+} from "./can-message"
+export { allowPoliciesOf, readAnchorPolicy, type AnchorPolicy } from "./anchor-policy"
+export { type StoredPolicies } from "./policy"
+
+export {
+    indexPolicySource,
+    SUMMARY_VERDICT_KEYS,
+    type SummaryVerdict,
+} from "./summary-verdicts"

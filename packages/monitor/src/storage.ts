@@ -26,10 +26,20 @@
  */
 
 import type {
+    BlockEdge,
     DidDocument,
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
     FollowEdge,
     InterestPolicy,
     WatchedRecord,
+} from "@germ-network/atproto-pmr-core"
+
+export type {
+    EvidenceAssurance,
+    EvidenceAuthorityIdentity,
+    SnapshotEvidence,
 } from "@germ-network/atproto-pmr-core"
 import type { SigningKeyUpdate } from "./plc-export"
 import type { SnapshotCheck } from "./refresh"
@@ -44,6 +54,8 @@ export type Cursor = string
 /** What the monitor serves for one DID: the verified bytes and their rev. */
 export interface SnapshotEntry {
     rev: string
+    /** CID of the signed commit that contains this snapshot's record. */
+    commitCid?: string | null
     /** The record as CAR — never a parsed form; the client verifies it. */
     car: Uint8Array
     observedAtMs: number
@@ -63,12 +75,40 @@ export interface SnapshotEntry {
     verifiedWith: string | null
     /** The record's CID (`bafyrei…`) as verified at ingest. */
     cid: string | null
-    /** The newest signing key a rotation push has been sent for. */
-    seenKey?: string | null
+    /** Absent/null on legacy snapshots and entries whose evidence was not provable. */
+    evidence?: SnapshotEvidence | null
+    /** First observed only after a verified key rotation; null for legacy keys. */
+    messagingKeyFirstSeenAtMs?: number | null
 }
 
 /** Whether a DID's declaration is held, and if not, whether that can reverse. */
 export type HolderState = "held" | "gone-reversible" | "gone-permanent"
+
+/**
+ * Why a reversible gone was recorded: `record` only when a live repo's
+ * exclusion proof verified the declaration absent; `repo` for everything
+ * else (a deactivated, taken-down or suspended repo, or an unproven
+ * not-found answer). Only `record` may retire a relay registration; `repo`
+ * only pauses it.
+ */
+export type GoneCause = "record" | "repo"
+
+/** One first observation a snapshot's evidence carries; see `MonitorIndex.retainEvidenceAnchors`. */
+export interface EvidenceAnchorRow {
+    kind: "commit" | "anchor"
+    identity: string
+    firstObservedAtMs: number
+}
+
+/** Provenance for the first verified observation of a declaration currentKey. */
+export interface MessagingKeyHistoryRow {
+    fingerprint: string
+    firstSeenAtMs: number | null
+    recordCid: string | null
+    commitCid: string | null
+    rev: string | null
+    verifiedWith: string | null
+}
 
 /** What a completion records about the bytes it just stored. */
 export interface VerifiedWrite {
@@ -77,6 +117,51 @@ export interface VerifiedWrite {
     /** The `#atproto` key the commit signature verified against. */
     verifiedWith: string
 }
+
+/**
+ * The writer's own state for one held declaration, kept on its index row and
+ * written in the transaction that indexes its rev. The ingest object decides
+ * from this and never reads the snapshot store back: that store serves public
+ * readers and is eventually consistent.
+ */
+export interface HeldDeclarationState {
+    rev: string
+    cid: string
+    verifiedWith: string
+    commitCid: string | null
+    /**
+     * The declaration's anchor key, which registration retirement compares;
+     * stored hex-encoded on the index row.
+     */
+    anchorKey: Uint8Array | null
+    /** Canonical fingerprint of the declaration's validated currentKey. */
+    messagingKeyFingerprint: string | null
+    messagingKeyFirstSeenAtMs: number | null
+    /** The newest signing key a rotation push has been sent for. */
+    seenKey: string | null
+}
+
+/** What a declaration's completion records beyond `VerifiedWrite`. */
+export interface VerifiedDeclarationWrite extends VerifiedWrite {
+    commitCid: string | null
+    anchorKey: Uint8Array | null
+    messagingKeyFingerprint: string | null
+    messagingKeyFirstSeenAtMs: number | null
+}
+
+/** The index reads and writes of the writer's own declaration state. */
+export interface HeldStateIndex {
+    /** `null` when the declaration is not held. */
+    heldDeclarationOf(did: string): Promise<HeldDeclarationState | null>
+    /** Records that a rotation push went out for `key`, without touching the snapshot. */
+    recordSeenKey(did: string, key: string): Promise<void>
+}
+
+/**
+ * The snapshot store as the ingest object sees it: write-only for records.
+ * Every decision about a record reads the index instead.
+ */
+export type SnapshotWriter = Omit<SnapshotStore, "getRecord">
 
 /** One stored snapshot as the index knows it; the rev authority for that record. */
 export interface IndexedRecord {
@@ -160,7 +245,15 @@ export interface PendingFetch {
      * DID clears it, so a commit that coalesces into the row still counts.
      */
     quiet: boolean
+    /** Generation captured with this selection; failures may defer only this generation. */
+    owedGen?: number
 }
+
+/** Why a pending fetch was deferred instead of settled. */
+export type PendingFailure =
+    | { kind: "threw"; errorName: string; message: string; atMs: number }
+    /** `reason` is null where the verifier gave none. */
+    | { kind: "unverifiable"; reason: string | null; atMs: number }
 
 export type IntakeOutcome =
     /** Already applied. The common case just after a reconnect. */
@@ -172,7 +265,7 @@ export type IntakeOutcome =
  * Single-writer state. Every method here is called by the one consumer;
  * none is on a read path.
  */
-export interface MonitorIndex {
+export interface MonitorIndex extends HeldStateIndex {
     readCursor(): Promise<Cursor | null>
 
     /**
@@ -193,8 +286,23 @@ export interface MonitorIndex {
      * check would suppress: a DID-document rotation, where the record is
      * unchanged but what it verifies against is not, and any operator-
      * driven re-check.
+     *
+     * `owedSinceUs` is the stream time (µs) of the event that prompted it; the
+     * row keeps the earliest while it stays owed. Without it the owe is not a
+     * stream event's and holds firehose coverage back by nothing.
      */
-    owe(did: string, rev: string): Promise<void>
+    owe(did: string, rev: string, owedSinceUs?: number): Promise<void>
+
+    /**
+     * The generation of the obligation owed for `did` now, or null when none
+     * is. If a pending row exists, adapters MUST return its current
+     * `owedGen`; null means there is no pending obligation and therefore no
+     * failure may be deferred or reported. Every `intake` and `owe` gives the
+     * row a new generation, so a fetch that reads it before it starts can
+     * tell, when it finishes, whether the obligation it was started for is
+     * still the one owed.
+     */
+    owedGenOf(did: string): Promise<number | null>
 
     /**
      * Discharge an obligation **without** indexing anything.
@@ -203,8 +311,13 @@ export interface MonitorIndex {
      * record that failed verification. The look happened and the answer
      * was an alarm; leaving the row would retry the same answer in a hot
      * loop against the very DID under attack.
+     *
+     * A discharge that names `gen` (from `owedGenOf`, read before the fetch)
+     * removes the row only while it is still that generation; an event owed
+     * during the fetch stays owed. Null, no obligation at the start, removes
+     * nothing. Omitted, the discharge is unconditional.
      */
-    clearPending(did: string): Promise<void>
+    clearPending(did: string, gen?: number | null): Promise<void>
 
     /**
      * An attempt that did not confirm anything. Moves the DID to the back of
@@ -240,7 +353,9 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**
@@ -263,14 +378,20 @@ export interface MonitorIndex {
      * still fire, correctly, but the DID must stay open to a future
      * identity/account/sync event rechecking it, since that is the only
      * way a reversal is ever noticed. `true` marking `isDeleted` is what
-     * that suppression is for — see `isDeleted`.
+     * that suppression is for — see `isDeleted`. A reversible answer for a
+     * DID already marked deleted lifts the mark: `isDeleted` is true only
+     * while the last answer was permanent.
      */
     completeDeletion(
         did: string,
         observedAtMs: number,
         permanent: boolean,
         /** Owed by a join, not a change: no window entry. */
-        quiet?: boolean
+        quiet: boolean | undefined,
+        /** Why a reversible gone was recorded; meaningless when `permanent`. */
+        cause: GoneCause,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**
@@ -283,13 +404,15 @@ export interface MonitorIndex {
         did: string,
         rev: string,
         observedAtMs: number,
-        verified: VerifiedWrite
+        verified: VerifiedDeclarationWrite,
+        /** As `clearPending`'s `gen`. */
+        gen?: number | null
     ): Promise<void>
 
     /**
      * Whether `did`'s declaration is marked *permanently* confirmed-gone
      * — set only by a `completeDeletion(did, _, true)` call, never by a
-     * reversible one.
+     * reversible one, and lifted by a later reversible answer.
      *
      * Exists so `intake`'s reverify path (identity/account/sync events,
      * which arrive for every DID regardless of collection) can stop
@@ -300,13 +423,27 @@ export interface MonitorIndex {
      * but unbounded noise across every later event for that DID. A DID
      * marked deleted only reversibly is deliberately NOT suppressed here,
      * so those events keep flowing and a reversal still gets noticed.
-     * Cleared the moment `complete` runs for the DID again (see there).
+     * Cleared the moment `complete` runs for the DID again (see there), or a
+     * reversible gone answer is recorded for it.
      */
     isDeleted(did: string): Promise<boolean>
 
     /** Retry queue. A fetch that failed is owed until it succeeds. */
     duePending(nowMs: number, limit: number): Promise<PendingFetch[]>
-    deferPending(did: string, notBeforeMs: number): Promise<void>
+    /** Counts the attempt and keeps `failure` on the row, so an operator can
+     * see why a DID is still owed without searching logs. When
+     * `expectedGeneration` is provided, adapters MUST update only that
+     * generation and answer null on a mismatch; null also means there was no
+     * obligation when the fetch began and must be a no-op. Answers the row's
+     * attempts after the update, or null when no matching pending row exists.
+     * Omitting the optional generation retains the legacy unconditional
+     * behavior for callers outside the settle retry path. */
+    deferPending(
+        did: string,
+        notBeforeMs: number,
+        failure: PendingFailure,
+        expectedGeneration?: number | null
+    ): Promise<number | null>
 
     /** The indexed rev, for regression detection and duplicate suppression. */
     revOf(did: string): Promise<string | null>
@@ -351,7 +488,53 @@ export interface MonitorIndex {
      */
     readBackfillProgress(): Promise<BackfillProgress>
     setBackfillProgress(progress: BackfillProgress): Promise<void>
+
+    /** First-observation anchor history survives replacing or deleting a snapshot. */
+    getEvidenceAnchor?(identity: string): Promise<number | null>
+    /**
+     * Insert each row only when its identity is absent, in one write. The
+     * DID's other commit rows are superseded: a regression is never stored,
+     * so only the newest commit's first observation can be reused.
+     */
+    retainEvidenceAnchors?(did: string, rows: readonly EvidenceAnchorRow[]): Promise<void>
+    /**
+     * Read/retain currentKey history, separate from repo-signer evidence.
+     * Stores reconcile prior raw-hex identities with the canonical digest,
+     * keeping null sentinels and the earliest observation's provenance.
+     * The optional raw alias preserves history across writer rollback.
+     */
+    getMessagingKeyHistory?(did: string, fingerprint: string, legacyFingerprint?: string): Promise<MessagingKeyHistoryRow | null>
+    retainMessagingKeyFirstSeen?(did: string, row: MessagingKeyHistoryRow, legacyFingerprint?: string): Promise<void>
+    /** Indexed declaration pages for the evidence bootstrap sweep. */
+    evidenceBackfillPage?(afterDid: string | null, limit: number): Promise<IndexedRecord[]>
+    readEvidenceBackfillProgress?(): Promise<EvidenceBackfillProgress>
+    setEvidenceBackfillProgress?(progress: EvidenceBackfillProgress): Promise<void>
+    /**
+     * The evidence sweep's owe: a fetch at `rev` only when none is owed. A
+     * row already owed keeps its attempts, backoff, quiet flag and
+     * generation, unlike `owe`, where news ends backoff.
+     */
+    oweEvidenceRefresh?(did: string, rev: string): Promise<void>
+    /**
+     * Every indexed record after `after`, in (did, collection, rkey) order, for
+     * the sweep that re-stores each snapshot in the current layout.
+     */
+    snapshotLayoutBackfillPage?(after: RecordRef | null, limit: number): Promise<IndexedRecord[]>
+    readSnapshotLayoutBackfillProgress?(): Promise<SnapshotLayoutBackfillProgress>
+    setSnapshotLayoutBackfillProgress?(progress: SnapshotLayoutBackfillProgress): Promise<void>
+    /**
+     * Owes a fetch of one indexed record, leaving any obligation already owed
+     * as it is. A declaration is owed as a change (a window entry, no push); a
+     * secondary only while its DID is in interest, and an own-block proof only
+     * for a registered owner. Does nothing for a declaration not held or a secondary of a DID outside interest.
+     */
+    oweSnapshotLayoutRefresh?(record: IndexedRecord): Promise<void>
 }
+
+/** Resumable position of the layout sweep. */
+export type SnapshotLayoutBackfillProgress =
+    | { done: false; cursor: RecordRef | null }
+    | { done: true }
 
 /**
  * `done: false` carries `cursor: null` before the first page and the
@@ -362,6 +545,11 @@ export interface MonitorIndex {
  * DID from one pass, is a separate sweep, not implemented by this baseline-build pass.)
  */
 export type BackfillProgress =
+    | { done: false; cursor: string | null }
+    | { done: true }
+
+/** Separate resumable cursor; the baseline backfill only discovers missing DIDs. */
+export type EvidenceBackfillProgress =
     | { done: false; cursor: string | null }
     | { done: true }
 
@@ -646,6 +834,13 @@ export interface PendingRecordFetch extends OwedRecord {
     epoch: number
 }
 
+/**
+ * Which owed secondaries a drain reads: `records` are the configured
+ * singletons (`MONITOR_COLLECTIONS`); `own-blocks` are registered owners'
+ * `app.bsky.graph.block` records, by rkey.
+ */
+export type SecondaryLane = "records" | "own-blocks"
+
 /** Why a secondary index write was refused: a newer rev is indexed, or the DID left interest. */
 export type SecondaryWriteAnswer = "older" | "left"
 
@@ -663,7 +858,9 @@ export interface SecondaryIntakeIndex {
      * Owe a fetch of one secondary and advance the follow stream's cursor,
      * atomically. The `rec_pending` upsert sets both `rev` and `epoch`, the
      * epoch read in the same step as membership, so a row left from an
-     * earlier epoch is settled at the current one.
+     * earlier epoch is settled at the current one. A new commit also resets the
+     * row's attempts and backoff; a settle that fails concurrently may still
+     * defer the row after the reset.
      * `duplicate` without owing when `rev` is the indexed one; `ignored` for
      * a DID not in interest.
      */
@@ -676,8 +873,25 @@ export interface SecondaryIntakeIndex {
  * their rev authority is the `records` row alone.
  */
 export interface SecondaryIndex {
-    dueSecondaries(nowMs: number, limit: number): Promise<PendingRecordFetch[]>
-    deferSecondary(ref: RecordRef, notBeforeMs: number): Promise<void>
+    /**
+     * Owed fetches due by `nowMs`, from one lane only: `records` (the
+     * configured secondaries) by default, or `own-blocks` (registered owners'
+     * block proofs), so a large owner never starves the other lane.
+     */
+    dueSecondaries(
+        nowMs: number,
+        limit: number,
+        lane?: SecondaryLane
+    ): Promise<PendingRecordFetch[]>
+    /**
+     * Count an attempt, push `not_before` out and keep `failure` on the row.
+     * Answers the attempts now stored, or null where the row is already gone.
+     */
+    deferSecondary(
+        ref: RecordRef,
+        notBeforeMs: number,
+        failure: PendingFailure
+    ): Promise<number | null>
     /**
      * Drop the pending row, only while it still owes `owedRev`: a newer
      * commit owed by the live stream during the settle survives.
@@ -700,6 +914,20 @@ export interface SecondaryIndex {
         epoch: number,
         owedRev: string
     ): Promise<SecondaryWriteAnswer | "stored">
+    /**
+     * Own-block proofs of DIDs no longer registered, held (`records`) or
+     * still owed (`rec_pending`), at most `limit`.
+     */
+    strayOwnBlockProofs(limit: number): Promise<RecordRef[]>
+    /**
+     * After a stray own-block proof's snapshot is deleted: drop its `records`
+     * and `rec_pending` rows, re-checking in the same step that the DID is
+     * still not registered. If it registered again meanwhile, its `records`
+     * row is dropped all the same and a fetch is owed at rev `""` under the
+     * DID's current epoch, so the deleted bytes are fetched again rather than
+     * indexed as held.
+     */
+    forgetStrayOwnBlockProof(ref: RecordRef): Promise<void>
     /** Drop a secondary verified absent at `rev`, under the same rules. */
     disposeSecondary(
         ref: RecordRef,
@@ -721,7 +949,6 @@ export interface SecondaryIndex {
  * declaration's entries, no TTL.
  */
 export interface SecondarySnapshotStore {
-    getSecondary(ref: RecordRef): Promise<SnapshotEntry | null>
     putSecondary(ref: RecordRef, entry: SnapshotEntry): Promise<void>
     /** Removes the record and its confirmation together. */
     deleteSecondary(ref: RecordRef): Promise<void>
@@ -730,8 +957,7 @@ export interface SecondarySnapshotStore {
 
 /**
  * Rows per bound-value D1 `INSERT`: 25 rows of `follows` (4 columns) is
- * exactly D1's 100 bound parameters. Change rows that follow from rows
- * already in D1 are never bound this way (see `FollowEdgeWriter`).
+ * exactly D1's 100 bound parameters.
  */
 export const D1_ROWS_PER_STATEMENT = 25
 
@@ -760,6 +986,27 @@ export interface EdgeWriteResult {
     subjects: string[]
 }
 
+/** One block, identified the way the stream identifies it. */
+export interface BlockRef {
+    blocker: string
+    rkey: string
+}
+
+/**
+ * The single writer's seam onto the block index. Blocks move no follower
+ * count: nothing is projected from them. Pruning on a DID's mirror
+ * transitions is `FollowEdgeWriter.mirror`'s, in the same batch as its
+ * follows.
+ */
+export interface BlockEdgeWriter {
+    /** Put blocks at listing generation `gen`; idempotent on `(blocker, rkey)`. */
+    putBlocks(blocks: readonly BlockEdge[], gen: number): Promise<void>
+    /** Delete by `(blocker, rkey)`; an absent block is a no-op. */
+    deleteBlocks(refs: readonly BlockRef[]): Promise<void>
+    /** Delete `blocker`'s blocks older than generation `gen`. */
+    sweepBlocks(blocker: string, gen: number): Promise<void>
+}
+
 /** One DID's standing in the edge index's mirrored tables. */
 export interface GraphMirrorRow {
     did: string
@@ -779,9 +1026,8 @@ export interface GraphMirrorRow {
 /**
  * A DID's standing now, beside the standing last mirrored for it (null if
  * never). The mirror acts on the difference: a prune when `owner` or `member`
- * went from true to false, change rows only for flags that moved. Recording
- * `now` as mirrored happens only after the D1 batch commits, so a retry
- * re-derives the same transition.
+ * went from true to false. Recording `now` as mirrored happens only after
+ * the D1 batch commits, so a retry re-derives the same transition.
  */
 export interface GraphMirrorTransition {
     now: GraphMirrorRow
@@ -792,18 +1038,12 @@ export interface GraphMirrorTransition {
  * The write side of the follow-edge index (D1). The single writer is its
  * only caller. "Served" means in `graph_owners`.
  *
- * Every method commits its rows and their `graph_changes` rows in one
- * `db.batch`, drawing every statement from the budget the writer was built
- * with; a write the budget cannot cover throws before anything is sent.
- * Change rows are derived from the reads they invalidate (`FollowEdgeStore`):
- * a `following` row for a served follower, a `followers` row only for a
- * subject that holds a declaration. Bound-value inserts (`putEdges` and its
- * change rows) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
- * number of statements per DID. A
- * change row that depends on rows a delete removes (sweep, prune, the
- * holder/owner fan-out) is an `INSERT INTO graph_changes … SELECT … FROM
- * follows`, placed before that delete in the same batch, so a prune costs a
- * constant number of statements whatever the edge count.
+ * Every method sends its statements in one `db.batch`, drawing every
+ * statement from the budget the writer was built with; a write the budget
+ * cannot cover throws before anything is sent. Bound-value inserts
+ * (`putEdges`) chunk at `D1_ROWS_PER_STATEMENT`; the mirror writes a constant
+ * number of statements per DID, and a prune or sweep a constant number
+ * whatever the edge count.
  */
 export interface FollowEdgeWriter {
     /**
@@ -819,13 +1059,10 @@ export interface FollowEdgeWriter {
     pruneFollower(follower: string): Promise<EdgeWriteResult>
     /**
      * Bring the mirrored `graph_owners`, `graph_holders` and `interest`
-     * rows from each transition's `mirrored` to its `now`, in one batch:
-     * `served-add`/`served-remove` and `holder-add`/`holder-remove` rows with
-     * their per-affected-DID fan-out (`following` for each follower,
-     * `followers` for each holder subject) on add and on remove, and the
-     * edges of a DID that stopped being served or left interest pruned.
-     * A flag unchanged between the two writes no change row, so re-mirroring
-     * an unchanged DID is a no-op. Returns the pruned edges' subjects.
+     * rows from each transition's `mirrored` to its `now`, in one batch, and
+     * prune the edges of a DID that stopped being served or left interest.
+     * Re-mirroring an unchanged DID is a no-op. Returns the pruned edges'
+     * subjects.
      */
     mirror(transitions: readonly GraphMirrorTransition[]): Promise<EdgeWriteResult>
     /** The mirrored DIDs, paged by DID, for the daily reconcile. */
@@ -837,9 +1074,4 @@ export interface FollowEdgeWriter {
     mirroredOf(dids: readonly string[]): Promise<Map<string, GraphMirrorRow>>
     /** The followers of each subject, for the `owner_followers` re-count. */
     followersOf(subjects: readonly string[]): Promise<Map<string, string[]>>
-    /**
-     * Delete up to `limit` `graph_changes` rows written before `beforeMs`,
-     * oldest first; returns how many, so the caller can resume next alarm.
-     */
-    pruneChanges(beforeMs: number, limit: number): Promise<number>
 }

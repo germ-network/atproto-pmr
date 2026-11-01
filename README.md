@@ -44,12 +44,10 @@ the normative/implementation-defined split, and a conformance summary.
 | [`spec/storage-consistency.md`](spec/storage-consistency.md) | the storage consistency contract, stated backend-neutrally |
 | [`spec/trust-model.md`](spec/trust-model.md) | what a relay is trusted with, what it necessarily learns, what a malicious one can do |
 
-[`reference/`](reference/) is a Cloudflare Durable Object implementation of
-the storage contract — the storage layer only, not a complete relay, and
-not normative. Its value for an adopter on a different backend is that it
-marks which requirements a serialized execution model provides for free and
-which you have to supply deliberately. It ships a **placeholder you must
-replace**; see [`reference/README.md`](reference/README.md).
+[`packages/`](packages/) holds an implementation on Cloudflare Workers and
+Durable Objects: `core` (the protocol logic), `monitor` (the key monitor), and
+their Cloudflare bindings `cloudflare` and `monitor-cloudflare`. It is not
+normative.
 
 ## Two things to know before implementing
 

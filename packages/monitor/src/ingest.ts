@@ -16,19 +16,32 @@
 
 import {
     RecordNotFoundError,
+    DECLARATION_COLLECTION_NSID,
+    declarationAnchorKeyOf,
+    messagingKeyFingerprint,
+    normalizeMessagingKeyFingerprint,
+    readRecordFromCar,
     type DidDocument,
     type InterestPolicy,
 } from "@germ-network/atproto-pmr-core"
+import { streamTimeUs } from "./firehose-coverage"
 import type { CommitEvent, MonitorEvent } from "./jetstream"
 import {
     compareRev,
     FETCH_AS_OF_SKEW_MS,
     type Cursor,
     type DidDocumentSink,
+    type GoneCause,
+    type EvidenceAssurance,
+    type EvidenceAuthorityIdentity,
     type InterestIndex,
     type KeyUpdateIndex,
     type MonitorIndex,
-    type SnapshotStore,
+    type PendingFetch,
+    type PendingFailure,
+    type SnapshotEntry,
+    type SnapshotEvidence,
+    type SnapshotWriter,
 } from "./storage"
 
 /** The authoritative record, as fetched from the DID's own PDS. */
@@ -44,6 +57,21 @@ export interface FetchedRecord {
      * Absent from a deployment fetch that does not; then nothing is stored.
      */
     didDocument?: FetchedDidDocument
+    /**
+     * Start of the bounded DID-document/PDS read attempt, which declaration
+     * evidence is bounded by. A fetch that omits it may have one stamped
+     * around the call by its caller (monitor-cloudflare does); with none,
+     * the declaration is stored without evidence.
+     */
+    attemptStartedAtMs?: number
+}
+
+/** The declaration a settle just stored, as verified. */
+export interface SettledDeclaration {
+    rev: string
+    cid: string
+    /** The record's CAR, exactly as stored. */
+    car: Uint8Array
 }
 
 /** A DID document as fetched from its directory. */
@@ -56,7 +84,7 @@ export interface FetchedDidDocument {
 
 export interface IngestDeps {
     index: MonitorIndex
-    snapshot: SnapshotStore
+    snapshot: SnapshotWriter
     /**
      * Tier 2: `com.atproto.sync.getRecord` at the DID's own PDS. The only
      * bytes that may enter the snapshot.
@@ -74,8 +102,30 @@ export interface IngestDeps {
      * stays owed before it is fetched again. Defaults to an hour.
      */
     unverifiableRetryMs?: number
+    /**
+     * Raised once for every deferral that counts an attempt: a settle that
+     * threw, or a never-held DID that came back unverifiable. Not raised for
+     * a confirmed deletion, a verified absence, a regression, or a DID that
+     * left interest mid-fetch. Called synchronously; a throw is swallowed.
+     */
+    onSettleFailure?(event: SettleFailureEvent): void
+    /**
+     * The longest a failed fetch for `did` waits before its next attempt. A
+     * pending row takes the DID out of the refresh schedule, so a DID that
+     * schedule covers should answer its own refresh interval, keeping it no
+     * staler than refresh would. Defaults to `SETTLE_RETRY_CAP_MS`.
+     */
+    retryCapMs?(did: string): Promise<number>
     /** Own-DID push, where a registration holds this DID. */
     onChange?(did: string, rev: string): Promise<void>
+    /**
+     * Every verified declaration stored (settle, quiet or not, and quiet
+     * refresh) and every one disposed of (deletion, interest leave), after
+     * the index write that discharges it. A snapshot-store read may still see
+     * the previous value; this argument is authoritative. `null` for a
+     * disposal. Raised before `onChange`; a throw is swallowed.
+     */
+    onSettled?(did: string, settled: SettledDeclaration | null): Promise<void>
     /** Raised when an observed rev moves backwards. Never silent. */
     onRegression?(did: string, indexed: string, observed: string): Promise<void>
     /**
@@ -117,6 +167,63 @@ export interface IngestDeps {
 
 const DEFAULT_UNVERIFIABLE_RETRY_MS = 3_600_000
 
+/** A permanently failing DID is retried about once a month, no more. */
+export const SETTLE_RETRY_CAP_MS = 30 * 24 * 3_600_000
+
+/** Longest error message kept on a pending row or logged with it. */
+export const PENDING_FAILURE_MESSAGE_MAX = 256
+
+/** 2^attempts seconds, capped at `capMs`. Finite for any attempts. */
+export function settleRetryBackoffMs(
+    attempts: number,
+    capMs: number = SETTLE_RETRY_CAP_MS
+): number {
+    return Math.min(2 ** Math.min(attempts, 40) * 1000, capMs)
+}
+
+/** `text` cut to `PENDING_FAILURE_MESSAGE_MAX`, as kept on a pending row. */
+export function truncated(text: string): string {
+    return text.length > PENDING_FAILURE_MESSAGE_MAX ? text.slice(0, PENDING_FAILURE_MESSAGE_MAX) : text
+}
+
+/**
+ * Defers `did` and tells `onSettleFailure` once, with exactly what was stored.
+ * A row that is already gone counts nothing, so reports nothing. A failing
+ * hook never costs the caller its deferral or the rest of the drain.
+ */
+async function deferFailure(
+    deps: IngestDeps,
+    did: string,
+    notBeforeMs: number,
+    failure: PendingFailure,
+    expectedGeneration: number | null
+): Promise<void> {
+    const kept: PendingFailure =
+        failure.kind === "threw"
+            ? { ...failure, message: truncated(failure.message) }
+            : { ...failure, reason: failure.reason === null ? null : truncated(failure.reason) }
+    if (expectedGeneration === null) return
+    const attempts = await deps.index.deferPending(did, notBeforeMs, kept, expectedGeneration)
+    if (attempts === null) return
+    try {
+        deps.onSettleFailure?.({ did, attempts, failure: kept, notBeforeMs })
+    } catch {}
+}
+
+/** `retryCapMs` for `did`, or the default where the deployment gives none. */
+export async function retryCapFor(deps: Pick<IngestDeps, "retryCapMs">, did: string): Promise<number> {
+    return (await deps.retryCapMs?.(did)) ?? SETTLE_RETRY_CAP_MS
+}
+
+export interface SettleFailureEvent {
+    did: string
+    /** As stored after this failure; a concurrent reset may make it lower
+     * than the attempts the retry was scheduled from. */
+    attempts: number
+    failure: PendingFailure
+    notBeforeMs: number
+}
+
 /** Which collection this monitor observes. Everything else is dropped. */
 export interface IngestConfig {
     collection: string
@@ -130,6 +237,11 @@ export interface IngestConfig {
 
 export type IntakeDecision =
     | "ignored"
+    /**
+     * The event needs no declaration fetch, but a durable signing-key update
+     * was owed. Adapters must schedule that work and preserve its cursor.
+     */
+    | "key-update"
     | "duplicate"
     | "accepted"
     /** In the snapshot, and its DID document may have re-keyed. */
@@ -155,18 +267,19 @@ export async function intake(
         // did not change. `owe` rather than `intake` because the dedupe
         // check would suppress exactly this.
         const known = await deps.index.revOf(event.did)
-        // A DID confirmed deleted has no live record to re-verify against
-        // — re-owing here would only rediscover the same deletion and
-        // re-push it, once per identity/account/sync event, forever.
+        // A DID confirmed permanently deleted has no live record to
+        // re-verify against. One that is only reversibly gone is re-asked,
+        // and `settle` records an answer that repeats the deletion quietly.
         const reverify = known !== null && !(await deps.index.isDeleted(event.did))
-        if (reverify) await deps.index.owe(event.did, known)
+        if (reverify) await deps.index.owe(event.did, known, streamTimeUs(cursor))
         // The relay's cached key is dropped for every DID whose document the
         // monitor keeps, declaration or not. After the owe, so a holder that
         // reverifies is watched.
-        if (await deps.index.isWatched(event.did)) {
+        const keyOwed = await deps.index.isWatched(event.did) && deps.keyUpdates !== undefined
+        if (keyOwed) {
             await deps.keyUpdates?.oweKeyUpdate(event.did, { kind: "delete" })
         }
-        return reverify ? "reverify" : "ignored"
+        return reverify ? "reverify" : keyOwed ? "key-update" : "ignored"
     }
 
     const commit: CommitEvent = event
@@ -207,9 +320,25 @@ export type SettleOutcome =
  * record does not exist at `rev`, not a failure to verify.
  */
 export type VerifyOutcome =
-    | { kind: "verified"; key: string; rev: string; cid: string }
-    | { kind: "verified-absent"; key: string; rev: string }
-    | { kind: "unverifiable" }
+    | {
+          kind: "verified"
+          key: string
+          rev: string
+          cid: string
+          collection?: string
+          rkey?: string
+          commitCid?: string
+          authority?: EvidenceAuthorityIdentity
+          assurance?: EvidenceAssurance
+          monitor?: string
+          /** Canonical hex fingerprint of the validated declaration currentKey, when present. */
+          messagingKeyFingerprint?: string | null
+          /** The declaration's anchor key (`declarationAnchorKeyOf`), kept for registration retirement. */
+          anchorKey?: Uint8Array | null
+      }
+    | { kind: "verified-absent"; key: string; rev: string; commitCid?: string }
+    /** `reason` says what failed to verify, where the verifier knows. */
+    | { kind: "unverifiable"; reason?: string }
 
 /**
  * The source confirmed this DID's declaration is gone. Nothing is left to
@@ -218,7 +347,8 @@ export type VerifyOutcome =
  * would: `completeDeletion` is `complete`'s deletion-shaped counterpart.
  * `permanent` decides only whether this ALSO suppresses future reverify
  * events (see `MonitorIndex.isDeleted`) — a reversible state (an account
- * takedown/suspension that may lift) still disposes of the stale snapshot
+ * takedown/suspension that may lift, or a record the account may publish
+ * again) still disposes of the stale snapshot
  * and still pushes, but must stay open to a later event noticing the
  * reversal.
  */
@@ -226,10 +356,13 @@ export async function settleDeletion(
     deps: IngestDeps,
     did: string,
     permanent: boolean,
-    quiet = false
+    quiet: boolean,
+    cause: GoneCause,
+    gen?: number | null
 ): Promise<void> {
     await deps.snapshot.deleteRecord(did)
-    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet)
+    await deps.index.completeDeletion(did, deps.nowMs(), permanent, quiet, cause, gen)
+    await raiseSettled(deps, did, null)
     if (!quiet) await deps.onDelete?.(did)
 }
 
@@ -248,6 +381,9 @@ export async function settleDeletion(
  */
 /** How one settle reports what it finds. */
 export interface SettleOptions {
+    /** The pending row's attempts so far; spaces a never-held unverifiable
+     * DID's next fetch. 0 where settle is not driven by the retry queue. */
+    attempts?: number
     /**
      * Owed by a join, not a change: an advance is stored through
      * `completeQuietly` with no `onChange`. A not-found for a DID that held a
@@ -256,6 +392,8 @@ export interface SettleOptions {
      * nothing is recorded.
      */
     quiet?: boolean
+    /** Generation selected before the fetch; null fences failure deferral if no row existed. */
+    owedGen?: number | null
 }
 
 export async function settle(
@@ -265,6 +403,7 @@ export async function settle(
 ): Promise<SettleOutcome> {
     const quiet = opts.quiet === true
     const epoch = await deps.interest.interestEpoch(did)
+    const gen = opts.owedGen === undefined ? await deps.index.owedGenOf(did) : opts.owedGen
     const moved = async () => (await deps.interest.interestEpoch(did)) !== epoch
     let record: FetchedRecord
     try {
@@ -276,23 +415,50 @@ export async function settle(
         if (quiet && (await neverHeld(deps, did))) {
             // A followee with no declaration is the ordinary case: nothing is
             // recorded for it, so it stays on the non-holder cadence.
-            await deps.index.clearPending(did)
+            await deps.index.clearPending(did, gen)
             if (repoLevel) await deps.secondaries?.dispose(did)
             return "deleted"
         }
-        await settleDeletion(deps, did, err.permanent, quiet)
+        // Only a permanent answer for a DID not yet marked deleted is news
+        // for one already gone.
+        const hardens = err.permanent && !(await deps.index.isDeleted(did))
+        const reconfirm = !hardens && (await alreadyGone(deps, did))
+        await settleDeletion(deps, did, err.permanent, quiet || reconfirm, "repo", gen)
         if (repoLevel) await deps.secondaries?.dispose(did)
         return "deleted"
     }
     await recordFetchedDocument(deps, did, record.didDocument)
 
-    const outcome = await settleFetched(deps, did, record, quiet, moved)
+    const outcome = await settleFetched(deps, did, record, quiet, moved, gen, opts.attempts ?? 0)
     // A DID left unwatched has nothing keeping its document current: stop
     // vouching for the one this fetch stored.
     if (!(await deps.index.isWatched(did))) {
         await withdrawFetchedDocument(deps, did, record.didDocument)
     }
     return outcome
+}
+
+/**
+ * Raises `onSettled`. A throw is swallowed: whatever a deployment keeps
+ * beside the index must not hold up the discharge it follows.
+ */
+export async function raiseSettled(
+    deps: IngestDeps,
+    did: string,
+    settled: SettledDeclaration | null
+): Promise<void> {
+    try {
+        await deps.onSettled?.(did, settled)
+    } catch {}
+}
+
+/**
+ * The declaration is already gone and recorded so: an answer that merely
+ * repeats it is no new change, and must not reach the window or `onDelete`
+ * again.
+ */
+async function alreadyGone(deps: IngestDeps, did: string): Promise<boolean> {
+    return (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
 }
 
 /** No declaration was ever indexed for `did`, held or gone. */
@@ -305,12 +471,14 @@ async function settleFetched(
     did: string,
     record: FetchedRecord,
     quiet: boolean,
-    moved: () => Promise<boolean>
+    moved: () => Promise<boolean>,
+    gen: number | null,
+    attempts: number
 ): Promise<SettleOutcome> {
     const verified = await deps.verify(did, record)
     if (await moved()) return "left"
     if (verified.kind === "unverifiable") {
-        await settleUnverifiable(deps, did, record)
+        await settleUnverifiable(deps, did, record, gen, attempts, verified.reason)
         return "unverifiable"
     }
 
@@ -318,7 +486,7 @@ async function settleFetched(
     const movement = compareRev(indexed, verified.rev)
     if (movement === "regressed" && indexed !== null) {
         await deps.onRegression?.(did, indexed, verified.rev)
-        await deps.index.clearPending(did)
+        await deps.index.clearPending(did, gen)
         return "rejected"
     }
 
@@ -326,50 +494,233 @@ async function settleFetched(
         // The repo is alive and signed to hold no such record. Reversible,
         // because the account may publish it again.
         if (quiet && (await neverHeld(deps, did))) {
-            await deps.index.clearPending(did)
+            await deps.index.clearPending(did, gen)
             return "deleted"
         }
-        await settleDeletion(deps, did, false, quiet)
+        await settleDeletion(deps, did, false, quiet || (await alreadyGone(deps, did)), "record", gen)
         return "deleted"
     }
 
     // A DID-document rotation lands here even when `rev` is unchanged —
     // `intake`'s "reverify" path exists for exactly this case (an identity
-    // event, not a repo commit). Compare against what was previously
-    // served so a pure key rotation still notifies a registered device,
+    // event, not a repo commit). Compare against the key the index holds
+    // so a pure key rotation still notifies a registered device,
     // not only a rev movement: a key rotation is arguably the single most
     // security-relevant thing this component exists to catch.
-    //
-    // Only checked on "unchanged" — an "advanced" movement already fires
-    // `onChange` below regardless, so resolving the full previous record
-    // (a KV round trip carrying the whole CAR) would be wasted work on
-    // every ordinary, non-rotation settle.
-    let keyRotated = false
-    if (movement === "unchanged") {
-        const previous = await deps.snapshot.getRecord(did)
-        const previousKey = previous === null ? null : (previous.verifiedWith ?? previous.signingKey)
-        keyRotated = previousKey !== null && previousKey !== verified.key
-    }
+    const held = await deps.index.heldDeclarationOf(did)
+    const keyRotated = movement === "unchanged" && held !== null && held.verifiedWith !== verified.key
 
     const observedAtMs = deps.nowMs()
+    const evidence = await prepareSnapshotEvidence(deps.index, did, verified, observedAtMs)
+    // Retained before the put, so a snapshot carrying evidence never exists
+    // without its anchors: a put that then fails leaves only rows the retry
+    // reuses. A first observation already retained is never moved.
+    if (evidence !== null) await retainSnapshotEvidence(deps.index, evidence)
+    const previousMessagingKeyFingerprint = held?.messagingKeyFingerprint ?? null
+    const currentKey = verified.messagingKeyFingerprint
+        ? messagingKeyIdentity(record.car, verified.messagingKeyFingerprint)
+        : null
+    let messagingKeyFirstSeenAtMs: number | null = null
+    if (currentKey?.fingerprint) {
+        const history = await deps.index.getMessagingKeyHistory?.(did, currentKey.fingerprint, currentKey.legacyFingerprint)
+        if (history !== null && history !== undefined) {
+            messagingKeyFirstSeenAtMs = history.firstSeenAtMs
+        } else if (
+            previousMessagingKeyFingerprint !== null &&
+            previousMessagingKeyFingerprint !== currentKey.fingerprint
+        ) {
+            // Preserve the legacy key as explicitly unknown so a later
+            // reappearance cannot be mistaken for a new first observation.
+            if ((await deps.index.getMessagingKeyHistory?.(did, previousMessagingKeyFingerprint)) == null) {
+                await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                    fingerprint: previousMessagingKeyFingerprint,
+                    firstSeenAtMs: null,
+                    recordCid: held?.cid ?? null,
+                    commitCid: held?.commitCid ?? null,
+                    rev: held?.rev ?? null,
+                    verifiedWith: held?.verifiedWith ?? null,
+                })
+            }
+            // A verified transition is the first trustworthy observation
+            // after tracking started, unless this key already has an
+            // unknown sentinel from a pre-tracker appearance.
+            messagingKeyFirstSeenAtMs = observedAtMs
+            await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                fingerprint: currentKey.fingerprint,
+                firstSeenAtMs: observedAtMs,
+                recordCid: verified.cid,
+                commitCid: verified.commitCid ?? null,
+                rev: verified.rev,
+                verifiedWith: verified.key,
+            }, currentKey.legacyFingerprint)
+        } else {
+            // First observation may be a legacy key. Keep a durable unknown
+            // sentinel so it stays unranked if it later disappears/returns.
+            await deps.index.retainMessagingKeyFirstSeen?.(did, {
+                fingerprint: currentKey.fingerprint,
+                firstSeenAtMs: null,
+                recordCid: verified.cid,
+                commitCid: verified.commitCid ?? null,
+                rev: verified.rev,
+                verifiedWith: verified.key,
+            }, currentKey.legacyFingerprint)
+        }
+    }
     await deps.snapshot.putRecord(did, {
         rev: verified.rev,
+        commitCid: verified.commitCid ?? null,
         car: record.car,
         observedAtMs,
         source: record.source,
         signingKey: verified.key,
         verifiedWith: verified.key,
         cid: verified.cid,
+        evidence,
+        messagingKeyFirstSeenAtMs,
     })
-    const written = { cid: verified.cid, verifiedWith: verified.key }
+    const written = {
+        cid: verified.cid,
+        verifiedWith: verified.key,
+        commitCid: verified.commitCid ?? null,
+        anchorKey: verified.anchorKey ?? null,
+        messagingKeyFingerprint: currentKey?.fingerprint ?? null,
+        messagingKeyFirstSeenAtMs,
+    }
+    const settled = { rev: verified.rev, cid: verified.cid, car: record.car }
     if (quiet) {
-        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written)
+        await deps.index.completeQuietly(did, verified.rev, observedAtMs, written, gen)
+        await raiseSettled(deps, did, settled)
         return "stored"
     }
-    await deps.index.complete(did, verified.rev, observedAtMs, written)
+    // Read before `complete`, which marks the DID held again.
+    const revived =
+        movement !== "advanced" &&
+        !keyRotated &&
+        (await deps.index.holderStateOf(did))?.startsWith("gone-") === true
+    await deps.index.complete(did, verified.rev, observedAtMs, written, gen)
+    await raiseSettled(deps, did, settled)
 
-    if (movement === "advanced" || keyRotated) await deps.onChange?.(did, verified.rev)
+    // A DID back from gone is news at whatever rev it returns.
+    if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
     return "stored"
+}
+
+/** Recover a compatibility alias only from the same accepted declaration key. */
+function messagingKeyIdentity(car: Uint8Array, fingerprint?: string | null): {
+    fingerprint: string | null
+    legacyFingerprint?: string
+} {
+    const normalized = fingerprint == null ? null : normalizeMessagingKeyFingerprint(fingerprint)
+    try {
+        const record = readRecordFromCar(car, DECLARATION_COLLECTION_NSID, "self")?.record
+        const key = declarationAnchorKeyOf(record)
+        if (key !== null) {
+            const canonical = messagingKeyFingerprint(key)
+            if (normalized === null || normalized === canonical) {
+                return {
+                    fingerprint: canonical,
+                    legacyFingerprint: [...key].map((b) => b.toString(16).padStart(2, "0")).join(""),
+                }
+            }
+        }
+    } catch {
+        // Unreadable legacy bytes cannot establish a different key or alias.
+    }
+    return { fingerprint: normalized }
+}
+
+/**
+ * Construct stable evidence identity and reuse the first anchor for a
+ * reappearing identity. Both first observations come from the index, which
+ * every evidence-bearing put has already retained them in.
+ */
+export async function prepareSnapshotEvidence(
+    index: MonitorIndex,
+    did: string,
+    verified: Extract<VerifyOutcome, { kind: "verified" }>,
+    nowMs: number
+): Promise<SnapshotEvidence | null> {
+    if (
+        verified.commitCid === undefined ||
+        verified.authority === undefined ||
+        verified.assurance === undefined ||
+        verified.monitor === undefined ||
+        verified.collection === undefined ||
+        verified.rkey === undefined
+    ) {
+        return null
+    }
+    const declaration = {
+        did,
+        collection: verified.collection,
+        rkey: verified.rkey,
+        recordCid: verified.cid,
+        commitCid: verified.commitCid,
+        rev: verified.rev,
+        verifiedWith: verified.key,
+        authority: verified.authority,
+    }
+    const commitId = commitHistoryId(declaration)
+    const anchorId = anchorHistoryId(declaration)
+    const commitFirstObservedAtMs = (await index.getEvidenceAnchor?.(commitId)) ?? nowMs
+    const anchorFirstObservedAtMs = (await index.getEvidenceAnchor?.(anchorId)) ?? nowMs
+    return {
+        ...declaration,
+        assurance: verified.assurance,
+        monitor: verified.monitor,
+        commitFirstObservedAtMs,
+        anchorFirstObservedAtMs,
+    }
+}
+
+/**
+ * Retain the anchors a snapshot about to be stored carries, so a later
+ * identity that replaces or deletes it can still reuse them. A first
+ * observation already retained is kept, never moved.
+ */
+export async function retainSnapshotEvidence(
+    index: MonitorIndex,
+    evidence: SnapshotEvidence
+): Promise<void> {
+    const commit = commitHistoryId(evidence)
+    const anchor = anchorHistoryId(evidence)
+    await index.retainEvidenceAnchors?.(evidence.did, [
+        { kind: "commit", identity: commit, firstObservedAtMs: evidence.commitFirstObservedAtMs },
+        { kind: "anchor", identity: anchor, firstObservedAtMs: evidence.anchorFirstObservedAtMs },
+    ])
+}
+
+/** The fields a commit's first observation is keyed by. */
+type CommitIdentity = Pick<
+    SnapshotEvidence,
+    | "did"
+    | "collection"
+    | "rkey"
+    | "recordCid"
+    | "commitCid"
+    | "rev"
+    | "verifiedWith"
+    | "authority"
+>
+
+function commitHistoryId(e: CommitIdentity): string {
+    return JSON.stringify([
+        "commit",
+        {
+            did: e.did,
+            collection: e.collection,
+            rkey: e.rkey,
+            recordCid: e.recordCid,
+            commitCid: e.commitCid,
+            rev: e.rev,
+            verifiedWith: e.verifiedWith,
+            authority: e.authority,
+        },
+    ])
+}
+
+function anchorHistoryId(e: Pick<SnapshotEvidence, "did" | "verifiedWith" | "authority">): string {
+    return JSON.stringify(["anchor", e.did, e.verifiedWith, e.authority])
 }
 
 /**
@@ -382,17 +733,25 @@ async function settleFetched(
 async function settleUnverifiable(
     deps: IngestDeps,
     did: string,
-    record: FetchedRecord
+    record: FetchedRecord,
+    gen: number | null,
+    attempts: number,
+    reason: string | undefined
 ): Promise<void> {
     const held = (await deps.index.revOf(did)) !== null
     if (held) {
-        await deps.index.clearPending(did)
+        await deps.index.clearPending(did, gen)
         await deps.index.markAttempted(did, deps.nowMs())
     } else {
-        await deps.index.deferPending(
-            did,
-            deps.nowMs() + (deps.unverifiableRetryMs ?? DEFAULT_UNVERIFIABLE_RETRY_MS)
+        const wait = Math.max(
+            deps.unverifiableRetryMs ?? DEFAULT_UNVERIFIABLE_RETRY_MS,
+            settleRetryBackoffMs(attempts, await retryCapFor(deps, did))
         )
+        await deferFailure(deps, did, deps.nowMs() + wait, {
+            kind: "unverifiable",
+            reason: reason ?? null,
+            atMs: deps.nowMs(),
+        }, gen)
     }
     await pushNewlySeenKey(deps, did, record.signingKey)
 }
@@ -408,14 +767,10 @@ export async function pushNewlySeenKey(
     fetchedKey: string | null
 ): Promise<void> {
     if (fetchedKey === null) return
-    const previous = await deps.snapshot.getRecord(did)
-    if (previous === null) return
-    const previousKey = previous.verifiedWith ?? previous.signingKey
-    if (previousKey === null || fetchedKey === previousKey) return
-    if (fetchedKey === previous.seenKey) return
-    // KV cannot update metadata alone, so recording the key rewrites the entry.
-    await deps.snapshot.putRecord(did, { ...previous, seenKey: fetchedKey })
-    await deps.onChange?.(did, previous.rev)
+    const held = await deps.index.heldDeclarationOf(did)
+    if (held === null || fetchedKey === held.verifiedWith || fetchedKey === held.seenKey) return
+    await deps.index.recordSeenKey(did, fetchedKey)
+    await deps.onChange?.(did, held.rev)
 }
 
 /**
@@ -483,23 +838,55 @@ export async function withdrawFetchedDocument(
     } catch {}
 }
 
-/** Drain what is owed. Called by the same clock that watches the socket. */
+/**
+ * Drain what is owed. Called by the same clock that watches the socket. One
+ * DID's failure, or a failure to record it, never costs the rest of the batch.
+ */
 export async function settleDue(
     deps: IngestDeps,
     limit = 32,
-    backoffMs = (attempts: number) => Math.min(2 ** attempts, 64) * 1000
+    /** Given the cap `retryCapMs` answered for the DID, so a test cannot
+     * skip the cap choice. */
+    backoffMs: (attempts: number, capMs: number) => number = settleRetryBackoffMs,
+    onSelected?: (pending: readonly PendingFetch[]) => void
 ): Promise<number> {
     const now = deps.nowMs()
     const due = await deps.index.duePending(now, limit)
+    onSelected?.(due)
     let settled = 0
     for (const p of due) {
+        // Legacy adapters may omit owedGen. Capture their fallback before
+        // awaiting the PDS so a newer obligation cannot be deferred for this
+        // failed attempt.
+        let expectedGeneration = p.owedGen ?? null
         try {
-            if ((await settle(deps, p.did, { quiet: p.quiet })) === "stored") settled += 1
-        } catch {
+            if (expectedGeneration === null) expectedGeneration = await deps.index.owedGenOf(p.did)
+            if (
+                (await settle(deps, p.did, {
+                    quiet: p.quiet,
+                    attempts: p.attempts,
+                    owedGen: expectedGeneration,
+                })) === "stored"
+            ) {
+                settled += 1
+            }
+        } catch (err) {
             // A PDS being down is ordinary. The obligation survives; the
             // stream will not redeliver, so the retry queue is the only
             // thing keeping this DID from being silently dropped.
-            await deps.index.deferPending(p.did, now + backoffMs(p.attempts))
+            try {
+                const capMs = await retryCapFor(deps, p.did)
+                await deferFailure(deps, p.did, now + backoffMs(p.attempts, capMs), {
+                    kind: "threw",
+                    errorName: err instanceof Error ? err.name : typeof err,
+                    message: String(err instanceof Error ? err.message : err),
+                    atMs: now,
+                }, expectedGeneration)
+            } catch (deferErr) {
+                // The row keeps its `not_before`, so it is due again next
+                // drain; letting this escape would skip the rest of the batch.
+                console.error("monitor: settle defer failed", { did: p.did, err: deferErr })
+            }
         }
     }
     return settled

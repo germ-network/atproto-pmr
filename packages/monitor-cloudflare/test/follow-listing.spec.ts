@@ -14,6 +14,7 @@ import {
 } from "@germ-network/atproto-pmr-monitor"
 import { FetchTimeoutError, RecordNotFoundError, RepoCollectionError } from "@germ-network/atproto-pmr-core"
 import { makeKey } from "../../core/test/fixtures/repo-car"
+import { d1BlockEdgeWriter } from "../src/block-edge-store"
 import { d1FollowEdgeWriter, statementBudget } from "../src/follow-edge-store"
 import type { MonitorIngest } from "../src/ingest-object"
 import {
@@ -65,10 +66,6 @@ const mirror = (obj: MonitorIngest, limit = 50) =>
     )
 const graphOwners = async () =>
     (await all<{ did: string }>("SELECT did FROM graph_owners ORDER BY did")).map((r) => r.did)
-const reasons = async (did: string) =>
-    (await all<{ reason: string }>("SELECT reason FROM graph_changes WHERE did = ? ORDER BY seq", did)).map(
-        (r) => r.reason
-    )
 const markPaged = (obj: MonitorIngest, did: string) =>
     sql(obj, "INSERT INTO listings (did, paged) VALUES (?, 1) ON CONFLICT(did) DO UPDATE SET paged = 1", did)
 const flush = (obj: MonitorIngest) =>
@@ -76,6 +73,7 @@ const flush = (obj: MonitorIngest) =>
         {
             ops: obj,
             edges: d1FollowEdgeWriter(db, statementBudget(1000)),
+            blocks: d1BlockEdgeWriter(db, statementBudget(1000)),
             budget: statementBudget(1000),
             interest: obj,
         },
@@ -100,7 +98,7 @@ describe("owner listing from getRepo", () => {
         expect(rows.every((r) => r.gen === 2)).toBe(true)
     })
 
-    it("an owner's first completed listing mirrors it with served-add", async () => {
+    it("an owner's first completed listing serves it", async () => {
         const s = registeredStub("l")
         await inObj(s, async (obj) => {
             await obj.register(O)
@@ -110,7 +108,6 @@ describe("owner listing from getRepo", () => {
             await step(obj)
             await mirror(obj)
             expect(await graphOwners()).toEqual([O])
-            expect(await reasons(O)).toContain("served-add")
         })
     })
 
@@ -160,7 +157,7 @@ describe("owner listing from getRepo", () => {
             await alarm(s)
             return seen
         })
-        expect(limits[0]).toBe(60)
+        expect(limits[0]).toBe(120)
     })
 
     it("a large verified repo drains across alarms and is served only after its sweep", async () => {
@@ -514,14 +511,13 @@ describe("paged owner listing", () => {
         expect(rows.every((r) => r.gen === 2)).toBe(true)
     })
 
-    it("a fallback listing's completion emits served-add", async () => {
+    it("a fallback listing's completion serves the owner", async () => {
         const s = registeredStub("l")
         await inObj(s, async (obj) => {
             await pagedOwner(obj, 3)
             await step(obj)
             await mirror(obj)
         })
-        expect(await reasons(O)).toContain("served-add")
         expect(await graphOwners()).toEqual([O])
     })
 
@@ -571,9 +567,9 @@ describe("paged owner listing", () => {
         const s = registeredStub("l")
         await inObj(s, async (obj) => {
             const net = await pagedOwner(obj, 6)
-            const list = (obj as unknown as { listFollows: (...a: unknown[]) => Promise<unknown> }).listFollows
+            const list = (obj as unknown as { listRecords: (...a: unknown[]) => Promise<unknown> }).listRecords
             let calls = 0
-            ;(obj as unknown as Record<string, unknown>).listFollows = (...a: unknown[]) => {
+            ;(obj as unknown as Record<string, unknown>).listRecords = (...a: unknown[]) => {
                 calls += 1
                 if (calls === 2) return Promise.reject(new Error("down"))
                 return list(...a)
@@ -675,7 +671,7 @@ describe("mutual listing from listRecords", () => {
                 pageSize: 1,
             })
             await step(obj)
-            expect(net.pages).toHaveLength(4)
+            expect(net.pages.filter((p) => p.collection === "follow")).toHaveLength(4)
         })
         expect((await followsOf(M)).map((r) => r.rkey)).toEqual(["c"])
     })
@@ -769,7 +765,10 @@ describe("listing queue and the alarm", () => {
             expect(queuedDids(obj)).toEqual([M])
             const net = stubNet(obj, { lists: { [M]: [] } })
             await step(obj)
-            expect(net.pages.map((p) => p.did)).toEqual([M])
+            expect(net.pages.map((p) => [p.did, p.collection])).toEqual([
+                [M, "follow"],
+                [M, "block"],
+            ])
         })
     })
 
@@ -874,9 +873,9 @@ describe("listing queue and the alarm", () => {
                 lists: { [M]: [{ rkey: "a", subject: "did:plc:r1" }, { rkey: "b", subject: "did:plc:r1" }] },
                 pageSize: 1,
             })
-            const list = (obj as unknown as { listFollows: (...a: unknown[]) => Promise<unknown> }).listFollows
+            const list = (obj as unknown as { listRecords: (...a: unknown[]) => Promise<unknown> }).listRecords
             let dead = false
-            ;(obj as unknown as Record<string, unknown>).listFollows = (...a: unknown[]) => {
+            ;(obj as unknown as Record<string, unknown>).listRecords = (...a: unknown[]) => {
                 if (net.pages.length >= 1) dead = true
                 return dead ? Promise.reject(new Error("pds down")) : list(...a)
             }

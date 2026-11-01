@@ -1,5 +1,5 @@
 /**
- * Cached DID documents (`spec/proxy-cache.md`, "The model"). The signing key
+ * Cached DID documents (`spec/key-transparency.md`, "The stored DID document"). The signing key
  * and PDS endpoint are read from the cached document instead of a fresh
  * directory fetch.
  */

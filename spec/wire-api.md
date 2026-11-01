@@ -33,7 +33,9 @@ Signature: pmr=:<base64>:
 ```
 
 Ed25519 is a registered algorithm (§3.3.6), so existing key material works
-unchanged. The signature base canonicalization is specified with test
+unchanged. The example shows `ed25519`; the profile below also admits
+`ml-dsa-65` for an ML-DSA-65 key, under the same components and parameters.
+The signature base canonicalization is specified with test
 vectors, so it is not this document's job to define what "exactly what is
 signed" means. Body integrity rides `Content-Digest`
 ([RFC 9530](https://www.rfc-editor.org/rfc/rfc9530.html)) as a signed field
@@ -47,9 +49,12 @@ carrying a server challenge is conformant use.
 - MUST carry a `nonce` parameter holding a challenge the server issued, and
   the server MUST reject a signature whose challenge is unknown, expired,
   or bound to a different realm or destination.
-- MUST use `alg="ed25519"`. A verifier MUST pin the algorithm to what the
-  signer's *known* key type implies and MUST NOT trust the `alg` carried in
-  the message.
+- MUST use the `alg` its key type implies: `ed25519` for an OKP/Ed25519
+  key, `ml-dsa-65` for an AKP/ML-DSA-65 key (see
+  [Key material](#key-material)). A verifier MUST pin the algorithm to what
+  the signer's *known* key type implies, MUST reject a message whose `alg`
+  differs, and MUST NOT trust the `alg` carried in the message. A verifier
+  never accepts two names for one key type.
 - MUST set `keyid` to the
   [RFC 9679](https://www.rfc-editor.org/rfc/rfc9679.html) COSE Key
   Thumbprint of the key that signs — the declared anchor key or a
@@ -217,6 +222,53 @@ every other key on every other surface here is COSE. The record's full
 field inventory belongs to the declaration's own format and is out of
 scope for this document.
 
+#### AKP / ML-DSA-65 signing keys
+
+A request-signing key MAY be an ML-DSA-65 key
+([FIPS 204](https://csrc.nist.gov/pubs/fips/204/final)), expressed as a
+`COSE_Key` of type AKP as defined by
+[RFC 9964](https://www.rfc-editor.org/rfc/rfc9964.html) §3 and §5:
+
+| Label | Name | Value |
+| --- | --- | --- |
+| 1 | `kty` | `7` (AKP) |
+| 3 | `alg` | `-49` (ML-DSA-65) |
+| -1 | `pub` | the ML-DSA-65 public key, a byte string of exactly 1952 bytes |
+
+- `alg` is REQUIRED, and `-49` is the only value accepted: a key labelled
+  ML-DSA-44 or ML-DSA-87 is not valid here.
+- A public key MUST NOT carry `priv` (label -2) (RFC 9964 §3); a relay
+  rejects one that does, so a leaked seed is never stored as a registration.
+  Other labels are ignored, as for OKP keys.
+- The map is encoded per [Deterministic CBOR](#deterministic-cbor), which
+  puts the labels in the order 1, 3, -1: the encoding is
+  `a3 01 07 03 38 30 20 59 07 a0` followed by the 1952 `pub` bytes.
+- The RFC 9679 thumbprint is SHA-256 over the deterministic encoding of
+  exactly `{1: 7, 3: -49, -1: pub}`, the required parameters RFC 9964 §6
+  names, with no other label.
+- The private key is its 32-byte seed (RFC 9964 §4), never an expanded key.
+
+The signature is pure ML-DSA-65 with the **empty context string** and no
+prehash: the message is the signature base, and the signature is the
+3309-byte output. The request's `Signature` field carries it exactly as for
+Ed25519. The `alg` name `ml-dsa-65` is the one
+[draft-skokan-httpbis-message-signatures-ml-dsa](https://panva.github.io/draft-httpbis-message-signatures-ml-dsa/draft-skokan-httpbis-message-signatures-ml-dsa.html)
+§3.2 proposes; this document does not claim it is a registered value.
+[RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html) §3.3 says an `alg`
+chosen with the `alg` parameter MUST come from its registry, so a signer
+that emits `ml-dsa-65` before registration departs from that requirement.
+A verifier that accepts the name stays within the RFC, because the key type
+and this profile, not the message, select the algorithm.
+
+An ML-DSA-65 key is a request-signing key only. The anchor key stays
+Ed25519 — the declaration's key byte `3` is the only one accepted — and the
+grantPut realm is unchanged. A relay that registers owners by key MAY
+require ML-DSA-65 by policy, refusing an Ed25519 key with an explicit 4xx.
+
+Known-answer vectors, produced and checked with OpenSSL alone, are in
+[`vectors/ml-dsa-65.json`](vectors/ml-dsa-65.json); see
+[`vectors/README.md`](vectors/README.md).
+
 Keys persist self-describing, never as fixed-width columns, so a new
 algorithm arrives as a new identifier rather than a schema migration. On
 COSE surfaces that identifier comes from the COSE registry.
@@ -271,7 +323,7 @@ makes fullness self-referential — see below.
 ## Mailboxes, cardinality, and lifecycle
 
 A PMR operates mailboxes — both kinds, always
-([`README.md`](README.md#what-an-atproto-pmr-is)). There is no capability
+([`README.md`](README.md#what-is-an-atproto-pmr)). There is no capability
 list and nothing to declare: a relay serves them or it is not a relay. What
 *does* vary, and what this section is the normative detail for, is how each
 kind is reached, how many of each a user has, and how grant issuance is
@@ -373,14 +425,47 @@ second place for the trusted key to be wrong.
 
 A registration lives while the anchor key stays in the DID's declaration.
 An implementation SHOULD monitor that declaration, and when the declared key
-disappears it SHOULD **pause** rather than tear down: stop accepting
-incoming DID-addressed mail and stop acting on behalf of the DID, continue
-accepting grant-addressed mail, and continue monitoring that one DID's
-declaration to see whether the key returns.
+disappears it SHOULD **pause** rather than tear down: stop acting on behalf
+of the DID and continue monitoring that one DID's declaration to see
+whether the key returns. A paused registration still **queues** all mail it
+is sent — pair, pool and grant alike — so nothing is lost while the key is
+away, and unpausing changes nothing about what it holds.
 
-Per-DID state MUST be keyed by **DID**, never by anchor key, so that key
-replacement does not foreclose either possible future semantics (rebind
-under a fresh challenge, or a fresh registration).
+A registration is **retired** only on a verified observation: the
+declaration, as proven by a monitor (§[Monitoring](#monitoring--a-separate-component-not-a-relay-surface)),
+names a different anchor key, or the record is verifiably absent from a live
+repo. A repo-level state (deactivated, taken down, suspended) and an
+observation the monitor could not verify only pause. A retired registration
+is destroyed with its queued mail; the same anchor key may register again
+later and gets a new registration.
+
+Registrations under different anchor keys are unrelated. Nothing of one
+(queued mail, blocks, grants, any other per-registration state) is visible to
+or carried into another, so a device that registers a new key **MUST**
+re-send its block set to the new registration. Registering a different anchor
+key replaces the prior registration and its mail.
+
+**Deregistration** (`DELETE /pmr/v1/registration`) destroys the registration
+and **tombstones its anchor key**, identified by its RFC 9679 COSE Key
+thumbprint. Mail for the destroyed registration is dropped, and that anchor
+cannot register again. The tombstone covers that one key, not the DID:
+another anchor key of the same DID may still register.
+
+`POST /pmr/v1/registrations` answers `409` once the request verifies when the
+declared anchor key is tombstoned. Terminal: no `Retry-After`; that key is
+never accepted again; register a different anchor key.
+
+`GET /pmr/v1/registration` also returns `st`: `"active"` or `"paused"` (a CBOR
+text string), `"paused"` exactly while the registration is paused.
+
+A relay **MUST** ignore a key it does not recognize in the
+`POST /pmr/v1/registrations` body, so a client can send a newer or
+deployment-specific field to a relay that lacks it. A client therefore MUST
+NOT treat a create-body field as in effect until `GET /pmr/v1/registration`
+reflects it. A field whose absence must be fatal cannot be added to this body:
+it needs a capability in the [enabler document](#the-enabler-document) or a
+new endpoint. The rule covers keys a relay does not recognize, never a
+recognized key with the wrong type, which is a `400`.
 
 ### Grants — the core capability
 
@@ -529,8 +614,8 @@ reveals — whether this relay's monitor observes the sender's declaration —
 the monitor already publishes per DID.
 
 A sender that receives `409` SHOULD retry after `Retry-After` with backoff.
-A `409` that persists beyond the monitor's refresh interval means this
-relay's monitor does not observe the sender's declaration (or the sender's
+A `409` that persists beyond the monitor's coverage lag (a stream gap plus
+its resync) means this relay's monitor does not observe the sender's declaration (or the sender's
 signing is wrong); the sender SHOULD surface that rather than retry forever.
 
 `5xx` is reserved for genuine relay faults — a store the relay cannot reach
@@ -597,9 +682,10 @@ denial-of-service surface on the (sender, recipient) relationship. Closure
 does not depend on anonymous puts — it is preserved by uniform acceptance.
 
 **No open DMs.** A *provisioned* pair mailbox MUST come into being only
-from something the recipient controls — their follow graph, or their
-device's own contact provisioning. An implementation MUST NOT provision a
-pair mailbox on a sender's request. Which recipient-side sources a
+from something the recipient controls — their follow graph, their declared
+messaging policy, or their device's own contact provisioning. An
+implementation MUST NOT provision a pair mailbox on a sender's request, and
+a sender's own declaration never opens one. Which recipient-side sources a
 deployment honors is implementation-defined; that provisioning is
 recipient-side is not. A sender with no provisioned mailbox is not
 refused: see [the recovery pool](#the-recovery-pool).
@@ -611,6 +697,39 @@ state, so the tier reveals nothing a sender could not compute. A tier
 resting on an aggregation means trusting an appview for an authorization
 decision; see
 [`trust-model.md`](trust-model.md#the-clients-fetch-posture).
+
+#### Receive-time admission
+
+A relay that can evaluate its recipient's messaging policy SHOULD judge each
+pair put when it arrives: does the recipient accept this sender? The verdict
+comes from the recipient's declared allow policies, social graph and blocks,
+as for the [can-message verdict](#can-message-verdict) with the put's signed
+sender as sender and the recipient as recipient. A sender the device
+provisioned is not judged by policy, only by blocks. Otherwise a put the
+policy admits is delivered as to a provisioned mailbox, and one it refuses or
+cannot yet decide goes to the [recovery pool](#the-recovery-pool) with the
+verdict's reasons, for the device to judge. A put from a sender the
+recipient blocks is handled as from a [blocked sender](#blocked-senders).
+
+Admission is per put: an admitted sender is judged again on its next put
+until the device provisions it, and mail already accepted is not re-judged
+when the recipient's graph later changes, except that a Bsky block clears it.
+On a yes, the sender's pooled entries move into the mailbox, oldest first, as
+far as capacity allows; the rest stay pooled. An admitted put is delivered even
+while the device's discard of that sender is live. The verdict never changes
+the response vocabulary: every outcome is a `202` or the `429` of a full
+mailbox. A relay that cannot read a verdict in time treats it as undecided; it
+MUST NOT answer `5xx` for that. Grant puts name no sender and are never
+adjudicated.
+
+A relay MUST NOT admit senders under a policy that admits strangers (such as
+`open`) until it bounds what an admitted sender can cost the recipient —
+mailbox depth and push wakes — as the recovery pool does. A put that only
+such a policy admits is pooled as `unknown`. A relay's own reasons for an
+undecided put include `admission-unavailable` (no verdict was readable in
+time), `recipient-not-held` (the relay holds no declaration for the
+recipient) and `policy-not-enabled` (the put is admitted only by a policy the
+relay does not yet honour).
 
 ### The grant-put payload
 
@@ -803,7 +922,7 @@ block may notice the transition from real to synthetic.
 
 | method | path | notes |
 |---|---|---|
-| `GET` | `/pmr/v1/blocks` | list blocked sender DIDs |
+| `GET` | `/pmr/v1/blocks` | blocked sender DIDs in `b`; those the relay mirrored from Bsky also in `bs` |
 | `PUT` | `/pmr/v1/blocks/{did}` | block |
 | `DELETE` | `/pmr/v1/blocks/{did}` | unblock; reversible by construction |
 
@@ -821,6 +940,30 @@ that peer, because only the device knows which addresses those are. A
 relay implementer should not attempt to synthesize the second half;
 inventing it would require exactly the sender-to-address mapping grants
 exist to prevent.
+
+**Bsky blocks.** A relay that indexes its recipient's Bsky blocks MUST treat
+a sender the recipient blocks on Bsky as blocked: it clears the sender's
+queued and pooled messages and handles later puts on the synthetic path. It
+applies a block it sees at accept immediately, and one made since no later
+than the next catch-up (socket drain, first page of the message catch-up,
+pool listing). A relay MUST NOT lift a block because it no longer sees the
+Bsky block, or because a verdict admits the sender: neither proves the recipient unblocked.
+Only a device unblock lifts a block, whoever set it. A device block takes a
+mirrored one over, and a device unblock holds only until the relay next sees
+the Bsky block, at the sender's next put or the catch-up after it (a put the
+verdict does not block leaves a pool entry or an admitted mailbox, which the
+next sync re-blocks). `bs` can therefore hold senders the recipient has
+since unblocked on Bsky; the device compares `bs` with its own
+`app.bsky.graph.block` records (the summary's block list is a hint of the
+same kind) and lifts a stale entry with `DELETE /pmr/v1/blocks/{did}`.
+`GET /pmr/v1/blocks` lists all
+blocked senders in `b` and those the relay has mirrored from Bsky in `bs`
+(the summary's block list is the owner's full list); a client
+republishing its block list to a new relay publishes only its own. The first
+put after a Bsky block may take measurably longer while the relay clears
+state; the block record is public, so this reveals nothing the sender cannot
+read. Messages delivered or pushed before the relay saw the block are not
+recalled; the device removes them using the summary's block list.
 
 Blocks do not need to migrate when a user changes relays. The client holds
 the block list durably and publishes it to a new relay as part of bringing
@@ -865,12 +1008,17 @@ Instead the pool is **adjudicated in batch** by the device:
 
 | method | path | notes |
 |---|---|---|
-| `GET` | `/pmr/v1/pool` | list the DIDs holding pool entries — **DIDs only, never bodies** |
+| `GET` | `/pmr/v1/pool` | list the DIDs holding pool entries — **DIDs only, never bodies** — each with `v` and `r` when the relay judged it |
 | `POST` | `/pmr/v1/pool/adjudication` | provision-or-discard per DID; bodies are delivered for the provisioned and dropped for the rest |
 
-The server pooled these senders because it could not evaluate them, so it
-offers the device the only judgement that exists — provision these,
-discard those — and acts on the answer. "No open DMs" becomes a protocol
+The server pooled these senders because it could not admit them — the
+recipient's policy refused them, or it could not decide yet — or, without
+receive-time admission, could not evaluate them. Each listing entry carries
+`v` (`no` | `unknown`) and `r` (reason codes) from the sender's latest pooled
+put when the relay judged it, so the device need not recompute the reason.
+The device's own contacts are not visible to the relay, so the device keeps
+the final say: it offers the only judgement that remains — provision these,
+discard those — and the server acts on the answer. "No open DMs" becomes a protocol
 step rather than an unstated client-side filter, and the pool becomes
 self-clearing, its size governed by the adjudication cycle rather than by
 an eviction policy.
@@ -890,7 +1038,9 @@ independently rate-limitable.
 
 **Discard is time-bounded** — neither one-shot nor standing. While a
 sender's discard window is live, arriving puts from that sender are
-dropped without pooling; once it lapses, the sender pools normally again.
+dropped without pooling, unless
+[receive-time admission](#receive-time-admission) admits the put; once it
+lapses, the sender pools normally again.
 One-shot would make adjudication a treadmill (an attacker re-sends
 immediately and the same DIDs reappear next round); standing would be a
 block in all but name, drawing a permanent consequence from a judgement
@@ -902,10 +1052,9 @@ to being pooled and later discarded, so the sender cannot distinguish
 suppression from ordinary pooling.
 
 This is safe to drain because the device verifies senders itself: the
-relay cannot evaluate admission for a sender it does not know, but an
-attacker flooding the pool cannot impersonate a permitted DID, so the
-client's filter rests on cryptography rather than a relay decision that
-was never made.
+relay's verdict is a hint, since it cannot see the device's own contacts, and
+an attacker flooding the pool cannot impersonate a permitted DID, so the
+client's filter rests on cryptography rather than a relay decision.
 
 Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 
@@ -921,11 +1070,19 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
 
-`GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for
-known pair-mailbox generations, including mailboxes with no queued messages.
-Clients use these descriptors to detect replacement generations during
-catch-up. A proof read returns CBOR `{sd, dc, g, car}` and is scoped to the
-authenticated owner; an unknown or superseded CID returns 404.
+Devices need not recompute admission; it is routing advice, not authority
+([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
+mailbox is from a sender the device provisioned or one the relay admitted
+under the recipient's policy at that put or a later one; the pool lists only
+senders the relay refused or could not decide, with `v` and `r`. A Bsky-blocked
+sender's mail stops appearing in catch-up once the relay has seen the block,
+and earlier deliveries are cleared on the device using the summary's block list.
+
+`GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for known
+pair-mailbox generations, including mailboxes with no queued messages. Clients
+use these descriptors to detect replacement generations during catch-up. A
+proof read returns CBOR `{sd, dc, g, car}` and is scoped to the authenticated
+owner; an unknown or superseded CID returns 404.
 
 A pair-mailbox delivery carries the relay's **evidence locator**: `sd`, the
 sender DID, `dc`, the selected declaration record CID, and `g`, the opaque
@@ -946,6 +1103,12 @@ of `01 71 12 20 ‖ <32-byte SHA-256 of the record block>` (so it begins
 pair deliveries. Legacy rows may omit `g`; grant deliveries omit all three.
 The same fields appear in `#delivery`, a `GET /pmr/v1/messages` entry, and a
 full-form push.
+
+A client MUST ignore a key it does not recognize in a delivered entry: in
+`#delivery`, in a `GET /pmr/v1/messages` entry, and in a push's sealed
+payload. This lets a deployment add fields of its own, which this
+specification does not define. A device never lets such a field stand in for
+its own verification of `m`.
 
 #### Catch-up cursor
 
@@ -1116,36 +1279,41 @@ likewise: it parses and verifies the CAR it takes from the monitor, rather than 
 path through the commit's tree), and does not take the declaration from the
 sender's PDS.
 
-### Device reads — records, graph, and summary
+### Device reads — records and summary
 
 A relay bound to a monitor answers its devices' reads of atproto state from
-the monitor's verified cache ([`proxy-cache.md`](proxy-cache.md)), so a
+the monitor's verified cache ([`key-transparency.md`](key-transparency.md#serving-held-snapshots-and-documents-to-devices)), so a
 device normally reaches its contacts' records without reaching their PDSes.
-Three routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
+Four routes; each answers `no-store`, and every body is [deterministic CBOR](#deterministic-cbor)
 with the short keys below. A decoder MUST ignore keys it does not know.
 
 | method | path | auth | answers |
 |---|---|---|---|
 | `GET` | `/pmr/v1/records/{did}/{collection}/{rkey}` | none | one record's proof CAR |
-| `GET` | `/pmr/v1/graph/{did}` | none | a served DID's follow graph |
-| `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's graph and its contacts' records, as a delta |
+| `GET` | `/pmr/v1/can-message/{sender}/{recipient}` | none | whether the sender may message the recipient, [below](#can-message-verdict) |
+| `GET` | `/pmr/v1/did/{did}` | none | a DID document and its PLC log, [below](#did-documents) |
+| `GET` | `/pmr/v1/summary?since=<token>` | owner ([anchor realm](#request-authentication)) | the owner's contacts' records and own blocks, as a delta |
 
 Nothing here is evidence. Records are CAR ([above](#records-are-car-wherever-they-are-relayed)):
-a device verifies each against the DID's signing key itself, and treats the
-graph as a hint it checks against the follower's signed follow record.
+a device verifies each against the DID's signing key itself. No route serves
+a follow graph: the summary chooses its contacts from the owner's graph on the
+relay, and a device reads only the results.
 
 #### Records
 
 `200` whether or not a record is found, `400` for a malformed path. Found:
 `f`=true, `c` the CAR byte for byte as held, `r` the commit's `rev`, `i` the
-record's CID, `t` when the relay last confirmed the snapshot current (ms). Not
+record's CID, `t` the snapshot's last direct fetch (ms). It is not the
+snapshot's freshness: that is the later of the monitor's
+[coverage watermark](key-transparency.md#the-coverage-watermarks) and the last
+direct fetch, and a device reads the watermark from the summary's `w`. Not
 found: `f`=false, `e` a code, `m` a reason. `rev` and `i` are hints a device
 re-derives from the CAR.
 
 | code | meaning |
 |---|---|
-| `not-watched` | the relay does not serve that DID or does not snapshot that collection and rkey |
-| `not-held` | nothing is held for the DID |
+| `not-watched` | the relay does not serve that DID or does not snapshot that collection and rkey, or the collection is `app.bsky.graph.block` and the DID is not registered with the relay ([below](#block-records)) |
+| `not-held` | nothing is held for the DID, or for that rkey |
 | `unverifiable` | a snapshot is held but is not served (below) |
 
 A relay serves a snapshot only if ingest verified it against the DID
@@ -1165,42 +1333,126 @@ DID's records stay `unverifiable` until its repo's next commit. A client that
 rotates its `#atproto` key SHOULD rewrite its declaration afterwards. A
 restart of the monitor's PLC stream without a usable cursor resets its
 continuous coverage, which leaves `did:plc` snapshots `unverifiable` until
-they are confirmed again. A declaration that fails this check requests no
-re-check.
+the monitor's resync confirms them again. A declaration that fails this check
+does not move the resync forward.
 
-The response never waits on the PDS. A declaration past 24 hours is served as
-held and queued for the monitor to re-check ([`proxy-cache.md`](proxy-cache.md#reads-and-the-24-hour-rule)).
-The residual leak is that re-check: the PDS learns someone is interested in
+##### Block records
+
+`app.bsky.graph.block` records are served by rkey, and only for a DID
+**registered** with the relay: it is that owner's own record, a CAR from the
+owner's repo signed under the owner's key, which a device verifies like any
+other record and checks names the blocked DID as its `subject`. The same route
+answers `not-watched` for any other DID, so a relay never serves one DID's
+blocks to learn about another. The summary's `b` list names the rkeys.
+
+The relay serves **presence only**, and is never the authority for absence. An
+rkey with no held proof reads `not-held`, whether the block was lifted, never
+existed or has not been fetched yet. A newly registered owner's blocks arrive
+over time, so an unheld rkey is not evidence of anything. A device MUST treat
+any answer other than a verified record as unverifiable, and confirm a lifted
+block with the owner's own PDS.
+
+Held blocks follow the owner's block commits and are reconciled against the
+owner's listing, so a block deleted while the relay missed the event stays
+served until that owner's next listing. After an `#atproto` key rotation the
+held proofs read `unverifiable` until each block record changes or the owner
+is listed again. Deregistering an owner removes their held blocks.
+
+The response never waits on the PDS. A declaration whose freshness is past 24 hours is served as
+held and moved forward in the monitor's resync ([`key-transparency.md`](key-transparency.md#reads-and-the-24-hour-rule)).
+The residual leak is that read: the PDS learns someone is interested in
 that DID.
 
-#### Graph
+#### Can-message verdict
 
-`200` with `d` the DID, `o` its `following` and `n` its `followers`, each an
-array of edges `{d: the other party, k: the follow record's rkey, u: mutual}`,
-sorted by `d` then `k`. `404` when the relay holds no projection for the DID,
-`400` for a malformed path. Edges are restricted to DIDs that carry a Germ
-declaration. The `404`/`200` split reveals which DIDs the relay serves a graph
-for; that set is not secret.
+`GET /pmr/v1/can-message/{sender}/{recipient}` answers one pair: may `sender`
+open a conversation with `recipient`? It is a hint; the recipient's device
+enforces its own policy on first contact. It serves a verdict, never a follow
+or block list.
+
+`200` with a CBOR map, `400` for a malformed path or DID, and one `404` when
+the relay holds no declaration snapshot for the recipient. The `404` is the
+same for a recipient the deployment does not serve and a served recipient
+with no snapshot yet, since neither is distinguishable from a declaration not
+yet fetched. It is a single not-found case, not a secrecy measure; a verdict
+at all shows the recipient's declaration is held.
+
+| key | field | value |
+|---|---|---|
+| `v` | verdict | `"yes"`, `"no"` or `"unknown"` |
+| `a` | via | `yes` only: every allow policy that admits the sender |
+| `p` | pending | `unknown` only: policies that could admit the sender but whose data is incomplete |
+| `r` | why | `no` and `unknown`: reason codes |
+
+Policy and reason codes are open strings; a decoder MUST keep codes it does
+not know. Reasons for `no`: `no-declaration`, `blocked`, `not-admitted`. For
+`unknown`: `declaration-unavailable`, `policy-undecodable`,
+`policy-unrecognized`, `graph-incomplete`, `block-unknown`,
+`policy-not-enabled`.
+
+The recipient's policies are the signed `AnchorPolicy` in the declaration's
+`keyPackage`: `closed` declares none, `follows` is `bsky-follows` (the
+recipient follows the sender on `app.bsky.graph`), `open` is `open`; any other
+byte is a policy this relay reports as `policy-unrecognized`. The relay reads
+the byte without checking the keyPackage's signatures. `messageMe.showButtonTo`
+is a UI hint for other apps and is not read. A graph fact is `no` only when
+the recipient's graph is served, so its edges are complete; otherwise it is
+unknown.
+
+Evaluated in order:
+
+1. Declaration missing (only for a caller whose policy source reports it;
+   the route answers `404` instead): `no [no-declaration]`; snapshot unavailable:
+   `unknown [declaration-unavailable]`; policy unreadable:
+   `unknown [policy-undecodable]`.
+2. The recipient blocks the sender: `no [blocked]`, under every policy. Many
+   social graphs, one block graph.
+3. Each declared policy admits (`open`; `bsky-follows` when followed),
+   refuses (`bsky-follows` when known not followed), or is pending
+   (`bsky-follows` with the follow unknown, `graph-incomplete`; any other
+   policy, `policy-unrecognized`).
+4. Block known absent: any admitting policy gives `yes`, listing all of them
+   in declared order, except that a relay admits only through `bsky-follows`
+   for now (see below). Otherwise any pending gives `unknown`; else
+   `no [not-admitted]`, which includes a declaration with no policies.
+5. Block unknown: admitting and pending policies together give `unknown`
+   with `block-unknown` first among the reasons; if there are none,
+   `no [not-admitted]`.
+
+A relay does not yet admit strangers, so a verdict that only `open` admits is
+`unknown [policy-not-enabled]` with `a` absent and the admitting and pending
+policies listed as pending, on this route, in the owner's summary and at
+receive-time admission alike. A policy a relay can evaluate but does not yet
+honour would read the same way. A client treats it as it treats any `unknown`:
+the recipient's device decides on first contact.
 
 #### Summary
 
-An owner reads the records of everyone in their graph with one request. A
+An owner reads the records of themselves and their contacts with one
+request. Contacts are the declaration holders among the accounts they follow
+and their followers, mutuals first. A
 response is a delta against a state the client names by **token**:
 
 | key | field |
 |---|---|
 | `t` | `token`: name this on the next read |
-| `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` is empty |
-| `g` | `graph`: the owner's graph, absent (null) if unchanged |
+| `f` | `full`: the named token was missing or no longer held; the client replaces everything it holds, and `x` and `y` are empty |
+| `b` | `ownBlocks`: the owner's own block list, each `{d: blocked DID, k: rkey of the block record}`, sent whole when it changed and absent (null) when unchanged; a client that reads no `b` keeps the list it holds |
 | `r` | `records`: added or changed records, each `{d, c: collection, k: rkey, i: cid, v: verifying key, b: CAR}` |
 | `x` | `removed`: `{d, c, k}` no longer in the summary, including any no longer servable |
+| `c` | `verdicts`: the owner's can-message verdict for each contact whose verdict or mutual bit is new or changed, each `{d: contact DID, v: verdict, u: mutual}` with `v` encoded as in the [can-message verdict](#can-message-verdict); the owner is the sender and the contact the recipient. `u` is a boolean, always present: true when the owner follows the contact and the contact follows the owner, as the relay's graph holds it. The owner has no `c` entry |
+| `y` | `droppedVerdicts`: DIDs that had a verdict in the named state and have none now |
 | `m` | `more`: changes remain; read again at once naming this token |
-| `n` | `truncated`: the graph has more contacts than a summary covers |
+| `n` | `truncated`: the owner has more contacts than a summary covers |
+| `w` | `coveredThrough`: the relay's monitor coverage, in ms, or null |
+| `l` | `lagging`: the summary's contacts whose coverage is not current, sorted DIDs, possibly empty |
 
 A read with no `since`, or one naming an unknown or dropped token, gets the
 whole summary as `full`. A relay keeps the last four states it served an
 owner, so a second device or a lost response never leaves a client wrong.
-`409` with `Retry-After` while the owner has no projection yet.
+`409` with `Retry-After` while the owner's graph is not yet served, and
+`503` with `Retry-After` when the relay cannot read their graph, blocks or contacts' graph facts; neither changes the states the relay holds, so a retry names
+the same token.
 
 One response carries at most a page of records. When `m` is true the client
 reads again naming the response's token and continues from what that response
@@ -1214,9 +1466,109 @@ by a cap that scales inversely with the number of watched collections; a
 contact pushed past the cap arrives in `x` though its records still exist, and
 costs full CARs when it returns.
 
+A client that has never held a `b` list (a build from before it, or a token
+the relay stored for one) MUST read without `since` when it first reads `b`, and
+drop its held tokens: a relay that stored a state for it counts the list as
+delivered, so naming that token would report the list as unchanged.
+
+A client that has never held a `c` list (a build from before it, or a token
+the relay stored for one) MUST read without `since` when it first reads `c`, and
+drop its held tokens, for the same reason.
+
+A client that has never held `u` (a build from before it, or a token the relay
+stored for one) MUST read without `since` when it first reads `u`, and drop its
+held tokens, for the same reason: a relay that stored a state for it counts the
+mutual bits as delivered. A client reading a `c` entry with no `u`, from a
+relay that predates it, holds the contact as not mutual.
+
+`w` and `l` tell the client how current what it holds is. `w` is the earlier of
+the monitor's [firehose coverage](key-transparency.md#the-firehose-coverage-rule)
+and its PLC coverage run's covered-through time, so a contact's records are
+current through `w` unless the contact is in `l`; it is null when either is
+missing, null or (for the firehose) over the lagging cap, which is no coverage.
+`l` lists, sorted, only DIDs that are among the contacts this summary covers
+(after truncation) and are on the monitor's lagging list, so it never names a
+DID outside the owner's contacts; it is empty when none lags. Both appear on every `200`,
+including a read that finds nothing changed and every page of a multi-page
+response. They describe the response and are not part of a stored state, so a
+token never depends on them and a client that predates them ignores them.
+`409` and `503` stay bodyless. The relay reads coverage **before** it reads the
+owner's graph or any record, so everything the response serves is at least as
+new as `w` says.
+
+A client adopts `w` and `l` from a response with `m` false, the last page. It
+treats a contact as **current** when `now − w` is within ten minutes, the
+contact is not in `l`, was not delivered in `x` (a contact in `x` is evicted),
+and is not a `did:web` DID, which no stream covers. For a current contact it
+sends without reading. For one that is not, it makes one summary read naming
+its token, then decides again; a contact that is still in `l`, or is `did:web`,
+is read with the [single-DID read](#records) before it is trusted. A `w` is a
+stream event time compared on the client's clock, under the clock assumption of
+[the firehose coverage rule](key-transparency.md#the-firehose-coverage-rule).
+A rotated record is not served and arrives in `x`, so the client does not take
+its absence from `r` as currency.
+
+A verdict covers a contact only while the contact is covered and the relay
+holds a servable declaration for it; a contact with none has no verdict, and that is not a `no`: a client
+treats a DID in `y`, or one never listed in `c`, as unanswered. A declaration
+the relay stored before it kept policies reads `unknown [declaration-unavailable]`
+here until the account's next repo commit rewrites it. Verdicts are small, so
+every verdict changed since the named state arrives in that response, whatever
+`m` says about records; a later page carries only verdicts that changed after
+it. A change to verdicts or mutual bits alone issues a new token. A mutual bit travels only on a
+`c` entry: a contact with no verdict is not listed when its mutual bit changes.
+
+The block list is the owner's own: it appears only here, as a list (no
+device reads another DID's block list, and serving them would cost),
+and is diffed independently of the records, so a change to blocks alone
+issues a new token. Each entry names the block record's
+rkey in the owner's repo, so a device can verify it against the signed record
+before relying on it; a block is a hint until then. A relay serves the
+owner's own block record by that rkey on the [record route](#block-records).
+These are
+the owner's `app.bsky.graph.block` records, unrelated to the relay's
+[blocked senders](#blocked-senders).
+
 A summary includes a record only if the relay holds it, ingest verified it and
 it passes the same trusted-current-key check as a record read, with the same
 exemption for `did:web`. A record that stops passing is reported in `x`.
+
+##### Summary test vector
+
+A complete non-full response with two `c` entries, a mutual `yes` and a
+non-mutual `no`, coverage `w` at 1700000000000 ms with `did:plc:b` lagging, and
+everything else empty or null. Keys are sorted as in
+[deterministic CBOR](#deterministic-cbor) (RFC 8949 §4.2.1): in the response
+`b c f l m n r t w x y`, in an entry `d u v`.
+
+```
+{
+  "b": null,
+  "c": [
+    {"d": "did:plc:a", "u": true,  "v": {"a": ["bsky-follows"], "v": "yes"}},
+    {"d": "did:plc:b", "u": false, "v": {"r": ["not-admitted"], "v": "no"}}
+  ],
+  "f": false, "l": ["did:plc:b"], "m": false, "n": false,
+  "r": [], "t": "abc", "w": 1700000000000, "x": [], "y": []
+}
+```
+
+```
+ab 6162 f6
+   6163 82
+      a3 6164 69 6469643a706c633a61  6175 f5
+         6176 a2 6161 81 6c 62736b792d666f6c6c6f7773  6176 63 796573
+      a3 6164 69 6469643a706c633a62  6175 f4
+         6176 a2 6172 81 6c 6e6f742d61646d6974746564  6176 62 6e6f
+   6166 f4
+   616c 81 69 6469643a706c633a62
+   616d f4  616e f4
+   6172 80  6174 63 616263
+   6177 1b 0000018bcfe56800
+   6178 80  6179 80
+```
+
+Whitespace in the hex is for reading; the body is the bytes concatenated.
 
 #### DID documents
 
@@ -1244,7 +1596,8 @@ A device verifies a log as the [did:plc specification](https://web.plc.directory
 (a legacy `create` genesis is hashed and verified in its own format); every
 entry's CID is the SHA-256 CID of its operation as served; each live operation's
 `prev` is the CID of the live operation before it, and its signature verifies
-under one of that operation's `rotationKeys` (low-S, canonical base64url, over
+under one of the `rotationKeys` of the operation `prev` names, or of its own
+for the genesis (low-S, canonical base64url, over
 the DAG-CBOR of the operation without `sig`); a `plc_tombstone` ends the log. The
 document the last live operation renders is the DID's document. The did:plc
 specification does not say how a legacy `create` converts to a regular operation;
@@ -1300,29 +1653,18 @@ woken consumer achieves the same coverage at a latency floor of its wake
 cadence. Either way it is a different workload from answering requests,
 which is the practical reason the two separate cleanly.
 
-Its surface — registration and the own-DID push, domain deltas, the
+Its surface — registration and the own-DID push, the
 unauthenticated change digest, and the community-view record fetch — is
 specified in [`key-transparency.md`](key-transparency.md).
 
 ### Observation
 
-| method | path | notes |
-|---|---|---|
-| `GET` | `/pmr/v1/observations` | list DIDs under observation |
-| `PUT` | `/pmr/v1/observations/{did}` | declare interest |
-| `DELETE` | `/pmr/v1/observations/{did}` | drop interest |
-| `GET` | `/pmr/v1/observations/{did}/record` | latest record as CAR, with its `rev` |
-
-Everything beyond the declaration: profiles, the follow graph, appview
-reads. How updates reach a client — a frame on the events socket, or a
-surface of its own — is part of this deferred design, not defined here.
-
-Unlike key monitoring, observation wants breadth and permissioned
-access rather than independence, so it is served once and sits well at a
-deployment holding the user's data — including their PDS.
-
-**Deferred.** The endpoints above are a sketch, not a specified surface;
-nothing here is normative yet.
+How a client learns that a contact's declaration changed is the
+[owner summary](#summary): its delta reports changed and removed records, and
+its `w` and `l` report whether what the client holds is current. There is no
+separate observation surface, and the events socket carries no summary frame.
+Everything beyond the declaration (profiles, the follow graph, appview reads)
+is served by the user's own deployment and is not defined here.
 
 ### Push delivery — Web Push (optional)
 
@@ -1653,6 +1995,9 @@ Three populations, and what each may learn is a security property:
 | peer, pair put | `202`; `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
+An owner `409` on summary is transient, with `Retry-After`; on registration
+create it is terminal, without one.
+
 The dividing line is authorization and what per-sender reservation makes
 self-referential: an owner gets diagnosis, an authenticated sender learns
 only their own quota state, an anonymous sender gets acknowledgement. A
@@ -1743,7 +2088,8 @@ pool sizing is recipient-side state, so no refusal may turn on it.
   currently in use.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
-  CBOR schemas for registration, grant issuance, ack batches, pool
+  CBOR schemas for registration (beyond the ignore-unknown-keys rule),
+  grant issuance, ack batches, pool
   adjudication, and the enabler document are not fixed here. The
   encoding rules that govern them — deterministic CBOR, `COSE_Key`, tag-1
   integer timestamps — are.

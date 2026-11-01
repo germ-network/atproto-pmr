@@ -1,15 +1,17 @@
 /**
- * Follow listings: how the edge index learns a DID's follows in full, where
- * the live stream only carries changes.
+ * Listings: how the edge index learns a DID's follows and blocks in full,
+ * where the live stream only carries changes.
  *
  * - An **owner listing** reads a graph owner's whole repo
  *   (`com.atproto.sync.getRepo`), verified once under its signing key, and
- *   keeps every follow. A repo past the walk's byte, node or record caps, or
- *   one that keeps timing out, is listed instead by the **paged owner
- *   listing**: `listRecords` pages, every follow kept, unverified.
+ *   keeps every follow and block. A repo past the walk's byte, node or
+ *   record caps (either collection's), or one that keeps timing out, is
+ *   listed instead by the **paged owner listing**: `listRecords` pages,
+ *   follows then blocks, all kept, unverified.
  * - A **mutual listing** pages `com.atproto.repo.listRecords` for a DID in
- *   interest that owns no graph, and keeps only follows of registered DIDs:
- *   hints that a registered user's followee follows them back.
+ *   interest that owns no graph, follows then blocks, and keeps only those
+ *   naming registered DIDs: hints that a registered user's followee follows
+ *   or blocks them.
  *
  * Which kind runs is decided each time a listing runs, from the DID's
  * standing then. Every listing takes a fresh generation from the single
@@ -30,13 +32,16 @@ import {
     FetchTimeoutError,
     RecordNotFoundError,
     RepoCollectionError,
-    type RepoCollectionExpectation,
+    type CollectionRecord,
+    type RepoCollectionsExpectation,
     type VerifiedCollection,
+    type VerifiedCollections,
 } from "@germ-network/atproto-pmr-core"
-import { FOLLOW_COLLECTION_NSID } from "./follow-stream"
+import { BLOCK_COLLECTION_NSID, FOLLOW_COLLECTION_NSID, type EdgeCollection } from "./follow-stream"
 import { recordWatchedDocument, type FetchedDidDocument } from "./ingest"
 import {
     D1_ROWS_PER_STATEMENT,
+    type BlockEdgeWriter,
     type DidDocumentSink,
     type FollowEdgeWriter,
     type InterestIndex,
@@ -69,10 +74,13 @@ export interface ListingProgress {
     gen: number
     phase: "fetch" | "drain"
     /**
-     * `fetch`: the last rkey of the last raw `listRecords` page read (null
-     * before the first). `drain`: the last staged rkey written (null before
-     * the first chunk).
+     * `fetch`: the collection being paged (follows first, then blocks) and
+     * the last rkey of the last raw page read in it (null before its first).
+     * `drain`: the collection and rkey of the last staged row written (a
+     * null cursor before the first chunk); staged rows drain in
+     * `(collection, rkey)` order.
      */
+    collection: EdgeCollection
     cursor: string | null
     /** The PDS a `listRecords` listing resolved once at its start; null for getRepo. */
     pds: string | null
@@ -123,7 +131,8 @@ export interface StartedListing {
  * Why a DID is queued. A listing already in progress is left alone by
  * `join`, `stale` and `upgrade`. `ownership` keeps it running but stamps its
  * queue row past its begin (forward-only, `MAX(now, began + 1, queued_at +
- * 1)`), so its completion keeps the row and the kind is decided again.
+ * 1)`), so its completion keeps the row and the kind is decided again;
+ * `lost-frame` does the same, so a fresh listing follows the running one.
  * `sync`, `gap` and `registration` restart it (progress and staging cleared,
  * a fresh forward-only stamp), since what it already read may predate the
  * cause. No reason resets `attempts` or `not_before` of a row already
@@ -146,6 +155,12 @@ export type ListingQueueReason =
     | "gap"
     /** A followee of a newly served owner: its mutual filter now keeps more. */
     | "registration"
+    /**
+     * A follow-stream frame by the DID threw, so an edge op may be lost. A
+     * running listing keeps its progress and failure counts, so a DID whose
+     * frames keep throwing is not restarted each time.
+     */
+    | "lost-frame"
 
 /**
  * The single writer's listing queue, staging table and per-DID listing
@@ -193,28 +208,34 @@ export interface ListingIndex {
     resumeListing(did: string, gen: number, notBeforeMs: number): Promise<boolean>
     /**
      * Append fetched rows to the DID's staging and reset the attempts.
-     * Clears the provisional `notBeforeMs`. `fetchCursor` is the raw page's
-     * last rkey; a `listRecords` listing's `pages` goes up by one per call.
+     * Clears the provisional `notBeforeMs`. `fetch` is where the next page
+     * starts: the raw page's last rkey, or a new collection at a null cursor;
+     * a `listRecords` listing's `pages` goes up by one per call, and restarts
+     * at 0 when the collection changes.
      * `done` moves the listing to `drain` (getRepo always passes true).
      */
     stageRows(
         did: string,
         gen: number,
-        rows: readonly FollowRecord[],
-        fetchCursor: string | null,
+        rows: readonly StagedRow[],
+        fetch: { collection: EdgeCollection; cursor: string | null },
         done: boolean
     ): Promise<boolean>
-    /** Up to `limit` staged rows of `did` after rkey `after`, in rkey order. */
-    stagedRows(did: string, after: string | null, limit: number): Promise<FollowRecord[]>
+    /** Up to `limit` staged rows of `did` after `after`, in `(collection, rkey)` order. */
+    stagedRows(
+        did: string,
+        after: { collection: EdgeCollection; rkey: string } | null,
+        limit: number
+    ): Promise<StagedRow[]>
     /**
-     * After a chunk's batch committed: store the last staged rkey written,
-     * reset the attempts, clear the provisional `notBeforeMs` and queue the chunk's subjects for re-count, in one
-     * step.
+     * After a chunk's batch committed: store the last staged row written,
+     * reset the attempts, clear the provisional `notBeforeMs` and queue the
+     * chunk's follow subjects for re-count, in one step.
      */
     saveDrainProgress(
         did: string,
         gen: number,
-        cursor: string,
+        cursor: { collection: EdgeCollection; rkey: string },
         subjects: readonly string[]
     ): Promise<boolean>
     /**
@@ -230,13 +251,13 @@ export interface ListingIndex {
      * - stamp `listed_at`. For an owner kind, stamp `owner_listed_at` only if
      *   the DID owns a graph in this same step; that stamp is what makes the
      *   graph served (its mirror standing's `owner` needs both ownership and
-     *   the stamp, so the next mirror writes `served-add`). A mutual
+     *   the stamp, so the next mirror adds it to `graph_owners`). A mutual
      *   completion clears it;
      * - on an owner's first completion (no `owner_listed_at` before) by a
-     *   registered DID, queue `registration` re-lists for the staged
-     *   subjects that are in interest and own no graph (an owner listing
-     *   keeps every follow already, and only a registered DID widens a
-     *   mutual filter);
+     *   registered DID, queue `registration` re-lists for the staged follow
+     *   subjects (not block subjects) that are in interest and own no graph
+     *   (an owner listing keeps every follow already, and only a registered
+     *   DID widens a mutual filter);
      * - clear the progress and staging;
      * - queue `subjects` (the sweep's) for re-count.
      */
@@ -304,13 +325,18 @@ export interface ResolvedPds {
     didDocument: FetchedDidDocument
 }
 
-/** One follow record from a `listRecords` page. */
+/** One follow or block record from a `listRecords` page. */
 export interface FollowRecord {
     rkey: string
     subject: string
 }
 
-/** One raw `listRecords` page: the follows kept and where the next page starts. */
+/** A record staged for a listing's drain. */
+export interface StagedRow extends FollowRecord {
+    collection: EdgeCollection
+}
+
+/** One raw `listRecords` page: the records kept and where the next page starts. */
 export interface FollowPage {
     records: FollowRecord[]
     /**
@@ -329,18 +355,24 @@ export interface FollowBackfillDeps {
     /** Where a listing's fetched document goes; unset, none is kept. */
     didDocuments?: DidDocumentSink
     edges: FollowEdgeWriter
+    blocks: BlockEdgeWriter
     /** The alarm's shared budget; listings take at most `statementReserve` of it. */
     budget: StatementBudget
     fetchRepo(did: string): Promise<FetchedRepo>
-    /** Core `verifyRepoCollection`; a seam so tests can stand in placeholder CARs. */
+    /** Core `verifyRepoCollections`; a seam so tests can stand in placeholder CARs. */
     verifyRepo(
         car: AsyncIterable<Uint8Array>,
-        expected: RepoCollectionExpectation
-    ): Promise<VerifiedCollection>
+        expected: RepoCollectionsExpectation
+    ): Promise<VerifiedCollections>
     /** The DID's PDS from a fresh document; called once per `listRecords` listing. */
     resolvePds(did: string): Promise<ResolvedPds>
-    /** One `listRecords` page of `did`'s follows at `pds`, ascending, after rkey `cursor`. */
-    listFollows(pds: string, did: string, cursor: string | null): Promise<FollowPage>
+    /** One `listRecords` page of `did`'s `collection` at `pds`, ascending, after rkey `cursor`. */
+    listRecords(
+        pds: string,
+        did: string,
+        collection: EdgeCollection,
+        cursor: string | null
+    ): Promise<FollowPage>
     nowMs(): number
 }
 
@@ -366,6 +398,11 @@ export interface FollowBackfillConfig {
      * stops and keeps what it has.
      */
     maxFollows: number
+    /**
+     * Block records the verifying walk holds before it refuses, switching the
+     * owner to pages (`MAX_BLOCKS`); also the mutual listing's block cap.
+     */
+    maxBlocks: number
     /** CAR bytes past which an owner is listed by pages, not getRepo (`FOLLOW_MAX_REPO_BYTES`). */
     maxRepoBytes: number
     maxMstNodes: number
@@ -404,14 +441,14 @@ export type ListingOutcome =
     /** Its progress was restarted or cleared while the step ran; nothing published. */
     | "superseded"
 
-const PUT_STATEMENTS_PER_CHUNK = 4
+const PUT_STATEMENTS_PER_CHUNK = 2
 const PUT_FIXED_STATEMENTS = 1
-const SWEEP_STATEMENTS = 3
+const SWEEP_STATEMENTS = 2
 const PAGE_SIZE = 100
 
 /**
- * D1 statements draining `edges` staged rows of one follower may need at
- * worst, plus the sweep when `withSweep`. A drain step starts only if this,
+ * D1 statements draining `edges` staged rows (follows and blocks) of one DID
+ * may need at worst, plus both sweeps when `withSweep`. A drain step starts only if this,
  * for its chunk, fits the reserve that is left.
  */
 export function worstCaseDrainStatements(edges: number, withSweep: boolean): number {
@@ -524,6 +561,7 @@ function progressOf(
         kind,
         gen: started.gen,
         phase: "fetch",
+        collection: "follow",
         cursor: null,
         pds,
         beganAtMs: started.beganAtMs,
@@ -680,7 +718,7 @@ async function resumeDrain(
 
 /**
  * Fetch a graph owner's repo, verify it once under the key of the document
- * fetched with it, and stage every follow. A byte, node or record cap
+ * fetched with it, and stage every follow and block. A byte, node or record cap
  * (`RepoCollectionError` `byte-cap-exceeded`, `node-cap-exceeded`,
  * `record-cap-exceeded`) stages nothing and switches the owner to pages; so
  * does the `timeoutsBeforePaged`-th consecutive timeout. Draining is
@@ -703,7 +741,7 @@ export async function listOwner(
     listing.attempts += 1
     listing.inProgress = progressOf("owner-repo", started, null)
 
-    let rows: FollowRecord[]
+    let rows: StagedRow[]
     let unverifiable = false
     try {
         const fetched = await deps.fetchRepo(did)
@@ -715,12 +753,24 @@ export async function listOwner(
         const verified = await deps.verifyRepo(fetched.car, {
             did,
             signingKey: fetched.signingKey,
-            collection: FOLLOW_COLLECTION_NSID,
+            collections: [FOLLOW_COLLECTION_NSID, BLOCK_COLLECTION_NSID],
             maxBytes: config.maxRepoBytes,
             maxNodes: config.maxMstNodes,
-            maxRecords: config.maxFollows,
+            maxRecords: {
+                [FOLLOW_COLLECTION_NSID]: config.maxFollows,
+                [BLOCK_COLLECTION_NSID]: config.maxBlocks,
+            },
         })
-        rows = followRecordsOf(verified)
+        rows = [
+            ...subjectRecordsOf(verified.records.get(FOLLOW_COLLECTION_NSID) ?? []).map((r) => ({
+                ...r,
+                collection: "follow" as const,
+            })),
+            ...subjectRecordsOf(verified.records.get(BLOCK_COLLECTION_NSID) ?? []).map((r) => ({
+                ...r,
+                collection: "block" as const,
+            })),
+        ]
     } catch (error) {
         if (isCapError(error)) return switchToPaged(deps, listing, gen)
         if (error instanceof FetchTimeoutError) {
@@ -742,23 +792,26 @@ export async function listOwner(
     }
 
     try {
-        if (!(await deps.listings.stageRows(did, gen, rows, null, true))) return "superseded"
+        if (!(await deps.listings.stageRows(did, gen, rows, { collection: "follow", cursor: null }, true))) {
+            return "superseded"
+        }
     } catch {
         return deferStep(deps, config, listing, gen, { timedOut: false, permanent: false })
     }
     listing.attempts = 0
     listing.timeouts = 0
     listing.permanentFailures = 0
-    listing.inProgress = { ...listing.inProgress, phase: "drain", cursor: null }
+    listing.inProgress = { ...listing.inProgress, phase: "drain", collection: "follow", cursor: null }
     return "in-progress"
 }
 
 /**
- * Read `listRecords` pages into staging, for a paged owner (every follow) or
- * a mutual listing (follows of registered DIDs only), up to the pages left
- * this alarm. The PDS is resolved once, at the first page. A raw empty page
- * ends the fetch; so does a page that does not advance the cursor, and the
- * mutual listing's `maxFollows / 100` pages. Resolving the PDS counts as a
+ * Read `listRecords` pages into staging, for a paged owner (every record) or
+ * a mutual listing (records naming registered DIDs only), follows first and
+ * then blocks, up to the pages left this alarm. The PDS is resolved once, at
+ * the first page. A raw empty page ends a collection; so does a page that
+ * does not advance the cursor, and the mutual listing's `maxFollows / 100`
+ * (`maxBlocks / 100`) pages. The fetch is done when blocks end. Resolving the PDS counts as a
  * page, and so does a failed one. A failed page leaves the cursor where it was and defers.
  */
 export async function fetchListingPages(
@@ -773,6 +826,7 @@ export async function fetchListingPages(
 
     let gen: number
     let pds: string
+    let collection: EdgeCollection
     let cursor: string | null
     let pages: number
     let pagesUsed = 0
@@ -787,6 +841,7 @@ export async function fetchListingPages(
         listing.attempts += 1
         gen = held.gen
         pds = held.pds
+        collection = held.collection
         cursor = held.cursor
         pages = held.pages
     } else {
@@ -811,23 +866,22 @@ export async function fetchListingPages(
             provisionalNotBefore(deps, config, listing)
         )
         gen = started.gen
+        collection = "follow"
         cursor = null
         pages = 0
         listing.inProgress = progressOf(kind, started, pds)
     }
 
-    const maxPages = Math.ceil(config.maxFollows / PAGE_SIZE)
     while (pagesUsed < pagesLeft) {
         pagesUsed += 1
+        const maxPages = Math.ceil((collection === "follow" ? config.maxFollows : config.maxBlocks) / PAGE_SIZE)
         let page: FollowPage
-        const kept: FollowRecord[] = []
+        const kept: StagedRow[] = []
         try {
-            page = await deps.listFollows(pds, did, cursor)
-            if (kind === "owner-paged") {
-                kept.push(...page.records)
-            } else {
-                for (const record of page.records) {
-                    if (await deps.interest.isRegistered(record.subject)) kept.push(record)
+            page = await deps.listRecords(pds, did, collection, cursor)
+            for (const record of page.records) {
+                if (kind === "owner-paged" || (await deps.interest.isRegistered(record.subject))) {
+                    kept.push({ ...record, collection })
                 }
             }
         } catch (error) {
@@ -840,11 +894,22 @@ export async function fetchListingPages(
         }
         const stuck = cursor !== null && page.lastRkey !== null && page.lastRkey <= cursor
         pages += 1
-        const done =
+        const collectionEnd =
             page.lastRkey === null || stuck || (kind === "mutual" && pages >= maxPages)
-        const next = stuck ? cursor : (page.lastRkey ?? cursor)
+        const done = collectionEnd && collection === "block"
+        const switching = collectionEnd && collection === "follow"
+        const next = switching ? null : stuck ? cursor : (page.lastRkey ?? cursor)
+        const nextCollection: EdgeCollection = switching ? "block" : collection
         try {
-            if (!(await deps.listings.stageRows(did, gen, kept, next, done))) {
+            if (
+                !(await deps.listings.stageRows(
+                    did,
+                    gen,
+                    kept,
+                    { collection: nextCollection, cursor: next },
+                    done
+                ))
+            ) {
                 return { outcome: "superseded", pagesUsed }
             }
         } catch {
@@ -855,12 +920,16 @@ export async function fetchListingPages(
             return { outcome, pagesUsed }
         }
         cursor = next
+        if (switching) {
+            collection = "block"
+            pages = 0
+        }
         listing.attempts = 0
         listing.timeouts = 0
         listing.permanentFailures = 0
         listing.inProgress = done
-            ? { ...listing.inProgress!, phase: "drain", cursor: null, pages }
-            : { ...listing.inProgress!, cursor, pages }
+            ? { ...listing.inProgress!, phase: "drain", collection, cursor: null, pages }
+            : { ...listing.inProgress!, collection, cursor, pages }
         if (done) break
     }
     return { outcome: "in-progress", pagesUsed }
@@ -882,7 +951,8 @@ export async function drainListing(
     if (progress === null || progress.phase !== "drain") return "superseded"
     const did = listing.did
     const { gen } = progress
-    let cursor = progress.cursor
+    let cursor =
+        progress.cursor === null ? null : { collection: progress.collection, rkey: progress.cursor }
     let committed = false
     try {
         for (;;) {
@@ -893,6 +963,9 @@ export async function drainListing(
                 if (left < SWEEP_STATEMENTS) {
                     return committed ? "in-progress" : "over-budget"
                 }
+                // Blocks first: the follow sweep's subjects then reach
+                // `completeListing` with no write in between that could lose them.
+                await deps.blocks.sweepBlocks(did, gen)
                 const swept = await deps.edges.sweep(did, gen)
                 const done = await deps.listings.completeListing(did, gen, {
                     beganAtMs: progress.beganAtMs,
@@ -906,16 +979,28 @@ export async function drainListing(
             }
             if (limit === 0) return committed ? "in-progress" : "over-budget"
             const chunk = rows.slice(0, limit)
-            const written = await deps.edges.putEdges(
-                chunk.map((r) => ({ follower: did, rkey: r.rkey, subject: r.subject })),
-                gen
-            )
-            cursor = chunk[chunk.length - 1]!.rkey
+            const follows = chunk.filter((r) => r.collection === "follow")
+            const blocks = chunk.filter((r) => r.collection === "block")
+            const written =
+                follows.length > 0
+                    ? await deps.edges.putEdges(
+                          follows.map((r) => ({ follower: did, rkey: r.rkey, subject: r.subject })),
+                          gen
+                      )
+                    : { subjects: [] }
+            if (blocks.length > 0) {
+                await deps.blocks.putBlocks(
+                    blocks.map((r) => ({ blocker: did, rkey: r.rkey, subject: r.subject })),
+                    gen
+                )
+            }
+            const last = chunk[chunk.length - 1]!
+            cursor = { collection: last.collection, rkey: last.rkey }
             const saved = await deps.listings.saveDrainProgress(did, gen, cursor, written.subjects)
             if (!saved) return "superseded"
             committed = true
             listing.attempts = 0
-            listing.inProgress = { ...progress, cursor }
+            listing.inProgress = { ...progress, collection: cursor.collection, cursor: cursor.rkey }
         }
     } catch {
         return deferStep(deps, config, listing, gen, { timedOut: false, permanent: false })
@@ -924,12 +1009,16 @@ export async function drainListing(
 
 /** Follows from a verified collection's records; a record with no string `subject` is skipped. */
 export function followRecordsOf(verified: VerifiedCollection): FollowRecord[] {
-    const follows: FollowRecord[] = []
-    for (const { rkey, record } of verified.records) {
+    return subjectRecordsOf(verified.records)
+}
+
+function subjectRecordsOf(records: readonly CollectionRecord[]): FollowRecord[] {
+    const out: FollowRecord[] = []
+    for (const { rkey, record } of records) {
         const subject = (record as { subject?: unknown } | null)?.subject
-        if (typeof subject === "string") follows.push({ rkey, subject })
+        if (typeof subject === "string") out.push({ rkey, subject })
     }
-    return follows
+    return out
 }
 
 /**

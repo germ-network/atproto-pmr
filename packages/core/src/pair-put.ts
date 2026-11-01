@@ -1,7 +1,8 @@
+import { admissionOrUnavailable, type AdmissionSource } from "./admission.js"
+import { deriveMessageId } from "./message-id.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
-import { deriveMessageId } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import {
     BodyStore,
@@ -33,6 +34,12 @@ export interface PairPutDeps {
      * must be able to replace and a platform may route through its own fetch.
      */
     resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
+    /**
+     * Whether the recipient accepts this sender, read once per put that
+     * reaches a registered store and before anything is stored. Omitted, the
+     * relay adjudicates nothing: unprovisioned senders pool without a verdict.
+     */
+    admission?: AdmissionSource
     /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.
@@ -146,21 +153,13 @@ export async function handlePairPut(
 
     const locator = await deps.directory.resolve(recipientDID)
     if (locator === null) {
-        // Unknown recipient relay. The RESPONSE is the same `202` a
-        // registered recipient's mailbox eventually produces.
-        //
-        // KNOWN, ACCEPTED GAP: this returns before touching any per-relay
-        // store, while a registered recipient costs at least one round
-        // trip — a timing difference that could reveal registration status
-        // to an attacker who can measure it, even though the content never
-        // does. Closing it means doing comparable work against a DID with
-        // no store to touch, and the obvious approach — instantiating a
-        // store for every unregistered DID an unauthenticated request names
-        // — is its own resource-exhaustion surface. Flagged in
-        // `spec/trust-model.md` rather than papered over.
+        // An unknown recipient answers the same 202 as a registered one.
         return new Response(null, { status: 202 })
     }
     const store = deps.store(locator)
+    const admission = deps.admission === undefined
+        ? undefined
+        : await admissionOrUnavailable(deps.admission, senderKey, recipientDID)
 
     const mailboxKey = senderKey
     const messageId = deriveMessageId(envelope.payload.payload)
@@ -172,7 +171,6 @@ export async function handlePairPut(
             declarationCID: declaration.declarationCID,
         },
     }
-
     const storeBody = () =>
         deps.bodies.putBody(
             messageId,
@@ -180,9 +178,8 @@ export async function handlePairPut(
             nowSeconds + config.limits.messageExpirySeconds
         )
 
-    // The key binding, generation recycle, and append must be one atomic
-    // store operation. Splitting reconciliation from append can admit an
-    // obsolete-key put between the two calls.
+    // The key binding, generation recycle and receive/append share one atomic
+    // store operation so an obsolete-key put cannot slip between them.
     const pair = await store.appendPair(
         mailboxKey,
         ref,
@@ -193,21 +190,30 @@ export async function handlePairPut(
             anchorKey: declaration.anchorKey.x,
             declarationCID: declaration.declarationCID,
             car: declaration.evidenceCAR,
-        }
+        },
+        admission
     )
     ref.pairGeneration = pair.generation
     ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
-    const appendResult = pair.result
-    if (appendResult.outcome === "refused") {
+    const result = pair.result
+    if (result.outcome === "refused") {
         return new Response(null, {
             status: 429,
-            headers: { "Retry-After": String(Math.max(0, appendResult.retryAfter - nowSeconds)) },
+            headers: { "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)) },
         })
     }
-    if ((appendResult.outcome === "appended" || appendResult.outcome === "pooled") && appendResult.persistBody) {
+    if (("persistBody" in result) && result.persistBody) {
         deps.defer((async () => {
             await storeBody()
-            if (appendResult.outcome === "appended") {
+            if (result.outcome === "appended" || result.outcome === "queued") {
+                if ("moved" in result && result.moved) {
+                    for (const moved of result.moved) {
+                        try {
+                            const body = await deps.bodies.getBody(moved.messageId)
+                            if (body) await store.deliverLive?.(mailboxKey, moved, body)
+                        } catch {}
+                    }
+                }
                 try { await store.deliverLive?.(mailboxKey, ref, envelope.payload.payload) } catch {}
                 try { await store.deliverPush?.(mailboxKey, ref, envelope.payload.payload) } catch {}
             }

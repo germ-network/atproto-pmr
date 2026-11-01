@@ -4,7 +4,9 @@
  * `snapshotDeclarationResolver`; a device-facing read would call it directly.
  */
 import { RecordNotFoundError, SIGNING_KEY_TTL_MS } from "./atproto-fetch"
+import type { StoredPolicies } from "./policy"
 import { readRecordFromCar, verifyRecordProof, type VerifiedRecord } from "./repo-proof"
+import type { SnapshotEvidence } from "./summary-evidence-contract"
 
 /** A third party's stored proof of one record. */
 export interface RecordSnapshot {
@@ -41,6 +43,17 @@ export interface StoredRecordSnapshot extends RecordSnapshot {
     rev: string | null
     /** The record's CID (`bafyrei…`), as verified at ingest. Null for an entry stored without it. */
     cid: string | null
+    /** Exact signed commit CID, absent on legacy entries. */
+    commitCid?: string | null
+    /** First-observation history stored atomically beside the CAR. */
+    evidence?: SnapshotEvidence | null
+    /**
+     * A declaration's policies, decoded once when it was stored. Absent for
+     * any other record and for a declaration stored before policies were
+     * kept, and for one ingest did not verify; a reader then falls back to
+     * parsing `car`.
+     */
+    policies?: StoredPolicies
 }
 
 /**

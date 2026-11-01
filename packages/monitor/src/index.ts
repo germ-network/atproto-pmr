@@ -44,18 +44,31 @@ export {
     FETCH_AS_OF_SKEW_MS,
     type DidDocumentSink,
     type DigestMarker,
+    type EvidenceAnchorRow,
+    type MessagingKeyHistoryRow,
+    type EvidenceBackfillProgress,
+    type SnapshotLayoutBackfillProgress,
+    type EvidenceAssurance,
+    type EvidenceAuthorityIdentity,
+    type SnapshotEvidence,
     type IntakeOutcome,
     type KeyUpdateIndex,
     type MonitorIndex,
     type OwedKeyUpdate,
     type Observation,
     type ObservationComparison,
+    type PendingFailure,
     type PendingFetch,
     type RevComparison,
     type SnapshotEntry,
     type HolderState,
+    type GoneCause,
     type IndexedRecord,
     type VerifiedWrite,
+    type VerifiedDeclarationWrite,
+    type HeldDeclarationState,
+    type HeldStateIndex,
+    type SnapshotWriter,
     type SigningKeyCacheWriter,
     type SnapshotStore,
     type InterestIndex,
@@ -64,11 +77,14 @@ export {
     type PendingRecordFetch,
     type RecordRef,
     type SecondaryIndex,
+    type SecondaryLane,
     type SecondaryIntakeIndex,
     type SecondaryIntakeOutcome,
     type SecondarySnapshotStore,
     type SecondaryWriteAnswer,
     D1_ROWS_PER_STATEMENT,
+    type BlockEdgeWriter,
+    type BlockRef,
     type EdgeRef,
     type EdgeWriteResult,
     type FollowEdgeWriter,
@@ -77,23 +93,40 @@ export {
     type StatementBudget,
 } from "./storage"
 
+// The operator's read of ingest progress.
+export {
+    PENDING_ATTEMPT_BUCKETS,
+    type FollowFrameFailures,
+    type MonitorIngestStatus,
+    type MonitorIngestStatusRequest,
+    type MonitorPendingDetail,
+    type PendingRowDetail,
+    type PendingSummary,
+} from "./status"
+
 // The allow list and the secondary records it keeps.
 export { applyInterestTransitions, type InterestDeps } from "./interest"
 export {
+    disposeStrayOwnBlockProofs,
     intakeSecondary,
+    OWN_BLOCK_SETTLE_BATCH,
     settleSecondary,
     settleSecondaryDue,
     type SecondaryConfig,
     type SecondaryDeps,
     type SecondaryIntakeDecision,
+    type SecondarySettleFailureEvent,
     type SecondarySettleOutcome,
 } from "./secondary"
 
 // The follow/profile stream.
 export {
+    BLOCK_COLLECTION_NSID,
     EDGE_OPS_TABLE,
     FOLLOW_COLLECTION_NSID,
+    followEventListingDid,
     routeFollowEvent,
+    type EdgeCollection,
     type EdgeOp,
     type FollowRoute,
     type FollowRouteDeps,
@@ -118,6 +151,7 @@ export {
     type FollowBackfillDeps,
     type FollowPage,
     type FollowRecord,
+    type StagedRow,
     type ListingIndex,
     type ListingKind,
     type ListingOutcome,
@@ -144,9 +178,7 @@ export {
     type RecountQueueIndex,
 } from "./follow-flush"
 export {
-    GRAPH_CHANGE_RETENTION_MS,
     mirrorGraph,
-    pruneGraphChanges,
     reconcileGraphMirror,
     type GraphMirrorDeps,
     type GraphMirrorIndex,
@@ -158,15 +190,7 @@ export {
     type DrainPlcLogsDeps,
     type PlcLogIndex,
 } from "./plc-log"
-export {
-    PROJECT_STATEMENTS_PER_DID,
-    runGraphProjector,
-    type GraphProjectorDeps,
-    type GraphProjectorIndex,
-    type MirroredGraphStanding,
-    type ProjectorCursor,
-} from "./graph-projector"
-export { listFollowRecords, type ListFollowRecordsOptions } from "./list-records"
+export { listEdgeRecords, type ListEdgeRecordsOptions } from "./list-records"
 
 // The change digest.
 export {
@@ -223,6 +247,12 @@ export {
     settle,
     settleDeletion,
     settleDue,
+    settleRetryBackoffMs,
+    prepareSnapshotEvidence,
+    retainSnapshotEvidence,
+    SETTLE_RETRY_CAP_MS,
+    PENDING_FAILURE_MESSAGE_MAX,
+    type SettleFailureEvent,
     type FetchedDidDocument,
     type FetchedRecord,
     type IngestConfig,
@@ -230,6 +260,7 @@ export {
     type IntakeDecision,
     type SettleOptions,
     type SettleOutcome,
+    type SettledDeclaration,
     type VerifyOutcome,
 } from "./ingest"
 
@@ -250,7 +281,13 @@ export {
 
 // Tier 3: baseline build.
 export { listReposByCollection, type ListReposOptions, type ListReposPage } from "./list-repos"
-export { sweepBackfill, type BackfillDeps, type SweepBackfillResult } from "./backfill"
+export {
+    sweepBackfill,
+    sweepEvidenceRefresh,
+    sweepSnapshotLayout,
+    type BackfillDeps,
+    type SweepBackfillResult,
+} from "./backfill"
 export {
     refreshDue,
     type RefreshDeps,
@@ -261,3 +298,12 @@ export {
     type SnapshotCheck,
 } from "./refresh"
 
+
+export {
+    computeFirehoseCoverage,
+    isResumeJump,
+    isStaleCursor,
+    streamTimeUs,
+    type FirehoseCoverageInput,
+    type OwedStreamEvent,
+} from "./firehose-coverage"

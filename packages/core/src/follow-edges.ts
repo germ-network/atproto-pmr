@@ -6,6 +6,8 @@
  * before relying on it.
  */
 
+export const FOLLOW_COLLECTION_NSID = "app.bsky.graph.follow"
+
 /** One `app.bsky.graph.follow` record: `follower` follows `subject`. */
 export interface FollowEdge {
     follower: string
@@ -22,8 +24,9 @@ export interface FollowEdge {
  * outside the declaration set. Writing is the ingest's, behind its own seam.
  */
 export interface FollowEdgeStore {
-    /** Edges with `follower === did`, subjects restricted to declaration holders. */
-    following(did: string): Promise<FollowEdge[]>
-    /** Edges with `subject === did`, followers restricted to declaration holders. */
-    followers(did: string): Promise<FollowEdge[]>
+    /**
+     * Both edge lists of a served graph's owner, restricted to declaration
+     * holders, from one consistent read; null when the graph is not served.
+     */
+    ownEdges(did: string): Promise<{ following: FollowEdge[]; followers: FollowEdge[] } | null>
 }

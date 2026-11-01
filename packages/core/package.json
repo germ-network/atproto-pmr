@@ -1,6 +1,6 @@
 {
 	"name": "@germ-network/atproto-pmr-core",
-	"version": "0.1.4",
+	"version": "0.4.1",
 	"private": true,
 	"description": "Protocol logic for an Atproto Personal Messaging Relay, parameterized over a storage seam",
 	"license": "MIT",
@@ -17,9 +17,10 @@
 		"node": ">=24"
 	},
 	"dependencies": {
-		"@noble/ciphers": "^2.3.0",
-		"@noble/curves": "^2.3.0",
-		"@noble/hashes": "^2.3.0",
+		"@noble/ciphers": "2.4.0",
+		"@noble/curves": "2.4.0",
+		"@noble/hashes": "2.4.0",
+		"@noble/post-quantum": "0.7.1",
 		"cborg": "^6.1.1"
 	},
 	"devDependencies": {

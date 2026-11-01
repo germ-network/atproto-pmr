@@ -6,38 +6,44 @@
  */
 import { describe, expect, it } from "vitest"
 import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
-import type { GraphReadResponse } from "../src/read-api"
+import type { OwnerGraph } from "../src/owner-graph"
 import type { ReadSigningKey } from "../src/read-signing-key"
 import { SNAPSHOT_MAX_AGE_MS } from "../src/snapshot-read"
 import {
+    CLOCK_DISCONTINUITY_HOLD_MS,
+    CLOCK_DISCONTINUITY_THRESHOLD_MS,
     SUMMARY_DELTA_KEYS,
     SUMMARY_MAX_RECORDS,
     buildSummaryIndex,
     decodeSummaryDelta,
+    diffSummaryIndex,
     encodeSummaryDelta,
     readSummaryPage,
     summaryContacts,
+    wallClockMonitor,
     type SummaryDelta,
     type SummaryHeldEntry,
     type SummaryIndex,
+    type SummaryIndexEntry,
     type SummaryPageDeps,
 } from "../src/summary"
+import type { SnapshotEvidence } from "../src/summary-evidence-contract"
 import { encodeCose, type CoseValue } from "../src/cose/cbor"
 
 const OWNER = "did:plc:owner"
 const NOW = 10_000_000_000
 const COLL = "app.example.thing"
 
-const edge = (did: string, rkey = "r", mutual = false) => ({ did, rkey, mutual })
+const edge = (did: string, mutual = false) => ({ did, mutual })
 const graphOf = (
-    following: GraphReadResponse["following"],
-    followers: GraphReadResponse["followers"] = []
-): GraphReadResponse => ({ did: OWNER, following, followers })
+    following: OwnerGraph["following"],
+    followers: OwnerGraph["followers"] = []
+): OwnerGraph => ({ did: OWNER, following, followers })
 
 describe("summaryContacts", () => {
     it("orders the owner, then mutuals, following and followers, each by DID", () => {
         const graph = graphOf(
-            [edge("did:plc:f2"), edge("did:plc:m2", "r", true), edge("did:plc:f1"), edge("did:plc:m1", "r", true)],
+            [edge("did:plc:f2"), edge("did:plc:m2", true), edge("did:plc:f1"), edge("did:plc:m1", true)],
             [edge("did:plc:g2"), edge("did:plc:g1")]
         )
         expect(summaryContacts(OWNER, graph, 100)).toEqual({
@@ -48,8 +54,8 @@ describe("summaryContacts", () => {
 
     it("a DID in several groups appears once, in its highest group", () => {
         const graph = graphOf(
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge("did:plc:b", "r2")],
-            [edge("did:plc:a"), edge("did:plc:b", "r", true), edge(OWNER)]
+            [edge("did:plc:a"), edge("did:plc:b", true), edge("did:plc:b")],
+            [edge("did:plc:a"), edge("did:plc:b", true), edge(OWNER)]
         )
         expect(summaryContacts(OWNER, graph, 100).dids).toEqual([OWNER, "did:plc:b", "did:plc:a"])
     })
@@ -67,7 +73,7 @@ describe("summaryContacts", () => {
 
 function indexWorld(
     options: {
-        graph?: GraphReadResponse | null
+        graph?: OwnerGraph | null
         watched?: SummaryPageDeps["watched"]
         held?: (SummaryHeldEntry | null)[] | ((did: string, collection: string, rkey: string) => SummaryHeldEntry | null)
         keys?: (did: string) => ReadSigningKey | undefined
@@ -79,7 +85,11 @@ function indexWorld(
     const recordReads: string[] = []
     const watched = options.watched ?? [{ collection: COLL, rkey: "self" }]
     const deps: SummaryPageDeps = {
-        projections: { get: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        getFirehoseCoverage: async () => null,
+        getPlcCoverage: async () => null,
+        graph: { ownGraph: async () => (options.graph === undefined ? graphOf([]) : options.graph) },
+        blocks: { ownBlocks: async () => [] },
+        senderGraph: { forSender: async () => new Map() },
         index: {
             entries: async (refs) => {
                 asked.push([...refs])
@@ -124,7 +134,7 @@ const held = (did: string, collection = COLL, rkey = "self", over: Partial<Summa
 })
 
 describe("buildSummaryIndex", () => {
-    it("is null when the owner has no projection", async () => {
+    it("is null when the owner's graph is not served", async () => {
         const w = indexWorld({ graph: null })
         expect(await buildSummaryIndex(OWNER, w.deps)).toBeNull()
         expect(w.asked).toEqual([])
@@ -220,14 +230,21 @@ describe("buildSummaryIndex", () => {
 })
 
 const refOf = (did: string, rkey = "self", collection = COLL) => ({ did, collection, rkey })
-const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey") => ({
+const entryOf = (did: string, cid: string, rkey = "self", verifiedWith = "zKey"): SummaryIndexEntry => ({
     ...refOf(did, rkey),
     cid,
     verifiedWith,
+    commitCid: null,
+    rev: null,
+    evidenceState: null,
 })
-const indexOf = (records: ReturnType<typeof entryOf>[], graph = graphOf([]), more?: boolean): SummaryIndex => ({
-    graph,
+const indexOf = (records: ReturnType<typeof entryOf>[], more?: boolean): SummaryIndex => ({
+    owner: OWNER,
+    ownBlocks: [],
     records,
+    verdicts: [],
+    evidenceSchema: 1,
+    permissionRecencySchema: 1,
     ...(more ? { more } : {}),
 })
 
@@ -255,6 +272,8 @@ function pageWorld(
                     verifiedWith: e.verifiedWith,
                     rev: "3k",
                     cid: e.cid,
+                    commitCid: e.commitCid ?? null,
+                    evidence: e.evidenceState ?? null,
                 }
             },
         },
@@ -278,7 +297,7 @@ describe("readSummaryPage", () => {
         const current = indexOf([entryOf("did:plc:a", "c1")])
         const w = pageWorld(current.records)
         const { page, delivered } = await readSummaryPage(null, current, w.deps, 10)
-        expect(page).toMatchObject({ full: true, removed: [], more: false, graph: current.graph })
+        expect(page).toMatchObject({ full: true, removed: [], more: false })
         expect(page.records.map((r) => r.did)).toEqual(["did:plc:a"])
         expect(delivered.records).toEqual(current.records)
     })
@@ -295,14 +314,13 @@ describe("readSummaryPage", () => {
     })
 
     it("pages changed records in (did, collection, rkey) order, the owner's first", async () => {
-        const graph = graphOf([])
         const records = [
             entryOf("did:plc:b", "c1", "z"),
             entryOf("did:plc:b", "c2", "a"),
             entryOf("did:plc:a", "c3"),
             entryOf(OWNER, "c4"),
         ]
-        const current = indexOf(records, graph)
+        const current = indexOf(records)
         const { page } = await readSummaryPage(null, current, pageWorld(records).deps, 10)
         expect(page.records.map((r) => `${r.did}/${r.rkey}`)).toEqual([
             `${OWNER}/self`,
@@ -322,17 +340,17 @@ describe("readSummaryPage", () => {
         expect(done.delivered.more).toBeUndefined()
     })
 
-    it("delivered is base minus removals plus the delivered records, with the current graph", async () => {
-        const oldGraph = graphOf([edge("did:plc:old")])
-        const newGraph = graphOf([edge("did:plc:new")])
-        const base = indexOf(
-            [entryOf("did:plc:keep", "k1"), entryOf("did:plc:change", "v1"), entryOf("did:plc:gone", "g1")],
-            oldGraph
-        )
-        const current = indexOf(
-            [entryOf("did:plc:added", "n1"), entryOf("did:plc:change", "v2"), entryOf("did:plc:keep", "k1")],
-            newGraph
-        )
+    it("delivered is base minus removals plus the delivered records", async () => {
+        const base = indexOf([
+            entryOf("did:plc:keep", "k1"),
+            entryOf("did:plc:change", "v1"),
+            entryOf("did:plc:gone", "g1"),
+        ])
+        const current = indexOf([
+            entryOf("did:plc:added", "n1"),
+            entryOf("did:plc:change", "v2"),
+            entryOf("did:plc:keep", "k1"),
+        ])
         const { delivered, page } = await readSummaryPage(base, current, pageWorld(current.records).deps, 10)
         expect(delivered).toEqual(current)
         expect(page.removed).toEqual([refOf("did:plc:gone")])
@@ -395,22 +413,9 @@ describe("readSummaryPage", () => {
         expect(delivered.records).toEqual([])
     })
 
-    it("the graph is carried on the first page it changed on, and null after", async () => {
-        const base = indexOf([], graphOf([]))
-        const current = indexOf([entryOf("did:plc:a", "c1"), entryOf("did:plc:b", "c2")], graphOf([edge("did:plc:a")]))
-        const w = pageWorld(current.records)
-        const first = await readSummaryPage(base, current, w.deps, 1)
-        expect(first.page.graph).toEqual(current.graph)
-        const second = await readSummaryPage(first.delivered, current, w.deps, 1)
-        expect(second.page.graph).toBeNull()
-        const unchanged = await readSummaryPage(current, current, w.deps, 1)
-        expect(unchanged.page).toMatchObject({ graph: null, records: [], removed: [], more: false })
-    })
-
     it("paging from each delivered index converges to current with more unset", async () => {
         const current = indexOf(
-            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`)),
-            graphOf([edge("did:plc:d1")])
+            Array.from({ length: 7 }, (_, i) => entryOf(`did:plc:d${i}`, `c${i}`))
         )
         const w = pageWorld(current.records)
         let held: SummaryIndex | null = null
@@ -433,11 +438,15 @@ describe("summary delta codec", () => {
     const delta: SummaryDelta = {
         token: "tok",
         full: false,
-        graph: null,
+        ownBlocks: null,
         records: [],
         removed: [],
+        verdicts: [],
+        droppedVerdicts: [],
         more: true,
         truncated: true,
+        coveredThroughMs: null,
+        lagging: [],
     }
 
     it("more and truncated round-trip", () => {
@@ -451,11 +460,156 @@ describe("summary delta codec", () => {
             new Map<string, CoseValue>([
                 [SUMMARY_DELTA_KEYS.token, "t"],
                 [SUMMARY_DELTA_KEYS.full, false],
-                [SUMMARY_DELTA_KEYS.graph, null],
                 [SUMMARY_DELTA_KEYS.records, []],
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])
         )
         expect(decodeSummaryDelta(bytes)).toMatchObject({ more: false, truncated: false })
+    })
+})
+
+const DECL = DECLARATION_COLLECTION_NSID
+
+/** Evidence for `did`'s declaration at `cid`, bound to commit `bafCommit` at rev `3k`. */
+const evidenceFor = (did: string, cid: string, over: Partial<SnapshotEvidence> = {}): SnapshotEvidence => ({
+    did,
+    collection: DECL,
+    rkey: "self",
+    recordCid: cid,
+    commitCid: "bafCommit",
+    rev: "3k",
+    verifiedWith: "zKey",
+    authority: { method: "plc", operationCid: "bafOp" },
+    assurance: "custody-chain",
+    monitor: "monitor.example.org",
+    commitFirstObservedAtMs: NOW - 5_000,
+    anchorFirstObservedAtMs: NOW - 60_000,
+    ...over,
+})
+
+/** The owner's declaration held at `c1`, with `evidence` stored beside it. */
+function declarationWorld(evidence: SnapshotEvidence | null, over: Partial<SummaryHeldEntry> = {}) {
+    const raw = held(OWNER, DECL, "self", { cid: "c1", commitCid: "bafCommit", rev: "3k", evidenceState: evidence, ...over })
+    const index = indexWorld({ watched: [{ collection: DECL, rkey: "self" }], held: (did) => (did === OWNER ? raw : null) })
+    const page = pageWorld([raw])
+    return { index, page: { ...page, deps: { ...page.deps, nowMs: () => NOW } } }
+}
+
+describe("summary evidence binding", () => {
+    it("evidence bound to the stored cid, commit and rev is delivered once, then settles", async () => {
+        const w = declarationWorld(evidenceFor(OWNER, "c1"))
+        const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+        const first = await readSummaryPage(null, built.index, w.page.deps, 10)
+        expect(first.page.records[0]!.evidence).toEqual({
+            commitCid: "bafCommit",
+            rev: "3k",
+            authority: { method: "plc", operationCid: "bafOp" },
+            assurance: "custody-chain",
+            monitor: "monitor.example.org",
+            commitAgeMs: 5_000,
+            anchorAgeMs: 60_000,
+            remainingTtlMs: SNAPSHOT_MAX_AGE_MS,
+        })
+        const rebuilt = (await buildSummaryIndex(OWNER, w.index.deps))!
+        expect(diffSummaryIndex(first.delivered, rebuilt.index).changed).toEqual([])
+        expect((await readSummaryPage(first.delivered, rebuilt.index, w.page.deps, 10)).page.records).toEqual([])
+    })
+
+    it("stored evidence that fails to bind is delivered as unavailable, then settles", async () => {
+        const w = declarationWorld(evidenceFor(OWNER, "c-other"))
+        const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+        expect(built.index.records[0]!.evidenceState).toBeNull()
+        const first = await readSummaryPage(null, built.index, w.page.deps, 10)
+        expect(first.page.records.map((r) => r.evidence)).toEqual([null])
+        const rebuilt = (await buildSummaryIndex(OWNER, w.index.deps))!
+        expect(diffSummaryIndex(first.delivered, rebuilt.index).changed).toEqual([])
+        expect((await readSummaryPage(first.delivered, rebuilt.index, w.page.deps, 10)).page.records).toEqual([])
+    })
+
+    it("binds against the stored cid, rev and commit without parsing the CAR", async () => {
+        // The world's CAR bytes are a placeholder, so a parse would drop the record.
+        const w = declarationWorld(evidenceFor(OWNER, "c1"))
+        const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+        const { page } = await readSummaryPage(null, built.index, w.page.deps, 10)
+        expect(page.records).toHaveLength(1)
+        expect(page.records[0]!.evidence).toMatchObject({ commitCid: "bafCommit", commitAgeMs: 5_000 })
+    })
+
+    it("evidence for another commit than the one stored with the CAR is unavailable", async () => {
+        const w = declarationWorld(evidenceFor(OWNER, "c1"), { commitCid: "bafOther" })
+        const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+        const { page } = await readSummaryPage(null, built.index, w.page.deps, 10)
+        expect(page.records).toHaveLength(1)
+        expect(page.records[0]!.evidence).toBeNull()
+    })
+})
+
+describe("wall clock discontinuity", () => {
+    it("equal advances of both clocks, or skew under the threshold, never flip it", () => {
+        let wall = 1_000_000
+        let mono = 0
+        const clock = wallClockMonitor({ wallMs: () => wall, monotonicMs: () => mono })
+        for (let i = 0; i < 10; i++) {
+            expect(clock.observe()).toBe(true)
+            wall += 3_600_000
+            mono += 3_600_000
+        }
+        wall += CLOCK_DISCONTINUITY_THRESHOLD_MS
+        expect(clock.observe()).toBe(true)
+    })
+
+    it("a jump makes ages unavailable and asks for rechecks for the hold window, then clears", async () => {
+        let wall = 1_000_000
+        let mono = 0
+        const wallClock = wallClockMonitor({ wallMs: () => wall, monotonicMs: () => mono })
+        const w = declarationWorld(evidenceFor(OWNER, "c1"))
+        const rechecks: string[] = []
+        w.index.deps.wallClock = wallClock
+        w.index.deps.onClockDiscontinuity = (did) => rechecks.push(did)
+        const pageDeps = { ...w.page.deps, wallClock }
+        const read = async () => {
+            const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+            return (await readSummaryPage(null, built.index, pageDeps, 10)).page.records[0]!.evidence
+        }
+
+        expect(await read()).toMatchObject({ commitAgeMs: 5_000, anchorAgeMs: 60_000 })
+        expect(rechecks).toEqual([])
+
+        wall += 60_000
+        mono += 1_000
+        // The binding stays available; only its ages and TTL are not.
+        expect(await read()).toMatchObject({
+            commitCid: "bafCommit",
+            assurance: "custody-chain",
+            commitAgeMs: null,
+            anchorAgeMs: null,
+            remainingTtlMs: null,
+        })
+        expect(rechecks).toEqual([OWNER])
+
+        wall += CLOCK_DISCONTINUITY_HOLD_MS
+        mono += CLOCK_DISCONTINUITY_HOLD_MS
+        expect(await read()).toMatchObject({ commitAgeMs: 5_000, anchorAgeMs: 60_000, remainingTtlMs: SNAPSHOT_MAX_AGE_MS })
+        expect(rechecks).toEqual([OWNER])
+    })
+})
+
+describe("default wall clock detector", () => {
+    it("ignores an injected nowMs, so fake times hours apart keep ages available", async () => {
+        let now = NOW
+        const w = declarationWorld(evidenceFor(OWNER, "c1"))
+        const rechecks: string[] = []
+        w.index.deps.nowMs = () => now
+        w.index.deps.onClockDiscontinuity = (did) => rechecks.push(did)
+        const pageDeps = { ...w.page.deps, nowMs: () => now }
+        const read = async () => {
+            const built = (await buildSummaryIndex(OWNER, w.index.deps))!
+            return (await readSummaryPage(null, built.index, pageDeps, 10)).page.records[0]!.evidence
+        }
+
+        expect(await read()).toMatchObject({ commitAgeMs: 5_000, anchorAgeMs: 60_000 })
+        now = NOW + 3_600_000
+        expect(await read()).toMatchObject({ commitAgeMs: 3_605_000, anchorAgeMs: 3_660_000 })
+        expect(rechecks).toEqual([])
     })
 })

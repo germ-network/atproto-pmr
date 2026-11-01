@@ -9,6 +9,7 @@
  * requirement is stated on the operation rather than left to be inferred.
  */
 
+import type { Admission, PoolVerdict } from "./admission.js"
 import type { SummaryIndex } from "./summary.js"
 
 /**
@@ -79,10 +80,26 @@ export interface VerificationHint {
     declarationCID: string
 }
 
+/**
+ * Deployment-defined keys a relay stores alongside an entry or a
+ * registration. Opaque to this package, which only carries and emits them;
+ * a key may never shadow one the specification defines.
+ */
+export type ExtensionFields = Readonly<Record<string, ExtensionValue>>
+
+/**
+ * Scalars only: these cross Durable Object RPC inside `MessageRef` and
+ * `RegistrationFields`, where a recursive value type defeats the RPC typings.
+ * Numbers must be safe integers; the wire grammar has no floats.
+ */
+export type ExtensionValue = string | number | boolean | null | Uint8Array
+
 export interface MessageRef {
     messageId: MessageId
     byteLength: number
     hint?: VerificationHint
+    /** Emitted beside `sd`/`dc`, so only on an entry that carries a hint. */
+    ext?: ExtensionFields
     /** Opaque generation of a sender-specific pair mailbox. Absent on legacy rows. */
     pairGeneration?: string
 }
@@ -100,7 +117,7 @@ export interface StoredPairMailboxEvidence extends PairMailboxEvidence {
 }
 
 export interface PairAppendResult {
-    result: AppendResult | PoolAppendResult
+    result: AppendResult | PoolAppendResult | ReceiveResult
     generation: string
     evidenceCID: string
     generationChanged: boolean
@@ -188,7 +205,38 @@ export interface PoolSender {
     did: string
     /** How many entries are waiting. Never their contents. */
     count: number
+    /**
+     * The receive-time verdict the sender's latest pooled put carried, so the
+     * device judges with the relay's reason rather than recomputing it.
+     * Absent for an entry pooled without one.
+     */
+    verdict?: PoolVerdict
 }
+
+/**
+ * What `receive` did with a pair put. As with `AppendResult`, the caller
+ * cannot tell a synthetic (blocked) absorption from a real append: both are
+ * `queued`, the synthetic one with `persistBody: false`.
+ */
+export type ReceiveResult =
+    /**
+     * Appended to the sender's mailbox; deliver it if `persistBody`. `moved`
+     * holds pooled entries a `yes` moved into the mailbox ahead of it, older
+     * first, whose bodies are already stored — deliver them before this one.
+     */
+    | { outcome: "queued"; persistBody: boolean; moved?: MessageRef[] }
+    /** Pooled (or dropped inside a discard window, `persistBody: false`); never delivered. */
+    | { outcome: "pooled"; persistBody: boolean }
+    | { outcome: "duplicate" }
+    | { outcome: "refused"; retryAfter: number }
+    | { outcome: "exhausted" }
+
+/**
+ * Who set a relay block. A `bsky` marker mirrors the owner's Bsky block and
+ * is not lifted by the relay's own view of Bsky; only a device unblock lifts a
+ * block, whichever marker it carries.
+ */
+export type BlockSource = "device" | "bsky"
 
 export interface RegistrationFields {
     did: string
@@ -214,6 +262,11 @@ export interface RegistrationFields {
         keyId: number
     }
     lastActive: number
+    /**
+     * Set only through `RegistrationExtension`. Every create replaces it
+     * whole, so an absent deployment key means withdrawn, not "unchanged".
+     */
+    ext?: ExtensionFields
 }
 
 /**
@@ -231,8 +284,8 @@ export interface RegistrationFields {
 export interface WatchState {
     /**
      * True while the owner's declared anchor key is confirmed gone or changed.
-     * While set, DID-addressed mail is absorbed (see `append`/`appendToPool`)
-     * and grant-addressed mail is unaffected. Reversible: cleared when the
+     * While set the registration stops acting on the DID's behalf, but still
+     * queues all mail. Reversible: cleared when the
      * trusted key is observed present again. Never triggers deregistration.
      */
     paused: boolean
@@ -312,9 +365,30 @@ export interface MonitorRecheckRequest {
     requestRefresh(did: string, requestedAtMs: number): Promise<void>
 }
 
+/**
+ * A monitor that answers, from its verified snapshot, what a DID's
+ * declaration currently names as its anchor. The only source that may
+ * inactivate a registration (R88): unlike the owner-PDS read in `watch.ts`,
+ * it is proof-checked, so a misserving PDS cannot retire a registration.
+ */
+export interface MonitorVerifiedAnchorRequest {
+    verifiedAnchorOf(did: string): Promise<VerifiedAnchorObservation>
+}
+
+/**
+ * - `present`: the verified declaration names `anchorKey` (a `COSE_Key` blob).
+ * - `absent`: the declaration record is verifiably gone from a live repo.
+ * - `unknown`: anything else — not yet verified, no snapshot, or a
+ *   repo-level state such as deactivation, which only pauses (R88).
+ */
+export type VerifiedAnchorObservation =
+    | { state: "present"; anchorKey: Uint8Array }
+    | { state: "absent" }
+    | { state: "unknown" }
+
 /** Global, small, read on every inbound request. */
 export interface Directory {
-    /** Hot path: routes every pair put and every owner request. */
+    /** Hot path: routes every pair put and every owner request. The active registration only. */
     resolve(did: string): Promise<Locator | null>
 
     /**
@@ -330,8 +404,31 @@ export interface Directory {
     /** Idempotent on DID. */
     create(did: string, registration: RegistrationFields): Promise<Locator>
 
-    /** Deregistration and dormancy eviction. */
+    /**
+     * Deregistration and dormancy eviction, and the replace path of a new
+     * key's registration: removes the DID's active registration and destroys
+     * it with its mail. Tombstones are untouched.
+     */
     delete(did: string): Promise<void>
+
+    /**
+     * Retires the active registration when it is `expectedActive`: unlinks it
+     * and destroys it with its mail, so a caller that read an earlier
+     * registration cannot retire the one that replaced it. The DID's anchor
+     * is not tombstoned and may register again. Returns the retired locator,
+     * or `null` when the active registration was not `expectedActive`.
+     */
+    retire(did: string, expectedActive: Locator): Promise<Locator | null>
+
+    /**
+     * Deregisters the active registration if `anchorThumbprint` is its
+     * anchor's, destroys it, and tombstones that anchor so it never registers
+     * again. A tombstone is written once and never rewritten. Other anchors
+     * of the same DID are unaffected.
+     */
+    deregister(did: string, anchorThumbprint: Uint8Array): Promise<void>
+
+    isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean>
 
     /**
      * Writes the GLOBAL routing row a grant put resolves against. Always a
@@ -370,6 +467,15 @@ export interface PMRStore {
     update(fields: Partial<RegistrationFields>): Promise<void>
 
     /**
+     * Whether the monitor has verified this registration's own anchor. Until
+     * then the monitor's view may predate the registration, so it cannot
+     * retire it.
+     */
+    isMonitorConfirmed(): Promise<boolean>
+    markMonitorConfirmed(): Promise<void>
+
+
+    /**
      * The own-DID declaration watch's state (`watch.ts`, `WatchState`).
      * `readWatchState` MUST return `INITIAL_WATCH_STATE` (unpaused) for a
      * registration that has never been checked, so a store with no watch row
@@ -395,7 +501,9 @@ export interface PMRStore {
     ): Promise<void>
     /**
      * Null for a token never served here or since dropped. The token is
-     * client-supplied: one that cannot be a key is simply not held.
+     * client-supplied: one that cannot be a key is simply not held. An index
+     * stored without verdicts reads with `verdicts` empty, and one stored
+     * before mutual bits reads with `mutual` unset on each verdict.
      */
     getSummaryIndex(token: string): Promise<SummaryIndex | null>
 
@@ -435,20 +543,8 @@ export interface PMRStore {
      * mailbox if the sender is blocked. **The caller cannot tell which
      * happened, and neither can the sender.**
      *
-     * PAUSE (`watch.ts`): when this registration's `readWatchState().paused`
-     * is set — the owner's own declared anchor key is confirmed gone — a
-     * DID-addressed (`did:`-keyed, pair) put from any sender MUST be absorbed:
-     * no bytes, no delivery, no nonce recorded, and an accepted-shaped outcome
-     * so the response stays the uniform 202 a real append yields. (The
-     * already-seen-nonce check runs first, as always, so a replay of a
-     * pre-pause envelope answers `duplicate` — also a no-op 202 — rather than
-     * the absorb; observationally identical.) `append` also receives
-     * `grant:`-keyed puts (see `grant-put.ts`), which MUST pass through
-     * untouched — pause stops DID-addressed mail and keeps grant-addressed
-     * mail. The nonce is deliberately NOT recorded on a paused absorb: the
-     * pause is transient, so a resend after the key returns must still land.
-     * Mail already queued when the pause begins is left in place (pause is not
-     * teardown); only new admission is gated.
+     * PAUSE does not gate admission: a paused registration (`watch.ts`)
+     * queues `did:`- and `grant:`-keyed puts exactly as an active one.
      *
      * CONSISTENCY CONTRACT (1): the capacity check and the write MUST be
      * one atomic step, or two concurrent puts both observe room and both
@@ -479,7 +575,8 @@ export interface PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        evidence: PairMailboxEvidence
+        evidence: PairMailboxEvidence,
+        admission?: Admission
     ): Promise<PairAppendResult>
 
     /** Exact selected proof for a sender-specific mailbox, or null on a miss. */
@@ -536,6 +633,37 @@ export interface PMRStore {
     hasMailbox(key: MailboxKey): Promise<boolean>
 
     /**
+     * Route one adjudicated pair put in a single atomic step, by the sender's
+     * standing and the recipient's `admission`:
+     *
+     *  - a `blocked` admission mirrors the Bsky block (`block(key, now,
+     *    "bsky")`; no marker is written over a device block) and the put is
+     *    absorbed synthetically;
+     *  - no verdict lifts a block marker: a Bsky-blocked sender stays
+     *    synthetic until the device unblocks it;
+     *  - a device-blocked sender is absorbed synthetically;
+     *  - a device-provisioned sender is appended, whatever the verdict;
+     *  - `yes` appends to a mailbox marked admitted, opened if none is held,
+     *    moving any pooled entries into it — even inside a discard window;
+     *  - `no` / `unknown` pools the put with its verdict, as `appendToPool`
+     *    (so a live discard window drops it).
+     *
+     * Order: the nonce check first (nothing at all is written for a
+     * duplicate), then the block-marker transition,
+     * then capacity: a `yes` is refused only when the new ref itself does not
+     * fit (a refusal writes no mailbox, mark or move); otherwise the oldest
+     * pooled entries that fit ahead of it move in and the rest stay pooled
+     * with their verdict. Then the writes.
+     */
+    receive(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        admission: Admission
+    ): Promise<ReceiveResult>
+
+    /**
      * Every mailbox with at least one pending message — pair or grant
      * alike, since the key alone does not say which, and reconnect-drain
      * (the events socket's primitive) treats them identically. Also the
@@ -567,17 +695,15 @@ export interface PMRStore {
      * CONSISTENCY CONTRACT (7) applies here too, and the discard check MUST
      * run inside this call — see `PoolAppendResult`.
      *
-     * PAUSE: the pool is DID-addressed by construction (a `PairMailboxKey`),
-     * so when this registration is paused (`readWatchState().paused`) every
-     * pooled put MUST be absorbed — `pooled` with `persistBody: false`, no
-     * bytes and no nonce recorded — exactly as `append` absorbs a paused pair
-     * put. See `append`.
+     * A paused registration pools as an active one does.
      */
     appendToPool(
         key: PairMailboxKey,
         ref: MessageRef,
         nonce: Nonce,
-        nowSeconds: number
+        nowSeconds: number,
+        /** Recorded as the sender's latest verdict when the put is pooled. */
+        verdict?: PoolVerdict
     ): Promise<PoolAppendResult>
 
     /**
@@ -614,8 +740,25 @@ export interface PMRStore {
      * Blocking is reversible — the pair-mailbox counterpart of
      * close/reopen on a grant address — and a blocked sender is never told.
      * The behavior this switches on comes from `SyntheticBehavior`.
+     *
+     * `source` defaults to `device`. A device block of a sender already
+     * blocked from Bsky takes the marker over, so it leaves the Bsky-mirrored
+     * set; a Bsky block of a device-blocked sender changes nothing.
+     * `unblock` removes the marker whoever set it.
      */
-    block(key: PairMailboxKey, nowSeconds: number): Promise<void>
+    block(key: PairMailboxKey, nowSeconds: number, source?: BlockSource): Promise<void>
+
+    /**
+     * Mirror the owner's current Bsky blocks: block (`bsky`) every sender in
+     * `blocked` the relay holds a mailbox or pool entry for. Never lifts a
+     * marker: absence from `blocked` proves nothing. Walks the relay's own keys,
+     * not `blocked`, so the cost follows what the relay holds rather than how
+     * many the owner blocks.
+     */
+    syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void>
+
+    /** The senders whose block marker mirrors a Bsky block — a subset of `listBlocked`. */
+    listBskyBlocked(): Promise<string[]>
 
     unblock(key: PairMailboxKey): Promise<void>
 

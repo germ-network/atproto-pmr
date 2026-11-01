@@ -1,5 +1,7 @@
 import { ed25519 } from "@noble/curves/ed25519.js"
 import { sha256 } from "@noble/hashes/sha2.js"
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js"
+import type { CosePublicKey } from "../cose/key.js"
 import {
     parseSignature,
     parseSignatureInput,
@@ -25,6 +27,29 @@ export const REQUIRED_COMPONENTS = ["@method", "@authority", "@path"] as const
 export const BODY_COMPONENT = "content-digest"
 
 export const DEFAULT_LABEL = "pmr"
+
+/** The RFC 9421 `alg` value the profile requires for each key type. */
+export type RequestSignatureAlg = "ed25519" | "ml-dsa-65"
+
+/**
+ * The `alg` a conforming request signed by `key` carries. Throws on bare
+ * bytes that are not a 32-byte Ed25519 key; the verifier checks that first.
+ */
+export function requestSignatureAlg(
+    key: Uint8Array | CosePublicKey
+): RequestSignatureAlg {
+    const cose = asCosePublicKey(key)
+    if (cose === null) {
+        throw new Error("request signing key: bare bytes must be a 32-byte Ed25519 key")
+    }
+    return cose.kty === "AKP" ? "ml-dsa-65" : "ed25519"
+}
+
+/** Bare bytes are a raw Ed25519 key; anything else of the wrong length is not a key. */
+function asCosePublicKey(key: Uint8Array | CosePublicKey): CosePublicKey | null {
+    if (!(key instanceof Uint8Array)) return key
+    return key.byteLength === 32 ? { kty: "OKP", crv: "Ed25519", x: key } : null
+}
 
 export type VerifyOutcome =
     | {
@@ -57,10 +82,11 @@ export interface VerifyInput {
      */
     body: Uint8Array | null
     /**
-     * The Ed25519 public key, **resolved by the caller** from the identity
-     * the challenge was bound to. Never taken from the message.
+     * The signer's public key, **resolved by the caller** from the identity
+     * the challenge was bound to. Never taken from the message. Its key
+     * type picks the algorithm; bare bytes are a raw Ed25519 key.
      */
-    publicKey: Uint8Array
+    publicKey: Uint8Array | CosePublicKey
     nowSeconds: number
     label?: string
 }
@@ -68,6 +94,9 @@ export interface VerifyInput {
 export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
     const label = input.label ?? DEFAULT_LABEL
     const { request } = input
+
+    const key = asCosePublicKey(input.publicKey)
+    if (key === null) return { valid: false, reason: "malformed key" }
 
     const inputHeader = request.headers.get("signature-input")
     const sigHeader = request.headers.get("signature")
@@ -130,7 +159,7 @@ export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
     // choose the algorithm — it is checked for conformance and discarded;
     // the algorithm is pinned to what the resolved key implies.
     const alg = entry.params.get("alg")
-    if (alg !== "ed25519") {
+    if (alg !== requestSignatureAlg(key)) {
         return { valid: false, reason: "unexpected alg" }
     }
     if (typeof entry.params.get("keyid") !== "string") {
@@ -169,14 +198,18 @@ export function verifyRequestSignature(input: VerifyInput): VerifyOutcome {
         return { valid: false, reason: `cannot build signature base: ${e}` }
     }
 
+    // Both libraries signal a malformed key or signature either by returning
+    // false or by throwing (a wrong-length ML-DSA pub throws), and either
+    // must end as a refusal, so this catch is load-bearing.
+    const message = new TextEncoder().encode(base)
     let ok = false
     try {
-        ok = ed25519.verify(
-            signature,
-            new TextEncoder().encode(base),
-            input.publicKey,
-            { zip215: false }
-        )
+        ok =
+            key.kty === "AKP"
+                ? ml_dsa65.verify(signature, message, key.pub, {
+                      context: new Uint8Array(0),
+                  })
+                : ed25519.verify(signature, message, key.x, { zip215: false })
     } catch {
         ok = false
     }

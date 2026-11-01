@@ -7,6 +7,8 @@ import {
     type PMRStore,
     type RegistrationFields,
     type ResolvedAddress,
+    parseOkpEd25519Key,
+    thumbprintOkpEd25519,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
 import type { PMRObject } from "./pmr-object"
@@ -20,6 +22,11 @@ interface GrantAddressRow {
     authKey: string
     closed?: boolean
     expiresAt: number
+}
+
+/** Write-once: a tombstone is never rewritten or removed. */
+function tombstoneKey(did: string, anchorThumbprint: Uint8Array): string {
+    return `tomb:${did}:${binaryToBase64URL(anchorThumbprint)}`
 }
 
 function ttlFor(expiresAt: number): number {
@@ -149,22 +156,94 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
 
     /** Unlinks the DID, then tears down the DO's storage — best-effort. */
     async delete(did: string): Promise<void> {
-        // Capture the locator BEFORE removing the routing row (resolve keys off it).
         const locator = await this.resolve(did)
+        if (locator === null) return
+        await this.unlinkAndDestroy(did, locator)
+    }
+
+    async retire(did: string, expectedActive: Locator): Promise<Locator | null> {
+        if ((await this.resolve(did)) !== expectedActive) return null
+        await this.unlinkAndDestroy(did, expectedActive)
+        return expectedActive
+    }
+
+    /**
+     * Raised once per registration removed: replace, retire and deregister
+     * all pass through here. `locator` names the removed registration, so a
+     * late call can be told apart from a newer registration of the same DID.
+     * Runs after the unlink; a throw is logged and swallowed, so a deployment
+     * index keyed to it must tolerate a missed call (re-check on use).
+     */
+    protected async onRemoved(_did: string, _locator: Locator): Promise<void> {}
+
+    private async unlinkAndDestroy(did: string, locator: Locator): Promise<void> {
         // Unlink first: this is the authoritative step. A crash between here and the
-        // teardown below degrades to an orphaned-but-intact DO (the prior behavior),
-        // never to a routing row pointing at a half-wiped DO.
+        // teardown below degrades to an orphaned-but-intact DO, never to a routing
+        // row pointing at a half-wiped DO.
         await this.env.pmrDirectory.delete(did)
-        if (locator !== null) {
-            try {
-                await this.env.pmrs.get(this.env.pmrs.idFromString(locator)).destroy()
-            } catch (err) {
-                // Best-effort reclamation: a failed teardown just leaves the orphan
-                // (the prior behavior), it must not fail the deregistration/replace.
-                console.warn(`KVDirectory.delete: DO teardown failed for ${did}:`, err)
-            }
+        const stub = this.env.pmrs.get(this.env.pmrs.idFromString(locator))
+        await this.dropGrantRows(did, stub)
+        try {
+            await stub.destroy()
+        } catch (err) {
+            // Best-effort reclamation: a failed teardown just leaves the orphan, it
+            // must not fail the deregistration/replace.
+            console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
+        }
+        try {
+            await this.onRemoved(did, locator)
+        } catch (err) {
+            console.warn(`KVDirectory: onRemoved failed for ${did}:`, err)
         }
         await this.notifyMonitor("unregister", did)
+    }
+
+    /**
+     * Deletes the global grant-address rows of a registration about to be
+     * destroyed. A deleted row answers a sender like a lapsed one, so this
+     * changes no response. Best-effort: rows left behind lapse on their TTL.
+     */
+    private async dropGrantRows(
+        did: string,
+        stub: { listGrants(): Promise<Array<{ address: string }>> }
+    ): Promise<void> {
+        try {
+            for (const grant of await stub.listGrants()) {
+                try {
+                    await this.deleteGrantAddress(grant.address)
+                } catch (err) {
+                    console.warn(`KVDirectory: grant row delete failed for ${did}:`, err)
+                }
+            }
+        } catch (err) {
+            console.warn(`KVDirectory: grant listing failed for ${did}:`, err)
+        }
+    }
+
+    async deregister(did: string, anchorThumbprint: Uint8Array): Promise<void> {
+        const locator = await this.resolve(did)
+        if (locator === null) return
+        const fields = await this.env.pmrs
+            .get(this.env.pmrs.idFromString(locator))
+            .load()
+        if (
+            fields === null ||
+            binaryToBase64URL(thumbprintOkpEd25519(parseOkpEd25519Key(fields.anchorKey))) !==
+                binaryToBase64URL(anchorThumbprint)
+        ) {
+            return
+        }
+        // The tombstone is written before the registration goes: a crash in
+        // between leaves it active-but-tombstoned until the DELETE is retried.
+        const key = tombstoneKey(did, anchorThumbprint)
+        if ((await this.env.pmrDirectory.get(key)) === null) {
+            await this.env.pmrDirectory.put(key, "1")
+        }
+        await this.unlinkAndDestroy(did, locator)
+    }
+
+    async isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean> {
+        return (await this.env.pmrDirectory.get(tombstoneKey(did, anchorThumbprint))) !== null
     }
 }
 

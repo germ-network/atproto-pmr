@@ -3,9 +3,10 @@
  * while the anchor key stays in the DID's declaration"; `atproto-pmr.md`,
  * Lifecycle). A relay periodically re-checks the *registration owner's own*
  * Germ declaration; when the declared anchor key disappears it **pauses**
- * rather than tears down — DID-addressed mail stops, grant-addressed mail
- * continues, and it keeps watching that one declaration to see whether the
- * key returns.
+ * rather than tears down — it keeps queuing all mail and keeps watching that
+ * one declaration to see whether the key returns. Only a monitor-verified
+ * change retires a registration (`registration-lifecycle.ts`); this
+ * watch never does.
  *
  * This module is the platform-neutral decision logic: pure functions over a
  * `DeclarationResolution` and the trusted key, folded into `WatchState`. The
@@ -13,10 +14,9 @@
  * `paused`, are the storage adapter's (see `PMRStore` and the Cloudflare
  * `PMRObject`).
  *
- * Rotation to a *different* key is out of scope here (GER-2212, Q-PMR-12):
- * today a changed key is treated the same as a disappeared one — pause — and
- * the pause "covers the gap either way" until rotation ships. State is keyed
- * by DID, never by key, so a rotation is not foreclosed.
+ * A changed key is treated here as a disappeared one — pause. Retiring the
+ * registration for a changed or verifiably absent declaration is the
+ * monitor-verified path's job, not this watch's.
  */
 
 import type { DeclarationResolution } from "./declaration.js"

@@ -1,21 +1,13 @@
 /**
- * The owner's summary carries the full CARs of their graph's records. A read
+ * The owner's summary carries the full CARs of their contacts' records. A read
  * names the state the client holds and gets only what changed since; a client
  * that names nothing, or a state no longer held, gets everything, so no lost
  * response, lost state or second device leaves a client wrong.
  */
 import { describe, expect, it } from "vitest"
-import { ed25519 } from "@noble/curves/ed25519.js"
-import { encodeBinding } from "../src/challenge"
 import { encodeCose, type CoseValue } from "../src/cose/cbor"
-import { encodeOkpEd25519Key } from "../src/cose/key"
-import { DECLARATION_COLLECTION_NSID } from "../src/declaration"
-import { signRequest } from "../src/http-sig/sign"
-import { handleSummaryRead, type OwnerDeps } from "../src/owner/endpoints"
-import type { GraphReadResponse } from "../src/read-api"
+import { handleSummaryRead } from "../src/owner/endpoints"
 import { readRecordFromCar } from "../src/repo-proof"
-import type { RecordSnapshotStore } from "../src/snapshot-read"
-import type { ChallengeStore, Directory, Locator, PMRStore, RegistrationFields } from "../src/storage"
 import {
     decodeSummaryDelta,
     diffSummaryIndex,
@@ -25,10 +17,19 @@ import {
     SUMMARY_RECORD_KEYS,
     SUMMARY_TOKENS_KEPT,
     type SummaryDelta,
-    type SummaryPageDeps,
     type SummaryIndex,
 } from "../src/summary"
-import { buildRepoCar, makeKey } from "./fixtures/repo-car"
+import {
+    COLLECTION,
+    dids,
+    OTHER_OWNER,
+    owner,
+    OWNER,
+    PEER,
+    read,
+    summaryWorld,
+    URL_BASE,
+} from "./fixtures/summary-world"
 
 describe("diffSummaryIndex", () => {
     const entry = (did: string, cid = "c1", verifiedWith = "k1") => ({
@@ -37,37 +38,42 @@ describe("diffSummaryIndex", () => {
         rkey: "self",
         cid,
         verifiedWith,
+        commitCid: null,
+        rev: null,
+        evidenceState: null,
     })
-    const g = (n = 0): GraphReadResponse => ({
-        did: "did:plc:me",
-        following: n ? [{ did: "did:plc:a", rkey: `r${n}`, mutual: false }] : [],
-        followers: [],
+    const idx = (records: ReturnType<typeof entry>[]): SummaryIndex => ({
+        owner: "did:plc:me",
+        ownBlocks: [],
+        records,
+        verdicts: [],
+        evidenceSchema: 1,
+        permissionRecencySchema: 1,
     })
-    const idx = (records: ReturnType<typeof entry>[], graph = g()): SummaryIndex => ({ graph, records })
 
     it("with no base, everything changed and full is set", () => {
         const current = idx([entry("did:plc:a"), entry("did:plc:b")])
         expect(diffSummaryIndex(null, current)).toEqual({
             full: true,
-            graphChanged: true,
+            blocksChanged: true,
             changed: current.records,
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
         })
     })
 
-    it("an unchanged summary yields nothing changed and graphChanged false", () => {
-        const base = idx([entry("did:plc:a")], g(1))
-        const current = idx([entry("did:plc:a")], g(1))
+    it("an unchanged summary yields nothing changed", () => {
+        const base = idx([entry("did:plc:a")])
+        const current = idx([entry("did:plc:a")])
         expect(diffSummaryIndex(base, current)).toEqual({
             full: false,
-            graphChanged: false,
+            blocksChanged: false,
             changed: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
         })
-    })
-
-    it("a changed graph is graphChanged", () => {
-        expect(diffSummaryIndex(idx([], g(1)), idx([], g(2))).graphChanged).toBe(true)
     })
 
     it("a record whose CID changed is changed", () => {
@@ -102,169 +108,6 @@ describe("diffSummaryIndex", () => {
 })
 
 describe("summary read", () => {
-    const COLLECTION = "app.example.thing"
-    const WATCHED = [{ collection: COLLECTION, rkey: "self" }]
-    const OWNER = "did:plc:alice0000000000000000"
-    const OTHER_OWNER = "did:plc:bob00000000000000000000"
-    const PEER = "did:plc:peer0000000000000000000"
-    const URL_BASE = "https://relay.example/pmr/v1/summary"
-    const T0 = 1_760_000_000
-
-    function summaryWorld() {
-        const registrations = new Map<string, RegistrationFields>()
-        const challenges = (() => {
-            const rows = new Map<string, string>()
-            return {
-                async mint(c: string, boundTo: string) {
-                    rows.set(c, boundTo)
-                },
-                async consume(c: string) {
-                    const v = rows.get(c)
-                    if (v === undefined) return null
-                    rows.delete(c)
-                    return v
-                },
-            } as ChallengeStore
-        })()
-        const directory = {
-            async resolve(did: string): Promise<Locator | null> {
-                return registrations.has(did) ? `loc:${did}` : null
-            },
-            async create(did: string, registration: RegistrationFields): Promise<Locator> {
-                if (!registrations.has(did)) registrations.set(did, registration)
-                return `loc:${did}`
-            },
-        } as unknown as Directory
-
-        // The served-state store, as the PMRStore contract describes it.
-        const served = new Map<string, { token: string; index: SummaryIndex }[]>()
-        const puts: { locator: string; token: string }[] = []
-        const store = (locator: Locator): PMRStore =>
-            ({
-                load: async () => registrations.get(locator.slice(4)) ?? null,
-                async putSummaryIndex(token: string, index: SummaryIndex, _servedAtMs: number, replaces?: string) {
-                    puts.push({ locator, token })
-                    const list = (served.get(locator) ?? []).filter(
-                        (e) => e.token !== token && e.token !== replaces
-                    )
-                    list.push({ token, index })
-                    served.set(locator, list.slice(-SUMMARY_TOKENS_KEPT))
-                },
-                async getSummaryIndex(token: string) {
-                    return served.get(locator)?.find((e) => e.token === token)?.index ?? null
-                },
-            }) as unknown as PMRStore
-
-        // What the monitor holds: a record per DID at a version; absent unless set.
-        const versions = new Map<string, number>()
-        const key = makeKey()
-        const projections = new Map<string, GraphReadResponse>()
-        const reads: string[] = []
-        const repos = new Map<string, ReturnType<typeof buildRepoCar>>()
-        const repoOf = (did: string, collection: string, rkey: string) => {
-            const version = versions.get(did)
-            if (version === undefined) return null
-            const cacheKey = `${did}|${collection}/${rkey}@${version}`
-            if (!repos.has(cacheKey)) {
-                repos.set(
-                    cacheKey,
-                    buildRepoCar({
-                        did,
-                        key,
-                        records: { [`${collection}/${rkey}`]: { $type: collection, did, version } },
-                    })
-                )
-            }
-            return repos.get(cacheKey)!
-        }
-        const unreadable = new Set<string>()
-        const records: RecordSnapshotStore = {
-            async get(did, collection, rkey) {
-                reads.push(`${did}|${collection}/${rkey}`)
-                if (unreadable.has(did)) return null
-                const repo = repoOf(did, collection, rkey)
-                if (!repo) return null
-                return {
-                    car: repo.car,
-                    freshAtMs: 0,
-                    verifiedWith: key.multikey,
-                    rev: "3kaaaaaaaaaaa",
-                    cid: repo.recordCids[`${collection}/${rkey}`]!,
-                }
-            },
-        }
-        const index: SummaryPageDeps["index"] = {
-            async entries(refs) {
-                return refs.map((r) => {
-                    const repo = repoOf(r.did, r.collection, r.rkey)
-                    return repo === null
-                        ? null
-                        : {
-                              ...r,
-                              cid: repo.recordCids[`${r.collection}/${r.rkey}`]!,
-                              verifiedWith: key.multikey,
-                              freshAtMs: T0 * 1000,
-                          }
-                })
-            },
-        }
-        const edge = (did: string): GraphReadResponse["following"][number] => ({
-            did,
-            rkey: "r1",
-            mutual: false,
-        })
-        projections.set(OWNER, { did: OWNER, following: [edge(PEER)], followers: [] })
-        projections.set(OTHER_OWNER, { did: OTHER_OWNER, following: [], followers: [] })
-        versions.set(OWNER, 1)
-        versions.set(OTHER_OWNER, 1)
-        versions.set(PEER, 1)
-
-        let n = 0
-        const deps: OwnerDeps & SummaryPageDeps & { randomBytes: (n: number) => Uint8Array; pageRecords?: number } = {
-            challenges,
-            directory,
-            resolveLocator: (did) => directory.resolve(did),
-            store,
-            nowSeconds: T0,
-            discardWindowSeconds: 3600,
-            projections: { get: async (did) => projections.get(did) ?? null },
-            records,
-            index,
-            signingKeys: {
-                keysFor: async (dids) =>
-                    new Map(dids.map((d) => [d, { kind: "trusted", key: key.multikey } as const])),
-            },
-            onLapse: () => {},
-            watched: WATCHED,
-            randomBytes: (len) => {
-                n += 1
-                const bytes = new Uint8Array(len)
-                new DataView(bytes.buffer).setUint32(0, n)
-                return bytes
-            },
-            nowMs: () => T0 * 1000 + n,
-        }
-        return { deps, registrations, directory, challenges, versions, projections, served, puts, reads, unreadable }
-    }
-
-    async function owner(w: ReturnType<typeof summaryWorld>, did: string) {
-        const secretKey = ed25519.utils.randomSecretKey()
-        await w.directory.create(did, {
-            did,
-            anchorKey: encodeOkpEd25519Key({ x: ed25519.getPublicKey(secretKey) }),
-            lastActive: T0,
-        })
-        return async (since?: string): Promise<Response> => {
-            const c = `chal-${Math.random().toString(36).slice(2)}`
-            await w.challenges.mint(c, encodeBinding({ realm: "anchor", subject: did }), T0 + 600)
-            const url = since === undefined ? URL_BASE : `${URL_BASE}?since=${encodeURIComponent(since)}`
-            const parts = signRequest({ method: "GET", url, nonce: c, keyid: "t", secretKey })
-            return handleSummaryRead(new Request(url, { method: "GET", headers: parts.headers }), w.deps)
-        }
-    }
-    const read = async (res: Response) => decodeSummaryDelta(new Uint8Array(await res.arrayBuffer()))
-    const dids = (d: { records: { did: string }[] }) => d.records.map((r) => r.did).sort()
-
     it("an unauthenticated read is 401", async () => {
         const w = summaryWorld()
         const res = await handleSummaryRead(new Request(URL_BASE), w.deps)
@@ -281,7 +124,6 @@ describe("summary read", () => {
         const delta = await read(res)
         expect(delta.full).toBe(true)
         expect(delta.token).not.toBe("")
-        expect(delta.graph).toEqual(w.projections.get(OWNER))
         expect(dids(delta)).toEqual([OWNER, PEER].sort())
     })
 
@@ -317,11 +159,15 @@ describe("summary read", () => {
         expect(second).toEqual({
             token: first.token,
             full: false,
-            graph: null,
+            ownBlocks: null,
             records: [],
             removed: [],
+            verdicts: [],
+            droppedVerdicts: [],
             more: false,
             truncated: false,
+            coveredThroughMs: null,
+            lagging: [],
         })
         expect(new Set(w.puts.map((p) => p.token))).toEqual(new Set([first.token]))
     })
@@ -355,23 +201,8 @@ describe("summary read", () => {
         const delta = await read(await get(first.token))
         expect(delta.full).toBe(false)
         expect(delta.token).not.toBe(first.token)
-        expect(delta.graph).toBeNull()
         expect(dids(delta)).toEqual([PEER])
         expect(delta.removed).toEqual([])
-    })
-
-    it("a changed graph is sent when it changed", async () => {
-        const w = summaryWorld()
-        const get = await owner(w, OWNER)
-        const first = await read(await get())
-        const next = { ...w.projections.get(OWNER)!, followers: [{ did: PEER, rkey: "r9", mutual: true }] }
-        w.projections.set(OWNER, next)
-        const delta = await read(await get(first.token))
-        expect(delta.graph).toEqual(next)
-        expect(delta.records).toEqual([])
-        // a graph change is a new state: a client still naming the old token must see it too
-        expect(delta.token).not.toBe(first.token)
-        expect((await read(await get(first.token))).graph).toEqual(next)
     })
 
     it("a record added in one served state and removed later is in removed for a client naming that state", async () => {
@@ -435,10 +266,121 @@ describe("summary read", () => {
         for (const t of tokens.slice(1)) expect(held.has(t)).toBe(true)
     })
 
-    it("an owner with no projection yet is 409 with Retry-After", async () => {
+    describe("own blocks", () => {
+        const heldTokens = (w: ReturnType<typeof summaryWorld>) =>
+            (w.served.get(`loc:${OWNER}`) ?? []).map((e) => e.token)
+
+        it("a full read carries the owner's blocks, and an unchanged read sends b null under the same token", async () => {
+            const w = summaryWorld()
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const second = await read(await get(first.token))
+            expect(second.ownBlocks).toBeNull()
+            expect(second.token).toBe(first.token)
+        })
+
+        it("a change to blocks alone issues a new token with the whole list", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks).toEqual([])
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const second = await read(await get(first.token))
+            expect(second.token).not.toBe(first.token)
+            expect(second).toMatchObject({ full: false, records: [], removed: [] })
+            expect(second.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const third = await read(await get(second.token))
+            expect(third.ownBlocks).toBeNull()
+            expect(third.token).toBe(second.token)
+        })
+
+        it("sorts the list by rkey, so an unordered source does not resend it on every poll", async () => {
+            const w = summaryWorld()
+            w.blocks.set(OWNER, [
+                { blocker: OWNER, rkey: "3k2", subject: "did:plc:y" },
+                { blocker: OWNER, rkey: "3k1", subject: "did:plc:x" },
+            ])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first.ownBlocks!.map((b) => b.rkey)).toEqual(["3k1", "3k2"])
+            w.blocks.set(OWNER, [...w.blocks.get(OWNER)!].reverse())
+            expect((await read(await get(first.token))).ownBlocks).toBeNull()
+        })
+
+        it("a paged sync delivers the list on its first page and a later change on the next", async () => {
+            const w = summaryWorld()
+            w.deps.pageRecords = 1
+            w.blocks.set(OWNER, [{ blocker: OWNER, rkey: "3k1", subject: "did:plc:x" }])
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            expect(first).toMatchObject({ full: true, more: true })
+            expect(first.ownBlocks).toEqual([{ did: "did:plc:x", rkey: "3k1" }])
+            const second = await read(await get(first.token))
+            expect(second.ownBlocks).toBeNull()
+            w.blocks.set(OWNER, [])
+            const third = await read(await get(second.token))
+            expect(third.ownBlocks).toEqual([])
+        })
+
+        it("answers 503 with Retry-After when the blocks cannot be read, keeping the held states", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.blocksFail.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(503)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+            w.blocksFail.delete(OWNER)
+            expect((await read(await get(first.token))).token).toBe(first.token)
+        })
+
+        it("answers 409 when the owner's graph is not served, keeping the held states", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.notServed.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(409)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+        })
+
+        it("answers 409 + Retry-After when the owner's graph is not served (graph.ownGraph null)", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.ownGraphs.delete(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(409)
+            expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0)
+            expect(heldTokens(w)).toEqual(held)
+        })
+
+        it("answers 503 + Retry-After and leaves the stored baseline untouched when graph.ownGraph throws", async () => {
+            const w = summaryWorld()
+            const get = await owner(w, OWNER)
+            const first = await read(await get())
+            const held = heldTokens(w)
+            w.graphFail.add(OWNER)
+            const res = await get(first.token)
+            expect(res.status).toBe(503)
+            expect(res.headers.get("Retry-After")).not.toBeNull()
+            expect(heldTokens(w)).toEqual(held)
+            w.graphFail.delete(OWNER)
+            expect((await read(await get(first.token))).token).toBe(first.token)
+        })
+    })
+
+    it("an owner whose graph is not served yet is 409 with Retry-After", async () => {
         const w = summaryWorld()
         const get = await owner(w, OWNER)
-        w.projections.delete(OWNER)
+        w.ownGraphs.delete(OWNER)
         const res = await get()
         expect(res.status).toBe(409)
         expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0)
@@ -459,8 +401,8 @@ describe("summary read", () => {
         const peers = [1, 2, 3, 4].map((i) => `did:plc:page${i}00000000000000000`)
         function pagedWorld(pageRecords = 2) {
             const w = summaryWorld()
-            const edge = (did: string) => ({ did, rkey: "r1", mutual: false })
-            w.projections.set(OWNER, { did: OWNER, following: peers.map(edge), followers: [] })
+            const edge = (did: string) => ({ did, mutual: false })
+            w.ownGraphs.set(OWNER, { did: OWNER, following: peers.map(edge), followers: [] })
             for (const p of peers) w.versions.set(p, 1)
             w.deps.pageRecords = pageRecords
             return w
@@ -480,7 +422,7 @@ describe("summary read", () => {
             const get = await owner(w, OWNER)
             const first = await read(await get())
             const second = await read(await get(first.token))
-            expect(second).toMatchObject({ full: false, more: true, graph: null })
+            expect(second).toMatchObject({ full: false, more: true })
             expect(second.records).toHaveLength(2)
             const third = await read(await get(second.token))
             expect(third).toMatchObject({ full: false, more: false })
@@ -532,10 +474,9 @@ describe("summary read", () => {
             const w = pagedWorld()
             const many = Array.from({ length: SUMMARY_MAX_RECORDS + 1 }, (_, i) => ({
                 did: `did:plc:many${String(i).padStart(6, "0")}`,
-                rkey: "r",
                 mutual: false,
             }))
-            w.projections.set(OWNER, { did: OWNER, following: many, followers: [] })
+            w.ownGraphs.set(OWNER, { did: OWNER, following: many, followers: [] })
             const get = await owner(w, OWNER)
             expect((await read(await get())).truncated).toBe(true)
         })
@@ -576,7 +517,9 @@ describe("summary codec", () => {
         full: false,
         more: false,
         truncated: false,
-        graph: { did: "did:plc:me", following: [{ did: "did:plc:a", rkey: "r1", mutual: true }], followers: [] },
+        coveredThroughMs: null,
+        lagging: [],
+        ownBlocks: [{ did: "did:plc:x", rkey: "3k1" }],
         records: [
             {
                 did: "did:plc:a",
@@ -585,15 +528,43 @@ describe("summary codec", () => {
                 cid: "bafy",
                 verifiedWith: "zKey",
                 car: Uint8Array.of(1, 2, 3),
+                evidence: null,
             },
         ],
         removed: [{ did: "did:plc:b", collection: "app.example.thing", rkey: "self" }],
+        verdicts: [],
+        droppedVerdicts: [],
     }
 
     it("a delta round-trips through encode and decode", () => {
         expect(decodeSummaryDelta(encodeSummaryDelta(delta))).toEqual(delta)
-        const unchangedGraph = { ...delta, graph: null, records: [], removed: [] }
-        expect(decodeSummaryDelta(encodeSummaryDelta(unchangedGraph))).toEqual(unchangedGraph)
+        const unchanged = { ...delta, ownBlocks: null, records: [], removed: [] }
+        expect(decodeSummaryDelta(encodeSummaryDelta(unchanged))).toEqual(unchanged)
+    })
+
+    it("round-trips bound evidence with integer durations and explicit unavailable values", () => {
+        const withEvidence = {
+            ...delta,
+            records: [{
+                ...delta.records[0]!,
+                evidence: {
+                    commitCid: "bafCommit",
+                    rev: "3m1",
+                    authority: {
+                        method: "web" as const,
+                        documentUrl: "https://example.org/did.json",
+                        verificationMethodId: "did:web:example.org#atproto",
+                        keyFingerprint: "sha256:abcd",
+                    },
+                    assurance: "current-key-cross-check" as const,
+                    monitor: "monitor.example.org",
+                    commitAgeMs: 12_345,
+                    anchorAgeMs: null,
+                    remainingTtlMs: 500,
+                },
+            }],
+        }
+        expect(decodeSummaryDelta(encodeSummaryDelta(withEvidence))).toEqual(withEvidence)
     })
 
     it("decode ignores unknown keys", () => {
@@ -601,7 +572,6 @@ describe("summary codec", () => {
             new Map<string, CoseValue>([
                 [SUMMARY_DELTA_KEYS.token, "t"],
                 [SUMMARY_DELTA_KEYS.full, true],
-                [SUMMARY_DELTA_KEYS.graph, null],
                 [
                     SUMMARY_DELTA_KEYS.records,
                     [
@@ -628,12 +598,19 @@ describe("summary codec", () => {
             new Map<string, CoseValue>([
                 [SUMMARY_DELTA_KEYS.token, "t"],
                 [SUMMARY_DELTA_KEYS.full, true],
-                [SUMMARY_DELTA_KEYS.graph, null],
                 [SUMMARY_DELTA_KEYS.records, []],
                 [SUMMARY_DELTA_KEYS.removed, []],
             ])
         expect(decodeSummaryDelta(encodeCose(base())).token).toBe("t")
-        const optional: string[] = [SUMMARY_DELTA_KEYS.more, SUMMARY_DELTA_KEYS.truncated]
+        const optional: string[] = [
+            SUMMARY_DELTA_KEYS.more,
+            SUMMARY_DELTA_KEYS.truncated,
+            SUMMARY_DELTA_KEYS.ownBlocks,
+            SUMMARY_DELTA_KEYS.verdicts,
+            SUMMARY_DELTA_KEYS.droppedVerdicts,
+            SUMMARY_DELTA_KEYS.coveredThroughMs,
+            SUMMARY_DELTA_KEYS.lagging,
+        ]
         for (const key of Object.values(SUMMARY_DELTA_KEYS)) {
             if (optional.includes(key)) continue
             const m = base()

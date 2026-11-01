@@ -55,7 +55,10 @@ exact signatures belong to an implementation.
 | `resolve(did) -> Locator?` | hot path; routes every pair put and every owner request |
 | `resolveAddress(address) -> (Locator, GrantRecord)?` | grant puts name no DID, so the address must resolve globally before any relay is known. `GrantRecord` is at minimum the `authKey` a [grant put's tag](wire-api.md#grant-address-and-put-tag-derivation) verifies against, plus `closed`. **Carries the uniform-cost requirement below** |
 | `create(did, registration) -> Locator` | idempotent on DID |
-| `delete(did)` | deregistration and dormancy eviction |
+| `delete(did)` | removes and destroys the DID's active registration with its mail: dormancy eviction, and the replace path of a new key's registration |
+| `retire(did, expectedActive) -> Locator?` | destroys the active registration with its mail if it is `expectedActive`, else does nothing; does not tombstone its anchor. Used only for a monitor-verified change of anchor or verified absence |
+| `deregister(did, anchorThumbprint)` | when the thumbprint is the active registration's anchor: tombstones it (write-once), then removes and destroys the registration |
+| `isTombstoned(did, anchorThumbprint) -> bool` | one lookup; a tombstone is never rewritten or removed |
 | `dueForWork(kind, before, limit) -> [Locator]` | enumerates registrations needing attention — principally dormancy eviction. Not reclamation, which is the storage layer's own policy, and not key monitoring, which is push-driven — see [Scheduling](#scheduling) |
 
 ### Registration state
@@ -97,7 +100,9 @@ A relay still keeps a little monitor-shaped state for its **own** registered
 DIDs, because it pauses when a declared key disappears
 (§[Registration state](#registration-state)): the last observed
 declaration revision, the last check time, the currently trusted anchor
-key, and the paused flag. That is a relay concern and stays here; serving
+key, and the paused flag. A pause is reversible and still queues mail; only a
+monitor-verified change of anchor or verified absence of the record retires
+the registration, which destroys it. That is a relay concern and stays here; serving
 monitoring *to others* is not.
 
 The **last observed declaration revision is a monotonic watermark**
@@ -138,11 +143,12 @@ distinct name.
 | operation | notes |
 |---|---|
 | `append(mailboxKey, messageRef) -> Appended \| Refused(full)` | **refuses at capacity — never accept-and-evict**; the cap check and the write MUST be one atomic step, or two concurrent puts both see room |
-| `appendToPool(senderKey, messageRef)` | **never returns `Refused`** under ordinary pressure; it evicts |
+| `receive(senderKey, messageRef, admission) -> Queued \| Pooled \| Refused(full)` | one atomic step per adjudicated pair put: routes by the sender's standing (none, a device contact, an admitted sender, a blocked sender) and the recipient's verdict; the nonce and pause checks come first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit), then the writes |
+| `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent** |
 | `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps |
-| `poolSenders() -> [senderKey]` | adjudication; **DIDs only, never bodies** |
+| `poolSenders() -> [senderKey, verdict?]` | adjudication; **DIDs only, never bodies** |
 
 `appendPair(senderDID, messageRef, nonce, verifiedEvidence)` is the pair-put
 operation for generation-aware stores. Its key binding, generation selection,
@@ -199,7 +205,7 @@ to a sender:
 
 | | blocked | discarded |
 |---|---|---|
-| applies to | a **provisioned** sender the recipient blocked | an **unprovisioned** sender the device declined |
+| applies to | a sender the recipient blocked, **provisioned or not**, whether the device blocked them or the relay mirrored a Bsky block | an **unprovisioned** sender the device declined |
 | put answers | `202` / `429` per the synthetic state | `202`, as any unprovisioned put does |
 | lifetime | until unblocked | **expires, deliberately** |
 | bodies stored | none | none |
@@ -226,6 +232,15 @@ is indistinguishable. Three properties matter to an adapter:
 
 Blocking is reversible, so the record survives unblocking as ordinary reset
 state.
+
+A mailbox the relay opened for a sender the recipient's policy admitted
+carries an *admitted* mark, kept beside the queue. It marks a sender judged
+again on every put; provisioning the sender clears it and makes the sender a
+device contact, judged only by blocks. A block mirrored from Bsky carries its
+own mark. Neither a verdict nor the Bsky block's absence lifts it; only a
+device unblock does, and that holds only until the relay next sees the Bsky
+block (the sender's next put or the catch-up after it). A device block takes
+it over.
 
 The concrete synthetic behavior is the implementer's, deliberately
 unpublished, and free to change. This document specifies the storage

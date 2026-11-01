@@ -3,8 +3,9 @@
  * policy, how registrations reach it, and what joining and leaving do to
  * everything kept for a DID.
  */
+import { readSecondary } from "./secondary-read"
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { RecordNotFoundError } from "@germ-network/atproto-pmr-core"
 import {
     applyInterestTransitions,
@@ -34,9 +35,12 @@ const testEnv = env as unknown as MonitorEnv & {
 const VERIFIED = { cid: "bafyreistub", verifiedWith: "zKey" }
 
 let n = 0
+const testStubs: DurableObjectStub<MonitorIngest>[] = []
 const stubOf = (ns: DurableObjectNamespace<MonitorIngest>) => {
     n += 1
-    return ns.get(ns.idFromName(`interest-${n}`))
+    const stub = ns.get(ns.idFromName(`interest-${n}`))
+    testStubs.push(stub)
+    return stub
 }
 /** One alarm with the network stubbed out; the connect stages fail, the rest runs. */
 async function alarm(stub: DurableObjectStub<MonitorIngest>) {
@@ -55,6 +59,16 @@ const everyoneStub = () => stubOf(testEnv.ingest)
 const registeredStub = () => stubOf(testEnv.ingestRegistered)
 const inObj = <R>(stub: DurableObjectStub<MonitorIngest>, fn: (obj: MonitorIngest) => Promise<R>) =>
     runInDurableObject(stub, (obj) => fn(obj as MonitorIngest))
+
+afterEach(async () => {
+    for (const stub of testStubs.splice(0)) {
+        try {
+            await runInDurableObject(stub, (obj) => obj.ctx.storage.deleteAlarm())
+        } catch {
+            // The alarm may already have run as the test's scheduled wake.
+        }
+    }
+})
 
 /** Forget everything the constructor seeded, as if the object predates the allow list. */
 const unseed = (stub: DurableObjectStub<MonitorIngest>) =>
@@ -664,7 +678,7 @@ describe("joining and leaving interest", () => {
             expect(await applyTransitions(obj)).toBe(1)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
             expect(await env.records.get(`chk:${PROFILE}/self:${did}`)).toBeNull()
         })
         expect(pushed).toEqual([])
@@ -721,7 +735,7 @@ describe("joining and leaving interest", () => {
             await obj.setRegistered(did, true, 1)
             await applyTransitions(obj)
             expect(await settleSecondaries()).toBe(1)
-            const got = await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })
+            const got = await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })
             expect(got).toMatchObject({ rev: "3m4", verifiedWith: KEY, cid: "bafyreiprofile" })
             expect(await obj.secondaryRevOf({ did, collection: PROFILE, rkey: "self" })).toBe("3m4")
             expect(await obj.revOf(did)).toBeNull()
@@ -744,7 +758,7 @@ describe("joining and leaving interest", () => {
             await obj.setRegistered(did, false, 2) // left, leave not yet applied
             expect(await settleSecondaries()).toBe(0)
             expect(fetches).toEqual([])
-            expect(await kvSnapshotStore(testEnv).getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
         })
         expect(await rows(stub, "SELECT did FROM rec_pending")).toEqual([])
     })
@@ -775,7 +789,7 @@ describe("joining and leaving interest", () => {
                     throw new RecordNotFoundError("gone", false, reason)
                 })
                 await settle(o.deps(), did)
-                const profile = await kvSnapshotStore(testEnv).getSecondary({
+                const profile = await readSecondary(testEnv, {
                     did,
                     collection: PROFILE,
                     rkey: "self",
@@ -858,7 +872,7 @@ describe("joining and leaving interest", () => {
             const [owed] = await obj.duePending(Date.now(), 10)
             expect(owed).toMatchObject({ did, quiet: true })
             await settleOwed(obj)
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).toBeNull()
             expect((await obj.recordsOf(did)).filter((r) => r.collection === PROFILE)).toEqual([])
         })
         expect(pushed).toEqual([])
@@ -873,7 +887,7 @@ describe("joining and leaving interest", () => {
             await settleDeletion((obj as unknown as Internals).deps(), did, false)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).not.toBeNull()
             expect((await obj.recordsOf(did)).map((r) => r.collection)).toEqual([PROFILE])
         })
     })
@@ -1117,7 +1131,7 @@ describe("joining and leaving interest", () => {
             await applyTransitions(obj)
             const store = kvSnapshotStore(testEnv)
             expect(await store.getRecord(did)).not.toBeNull()
-            expect(await store.getSecondary({ did, collection: PROFILE, rkey: "self" })).not.toBeNull()
+            expect(await readSecondary(testEnv, { did, collection: PROFILE, rkey: "self" })).not.toBeNull()
             expect(await obj.revOf(did)).toBe("3m1")
         })
     })
@@ -1494,7 +1508,9 @@ describe("declaration intake by policy", () => {
         const stub = registeredStub()
         const outside = uniqDid()
         const cursor = (obj: MonitorIngest) => obj.readCursor()
-        let now = 1_000_000
+        // Keep scheduled storage alarms in the future relative to Workerd's
+        // real clock while advancing the ignored-cursor interval locally.
+        let now = Date.now()
         const clock = vi.spyOn(Date, "now").mockImplementation(() => now)
         try {
             await inObj(stub, async (obj) => {
@@ -1556,6 +1572,8 @@ describe("documents and key updates follow interest", () => {
         })
         expect(await rows(stub, "SELECT did, kind FROM key_updates")).toEqual([{ did: followee, kind: "delete" }])
         expect(await rows(stub, "SELECT did FROM pending")).toEqual([])
+        const promptAt = Number((await rows(stub, "SELECT v FROM meta WHERE k = 'prompt_at'"))[0]?.v)
+        expect(promptAt - Date.now()).toBeGreaterThan(50_000)
     })
     it("a head check for a DID that is not watched records no document (a gone-reversible holder under everyone)", async () => {
         const stub = everyoneStub()

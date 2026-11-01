@@ -368,3 +368,37 @@ describe("fetchRepoCar", () => {
         ).rejects.toMatchObject({ name: "RecordNotFoundError", reason: "RepoDeactivated", permanent: false })
     })
 })
+
+describe("which not-found answers are permanent", () => {
+    const answers = (name: string) => () =>
+        Response.json({ error: name, message: "gone" }, { status: 400 })
+
+    /** Each fetcher answering `name` at the endpoint it reads. */
+    const fetchers = (name: string) => {
+        const call = (endpoint: string, run: (impl: typeof fetch) => Promise<unknown>) =>
+            run(fixture({ [endpoint]: answers(name) }).impl).catch((e) => e)
+        return [
+            call("sync.getLatestCommit", (fetchImpl) => fetchHeadRev(DID, { fetchImpl })),
+            call("sync.getRecord", (fetchImpl) =>
+                fetchRecordCar(DID, { collection: COLLECTION, fetchImpl })
+            ),
+            call("sync.getRepo", (fetchImpl) =>
+                fetchRepoCar(DID, { timeoutMs: 5_000, maxBytes: 1_000, fetchImpl })
+            ),
+        ]
+    }
+
+    it("RecordNotFound is terminal but not permanent: the account may publish the record again", async () => {
+        for (const err of await Promise.all(fetchers("RecordNotFound"))) {
+            expect(err).toBeInstanceOf(RecordNotFoundError)
+            expect(err).toMatchObject({ reason: "RecordNotFound", permanent: false })
+        }
+    })
+
+    it("RepoNotFound stays permanent", async () => {
+        for (const err of await Promise.all(fetchers("RepoNotFound"))) {
+            expect(err).toBeInstanceOf(RecordNotFoundError)
+            expect(err).toMatchObject({ reason: "RepoNotFound", permanent: true })
+        }
+    })
+})

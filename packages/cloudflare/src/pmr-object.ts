@@ -13,6 +13,11 @@ import {
     parseGrantLifecycle,
     reconcileWatchState,
     type AppendResult,
+    type Admission,
+    type PoolVerdict,
+    type BlockSource,
+    type ReceiveResult,
+    type PairMailboxKey,
     type PairAppendResult,
     type PairMailboxEvidence,
     type StoredPairMailboxEvidence,
@@ -38,6 +43,7 @@ import {
 } from "@germ-network/atproto-pmr-core"
 import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
+import { monitorOwnBlocks } from "./monitor-own-blocks"
 import { webPushSender } from "./push-sender"
 
 /**
@@ -58,6 +64,7 @@ const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
+const KEY_MONITOR_CONFIRMED = "monitorConfirmed"
 
 /** One served summary state per entry, so storing one never rewrites another. */
 const SUMMARY_PREFIX = "summary:"
@@ -66,9 +73,9 @@ const summaryKey = (token: string) => SUMMARY_PREFIX + token
 const KEY_SUMMARY_ORDER = "summaryOrder"
 
 /**
- * An index is stored as a header under `summaryKey` and its edges and
- * entries in parts under `summaryPartKey`, each part far below the 2 MB value
- * limit however large the owner's graph. A distinct prefix keeps a
+ * An index is stored as a header under `summaryKey` and the owner's
+ * blocks, the record entries and the verdicts in parts under `summaryPartKey`, each part far below the 2 MB value
+ * limit however many blocks or contacts the owner has. A distinct prefix keeps a
  * client-named token from addressing a part.
  */
 const SUMMARY_PART_PREFIX = "summaryPart:"
@@ -79,13 +86,15 @@ const SUMMARY_PART_CHARS = 1_000_000
 const STORAGE_BATCH = 128
 
 interface SummaryHeader {
-    graphDid: string
+    owner: string
     more?: boolean
+    evidenceSchema?: number
+    permissionRecencySchema?: number
     parts: number
 }
 
 interface SummaryPart {
-    field: "following" | "followers" | "records"
+    field: "ownBlocks" | "records" | "verdicts"
     items: unknown[]
 }
 interface SummaryOrder {
@@ -116,11 +125,24 @@ const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
 const PAIR_EVIDENCE_PREFIX = "pairEvidence:"
+/** A pooled sender's latest receive-time verdict, kept as long as its `pool:` entries. */
+const POOL_VERDICT_PREFIX = "poolv:"
+/**
+ * Marks a pair mailbox the relay opened for a sender the recipient's policy
+ * admitted; absent for a device contact. A relay that stops adjudicating
+ * treats every mailbox, marked or not, as a device contact's.
+ */
+const ADMITTED_PREFIX = "adm:"
+/** Marks a relay block (`syn:`) that mirrors a Bsky block, so a device takeover or unblock can tell it from a device block. */
+const BSKY_BLOCK_PREFIX = "bsky:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
 const discardKey = (k: MailboxKey) => `discard:${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
+const poolVerdictKey = (k: MailboxKey) => `${POOL_VERDICT_PREFIX}${k}`
+const admittedKey = (k: MailboxKey) => `${ADMITTED_PREFIX}${k}`
+const bskyBlockKey = (k: MailboxKey) => `${BSKY_BLOCK_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
 const pairEvidenceKey = (k: MailboxKey) => `${PAIR_EVIDENCE_PREFIX}${k}`
@@ -372,7 +394,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // whole backlog to be computed before the socket even opens.
         this.ctx.waitUntil(
             drainBacklog(
-                { store: this, bodies: kvBodyStore(this.env) },
+                {
+                    store: this,
+                    bodies: kvBodyStore(this.env),
+                    blocks: monitorOwnBlocks(this.env),
+                },
                 capabilities,
                 (frame) => server.send(frame)
             )
@@ -421,6 +447,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
+    async isMonitorConfirmed(): Promise<boolean> {
+        return (await this.db.get<boolean>(KEY_MONITOR_CONFIRMED)) === true
+    }
+
+    async markMonitorConfirmed(): Promise<void> {
+        await this.db.put(KEY_MONITOR_CONFIRMED, true)
+    }
+
     // MARK: - The declaration watch
 
     async readWatchState(): Promise<WatchState> {
@@ -457,8 +491,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 [
                     summaryKey(token),
                     {
-                        graphDid: index.graph.did,
+                        owner: index.owner,
                         ...(index.more ? { more: true } : {}),
+                        ...(index.evidenceSchema === undefined ? {} : { evidenceSchema: index.evidenceSchema }),
+                        ...(index.permissionRecencySchema === undefined
+                            ? {}
+                            : { permissionRecencySchema: index.permissionRecencySchema }),
                         parts: parts.length,
                     } satisfies SummaryHeader,
                 ],
@@ -484,11 +522,17 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // A client names the token, so one too long to be a key is simply not held.
         if (new TextEncoder().encode(summaryKey(token)).length > MAX_KEY_BYTES) return null
         const header = await this.db.get<SummaryHeader>(summaryKey(token))
-        if (!header || typeof header.parts !== "number") return null
+        if (!header || typeof header.parts !== "number" || typeof header.owner !== "string") return null
         const index: SummaryIndex = {
-            graph: { did: header.graphDid, following: [], followers: [] },
+            owner: header.owner,
+            ownBlocks: [],
             records: [],
+            verdicts: [],
             ...(header.more ? { more: true } : {}),
+            ...(header.evidenceSchema === undefined ? {} : { evidenceSchema: header.evidenceSchema }),
+            ...(header.permissionRecencySchema === undefined
+                ? {}
+                : { permissionRecencySchema: header.permissionRecencySchema }),
         }
         const keys = summaryPartKeys(token, 0, header.parts)
         for (const batch of chunk(keys, STORAGE_BATCH)) {
@@ -497,7 +541,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 const part = read.get(key)
                 if (!part) return null
                 if (part.field === "records") index.records.push(...(part.items as SummaryIndex["records"]))
-                else index.graph[part.field].push(...(part.items as SummaryIndex["graph"]["following"]))
+                else if (part.field === "ownBlocks") {
+                    index.ownBlocks.push(...(part.items as SummaryIndex["ownBlocks"]))
+                } else if (part.field === "verdicts") {
+                    index.verdicts.push(...(part.items as SummaryIndex["verdicts"]))
+                }
             }
         }
         return index
@@ -557,7 +605,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        evidence: PairMailboxEvidence
+        evidence: PairMailboxEvidence,
+        admission?: Admission
     ): Promise<PairAppendResult> {
         return this.ctx.blockConcurrencyWhile(async () => {
         if (evidence.senderDID !== key || evidence.anchorKey.byteLength !== 32) {
@@ -611,9 +660,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             pairGeneration: selected.generation,
             hint: { senderDID: key, declarationCID: selected.declarationCID },
         }
-        const result = (await this.hasMailbox(key))
-            ? await this.append(key, boundRef, nonce, nowSeconds)
-            : await this.appendToPool(key, boundRef, nonce, nowSeconds)
+        const result = admission === undefined
+            ? (await this.hasMailbox(key))
+                ? await this.append(key, boundRef, nonce, nowSeconds)
+                : await this.appendToPool(key, boundRef, nonce, nowSeconds)
+            : await this.receive(key, boundRef, nonce, nowSeconds, admission)
         return {
             result,
             generation: selected.generation,
@@ -669,19 +720,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
-        }
-
-        // PAUSE (watch.ts): the owner's own declared anchor key is confirmed
-        // gone, so DID-addressed mail is absorbed — no bytes, no delivery, and
-        // (unlike an accepted append) no nonce recorded, because the pause is
-        // transient and a resend after the key returns must still land. Only
-        // pair (`did:`) keys pause; a `grant:`-keyed put (grant-put.ts) passes
-        // through untouched, since pause stops DID-addressed mail and keeps
-        // grant-addressed mail. The response is the same 202 a real append
-        // yields; the trigger (the owner's declaration) is public, so this is
-        // not a blocking-style secret that needs timing parity.
-        if (isPairMailboxKey(key) && (await this.readWatchState()).paused) {
-            return { outcome: "appended", persistBody: false }
         }
 
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
@@ -796,6 +834,89 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return (await this.db.get(syntheticKey(key))) !== undefined
     }
 
+    async receive(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        admission: Admission
+    ): Promise<ReceiveResult> {
+        const seen = await this.loadNonces(key)
+        if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
+
+        let blocked = await this.db.get<SyntheticState>(syntheticKey(key))
+        if (admission.verdict === "blocked" && blocked === undefined) {
+            await this.block(key, nowSeconds, "bsky")
+            blocked = await this.db.get<SyntheticState>(syntheticKey(key))
+        }
+        if (blocked !== undefined) {
+            const result = await this.advanceSynthetic(key, blocked, nowSeconds)
+            if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
+            return toReceiveResult(result)
+        }
+
+        const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
+        const admitted = (await this.db.get(admittedKey(key))) !== undefined
+        if (queue !== undefined && !admitted) {
+            const result = await this.appendReal(key, ref, nowSeconds)
+            if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
+            return toReceiveResult(result)
+        }
+
+        if (admission.verdict === "yes") {
+            return this.admit(key, ref, nonce, nowSeconds, queue ?? [], seen)
+        }
+        // A blocked verdict always ends on the synthetic path above.
+        if (admission.verdict === "blocked") throw new Error("unreachable")
+        const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
+            verdict: admission.verdict,
+            why: admission.why,
+        })
+        return pooled.outcome === "pooled"
+            ? { outcome: "pooled", persistBody: pooled.persistBody }
+            : pooled
+    }
+
+    /**
+     * Queue a put the recipient's policy admitted, opening and marking the
+     * sender's mailbox if need be. Refused, writing nothing, only when the new
+     * ref itself does not fit; the oldest pooled entries that fit ahead of it
+     * move in and the rest stay pooled with their verdict.
+     */
+    private async admit(
+        key: MailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        queue: MessageRef[],
+        seen: string[]
+    ): Promise<ReceiveResult> {
+        const capacity = this.capacity()
+        if (queue.length >= capacity) {
+            return {
+                outcome: "refused",
+                retryAfter: await this.retryInstant(key, nowSeconds),
+            }
+        }
+        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+        const moved = pooled.slice(0, capacity - queue.length - 1)
+        await this.db.put(mailboxKey(key), [...queue, ...moved, ref])
+        await this.db.put(admittedKey(key), true)
+        if (moved.length > 0) {
+            const rest = pooled.slice(moved.length)
+            if (rest.length === 0) {
+                await this.releasePool(key, pooled)
+            } else {
+                await this.db.put(poolKey(key), rest)
+                const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
+                const freed = moved.reduce((n, r) => n + r.byteLength, 0)
+                await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
+            }
+        }
+        await this.recordNonce(key, nonce, seen)
+        return { outcome: "queued", persistBody: true, ...(moved.length > 0 ? { moved } : {}) }
+    }
+
     /**
      * Reconnect-drain's primitive. `startAfter` gives cursor semantics for
      * free from the underlying storage — `nextCursor` is just the last raw
@@ -903,18 +1024,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         ref: MessageRef,
         nonce: Nonce,
-        nowSeconds: number
+        nowSeconds: number,
+        verdict?: PoolVerdict
     ): Promise<PoolAppendResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
             return { outcome: "duplicate" }
-        }
-
-        // PAUSE (watch.ts): the pool is DID-addressed by construction, so a
-        // paused registration absorbs every pooled put — no bytes, no nonce
-        // recorded — exactly as `append` absorbs a paused pair put. See there.
-        if ((await this.readWatchState()).paused) {
-            return { outcome: "pooled", persistBody: false }
         }
 
         const discardedUntil = await this.db.get<number>(discardKey(key))
@@ -950,6 +1065,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
 
         await this.db.put(poolKey(key), existing)
+        if (verdict !== undefined) await this.db.put(poolVerdictKey(key), verdict)
         await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
         await this.recordNonce(key, nonce, seen)
         return { outcome: "pooled", persistBody: true }
@@ -964,10 +1080,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      */
     async poolSenders(): Promise<PoolSender[]> {
         const entries = await this.db.list<MessageRef[]>({ prefix: POOL_PREFIX })
-        return [...entries].map(([k, refs]) => ({
-            did: k.slice(POOL_PREFIX.length),
-            count: refs.length,
-        }))
+        const verdicts = await this.db.list<PoolVerdict>({
+            prefix: POOL_VERDICT_PREFIX,
+        })
+        return [...entries].map(([k, refs]) => {
+            const did = k.slice(POOL_PREFIX.length)
+            const verdict = verdicts.get(poolVerdictKey(did as MailboxKey))
+            return {
+                did,
+                count: refs.length,
+                ...(verdict !== undefined ? { verdict } : {}),
+            }
+        })
     }
 
     /**
@@ -988,6 +1112,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // reaches here with a stale key — provisioning a blocked sender
         // would undo the block by creating them a live mailbox.
         if ((await this.db.get(syntheticKey(key))) !== undefined) return []
+
+        // A device contact is judged only by blocks from here on.
+        await this.db.delete(admittedKey(key))
 
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         if (pooled.length === 0) {
@@ -1073,12 +1200,20 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
         const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
         await this.db.delete(poolKey(key))
+        await this.db.delete(poolVerdictKey(key))
         await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
     }
 
     // MARK: - Blocking and discard
 
-    async block(key: MailboxKey, _nowSeconds: number): Promise<void> {
+    async block(
+        key: MailboxKey,
+        _nowSeconds: number,
+        source: BlockSource = "device"
+    ): Promise<void> {
+        // A device block takes over a mirrored one, so it leaves
+        // `bs`; the marker is dropped before the early return.
+        if (source === "device") await this.db.delete(bskyBlockKey(key))
         if ((await this.db.get(syntheticKey(key))) !== undefined) return
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
@@ -1087,10 +1222,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // than a real mailbox's, which is a distinguisher. `advance`
         // receives this empty object on the first put and initializes.
         await this.db.put(syntheticKey(key), {} satisfies SyntheticState)
+        if (source === "bsky") await this.db.put(bskyBlockKey(key), true)
 
         // Dropping the queue is the point, not a side effect: no bytes are
         // kept for a blocked sender.
         await this.db.delete(mailboxKey(key))
+        await this.db.delete(admittedKey(key))
 
         // And the pool, for the same reason. A sender who was pooled and
         // then blocked would otherwise still surface in the owner's pool
@@ -1103,6 +1240,33 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async unblock(key: MailboxKey): Promise<void> {
         await this.db.delete(syntheticKey(key))
+        await this.db.delete(bskyBlockKey(key))
+    }
+
+    async syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void> {
+        const held = new Set<string>()
+        for (const [prefix, family] of [
+            [POOL_PREFIX, "pool"],
+            [ADMITTED_PREFIX, "adm"],
+            [MAILBOX_PREFIX, "mbox"],
+        ] as const) {
+            const keys = await this.db.list({ prefix })
+            for (const k of keys.keys()) {
+                const sender = k.slice(prefix.length)
+                // Grant mailboxes name no sender.
+                if (family === "mbox" && !isPairMailboxKey(sender)) continue
+                held.add(sender)
+            }
+        }
+        for (const sender of held) {
+            const key = sender as PairMailboxKey
+            if (blocked.has(sender)) await this.block(key, 0, "bsky")
+        }
+    }
+
+    async listBskyBlocked(): Promise<string[]> {
+        const entries = await this.db.list({ prefix: BSKY_BLOCK_PREFIX })
+        return [...entries.keys()].map((k) => k.slice(BSKY_BLOCK_PREFIX.length))
     }
 
     /** The block markers' own keys — the DIDs. No second table to drift. */
@@ -1181,11 +1345,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     // MARK: - Teardown
 
     /**
-     * Tear down all of this registration's stored state — the deregistration /
-     * replace teardown. `KVDirectory.delete` calls this after unlinking the DID,
-     * so an orphaned DO does not leak its storage forever (nothing else reclaims
-     * it — there is no alarm or sweep). Reached by locator, not by DID: the caller
-     * has already removed the routing row.
+     * Tear down all of this registration's stored state. Reached by locator,
+     * not by DID: the caller has already removed the routing row.
      */
     async destroy(): Promise<void> {
         await this.db.deleteAll()
@@ -1205,9 +1366,9 @@ function summaryPartKeys(token: string, from: number, to: number): string[] {
 function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
     const parts: SummaryPart[] = []
     for (const [field, items] of [
-        ["following", index.graph.following],
-        ["followers", index.graph.followers],
+        ["ownBlocks", index.ownBlocks],
         ["records", index.records],
+        ["verdicts", index.verdicts],
     ] as const) {
         let current: unknown[] = []
         let chars = 0
@@ -1224,4 +1385,10 @@ function splitSummaryIndex(index: SummaryIndex): SummaryPart[] {
         if (current.length > 0) parts.push({ field, items: current })
     }
     return parts
+}
+
+function toReceiveResult(result: AppendResult): ReceiveResult {
+    return result.outcome === "appended"
+        ? { outcome: "queued", persistBody: result.persistBody }
+        : result
 }
