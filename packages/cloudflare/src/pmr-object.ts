@@ -62,6 +62,7 @@ import { webPushSender } from "./push-sender"
 const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
 const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
+const KEY_PAIR_EVIDENCE_EXPIRY_MIN = "pairEvidenceExpiryMin"
 const PAIR_EVIDENCE_EXPIRY_BATCH_SIZE = 100
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
@@ -1364,43 +1365,53 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         if (current === null || next < current) await this.db.setAlarm(next)
         const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
         if (cursor !== undefined && pairEvidenceKey(key) <= cursor) {
-            await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+            // This row sorts before the current page; retain its deadline in
+            // the in-progress minimum without restarting the bounded scan.
+            const passMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+            await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, Math.min(passMin ?? Number.POSITIVE_INFINITY, expiresAt))
         }
     }
 
     /** Reclaims selected declaration CARs at their message-retention deadline. */
     async alarm(): Promise<void> {
-        const nowSeconds = Math.floor(Date.now() / 1000)
-        const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-        const proofs = await this.db.list<StoredPairEvidence>({
-            prefix: PAIR_EVIDENCE_PREFIX,
-            ...(cursor !== undefined ? { startAfter: cursor } : {}),
-            limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
-        })
-        let nextExpiry = Number.POSITIVE_INFINITY
-        for (const [rawKey, proof] of proofs) {
-            const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
-            if (proof.expiresAt === 0) continue
-            if (proof.expiresAt <= nowSeconds) {
-                if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
-                    const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-                    await this.releasePool(key, pooled)
-                    await this.db.delete(rawKey)
+        await this.ctx.blockConcurrencyWhile(async () => {
+            const nowSeconds = Math.floor(Date.now() / 1000)
+            const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+            const proofs = await this.db.list<StoredPairEvidence>({
+                prefix: PAIR_EVIDENCE_PREFIX,
+                ...(cursor !== undefined ? { startAfter: cursor } : {}),
+                limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
+            })
+            let nextExpiry = Number.POSITIVE_INFINITY
+            for (const [rawKey, proof] of proofs) {
+                const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
+                if (proof.expiresAt === 0) continue
+                if (proof.expiresAt <= nowSeconds) {
+                    if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
+                        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+                        await this.releasePool(key, pooled)
+                        await this.db.delete(rawKey)
+                    } else {
+                        await this.clearPairProof(key)
+                    }
                 } else {
-                    await this.clearPairProof(key)
+                    nextExpiry = Math.min(nextExpiry, proof.expiresAt)
                 }
-            } else {
-                nextExpiry = Math.min(nextExpiry, proof.expiresAt)
             }
-        }
-        if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
-            const lastKey = [...proofs.keys()].at(-1)
-            if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
-            await this.db.setAlarm(Math.min(nextExpiry * 1000, Date.now() + 1_000))
-        } else {
-            await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-            if (Number.isFinite(nextExpiry)) await this.db.setAlarm(nextExpiry * 1000)
-        }
+            const previousMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+            const passMin = Math.min(previousMin ?? Number.POSITIVE_INFINITY, nextExpiry)
+            if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
+                const lastKey = [...proofs.keys()].at(-1)
+                if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
+                if (Number.isFinite(passMin)) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, passMin)
+                else await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+                await this.db.setAlarm(Math.min(passMin * 1000, Date.now() + 1_000))
+            } else {
+                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+                if (Number.isFinite(passMin)) await this.db.setAlarm(passMin * 1000)
+            }
+        })
     }
 
     async unblock(key: MailboxKey): Promise<void> {

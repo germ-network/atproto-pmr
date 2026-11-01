@@ -145,6 +145,46 @@ describe("a provisioned pair mailbox refuses when full", () => {
         })
     })
 
+    it("preserves the earliest expiry across bounded alarm batches", async () => {
+        const stub = freshStub()
+        const future = "did:plc:a-future" as const
+        await inPMR(stub, async (pmr) => {
+            const senders = [future, ...Array.from({ length: 120 }, (_, i) =>
+                `did:plc:z${String(i).padStart(3, "0")}` as const)]
+            for (const [i, sender] of senders.entries()) {
+                await pmr.appendPair(sender, ref(`expiry-${i}`, 1), freshNonce(), T0, {
+                    senderDID: sender,
+                    anchorKey: new Uint8Array(32).fill(9),
+                    declarationCID: `bafy-expiry-${i}`,
+                    revision: "3333333333333",
+                    car: new Uint8Array([9]),
+                    expiresAt: T0 + 3600,
+                })
+            }
+
+            const storage = (pmr as unknown as { ctx: DurableObjectState }).ctx.storage
+            const proofs = await storage.list<Record<string, unknown>>({ prefix: "pairEvidence:" })
+            for (const [key, proof] of proofs) {
+                if (key !== `pairEvidence:${future}`) {
+                    await storage.put(key, { ...proof, expiresAt: T0 - 10 })
+                }
+            }
+
+            // Simulate the platform consuming each scheduled alarm before the
+            // next invocation. The first page sees the future proof, while
+            // the final page contains only expired proofs.
+            await storage.deleteAlarm()
+            await pmr.alarm()
+            await storage.deleteAlarm()
+            await pmr.alarm()
+
+            const nextAlarm = await storage.getAlarm()
+            expect(nextAlarm).not.toBeNull()
+            expect(nextAlarm).toBeGreaterThan(Date.now() + 3_500_000)
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([future])
+        })
+    })
+
     it("applies a verified key rotation even when its triggering put is a duplicate", async () => {
         const stub = freshStub()
         const sender = "did:plc:duplicate-rotation" as const
