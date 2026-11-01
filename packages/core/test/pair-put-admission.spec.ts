@@ -109,7 +109,13 @@ function world(opts: {
         } as never,
         resolveDeclaration:
             opts.resolution ??
-            (() => ({ found: true, anchorKey: { x: opts.publicKey }, declarationCID: DC, revision: "2222222222222" })),
+            (() => ({
+                found: true,
+                anchorKey: { x: opts.publicKey },
+                declarationCID: DC,
+                revision: "2222222222222",
+                evidenceCAR: new Uint8Array([1]),
+            })),
         ...(source ? { admission: source } : {}),
         defer: (work) => void deferred.push(work),
     }

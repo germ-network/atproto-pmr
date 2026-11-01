@@ -1085,6 +1085,10 @@ to detect replacement generations during catch-up. A proof read returns CBOR
 `{sd, dc, g, car}` and is scoped to the authenticated owner; an expired or
 unknown CID returns 404.
 
+On the events socket, a generation is learned from a delivery carrying `g`.
+When a rotation has no delivery to send, the client learns the new generation
+on its next REST catch-up through `gs`; the relay sends no separate state frame.
+
 A pair-mailbox delivery MAY carry the relay's **evidence locator**: `sd`, the
 sender DID, `dc`, the selected declaration record CID, and `g`, the opaque
 pair-mailbox generation. `dc` identifies one shared proof selected for the

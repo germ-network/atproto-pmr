@@ -216,7 +216,6 @@ export {
     encodeDeliveryFrame,
     RESERVED_ENTRY_KEYS,
     encodePoolFrame,
-    encodePairGenerationFrame,
     handleAckFrame,
     type AckPayload,
     type DecodedFrame,

@@ -1,14 +1,13 @@
-import { admissionOrUnavailable, type AdmissionSource } from "./admission.js"
-import { deriveMessageId } from "./message-id.js"
+import type { AdmissionSource } from "./admission.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
+import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { PMRConfig } from "./config.js"
 import {
     BodyStore,
     Directory,
     Locator,
-    MessageRef,
     PairMailboxKey,
     PMRStore,
 } from "./storage.js"
@@ -153,81 +152,37 @@ export async function handlePairPut(
 
     const locator = await deps.directory.resolve(recipientDID)
     if (locator === null) {
-        // An unknown recipient answers the same 202 as a registered one.
+        // KNOWN, ACCEPTED GAP: an unknown recipient ends here with 202,
+        // whereas a registered recipient continues to admission and storage.
+        // Closing that timing difference requires a uniform unknown-recipient
+        // storage path; it remains accepted for this endpoint.
         return new Response(null, { status: 202 })
     }
-    const store = deps.store(locator)
-    const admission = deps.admission === undefined
-        ? undefined
-        : await admissionOrUnavailable(deps.admission, senderKey, recipientDID)
-
-    const mailboxKey = senderKey
-    const messageId = deriveMessageId(envelope.payload.payload)
-    const ref: MessageRef = {
-        messageId,
-        byteLength: envelope.payload.payload.byteLength,
-        hint: {
-            senderDID: envelope.payload.senderDID,
-            declarationCID: declaration.declarationCID,
-        },
-    }
-    const storeBody = () =>
-        deps.bodies.putBody(
-            messageId,
-            envelope.payload.payload,
-            nowSeconds + config.limits.messageExpirySeconds
-        )
-
-    // The key binding, generation recycle and receive/append share one atomic
-    // store operation so an obsolete-key put cannot slip between them.
-    const pair = await store.appendPair(
-        mailboxKey,
-        ref,
-        envelope.payload.nonce,
-        nowSeconds,
-        {
-            senderDID: mailboxKey,
+    const result = await ingestAuthenticatedPut({
+        recipientDID,
+        senderDID: senderKey,
+        declarationCID: declaration.declarationCID,
+        payload: envelope.payload.payload,
+        replayKey: envelope.payload.nonce,
+        locator,
+        evidence: {
+            senderDID: senderKey,
             anchorKey: declaration.anchorKey.x,
             declarationCID: declaration.declarationCID,
             revision: declaration.revision,
             car: declaration.evidenceCAR,
             expiresAt: nowSeconds + config.limits.messageExpirySeconds,
         },
-        admission
-    )
-    if (pair.rejected !== undefined) return declarationUnverifiable()
-    if (pair.result === undefined || pair.generation === undefined || pair.evidenceCID === undefined) {
-        return declarationUnverifiable()
-    }
-    ref.pairGeneration = pair.generation
-    ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
-    const result = pair.result
+    }, deps, nowSeconds)
     if (result.outcome === "refused") {
-        deps.defer(Promise.allSettled(pair.recycledMessageIds.map((id) => deps.bodies.deleteBody(id))))
         return new Response(null, {
             status: 429,
             headers: { "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)) },
         })
     }
-    deps.defer(Promise.allSettled(pair.recycledMessageIds
-        .filter((id) => !(("persistBody" in result) && result.persistBody && id === messageId))
-        .map((id) => deps.bodies.deleteBody(id))))
-    if (("persistBody" in result) && result.persistBody) {
-        deps.defer((async () => {
-            await storeBody()
-            if (result.outcome === "appended" || result.outcome === "queued") {
-                if ("moved" in result && result.moved) {
-                    for (const moved of result.moved) {
-                        try {
-                            const body = await deps.bodies.getBody(moved.messageId)
-                            if (body) await store.deliverLive?.(mailboxKey, moved, body)
-                        } catch {}
-                    }
-                }
-                try { await store.deliverLive?.(mailboxKey, ref, envelope.payload.payload) } catch {}
-                try { await store.deliverPush?.(mailboxKey, ref, envelope.payload.payload) } catch {}
-            }
-        })())
+    if (result.outcome === "unverifiable") return declarationUnverifiable()
+    if (result.outcome === "tooLarge") {
+        return new Response("Payload exceeds the advertised maximum", { status: 413 })
     }
     return new Response(null, { status: 202 })
 }

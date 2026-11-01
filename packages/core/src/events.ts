@@ -117,17 +117,6 @@ export function encodeDeliveryFrame(
     return encodeFrame("delivery", messageEntryFields(mailboxKey, ref, message))
 }
 
-/** The current opaque generation for one sender-specific pair mailbox. */
-export function encodePairGenerationFrame(
-    mailboxKey: string,
-    generation: string
-): Uint8Array {
-    return encodeFrame(
-        "pairGeneration",
-        new Map<string, CoseValue>([["k", mailboxKey], ["g", generation]])
-    )
-}
-
 /**
  * The wake with no list — `wire-api.md`'s own framing for why: naming
  * pooled senders here would be a per-arrival push identifying who, exactly

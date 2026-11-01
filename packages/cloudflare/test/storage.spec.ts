@@ -62,6 +62,17 @@ describe("a provisioned pair mailbox refuses when full", () => {
             expect((await pmr.openMailboxes(null, 20)).entries).toEqual([])
 
             await pmr.provisionFromPool(sender, T0)
+            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toMatchObject({
+                declarationCID: evidence.declarationCID,
+                car: evidence.car,
+            })
+            expect(await pmr.list(sender, 20)).toEqual([
+                expect.objectContaining({
+                    messageId: "pool-only",
+                    hint: { senderDID: sender, declarationCID: evidence.declarationCID },
+                    pairGeneration: expect.any(String),
+                }),
+            ])
             const accepted = await pmr.appendPair(sender, ref("accepted"), freshNonce(), T0, evidence)
             expect(accepted.result?.outcome).toBe("appended")
             const stale = await pmr.appendPair(sender, ref("stale"), freshNonce(), T0, {
@@ -75,6 +86,36 @@ describe("a provisioned pair mailbox refuses when full", () => {
                 expect.objectContaining({ messageId: "pool-only" }),
                 expect.objectContaining({ messageId: "accepted" }),
             ])
+        })
+    })
+
+    it("charges a pooled proof CAR against the shared byte cap", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:pool-proof-budget" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(4),
+            declarationCID: "bafy-budgeted",
+            revision: "2222222222222",
+            car: new Uint8Array(1_000_000),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            for (let i = 0; i < 3; i++) {
+                const result = await pmr.appendPair(sender, ref(`large-${i}`, 1_000_000), freshNonce(), T0, evidence)
+                expect(result.result?.outcome).toBe("pooled")
+            }
+            const other = "did:plc:pool-proof-budget-other" as const
+            const exhausted = await pmr.appendPair(other, ref("not-kept"), freshNonce(), T0, {
+                senderDID: other,
+                anchorKey: new Uint8Array(32).fill(5),
+                declarationCID: "bafy-other",
+                revision: "2222222222222",
+                car: new Uint8Array([5]),
+                expiresAt: T0 + 3600,
+            })
+            expect(exhausted.result?.outcome).toBe("exhausted")
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([sender])
         })
     })
 

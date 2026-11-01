@@ -126,6 +126,8 @@ export interface PairMailboxMetadata {
 export interface StoredPairMailboxEvidence extends PairMailboxMetadata {
     car: Uint8Array
     expiresAt: number
+    /** Portion of the recovery-pool byte budget reserved for this proof CAR. */
+    poolAccountedBytes?: number
 }
 
 export interface PairAppendResult {
@@ -673,7 +675,8 @@ export interface PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        admission: Admission
+        admission: Admission,
+        additionalPoolBytes?: number
     ): Promise<ReceiveResult>
 
     /**
@@ -716,7 +719,9 @@ export interface PMRStore {
         nonce: Nonce,
         nowSeconds: number,
         /** Recorded as the sender's latest verdict when the put is pooled. */
-        verdict?: PoolVerdict
+        verdict?: PoolVerdict,
+        /** Additional proof bytes reserved atomically with a pair-pool entry. */
+        additionalBytes?: number
     ): Promise<PoolAppendResult>
 
     /**

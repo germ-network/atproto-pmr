@@ -619,80 +619,145 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             !Number.isSafeInteger(evidence.expiresAt) || evidence.expiresAt <= nowSeconds
         ) return { generationChanged: false, recycledMessageIds: [], rejected: "invalidEvidence" }
         return this.ctx.blockConcurrencyWhile(async () => {
-        const evidenceKey = pairEvidenceKey(key)
-        const prior = await this.db.get<StoredPairEvidence>(evidenceKey)
-        if (prior !== undefined && (
-            evidence.revision < prior.revision ||
-            (evidence.revision === prior.revision &&
-                (evidence.declarationCID !== prior.declarationCID || !sameBytes(evidence.anchorKey, prior.anchorKey)))
-        )) return { generationChanged: false, recycledMessageIds: [], rejected: "staleEvidence" }
-        let selected: StoredPairEvidence
-        let recycledMessageIds: string[] = []
-        let generationChanged = false
-        if (prior === undefined) {
-            selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
-            generationChanged = true
-        } else if (!sameBytes(prior.anchorKey, evidence.anchorKey)) {
-            const [queue, pool] = await Promise.all([
-                this.db.get<MessageRef[]>(mailboxKey(key)),
-                this.db.get<MessageRef[]>(poolKey(key)),
-            ])
-            recycledMessageIds = [...(queue ?? []), ...(pool ?? [])].map((r) => r.messageId)
-            // Preserve provisioned-vs-pooled status while disposing of all
-            // undelivered old-key work. The evidence row changes atomically
-            // with the generation that subsequent puts will carry.
-            if (queue !== undefined) await this.db.put(mailboxKey(key), [])
-            await this.releasePool(key, pool ?? [])
-            await this.db.delete(retryHintKey(key))
-            selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
-            generationChanged = true
-        } else {
-            // A declaration edit is not a new mailbox generation. Retain one
-            // selected proof rather than archiving every same-key revision.
-            selected = { ...prior, revision: evidence.revision }
-        }
-        await this.db.put(evidenceKey, selected)
+            const evidenceKey = pairEvidenceKey(key)
+            const prior = await this.db.get<StoredPairEvidence>(evidenceKey)
+            if (prior !== undefined && (
+                evidence.revision < prior.revision ||
+                (evidence.revision === prior.revision &&
+                    (evidence.declarationCID !== prior.declarationCID || !sameBytes(evidence.anchorKey, prior.anchorKey)))
+            )) return { generationChanged: false, recycledMessageIds: [], rejected: "staleEvidence" }
 
-        const boundRef: MessageRef = {
-            ...ref,
-            ...((await this.hasMailbox(key)) || admission?.verdict === "yes"
-                ? { pairGeneration: selected.generation }
-                : {}),
-            hint: { senderDID: key, declarationCID: selected.declarationCID },
-        }
-        const result = admission === undefined
-            ? (await this.hasMailbox(key))
-                ? await this.append(key, boundRef, nonce, nowSeconds)
-                : await this.appendToPool(key, boundRef, nonce, nowSeconds)
-            : await this.receive(key, boundRef, nonce, nowSeconds, admission)
-        const accepted = ("persistBody" in result) && result.persistBody &&
-            (result.outcome === "appended" || result.outcome === "queued")
-        if (accepted) {
-            selected = generationChanged || selected.car.byteLength === 0
-                ? { ...selected, ...evidence, generation: selected.generation }
-                : { ...selected, expiresAt: Math.max(selected.expiresAt, evidence.expiresAt) }
-            await this.db.put(evidenceKey, selected)
-            await this.schedulePairEvidenceExpiry(selected.expiresAt)
-            // The append happened with the previous locator when an expired
-            // proof was being refreshed. Keep the durable entry aligned with
-            // the proof now selected for this generation.
-            if (selected.declarationCID !== boundRef.hint?.declarationCID) {
+            const mailboxExisted = (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
+            let selected: StoredPairEvidence
+            let recycledMessageIds: string[] = []
+            let generationChanged = false
+            if (prior === undefined) {
+                selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
+                generationChanged = true
+            } else if (!sameBytes(prior.anchorKey, evidence.anchorKey)) {
+                const [queue, pool] = await Promise.all([
+                    this.db.get<MessageRef[]>(mailboxKey(key)),
+                    this.db.get<MessageRef[]>(poolKey(key)),
+                ])
+                recycledMessageIds = [...(queue ?? []), ...(pool ?? [])].map((r) => r.messageId)
+                if (queue !== undefined) await this.db.put(mailboxKey(key), [])
+                await this.releasePool(key, pool ?? [])
+                await this.db.delete(retryHintKey(key))
+                selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
+                generationChanged = true
+            } else {
+                // A declaration edit is not a new mailbox generation. Retain
+                // one selected proof rather than archiving each revision.
+                selected = { ...prior, revision: evidence.revision }
+            }
+            if (selected.car.byteLength > 0 && selected.expiresAt <= nowSeconds) {
+                await this.clearPairProof(key)
+                selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
+            }
+
+            // Pool-only first contact gets no revision row unless its proof
+            // fits inside the pool's existing byte budget. Existing floors,
+            // rotations and provisioned mailboxes remain durable.
+            if (prior !== undefined || mailboxExisted || admission?.verdict === "yes") {
+                await this.db.put(evidenceKey, selected)
+            }
+
+            const mailboxPresent = mailboxExisted || admission?.verdict === "yes"
+            const baseRef = { ...ref }
+            delete baseRef.hint
+            delete baseRef.pairGeneration
+            const boundRef: MessageRef = mailboxPresent
+                ? {
+                    ...baseRef,
+                    pairGeneration: selected.generation,
+                    hint: { senderDID: key, declarationCID: selected.declarationCID },
+                }
+                : baseRef
+            const additionalPoolBytes = !mailboxPresent && admission?.verdict !== "blocked" &&
+                selected.car.byteLength === 0
+                ? evidence.car.byteLength
+                : 0
+            const result = admission === undefined
+                ? (await this.hasMailbox(key))
+                    ? await this.append(key, boundRef, nonce, nowSeconds)
+                    : await this.appendToPool(key, boundRef, nonce, nowSeconds, undefined, additionalPoolBytes)
+                : await this.receive(key, boundRef, nonce, nowSeconds, admission, additionalPoolBytes)
+
+            const accepted = ("persistBody" in result) && result.persistBody &&
+                (result.outcome === "appended" || result.outcome === "queued")
+            const pooled = result.outcome === "pooled" && result.persistBody && !mailboxPresent
+            if (accepted) {
+                const latest = await this.db.get<StoredPairEvidence>(evidenceKey)
+                selected = generationChanged || latest?.car.byteLength === 0
+                    ? {
+                        ...selected,
+                        ...evidence,
+                        generation: selected.generation,
+                        poolAccountedBytes: latest?.poolAccountedBytes ?? 0,
+                    }
+                    : {
+                        ...(latest ?? selected),
+                        expiresAt: Math.max(latest?.expiresAt ?? 0, evidence.expiresAt),
+                    }
+                await this.db.put(evidenceKey, selected)
+                await this.schedulePairEvidenceExpiry(selected.expiresAt)
                 const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
                 if (queue !== undefined) {
                     const updated = queue.map((entry) => entry.messageId === ref.messageId
-                        ? { ...entry, hint: { senderDID: key, declarationCID: selected.declarationCID } }
+                        ? {
+                            ...entry,
+                            pairGeneration: selected.generation,
+                            hint: { senderDID: key, declarationCID: selected.declarationCID },
+                        }
                         : entry)
                     await this.db.put(mailboxKey(key), updated)
                 }
+            } else if (pooled) {
+                const held = await this.db.get<StoredPairEvidence>(evidenceKey)
+                if (held !== undefined && held.car.byteLength > 0 && held.expiresAt <= nowSeconds) {
+                    await this.clearPairProof(key)
+                }
+                const current = await this.db.get<StoredPairEvidence>(evidenceKey)
+                const hasHeldProof = current !== undefined && current.car.byteLength > 0 &&
+                    current.expiresAt > nowSeconds
+                const proofBytes = hasHeldProof
+                    ? 0
+                    : evidence.car.byteLength
+                const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
+                const cap = parseInt(this.env.POOL_CAP_BYTES)
+                if (hasHeldProof || used + proofBytes <= cap) {
+                    selected = hasHeldProof
+                        ? { ...current, expiresAt: Math.max(current.expiresAt, evidence.expiresAt) }
+                        : { ...selected, ...evidence, generation: selected.generation, poolAccountedBytes: proofBytes }
+                    await this.db.put(evidenceKey, selected)
+                    if (proofBytes > 0) await this.db.put(KEY_POOL_BYTES, used + proofBytes)
+                    const pooledRefs = await this.db.get<MessageRef[]>(poolKey(key))
+                    if (pooledRefs !== undefined) {
+                        await this.db.put(poolKey(key), pooledRefs.map((entry) => ({
+                            ...entry,
+                            pairGeneration: selected.generation,
+                            hint: { senderDID: key, declarationCID: selected.declarationCID },
+                        })))
+                    }
+                    await this.schedulePairEvidenceExpiry(selected.expiresAt)
+                } else if (prior !== undefined || generationChanged) {
+                    // Keep the small anti-rollback watermark for an existing
+                    // mailbox generation, but never reserve unbudgeted CAR bytes.
+                    selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
+                    await this.db.put(evidenceKey, selected)
+                    await this.schedulePairEvidenceExpiry(selected.expiresAt)
+                }
+            } else if ((prior !== undefined || generationChanged) && selected.car.byteLength === 0) {
+                await this.schedulePairEvidenceExpiry(selected.expiresAt)
             }
-        }
-        return {
-            result,
-            generation: selected.generation,
-            evidenceCID: selected.declarationCID,
-            generationChanged,
-            recycledMessageIds,
-        }
+
+            return {
+                result,
+                generation: selected.generation,
+                evidenceCID: selected.declarationCID,
+                generationChanged,
+                recycledMessageIds,
+            }
         })
     }
 
@@ -866,7 +931,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        admission: Admission
+        admission: Admission,
+        additionalPoolBytes = 0
     ): Promise<ReceiveResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
@@ -898,7 +964,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
             verdict: admission.verdict,
             why: admission.why,
-        })
+        }, additionalPoolBytes)
         return pooled.outcome === "pooled"
             ? { outcome: "pooled", persistBody: pooled.persistBody }
             : pooled
@@ -1005,8 +1071,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         for (const [rawKey, evidence] of proofs) {
             const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as MailboxKey
             const previous = combined.get(key)
-            if (evidence.car.byteLength > 0 && evidence.expiresAt <= Math.floor(Date.now() / 1000)) {
-                await this.db.put(rawKey, { ...evidence, car: new Uint8Array() })
+            if (evidence.expiresAt > 0 && evidence.expiresAt <= Math.floor(Date.now() / 1000)) {
+                if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
+                    const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+                    await this.releasePool(key, pooled)
+                    await this.db.delete(rawKey)
+                } else {
+                    await this.clearPairProof(key as PairMailboxKey)
+                }
             }
             // Pool-only senders have no mailbox descriptor. Proof metadata
             // alone must never reveal a sender to the owner.
@@ -1058,7 +1130,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        verdict?: PoolVerdict
+        verdict?: PoolVerdict,
+        additionalBytes = 0
     ): Promise<PoolAppendResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
@@ -1078,6 +1151,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const effectiveDepth = underPressure ? depthUnderPressure : depth
 
         const existing = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+        const wasEmpty = existing.length === 0
 
         if (discarded) {
             // Nothing kept and no nonce recorded, so a fresh attempt once
@@ -1086,15 +1160,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             return { outcome: "pooled", persistBody: false }
         }
 
-        if (existing.length === 0 && underPressure) {
-            return { outcome: "exhausted" }
-        }
-
         existing.push(ref)
         let reclaimed = 0
         while (existing.length > effectiveDepth) {
             const evicted = existing.shift()
             if (evicted !== undefined) reclaimed += evicted.byteLength
+        }
+
+        if ((wasEmpty && underPressure) ||
+            usedBytes + ref.byteLength - reclaimed + additionalBytes > capBytes) {
+            return { outcome: "exhausted" }
         }
 
         await this.db.put(poolKey(key), existing)
@@ -1225,11 +1300,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         pooled: MessageRef[]
     ): Promise<void> {
-        const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
+        const evidence = isPairMailboxKey(key)
+            ? await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
+            : undefined
+        const proofBytes = evidence?.poolAccountedBytes ?? 0
+        const freed = pooled.reduce((n, r) => n + r.byteLength, 0) + proofBytes
         const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
         await this.db.delete(poolKey(key))
         await this.db.delete(poolVerdictKey(key))
         await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
+        if (proofBytes > 0 && evidence !== undefined) {
+            await this.db.put(pairEvidenceKey(key), { ...evidence, poolAccountedBytes: 0 })
+        }
     }
 
     // MARK: - Blocking and discard
@@ -1269,7 +1351,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     private async clearPairProof(key: PairMailboxKey): Promise<void> {
         const proof = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
-        if (proof !== undefined) await this.db.put(pairEvidenceKey(key), { ...proof, car: new Uint8Array(), expiresAt: 0 })
+        if (proof !== undefined) {
+            const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
+            await this.db.put(KEY_POOL_BYTES, Math.max(0, used - (proof.poolAccountedBytes ?? 0)))
+            await this.db.put(pairEvidenceKey(key), {
+                ...proof,
+                car: new Uint8Array(),
+                expiresAt: 0,
+                poolAccountedBytes: 0,
+            })
+        }
     }
 
     private async schedulePairEvidenceExpiry(expiresAt: number): Promise<void> {
@@ -1283,16 +1374,22 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const nowSeconds = Math.floor(Date.now() / 1000)
         const proofs = await this.db.list<StoredPairEvidence>({ prefix: PAIR_EVIDENCE_PREFIX })
         let nextExpiry = Number.POSITIVE_INFINITY
-        for (const [key, proof] of proofs) {
-            if (proof.car.byteLength === 0) continue
+        for (const [rawKey, proof] of proofs) {
+            const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
+            if (proof.expiresAt === 0) continue
             if (proof.expiresAt <= nowSeconds) {
-                await this.db.put(key, { ...proof, car: new Uint8Array() })
+                if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
+                    const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
+                    await this.releasePool(key, pooled)
+                    await this.db.delete(rawKey)
+                } else {
+                    await this.clearPairProof(key)
+                }
             } else {
                 nextExpiry = Math.min(nextExpiry, proof.expiresAt)
             }
         }
         if (Number.isFinite(nextExpiry)) await this.db.setAlarm(nextExpiry * 1000)
-        else await this.db.deleteAlarm()
     }
 
     async unblock(key: MailboxKey): Promise<void> {
