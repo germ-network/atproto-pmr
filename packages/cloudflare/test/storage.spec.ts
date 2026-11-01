@@ -21,7 +21,7 @@ import type { PMREnv } from "../src/env"
 
 const testEnv = env as unknown as PMREnv
 
-const T0 = 1_760_000_000
+const T0 = Math.floor(Date.now() / 1000)
 
 function ref(id: string, byteLength = 100): MessageRef {
     return { messageId: id, byteLength }
@@ -44,6 +44,293 @@ function freshStub(): DurableObjectStub<PMRObject> {
 }
 
 describe("a provisioned pair mailbox refuses when full", () => {
+    it("keeps pool-only senders private and rejects stale declaration revisions", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:review-watermark" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(7),
+            declarationCID: "bafy-current",
+            revision: "5555555555555",
+            car: new Uint8Array([7]),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            const pooled = await pmr.appendPair(sender, ref("pool-only"), freshNonce(), T0, evidence)
+            expect(pooled.result?.outcome).toBe("pooled")
+            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
+            expect((await pmr.openMailboxes(null, 20)).entries).toEqual([])
+
+            await pmr.provisionFromPool(sender, T0)
+            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toMatchObject({
+                declarationCID: evidence.declarationCID,
+                car: evidence.car,
+            })
+            expect(await pmr.list(sender, 20)).toEqual([
+                expect.objectContaining({
+                    messageId: "pool-only",
+                    hint: { senderDID: sender, declarationCID: evidence.declarationCID },
+                    pairGeneration: expect.any(String),
+                }),
+            ])
+            const accepted = await pmr.appendPair(sender, ref("accepted"), freshNonce(), T0, evidence)
+            expect(accepted.result?.outcome).toBe("appended")
+            const stale = await pmr.appendPair(sender, ref("stale"), freshNonce(), T0, {
+                ...evidence,
+                anchorKey: new Uint8Array(32).fill(8),
+                declarationCID: "bafy-old",
+                revision: "4444444444444",
+            })
+            expect(stale.rejected).toBe("staleEvidence")
+            expect(await pmr.list(sender, 20)).toEqual([
+                expect.objectContaining({ messageId: "pool-only" }),
+                expect.objectContaining({ messageId: "accepted" }),
+            ])
+        })
+    })
+
+    it("charges a pooled proof CAR against the shared byte cap", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:pool-proof-budget" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(4),
+            declarationCID: "bafy-budgeted",
+            revision: "2222222222222",
+            car: new Uint8Array(1_000_000),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            for (let i = 0; i < 3; i++) {
+                const result = await pmr.appendPair(sender, ref(`large-${i}`, 1_000_000), freshNonce(), T0, evidence)
+                expect(result.result?.outcome).toBe("pooled")
+            }
+            const other = "did:plc:pool-proof-budget-other" as const
+            const exhausted = await pmr.appendPair(other, ref("not-kept"), freshNonce(), T0, {
+                senderDID: other,
+                anchorKey: new Uint8Array(32).fill(5),
+                declarationCID: "bafy-other",
+                revision: "2222222222222",
+                car: new Uint8Array([5]),
+                expiresAt: T0 + 3600,
+            })
+            expect(exhausted.result?.outcome).toBe("exhausted")
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([sender])
+        })
+    })
+
+    it("keeps a pooled message without proof metadata when the proof cannot fit", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:proof-does-not-fit" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(6),
+            declarationCID: "bafy-too-large",
+            revision: "3333333333333",
+            car: new Uint8Array(1_000_000),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            const cap = parseInt(testEnv.POOL_CAP_BYTES)
+            await pmr.appendToPool("did:plc:proof-budget-filler", ref("filler", cap - 500_000), freshNonce(), T0)
+            const result = await pmr.appendPair(sender, ref("without-proof", 1), freshNonce(), T0, evidence)
+            expect(result.result?.outcome).toBe("pooled")
+            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
+            expect(await pmr.list(sender, 10)).toEqual([])
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
+            await pmr.provisionFromPool(sender, T0)
+            const [provisioned] = await pmr.list(sender, 10)
+            expect(provisioned?.hint).toBeUndefined()
+            expect(provisioned?.pairGeneration).toBeUndefined()
+        })
+    })
+
+    it("preserves the earliest expiry across bounded alarm batches", async () => {
+        const stub = freshStub()
+        const future = "did:plc:a-future" as const
+        await inPMR(stub, async (pmr) => {
+            const senders = [future, ...Array.from({ length: 120 }, (_, i) =>
+                `did:plc:z${String(i).padStart(3, "0")}` as const)]
+            for (const [i, sender] of senders.entries()) {
+                await pmr.appendPair(sender, ref(`expiry-${i}`, 1), freshNonce(), T0, {
+                    senderDID: sender,
+                    anchorKey: new Uint8Array(32).fill(9),
+                    declarationCID: `bafy-expiry-${i}`,
+                    revision: "3333333333333",
+                    car: new Uint8Array([9]),
+                    expiresAt: T0 + 3600,
+                })
+            }
+
+            const storage = (pmr as unknown as { ctx: DurableObjectState }).ctx.storage
+            const proofs = await storage.list<Record<string, unknown>>({ prefix: "pairEvidence:" })
+            for (const [key, proof] of proofs) {
+                if (key !== `pairEvidence:${future}`) {
+                    await storage.put(key, { ...proof, expiresAt: T0 - 10 })
+                }
+            }
+
+            // Simulate the platform consuming each scheduled alarm before the
+            // next invocation. The first page sees the future proof, while
+            // the final page contains only expired proofs.
+            await storage.deleteAlarm()
+            await pmr.alarm()
+            await storage.deleteAlarm()
+            await pmr.alarm()
+
+            const nextAlarm = await storage.getAlarm()
+            expect(nextAlarm).not.toBeNull()
+            expect(nextAlarm).toBeGreaterThan(Date.now() + 3_500_000)
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([future])
+        })
+    })
+
+    it("applies a verified key rotation even when its triggering put is a duplicate", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:duplicate-rotation" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(1),
+            declarationCID: "bafy-old",
+            revision: "2222222222222",
+            car: new Uint8Array([1]),
+            expiresAt: T0 + 3600,
+        }
+        const nonce = freshNonce()
+        await inPMR(stub, async (pmr) => {
+            await pmr.provisionFromPool(sender, T0)
+            const first = await pmr.appendPair(sender, ref("old-key-message"), nonce, T0, evidence)
+            const rotated = await pmr.appendPair(sender, ref("new-key-duplicate"), nonce, T0, {
+                ...evidence,
+                anchorKey: new Uint8Array(32).fill(2),
+                declarationCID: "bafy-new",
+                revision: "3333333333333",
+            })
+            expect(rotated.result?.outcome).toBe("duplicate")
+            expect(rotated.generation).not.toBe(first.generation)
+            expect(await pmr.list(sender, 20)).toEqual([])
+            expect(await pmr.getPairEvidence(sender, "bafy-new", T0)).toBeNull()
+        })
+    })
+
+    it("keeps one proof for same-key edits and atomically recycles only that sender on key change", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:pair-evidence-sender" as const
+        const other = "did:plc:pair-evidence-other" as const
+        const firstEvidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(1),
+            declarationCID: "bafy-first",
+            revision: "2222222222222",
+            car: new Uint8Array([1, 2, 3]),
+            expiresAt: T0 + 3600,
+        }
+        const nonce = (value: number) => new Uint8Array(16).fill(value)
+
+        await inPMR(stub, async (pmr) => {
+            await pmr.provisionFromPool(sender, T0)
+            const first = await pmr.appendPair(sender, ref("same-id"), nonce(1), T0, firstEvidence)
+            expect(first.generationChanged).toBe(true)
+            const sameKey = await pmr.appendPair(
+                sender,
+                ref("same-id"),
+                nonce(2),
+                T0,
+                { ...firstEvidence, revision: "3333333333333", declarationCID: "bafy-edited", car: new Uint8Array([4]) }
+            )
+            expect(sameKey.generation).toBe(first.generation)
+            expect(sameKey.generationChanged).toBe(false)
+            expect(sameKey.evidenceCID).toBe("bafy-first")
+            expect(await pmr.getPairEvidence(sender, "bafy-first", T0)).toMatchObject({
+                generation: first.generation,
+                declarationCID: "bafy-first",
+                car: new Uint8Array([1, 2, 3]),
+            })
+            expect(await pmr.getPairEvidence(sender, "bafy-edited", T0)).toBeNull()
+
+            await pmr.appendPair(other, ref("other-id"), nonce(3), T0, {
+                ...firstEvidence,
+                senderDID: other,
+            })
+            const rotated = await pmr.appendPair(
+                sender,
+                ref("same-id"),
+                nonce(4),
+                T0,
+                {
+                    ...firstEvidence,
+                    anchorKey: new Uint8Array(32).fill(2),
+                    revision: "4444444444444",
+                    declarationCID: "bafy-rotated",
+                    car: new Uint8Array([9]),
+                }
+            )
+            expect(rotated.generation).not.toBe(first.generation)
+            expect(rotated.generationChanged).toBe(true)
+            expect(rotated.recycledMessageIds).toContain("same-id")
+            expect(await pmr.list(sender, 10)).toEqual([
+                expect.objectContaining({ messageId: "same-id", pairGeneration: rotated.generation }),
+            ])
+
+            // An ack from the disposed generation cannot remove a same-ID
+            // entry accepted into its replacement generation.
+            await pmr.remove(sender, "same-id", first.generation)
+            expect(await pmr.list(sender, 10)).toHaveLength(1)
+            // Legacy clients omit g and still acknowledge by message ID.
+            await pmr.remove(sender, "same-id")
+            expect(await pmr.list(sender, 10)).toHaveLength(0)
+            const legacy = await pmr.appendPair(sender, ref("same-id"), nonce(5), T0, {
+                ...firstEvidence,
+                anchorKey: new Uint8Array(32).fill(2),
+                revision: "5555555555555",
+                declarationCID: "bafy-next",
+            })
+            expect(legacy.result?.outcome).toBe("appended")
+            expect(legacy.generation).toBe(rotated.generation)
+            await pmr.remove(sender, "same-id", first.generation)
+            expect(await pmr.list(sender, 10)).toHaveLength(1)
+            await pmr.remove(sender, "same-id", legacy.generation)
+            expect(await pmr.list(sender, 10)).toHaveLength(0)
+            expect(await pmr.getPairEvidence(other, "bafy-first", T0)).toBeNull()
+            expect(await pmr.getPairEvidence(sender, "bafy-rotated", T0 + 3600)).toBeNull()
+            await pmr.block(sender, T0)
+            expect(await pmr.getPairEvidence(sender, "bafy-rotated", T0)).toBeNull()
+        })
+    })
+
+    it("paginates empty pair-generation descriptors alongside queued mailboxes", async () => {
+        const stub = freshStub()
+        const first = "did:plc:generation-a" as const
+        const second = "did:plc:generation-b" as const
+        const nonce = (value: number) => new Uint8Array(16).fill(value)
+        const evidence = (senderDID: typeof first) => ({
+            senderDID,
+            anchorKey: new Uint8Array(32).fill(3),
+            declarationCID: `bafy-${senderDID.slice(-1)}`,
+            revision: "2222222222222",
+            car: new Uint8Array([3]),
+            expiresAt: T0 + 3600,
+        })
+        await inPMR(stub, async (pmr) => {
+            const a = await pmr.appendPair(first, ref("a"), nonce(5), T0, evidence(first))
+            await pmr.provisionFromPool(first, T0)
+            await pmr.remove(first, "a")
+            const b = await pmr.appendPair(second, ref("b"), nonce(6), T0, evidence(second))
+            await pmr.provisionFromPool(second, T0)
+            await pmr.remove(second, "b")
+
+            const one = await pmr.openMailboxes(null, 1)
+            expect(one.entries).toEqual([
+                { key: first, messages: [], pairGeneration: a.generation },
+            ])
+            const two = await pmr.openMailboxes(one.nextCursor, 1)
+            expect(two.entries).toEqual([
+                { key: second, messages: [], pairGeneration: b.generation },
+            ])
+            expect(two.nextCursor).toBeNull()
+        })
+    })
+
     it("accepts up to capacity, then refuses", async () => {
         const stub = freshStub()
         const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
@@ -428,6 +715,31 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
 })
 
 describe("the recovery pool inverts the provisioned mailbox's policy", () => {
+    it("keeps an existing sender's newest ref even if replacement grows past the cap", async () => {
+        const stub = freshStub()
+        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        const sender = "did:plc:near-cap-existing"
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
+            await pmr.appendToPool(sender, ref("old", 1), freshNonce(), T0)
+            const newest = await pmr.appendToPool(sender, ref("new", 2), freshNonce(), T0)
+            expect(newest.outcome).toBe("pooled")
+            expect((await pmr.poolSenders()).find((entry) => entry.did === sender)?.count).toBe(1)
+        })
+    })
+
+    it("accepts a first ref larger than the pool's remaining room while not yet full", async () => {
+        const stub = freshStub()
+        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        const sender = "did:plc:remaining-room"
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
+            const first = await pmr.appendToPool(sender, ref("first", 2), freshNonce(), T0)
+            expect(first.outcome).toBe("pooled")
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
+        })
+    })
+
     it("keeps the NEWEST under depth pressure", async () => {
         // The freshest attempt carries current state; stale attempts are
         // worthless. This is the opposite of the provisioned mailbox and must

@@ -1064,6 +1064,7 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
 | `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the enabler document's limit |
+| `GET` | `/pmr/v1/pair-evidence/{senderDID}?cid=` | fetch the selected proof for a pair-mailbox generation |
 | `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
@@ -1072,28 +1073,41 @@ succeed rather than error, because the client's ack path retries.
 Devices need not recompute admission; it is routing advice, not authority
 ([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
 mailbox is from a sender the device provisioned or one the relay admitted
-under the recipient's policy at that put or a later one; the pool lists only senders the relay refused or could not
-decide, with `v` and `r`. A Bsky-blocked sender's mail stops appearing in
-catch-up once the relay has seen the block, and earlier deliveries are
-cleared on the device using the summary's block list.
+under the recipient's policy at that put or a later one; the pool lists only
+senders the relay refused or could not decide, with `v` and `r`. A Bsky-blocked
+sender's mail stops appearing in catch-up once the relay has seen the block,
+and earlier deliveries are cleared on the device using the summary's block list.
 
-A pair-mailbox delivery carries the relay's **verification hint**: `sd`, the
-sender DID, and `dc`, the CID of the sender's declaration record as the relay
-last saw it. `dc` is a freshness cue — the newest declaration this relay has
-seen for that DID — not a trust signal and not a key identifier; it changes
-on any change to the declaration, including a key-package rotation under the
-same anchor key. A device never trusts it: the device verifies DID →
-declaration → anchor key from the CAR itself, and uses `dc` only to decide
-whether to re-verify. A device MUST re-verify the payload before acting on
-it; see [`trust-model.md`](trust-model.md#p8--the-relays-verdict-is-a-hint).
+`GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for
+provisioned pair-mailbox generations, including mailboxes with no queued
+messages. Pool-only senders never appear in `gs`. Clients use these descriptors
+to detect replacement generations during catch-up. A proof read returns CBOR
+`{sd, dc, g, car}` and is scoped to the authenticated owner; an expired or
+unknown CID returns 404.
+
+On the events socket, a generation is learned from a delivery carrying `g`.
+When a rotation has no delivery to send, the client learns the new generation
+on its next REST catch-up through `gs`; the relay sends no separate state frame.
+
+A pair-mailbox delivery MAY carry the relay's **evidence locator**: `sd`, the
+sender DID, `dc`, the selected declaration record CID, and `g`, the opaque
+pair-mailbox generation. `dc` identifies one shared proof selected for the
+sender-specific mailbox generation; it is neither authority nor a claim that
+the latest declaration CID is unchanged. The owner may fetch that proof from
+`/pmr/v1/pair-evidence/{senderDID}?cid=<dc>`. A device MUST independently
+verify the CAR's CID, DID, controller, path and declaration self-binding, and
+must authenticate the message under the resulting key before acting on it.
+CID is a locator, never authority; see
+[`trust-model.md`](trust-model.md#p8--the-relays-verdict-is-a-hint).
 
 `dc` is the record CID, not the commit's: CIDv1, dag-cbor (`0x71`),
 sha2-256, rendered as a CBOR text string in multibase base32 lower-case
 unpadded — `b` followed by the RFC 4648 §6 base32 alphabet rendered lower-case and unpadded (multibase `b`),
 of `01 71 12 20 ‖ <32-byte SHA-256 of the record block>` (so it begins
-`bafyrei`). `sd` and `dc` are both present or both absent: a hint without a
-`dc` is not emitted at all. The same two fields appear in `#delivery`, in a
-`GET /pmr/v1/messages` entry, and in a full-form push.
+`bafyrei`). `sd`, `dc`, and `g` are present together for generation-aware
+pair deliveries. Legacy rows may omit `g`; grant deliveries omit all three.
+The same fields appear in `#delivery`, a `GET /pmr/v1/messages` entry, and a
+full-form push.
 
 A client MUST ignore a key it does not recognize in a delivered entry: in
 `#delivery`, in a `GET /pmr/v1/messages` entry, and in a push's sealed
@@ -1132,9 +1146,9 @@ body   = { ... type-specific fields ... }
 
 | `t` | direction | body | notes |
 |---|---|---|---|
-| `#capabilities` | server → client | `{gr}` | the grant lifecycle effective *for this registration* — see below |
-| `#delivery` | server → client | `{k, id, m, sd?, dc?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. `sd`/`dc` (the verification hint, see [Delivery — owner-facing](#delivery--owner-facing)) are present together, and only for a pair-mailbox entry |
-| `#ack` | client → server | `{k, id}` | acknowledges one message. Idempotent — acking an already-removed message MUST succeed, matching the REST ack endpoint |
+| `#capabilities` | server → client | `{gr, pg?}` | the grant lifecycle effective *for this registration* and optional pair-generation support |
+| `#delivery` | server → client | `{k, id, m, sd?, dc?, g?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. Pair-generation-aware deliveries carry `g`; pair proof fields `sd`/`dc` appear together |
+| `#ack` | client → server | `{k, id, g?}` | acknowledges one message. A client that received `g` SHOULD echo it; a supplied stale generation is a no-op. Missing `g` remains a legacy ack and removes the matching message ID |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
 
@@ -1159,13 +1173,14 @@ early or duplicate arrival is still safe to act on.
 #### `#capabilities`
 
 ```
-{ "gr": "active" | "draining" | "absent" }
+{ "gr": "active" | "draining" | "absent", "pg"?: true }
 ```
 
-One field, and still a map: operating mailboxes is not something a relay
-declares, so grant issuance is all that varies today — but a bare enum
-would make adding a second field a breaking frame change. A client MUST
-ignore fields it does not recognize.
+`pg: true` advertises that pair deliveries may include `g`. It does not
+require client opt-in. Clients that do not recognize `g` continue to ack by
+message ID; clients that do recognize it SHOULD echo the received generation
+so a delayed acknowledgement cannot remove a replacement-generation entry.
+The relay does not send a separate generation frame.
 
 A relay **MUST** send it first on connect, and **SHOULD** send it again
 unsolicited when the state changes, so a long-lived connection learns of a
@@ -1752,7 +1767,7 @@ socket frames use:
 | `k` | present when `t` is `"m"`: the mailbox key the message landed in |
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
-| `sd` / `dc` | present under the same condition as `m`, for a pair-mailbox entry: the verification hint, identical to `#delivery`'s `sd`/`dc` |
+| `sd` / `dc` / `g` | present under the same condition as `m`, for a generation-aware pair-mailbox entry: the evidence locator and generation, identical to `#delivery` |
 
 ```json
 { "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }

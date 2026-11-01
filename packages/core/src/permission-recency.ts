@@ -65,4 +65,3 @@ export function permissionRecencyAtMs(inputs: PermissionRecencyInputs): Permissi
     )
     return valid.length === values.length ? Math.max(...valid) : null
 }
-

@@ -145,16 +145,15 @@ describe("connect and drain", () => {
 })
 
 describe("the capabilities frame", () => {
-    it("reports the deployment's grant lifecycle, and nothing else", async () => {
+    it("reports the deployment's grant lifecycle and pair-generation support", async () => {
         const stub = freshStub()
         const { frames } = await connectAndDrain(stub)
         const c = frames[0]
         expect(c.type).toBe("capabilities")
         // wrangler.test.toml sets GRANT_LIFECYCLE = "active".
         expect(c.body.get("gr")).toBe("active")
-        // Mailbox operation is not declared, so nothing reports on it: a
-        // relay serves both kinds or is not a relay.
-        expect([...c.body.keys()]).toEqual(["gr"])
+        expect(c.body.get("pg")).toBe(true)
+        expect([...c.body.keys()]).toEqual(["gr", "pg"])
     })
 
     it("reports a drain as absent once this registration holds no live grant", async () => {

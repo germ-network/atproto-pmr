@@ -54,6 +54,22 @@ function world(opts: {
     const bodies = new Map<string, Uint8Array>()
     let recipientKnown = true
     const store = {
+        appendPair: async (
+            key: string, ref: MessageRef, nonce: Uint8Array, now: number,
+            evidence: { declarationCID: string }, admission?: Admission
+        ) => {
+            ref.pairGeneration = "generation-1"
+            ref.hint = { senderDID: key, declarationCID: evidence.declarationCID }
+            const result = admission !== undefined
+                ? await store.receive(key, ref, nonce, now, admission)
+                : await store.hasMailbox()
+                    ? await store.append(key, ref, nonce, now)
+                    : await store.appendToPool(key, ref, nonce, now)
+            return {
+                result, generation: "generation-1", evidenceCID: evidence.declarationCID,
+                generationChanged: true, recycledMessageIds: [],
+            }
+        },
         receive: async (key: string, ref: MessageRef, _n: unknown, _now: number, admission: Admission) => {
             received.push({ key, ref, admission })
             return opts.result ?? { outcome: "pooled", persistBody: true }
@@ -93,7 +109,13 @@ function world(opts: {
         } as never,
         resolveDeclaration:
             opts.resolution ??
-            (() => ({ found: true, anchorKey: { x: opts.publicKey }, declarationCID: DC })),
+            (() => ({
+                found: true,
+                anchorKey: { x: opts.publicKey },
+                declarationCID: DC,
+                revision: "2222222222222",
+                evidenceCAR: new Uint8Array([1]),
+            })),
         ...(source ? { admission: source } : {}),
         defer: (work) => void deferred.push(work),
     }

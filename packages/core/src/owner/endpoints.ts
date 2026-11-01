@@ -849,7 +849,13 @@ export async function handleMessagesList(
     const page = await a.auth.store.openMailboxes(cursor, deps.catchUpPageMailboxes)
 
     const ms: CoseValue[] = []
+    const generations: CoseValue[] = []
     for (const entry of page.entries) {
+        if (entry.pairGeneration !== undefined) {
+            generations.push(
+                new Map<string, CoseValue>([["k", entry.key], ["g", entry.pairGeneration]])
+            )
+        }
         for (const ref of entry.messages) {
             const body = await deps.bodies.getBody(ref.messageId)
             if (body === null) continue
@@ -860,7 +866,47 @@ export async function handleMessagesList(
     return amortize(
         cbor([
             ["ms", ms],
+            ["gs", generations],
             ["n", page.nextCursor],
+        ]),
+        a.auth.did,
+        deps
+    )
+}
+
+/**
+ * `GET /pmr/v1/pair-evidence/{senderDID}?cid=<declarationCID>` — read the
+ * single proof selected for a sender-specific pair-mailbox generation. The
+ * CID is an exact locator; a miss is not evidence that the generation is
+ * obsolete. Only the authenticated mailbox owner can read this proof.
+ */
+export async function handlePairEvidenceRead(
+    request: Request,
+    deps: OwnerDeps
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const url = new URL(request.url)
+    let sender: PairMailboxKey
+    try {
+        const prefix = "/pmr/v1/pair-evidence/"
+        if (!url.pathname.startsWith(prefix)) throw new Error("bad path")
+        sender = asPairMailboxKey(decodeURIComponent(url.pathname.slice(prefix.length)))
+    } catch {
+        return new Response("Malformed path", { status: 400 })
+    }
+    const cid = url.searchParams.get("cid")
+    if (cid === null || cid.length === 0) return new Response("Missing CID", { status: 400 })
+    const evidence = await a.auth.store.getPairEvidence(sender, cid, deps.nowSeconds)
+    if (evidence === null) return new Response(null, { status: 404 })
+
+    return amortize(
+        cbor([
+            ["sd", evidence.senderDID],
+            ["dc", evidence.declarationCID],
+            ["g", evidence.generation],
+            ["car", evidence.car],
         ]),
         a.auth.did,
         deps
@@ -893,7 +939,7 @@ export async function handleMessagesAcks(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    let acks: { key: string; messageId: string }[]
+    let acks: { key: string; messageId: string; pairGeneration?: string }[]
     try {
         const map = decodeCoseMap(a.body ?? new Uint8Array(0))
         const raw = map.get("a")
@@ -902,11 +948,15 @@ export async function handleMessagesAcks(
             if (!(entry instanceof Map)) throw new Error("expected a map")
             const k = entry.get("k")
             const id = entry.get("id")
+            const generation = entry.get("g")
             if (typeof k !== "string" || typeof id !== "string") {
                 throw new Error("expected string k/id")
             }
+            if (generation !== undefined && typeof generation !== "string") {
+                throw new Error("expected string generation")
+            }
             asMailboxKey(k) // throws on a key matching neither prefix
-            return { key: k, messageId: id }
+            return { key: k, messageId: id, ...(generation === undefined ? {} : { pairGeneration: generation }) }
         })
     } catch {
         return new Response("Malformed body", { status: 400 })
@@ -917,7 +967,7 @@ export async function handleMessagesAcks(
     }
 
     for (const ack of acks) {
-        await a.auth.store.remove(asMailboxKey(ack.key), ack.messageId)
+        await a.auth.store.remove(asMailboxKey(ack.key), ack.messageId, ack.pairGeneration)
     }
 
     return amortize(new Response(null, { status: 204 }), a.auth.did, deps)

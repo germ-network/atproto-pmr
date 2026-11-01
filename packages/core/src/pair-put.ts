@@ -1,7 +1,7 @@
 import type { AdmissionSource } from "./admission.js"
-import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
+import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { PMRConfig } from "./config.js"
 import {
@@ -28,9 +28,9 @@ export interface PairPutDeps {
     store: (locator: Locator) => PMRStore
     bodies: BodyStore
     /**
-     * DID → declaration → anchor key. Injected because it makes a network
-     * call, which a test must be able to replace and a platform may want to
-     * route through its own fetch.
+     * DID → independently verified declaration CAR → anchor key and CID.
+     * Injected because the monitor read makes a network call, which a test
+     * must be able to replace and a platform may route through its own fetch.
      */
     resolveDeclaration: (senderDID: string) => Promise<SenderDeclarationResolution>
     /**
@@ -150,40 +150,41 @@ export async function handlePairPut(
             : new Response(null, { status: 202 })
     }
 
-    const result = await ingestAuthenticatedPut(
-        {
-            recipientDID,
-            senderDID: senderKey,
-            declarationCID: declaration.declarationCID,
-            payload: envelope.payload.payload,
-            replayKey: envelope.payload.nonce,
-        },
-        deps,
-        nowSeconds
-    )
-    switch (result.outcome) {
-        case "refused":
-            return new Response(null, {
-                status: 429,
-                headers: {
-                    "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)),
-                },
-            })
-        case "tooLarge":
-            return new Response("Payload exceeds the advertised maximum", { status: 413 })
-        // An unknown recipient answers the same `202` a registered one does.
-        // KNOWN, ACCEPTED GAP: that return skips every per-relay store, while a
-        // registered recipient costs at least one round trip. The timing
-        // difference could reveal registration status to an attacker who can
-        // measure it, though the content never does. Closing it means doing
-        // comparable work against a DID with no store to touch, and the obvious
-        // approach (instantiating a store for every unregistered DID an
-        // unauthenticated request names) is its own resource-exhaustion
-        // surface. Flagged in `spec/trust-model.md`.
-        case "accepted":
-        case "noRecipient":
-            return new Response(null, { status: 202 })
+    const locator = await deps.directory.resolve(recipientDID)
+    if (locator === null) {
+        // KNOWN, ACCEPTED GAP: an unknown recipient ends here with 202,
+        // whereas a registered recipient continues to admission and storage.
+        // Closing that timing difference requires a uniform unknown-recipient
+        // storage path; it remains accepted for this endpoint.
+        return new Response(null, { status: 202 })
     }
+    const result = await ingestAuthenticatedPut({
+        recipientDID,
+        senderDID: senderKey,
+        declarationCID: declaration.declarationCID,
+        payload: envelope.payload.payload,
+        replayKey: envelope.payload.nonce,
+        locator,
+        evidence: {
+            senderDID: senderKey,
+            anchorKey: declaration.anchorKey.x,
+            declarationCID: declaration.declarationCID,
+            revision: declaration.revision,
+            car: declaration.evidenceCAR,
+            expiresAt: nowSeconds + config.limits.messageExpirySeconds,
+        },
+    }, deps, nowSeconds)
+    if (result.outcome === "refused") {
+        return new Response(null, {
+            status: 429,
+            headers: { "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)) },
+        })
+    }
+    if (result.outcome === "unverifiable") return declarationUnverifiable()
+    if (result.outcome === "tooLarge") {
+        return new Response("Payload exceeds the advertised maximum", { status: 413 })
+    }
+    return new Response(null, { status: 202 })
 }
 
 function declarationUnverifiable(): Response {

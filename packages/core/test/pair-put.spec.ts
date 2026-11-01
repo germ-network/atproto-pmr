@@ -31,18 +31,23 @@ const CONFIG = {
 function world(resolution: (did: string) => SenderDeclarationResolution) {
     const appended: Array<{ key: string; ref: MessageRef }> = []
     const bodies: string[] = []
+    const deletedBodies: string[] = []
     const lookups: string[] = []
+    let recycledMessageIds: string[] = []
     let hasMailbox = true
     let recipientKnown = true
     const store = {
         hasMailbox: async () => hasMailbox,
-        append: async (key: string, ref: MessageRef) => {
+        appendPair: async (key: string, ref: MessageRef) => {
             appended.push({ key, ref })
-            return { outcome: "appended", persistBody: true }
-        },
-        appendToPool: async (key: string, ref: MessageRef) => {
-            appended.push({ key, ref })
-            return { outcome: "pooled", persistBody: true }
+            return {
+                result: hasMailbox
+                    ? { outcome: "appended", persistBody: true }
+                    : { outcome: "pooled", persistBody: true },
+                generation: "generation-1",
+                evidenceCID: DC,
+                recycledMessageIds,
+            }
         },
     } as unknown as PMRStore
     const deferred: Promise<unknown>[] = []
@@ -57,6 +62,7 @@ function world(resolution: (did: string) => SenderDeclarationResolution) {
         store: () => store,
         bodies: {
             putBody: async (id: string) => void bodies.push(id),
+            deleteBody: async (id: string) => void deletedBodies.push(id),
         } as never,
         resolveDeclaration: async (did) => resolution(did),
         defer: (work) => void deferred.push(work),
@@ -65,10 +71,12 @@ function world(resolution: (did: string) => SenderDeclarationResolution) {
         deps,
         appended,
         bodies,
+        deletedBodies,
         lookups,
         settle: () => Promise.all(deferred),
         setRecipientKnown: (known: boolean) => void (recipientKnown = known),
         setHasMailbox: (has: boolean) => void (hasMailbox = has),
+        setRecycledMessageIds: (ids: string[]) => void (recycledMessageIds = ids),
     }
 }
 
@@ -98,6 +106,8 @@ const known = (publicKey: Uint8Array) => (): SenderDeclarationResolution => ({
     found: true,
     anchorKey: { x: publicKey },
     declarationCID: DC,
+    revision: "2222222222222",
+    evidenceCAR: new Uint8Array([1]),
 })
 
 describe("handlePairPut", () => {
@@ -109,6 +119,18 @@ describe("handlePairPut", () => {
         expect(response.status).toBe(202)
         expect(w.appended).toHaveLength(1)
         expect(w.appended[0]!.ref.hint).toEqual({ senderDID: SENDER, declarationCID: DC })
+        expect(w.appended[0]!.ref.pairGeneration).toBe("generation-1")
+        expect(w.bodies).toHaveLength(1)
+    })
+
+    it("deletes bodies for refs recycled by a confirmed key rotation", async () => {
+        const { secretKey, publicKey } = keyPair()
+        const w = world(known(publicKey))
+        w.setRecycledMessageIds(["old-body"])
+        const response = await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)
+        await w.settle()
+        expect(response.status).toBe(202)
+        expect(w.deletedBodies).toEqual(["old-body"])
         expect(w.bodies).toHaveLength(1)
     })
 

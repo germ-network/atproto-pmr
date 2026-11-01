@@ -33,8 +33,26 @@ function world(opts: {
     const admissionAsked: Array<[string, string]> = []
     const bodyWrites: Array<[string, number]> = []
     const storeLocators: unknown[] = []
+    const pairEvidence: unknown[] = []
     const deferred: Promise<unknown>[] = []
     const store = {
+        appendPair: async (
+            key: string, ref: MessageRef, replay: Uint8Array, now: number,
+            evidence: { declarationCID: string; revision: string }, verdict?: Admission
+        ) => {
+            pairEvidence.push(evidence)
+            ref.pairGeneration = "generation-1"
+            ref.hint = { senderDID: key, declarationCID: evidence.declarationCID }
+            const result = verdict !== undefined
+                ? await store.receive(key, ref, replay, now, verdict)
+                : await store.hasMailbox()
+                    ? await store.append(key, ref, replay)
+                    : await store.appendToPool(key, ref, replay)
+            return {
+                result, generation: "generation-1", evidenceCID: evidence.declarationCID,
+                generationChanged: true, recycledMessageIds: [],
+            }
+        },
         receive: async (key: string, ref: MessageRef, replay: Uint8Array, _now: number, verdict: Admission) => {
             admissionPassed.push(verdict)
             stored.push({ via: "receive", key, ref, replay })
@@ -79,7 +97,7 @@ function world(opts: {
         admission,
         defer: (work: Promise<unknown>) => void deferred.push(work),
     }
-    return { deps, admissionPassed, admissionAsked, bodyWrites, stored, bodies, lookups, storeLocators, events, settle: () => Promise.all(deferred), deferredCount: () => deferred.length }
+    return { deps, admissionPassed, admissionAsked, bodyWrites, stored, bodies, lookups, storeLocators, pairEvidence, events, settle: () => Promise.all(deferred), deferredCount: () => deferred.length }
 }
 
 function put(overrides: Partial<AuthenticatedPut> = {}): AuthenticatedPut {
@@ -279,6 +297,8 @@ describe("handlePairPut over ingestAuthenticatedPut", () => {
             found: true as const,
             anchorKey: { x: ed25519.getPublicKey(secretKey) },
             declarationCID: DC,
+            revision: "2222222222222",
+            evidenceCAR: new Uint8Array([1]),
         }),
     })
 
@@ -289,6 +309,7 @@ describe("handlePairPut over ingestAuthenticatedPut", () => {
         expect(await accepted.text()).toBe("")
         expect(ok.stored[0]!.replay).toEqual(new Uint8Array(16).fill(1))
         expect(ok.stored[0]!.ref.hint).toEqual({ senderDID: SENDER, declarationCID: DC })
+        expect(ok.pairEvidence).toEqual([expect.objectContaining({ declarationCID: DC, revision: "2222222222222" })])
 
         const unknown = world({ recipientKnown: false })
         const absent = await handlePairPut(request(PAYLOAD), RECIPIENT, pairDeps(unknown), NOW)

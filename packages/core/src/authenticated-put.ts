@@ -2,13 +2,21 @@ import { admissionOrUnavailable } from "./admission.js"
 import { RESERVED_ENTRY_KEYS } from "./events.js"
 import { deriveMessageId } from "./message-id.js"
 import type { PairPutDeps } from "./pair-put.js"
-import type { ExtensionFields, Locator, MessageRef, PairMailboxKey, PMRStore } from "./storage.js"
+import type {
+    ExtensionFields,
+    Locator,
+    MessageRef,
+    PairMailboxEvidence,
+    PairMailboxKey,
+    PMRStore,
+} from "./storage.js"
 
 /**
- * A pair put whose sender the caller has already authenticated, by the
- * pair-put envelope or by other means the deployment vouches for. From here
- * on it is stored exactly as a verified pair put is: same admission, pool,
- * blocked-sender handling and per-sender quota.
+ * A put whose sender the caller has already authenticated. Supplying
+ * independently verified declaration evidence routes it through the same
+ * generation and proof operation as the pair-put endpoint; without evidence,
+ * this is the generic authenticated-message path and does not claim pair
+ * generation or proof semantics.
  */
 export interface AuthenticatedPut {
     recipientDID: string
@@ -30,6 +38,8 @@ export interface AuthenticatedPut {
     locator?: Locator
     /** Stored on the entry and emitted beside `sd`/`dc`. A key in `RESERVED_ENTRY_KEYS`, or a number that is not a safe integer, throws. */
     ext?: ExtensionFields
+    /** Independently verified declaration proof; enables pair-generation handling. */
+    evidence?: PairMailboxEvidence
 }
 
 export type AuthenticatedPutDeps = Pick<
@@ -48,6 +58,8 @@ export type AuthenticatedPutOutcome =
     | { outcome: "refused"; retryAfter: number }
     /** No `locator` was given and the recipient DID has no registration on this relay. */
     | { outcome: "noRecipient" }
+    /** The supplied declaration evidence was malformed or stale. */
+    | { outcome: "unverifiable" }
     /** `payload` exceeds `config.limits.messageMaxBytes`; nothing was read or stored. */
     | { outcome: "tooLarge" }
 
@@ -91,6 +103,50 @@ export async function ingestAuthenticatedPut(
             put.payload,
             nowSeconds + config.limits.messageExpirySeconds
         )
+
+    if (put.evidence !== undefined) {
+        const admission = deps.admission === undefined
+            ? undefined
+            : await admissionOrUnavailable(deps.admission, mailboxKey, put.recipientDID)
+        const pair = await store.appendPair(
+            mailboxKey,
+            ref,
+            put.replayKey,
+            nowSeconds,
+            put.evidence,
+            admission
+        )
+        if (pair.rejected !== undefined || pair.result === undefined || pair.generation === undefined || pair.evidenceCID === undefined) {
+            return { outcome: "unverifiable" }
+        }
+        ref.pairGeneration = pair.generation
+        ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
+        const result = pair.result
+        deps.defer(Promise.allSettled(pair.recycledMessageIds
+            .filter((id) => !("persistBody" in result && result.persistBody && id === messageId))
+            .map((id) => deps.bodies.deleteBody(id))))
+        if (result.outcome === "refused") {
+            return { outcome: "refused", retryAfter: result.retryAfter }
+        }
+        if (("persistBody" in result) && result.persistBody) {
+            if (result.outcome === "appended" || result.outcome === "queued") {
+                deps.defer(deliverQueued(
+                    store,
+                    mailboxKey,
+                    ref,
+                    put.payload,
+                    storeBody,
+                    "moved" in result ? result.moved?.map((moved) => ({
+                        ref: moved,
+                        body: () => deps.bodies.getBody(moved.messageId),
+                    })) : []
+                ))
+            } else if (result.outcome === "pooled") {
+                deps.defer(storeBody())
+            }
+        }
+        return { outcome: "accepted" }
+    }
 
     if (deps.admission) {
         const admission = await admissionOrUnavailable(

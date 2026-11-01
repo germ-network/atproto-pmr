@@ -105,6 +105,7 @@ export function messageEntryFields(
             }
         }
     }
+    if (ref.pairGeneration !== undefined) entries.push(["g", ref.pairGeneration])
     return new Map(entries)
 }
 
@@ -140,12 +141,17 @@ export function encodePoolFrame(): Uint8Array {
  */
 export interface EffectiveCapabilities {
     grant: GrantLifecycle
+    /** Present and true when pair deliveries/acks carry mailbox generations. */
+    pairGeneration?: boolean
 }
 
 export function encodeCapabilitiesFrame(c: EffectiveCapabilities): Uint8Array {
     return encodeFrame(
         "capabilities",
-        new Map<string, CoseValue>([["gr", c.grant]])
+        new Map<string, CoseValue>([
+            ["gr", c.grant],
+            ...(c.pairGeneration === true ? [["pg", true] as [string, CoseValue]] : []),
+        ])
     )
 }
 
@@ -171,8 +177,13 @@ export function decodeCapabilitiesFrame(
         }
         return v as T
     }
+    const pairGeneration = frame.body.get("pg")
+    if (pairGeneration !== undefined && typeof pairGeneration !== "boolean") {
+        throw new Error('events: malformed capabilities frame at "pg"')
+    }
     return {
         grant: read("gr", ["active", "draining", "absent"] as const),
+        ...(pairGeneration === undefined ? {} : { pairGeneration }),
     }
 }
 
@@ -193,6 +204,7 @@ export function encodeCaughtUpFrame(): Uint8Array {
 export interface AckPayload {
     key: string
     messageId: string
+    pairGeneration?: string
 }
 
 export function decodeAckFrame(bytes: Uint8Array): AckPayload {
@@ -205,7 +217,11 @@ export function decodeAckFrame(bytes: Uint8Array): AckPayload {
     if (typeof key !== "string" || typeof id !== "string") {
         throw new Error("events: malformed ack frame")
     }
-    return { key, messageId: id }
+    const generation = frame.body.get("g")
+    if (generation !== undefined && typeof generation !== "string") {
+        throw new Error("events: malformed ack generation")
+    }
+    return { key, messageId: id, ...(generation === undefined ? {} : { pairGeneration: generation }) }
 }
 
 export interface EventsDeps {
@@ -297,5 +313,5 @@ export async function handleAckFrame(
     frameBytes: Uint8Array
 ): Promise<void> {
     const ack = decodeAckFrame(frameBytes)
-    await deps.store.remove(asMailboxKey(ack.key), ack.messageId)
+    await deps.store.remove(asMailboxKey(ack.key), ack.messageId, ack.pairGeneration)
 }
