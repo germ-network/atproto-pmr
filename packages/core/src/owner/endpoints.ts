@@ -61,6 +61,7 @@ import {
  */
 
 const OWNER_BODY_MAX_BYTES = 16 * 1024
+const REGISTRATION_MONITOR_TIMEOUT_MS = 5_000
 
 /**
  * Deployment-defined registration fields. Absent, registration behaves and
@@ -97,9 +98,38 @@ export interface CommittedRegistration {
 
 export class RegistrationFieldError extends Error {}
 
+// This brand is private: only the authenticated create path mints this context.
+const authenticatedRegistration = Symbol("authenticated registration")
+
+/** Authority supplied only to a trusted, deployment-injected bundle hook. */
+export interface AuthenticatedRegistration {
+    readonly [authenticatedRegistration]: true
+    readonly did: string
+    /** Raw Ed25519 key verified against the signed request. */
+    readonly anchorKey: Uint8Array
+    readonly nowSeconds: number
+}
+
+export type RegistrationSubscription = NonNullable<RegistrationFields["pushSubscription"]>
+export type RegistrationMonitorOutcome = "accepted" | "unresolved" | "unavailable"
+export type RegistrationMonitorHook = (
+    auth: AuthenticatedRegistration,
+    subscription: RegistrationSubscription
+) => Promise<"accepted" | "unresolved">
+
 export interface OwnerDeps extends OwnerAuthDeps {
     directory: Directory
     registrationExtension?: RegistrationExtension
+    /** Trusted composition seam. Called only after authenticated validation and
+     * mailbox commit; no endpoint accepts caller-supplied verified authority. */
+    registrationMonitor?: RegistrationMonitorHook
+    /** Wait budget after mailbox commit, milliseconds. Defaults to 5,000;
+     * invalid/nonpositive/overflowing values also use the default. A deadline
+     * yields unresolved, not cancellation: the monitor may still commit. */
+    registrationMonitorTimeoutMs?: number
+    /** Retain the monitor attempt past the response (e.g. Worker waitUntil).
+     * Receives a promise whose rejection is already handled. */
+    deferRegistrationMonitor?: (work: Promise<void>) => void
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
     /**
@@ -329,6 +359,32 @@ export async function handleRegistrationCreate(
         }
     }
 
+    let bundle: { monitor?: RegistrationSubscription } | undefined
+    if (decodedBody.has("bundle")) {
+        try {
+            const raw = decodedBody.get("bundle")
+            if (!(raw instanceof Map) || raw.get("v") !== 1) throw new Error()
+            bundle = {}
+            if (raw.has("monitor")) {
+                const monitor = raw.get("monitor")
+                if (!(monitor instanceof Map)) throw new Error()
+                const endpoint = monitor.get("pse")
+                const contentKey = monitor.get("psk")
+                const keyId = monitor.get("psi")
+                if (
+                    typeof endpoint !== "string" ||
+                    new URL(endpoint).protocol !== "https:" ||
+                    !(contentKey instanceof Uint8Array) || contentKey.byteLength !== 32 ||
+                    typeof keyId !== "number" || !Number.isInteger(keyId) ||
+                    keyId < 0 || keyId > 255
+                ) throw new Error()
+                bundle.monitor = { endpoint, contentKey, keyId }
+            }
+        } catch {
+            return new Response("Malformed body", { status: 400 })
+        }
+    }
+
     // Replaced whole on every create, so a key the body omits is withdrawn.
     if (deps.registrationExtension !== undefined) {
         try {
@@ -397,7 +453,48 @@ export async function handleRegistrationCreate(
         ext: fields.ext ?? {},
     })
 
-    return cbor([["l", locator]], 201)
+    if (bundle === undefined) return cbor([["l", locator]], 201)
+
+    let outcome: RegistrationMonitorOutcome = "unavailable"
+    if (bundle.monitor !== undefined && deps.registrationMonitor !== undefined) {
+        const timeoutMs = deps.registrationMonitorTimeoutMs
+        const budget = typeof timeoutMs === "number" && Number.isInteger(timeoutMs) &&
+            timeoutMs > 0 && timeoutMs <= 2_147_483_647
+            ? timeoutMs : REGISTRATION_MONITOR_TIMEOUT_MS
+        // Handle rejection on the attempt itself: timing out does not cancel a
+        // store write, and its eventual failure must not be unhandled.
+        const hook = deps.registrationMonitor
+        const subscription = bundle.monitor
+        const attempt = Promise.resolve().then(() => hook({
+            [authenticatedRegistration]: true,
+            did,
+            anchorKey: anchorKey.slice(),
+            nowSeconds: deps.nowSeconds,
+        }, subscription)).then(
+            (result): RegistrationMonitorOutcome => result === "accepted" ? "accepted" : "unresolved",
+            (): RegistrationMonitorOutcome => "unresolved"
+        )
+        try {
+            deps.deferRegistrationMonitor?.(attempt.then(() => {}))
+        } catch {
+            // Host lifetime bookkeeping must not discard the mailbox receipt.
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+            outcome = await Promise.race([
+                attempt,
+                new Promise<RegistrationMonitorOutcome>(resolve => {
+                    timer = setTimeout(() => resolve("unresolved"), budget)
+                }),
+            ])
+        } finally {
+            if (timer !== undefined) clearTimeout(timer)
+        }
+    }
+    return cbor([
+        ["l", locator],
+        ["bundle", new Map<string, CoseValue>([["v", 1], ["monitor", outcome]])],
+    ], 201)
 }
 
 /** The extension's read keys, minus any that would shadow the core ones. */

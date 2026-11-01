@@ -9,6 +9,7 @@ import {
     redeemChallenge,
     verifyRequestSignature,
     withNextChallenge,
+    type RegistrationMonitorHook,
     type ChallengeConfig,
     type ChallengeStore,
 } from "@germ-network/atproto-pmr-core"
@@ -269,4 +270,32 @@ export async function handleMonitorRegistrationDelete(
     // other "no such registration" failure, by design. No next-challenge
     // here — nothing is left to bind it to.
     return new Response(null, { status: 204 })
+}
+
+/** Compose into core's authenticated mailbox create path, never an HTTP call.
+ * A current PDS key only authorizes first create or a same-stored-key rebind.
+ * Store errors propagate to core, which preserves the mailbox acknowledgement.
+ * Like standalone registration, this inherits the store's documented stale-read
+ * window; it does not implement a cross-store transaction or key rotation.
+ */
+export function monitorRegistrationHook(
+    registrations: MonitorRegistrationStore
+): RegistrationMonitorHook {
+    return async (auth, subscription) => {
+        const existing = await registrations.load(auth.did)
+        if (existing !== null) {
+            const stored = parseOkpEd25519Key(existing.anchorKey).x
+            if (stored.length !== auth.anchorKey.length ||
+                !stored.every((byte, i) => byte === auth.anchorKey[i])) {
+                return "unresolved"
+            }
+        }
+        await registrations.put({
+            did: auth.did,
+            anchorKey: existing?.anchorKey ?? encodeOkpEd25519Key({ x: auth.anchorKey }),
+            pushSubscription: subscription,
+            registeredAt: auth.nowSeconds,
+        })
+        return "accepted"
+    }
 }
