@@ -1,7 +1,7 @@
 import vectors from "../../../spec/vectors/registration-bundle.json"
 import * as signatures from "../../core/src/http-sig/verify"
 import { ed25519 } from "@noble/curves/ed25519.js"
-import { describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
     decodeCoseMap, encodeBinding, encodeCose, encodeOkpEd25519Key,
     handleRegistrationCreate, signRequest, toResponseBody,
@@ -271,5 +271,126 @@ describe("bundle admission boundaries", () => {
         expect(w.monitor()).toBe(prior)
         expect(w.registrations.load).not.toHaveBeenCalled()
         expect(w.registrations.put).not.toHaveBeenCalled()
+    })
+})
+
+
+afterEach(() => vi.useRealTimers())
+
+describe("bounded post-mailbox monitor wait", () => {
+    function parked(phase: "load" | "put", timeoutMs?: number) {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+        const w = world()
+        let release!: () => void
+        let fail!: (error: Error) => void
+        let entered!: () => void
+        let retained!: Promise<void>
+        const arrived = new Promise<void>(resolve => { entered = resolve })
+        const gate = new Promise<void>((resolve, reject) => { release = resolve; fail = reject })
+        const originalPut = w.registrations.put.getMockImplementation()!
+        if (phase === "load") {
+            w.registrations.load.mockImplementationOnce(async () => {
+                entered()
+                await gate
+                return null
+            })
+        } else {
+            w.registrations.put.mockImplementationOnce(async row => {
+                entered()
+                await gate
+                await originalPut(row)
+            })
+        }
+        const deps = { ...w.deps, registrationMonitorTimeoutMs: timeoutMs,
+            deferRegistrationMonitor: vi.fn((work: Promise<void>) => { retained = work }) }
+        let settled = false
+        const response = w.request().then(request => handleRegistrationCreate(request, deps))
+            .then(response => { settled = true; return response })
+        return { w, deps, arrived, response, release, fail, retained: () => retained, settled: () => settled }
+    }
+
+    it("returns the mailbox receipt at the default deadline and retains a late successful put", async () => {
+        const p = parked("put")
+        await p.arrived
+        expect(p.w.mailbox()).not.toBeNull()
+        expect(p.deps.deferRegistrationMonitor).toHaveBeenCalledOnce()
+        await vi.advanceTimersByTimeAsync(4_999)
+        expect(p.settled()).toBe(false)
+        expect(p.w.monitor()).toBeNull()
+        await vi.advanceTimersByTimeAsync(1)
+        const response = await p.response
+        const lateReceipt = response.clone()
+        await receipt(response, "unresolved")
+        p.release()
+        await expect(p.retained()).resolves.toBeUndefined()
+        expect(p.w.monitor()?.pushSubscription.keyId).toBe(2)
+        await receipt(lateReceipt, "unresolved")
+        expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it.each(["load", "put"] as const)("bounds a parked monitor %s and handles its late rejection", async phase => {
+        const p = parked(phase, 25)
+        await p.arrived
+        await vi.advanceTimersByTimeAsync(25)
+        await receipt(await p.response, "unresolved")
+        p.fail(new Error("late private store failure"))
+        await expect(p.retained()).resolves.toBeUndefined()
+        expect(p.w.mailbox()).not.toBeNull()
+        expect(p.w.monitor()).toBeNull()
+        expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("accepts completion inside the configured budget and clears the deadline", async () => {
+        const p = parked("put", 25)
+        await p.arrived
+        await vi.advanceTimersByTimeAsync(24)
+        expect(p.settled()).toBe(false)
+        p.release()
+        await receipt(await p.response, "accepted")
+        await expect(p.retained()).resolves.toBeUndefined()
+        expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it.each([0, -1, NaN, Infinity, 2_147_483_648])("uses the finite default for invalid budget %s", async timeoutMs => {
+        const p = parked("put", timeoutMs)
+        await p.arrived
+        await vi.advanceTimersByTimeAsync(4_999)
+        expect(p.settled()).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
+        await receipt(await p.response, "unresolved")
+        p.release()
+        await p.retained()
+    })
+
+    it("starts the budget after a slow mailbox write completes", async () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+        const w = world()
+        let release!: () => void
+        let entered!: () => void
+        const arrived = new Promise<void>(resolve => { entered = resolve })
+        const original = w.update.getMockImplementation()!
+        w.update.mockImplementationOnce(async fields => {
+            entered()
+            await new Promise<void>(resolve => { release = resolve })
+            await original(fields)
+        })
+        let settled = false
+        const response = w.call().then(response => { settled = true; return response })
+        await arrived
+        await vi.advanceTimersByTimeAsync(10_000)
+        expect(settled).toBe(false)
+        expect(w.registrations.load).not.toHaveBeenCalled()
+        expect(vi.getTimerCount()).toBe(0)
+        release()
+        await receipt(await response, "accepted")
+        expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("a throwing lifetime callback cannot discard a successful mailbox/monitor receipt", async () => {
+        const w = world()
+        await receipt(await handleRegistrationCreate(await w.request(), {
+            ...w.deps,
+            deferRegistrationMonitor: () => { throw new Error("host unavailable") },
+        }), "accepted")
     })
 })

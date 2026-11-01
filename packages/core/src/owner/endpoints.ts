@@ -61,6 +61,7 @@ import {
  */
 
 const OWNER_BODY_MAX_BYTES = 16 * 1024
+const REGISTRATION_MONITOR_TIMEOUT_MS = 5_000
 
 /**
  * Deployment-defined registration fields. Absent, registration behaves and
@@ -122,6 +123,13 @@ export interface OwnerDeps extends OwnerAuthDeps {
     /** Trusted composition seam. Called only after authenticated validation and
      * mailbox commit; no endpoint accepts caller-supplied verified authority. */
     registrationMonitor?: RegistrationMonitorHook
+    /** Wait budget after mailbox commit, milliseconds. Defaults to 5,000;
+     * invalid/nonpositive/overflowing values also use the default. A deadline
+     * yields unresolved, not cancellation: the monitor may still commit. */
+    registrationMonitorTimeoutMs?: number
+    /** Retain the monitor attempt past the response (e.g. Worker waitUntil).
+     * Receives a promise whose rejection is already handled. */
+    deferRegistrationMonitor?: (work: Promise<void>) => void
     /** How long a discard suppresses a sender, in seconds. */
     discardWindowSeconds: number
     /**
@@ -449,17 +457,38 @@ export async function handleRegistrationCreate(
 
     let outcome: RegistrationMonitorOutcome = "unavailable"
     if (bundle.monitor !== undefined && deps.registrationMonitor !== undefined) {
+        const timeoutMs = deps.registrationMonitorTimeoutMs
+        const budget = typeof timeoutMs === "number" && Number.isInteger(timeoutMs) &&
+            timeoutMs > 0 && timeoutMs <= 2_147_483_647
+            ? timeoutMs : REGISTRATION_MONITOR_TIMEOUT_MS
+        // Handle rejection on the attempt itself: timing out does not cancel a
+        // store write, and its eventual failure must not be unhandled.
+        const hook = deps.registrationMonitor
+        const subscription = bundle.monitor
+        const attempt = Promise.resolve().then(() => hook({
+            [authenticatedRegistration]: true,
+            did,
+            anchorKey: anchorKey.slice(),
+            nowSeconds: deps.nowSeconds,
+        }, subscription)).then(
+            (result): RegistrationMonitorOutcome => result === "accepted" ? "accepted" : "unresolved",
+            (): RegistrationMonitorOutcome => "unresolved"
+        )
         try {
-            const result = await deps.registrationMonitor({
-                [authenticatedRegistration]: true,
-                did,
-                anchorKey: anchorKey.slice(),
-                nowSeconds: deps.nowSeconds,
-            }, bundle.monitor)
-            // A bad adapter must never manufacture acceptance or leak a diagnosis.
-            outcome = result === "accepted" ? "accepted" : "unresolved"
+            deps.deferRegistrationMonitor?.(attempt.then(() => {}))
         } catch {
-            outcome = "unresolved"
+            // Host lifetime bookkeeping must not discard the mailbox receipt.
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+            outcome = await Promise.race([
+                attempt,
+                new Promise<RegistrationMonitorOutcome>(resolve => {
+                    timer = setTimeout(() => resolve("unresolved"), budget)
+                }),
+            ])
+        } finally {
+            if (timer !== undefined) clearTimeout(timer)
         }
     }
     return cbor([

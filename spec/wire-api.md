@@ -514,15 +514,23 @@ After mailbox commit the `201` body retains `l` and acknowledges:
 No cross-store transaction, rollback, durable pending protocol or stronger
 consistency is implied. In particular the monitor store's documented KV
 stale-read window still applies. A lost response is ambiguous; retry with the
-same subscription/key material and a fresh challenge. A pending put cannot be
-acknowledged as accepted before it completes.
+same subscription/key material and a fresh challenge. The monitor attempt has a
+bounded wait after mailbox commit: five seconds by default in core, configurable
+by the deployment. A deadline returns `201` with
+the mailbox locator and monitor `unresolved`. It does not cancel the attempt or
+assert the monitor was not saved; a late write may complete. Deployments with
+request-scoped execution must retain the attempt through their background-work
+mechanism (for example, Worker `waitUntil`). Late failure must be handled.
+A pending put cannot be acknowledged as accepted before it completes.
 
 For clients, a legacy `201` with valid `l` grants mailbox acceptance and means
 monitor unsupported; do not retry unchanged capability indefinitely. A malformed
 or unknown-version bundle response with valid `l` preserves mailbox acceptance
 but leaves monitor unresolved. Unknown outcomes never mean accepted. An invalid
-locator or non-`201` grants no new mailbox acceptance. Devices without monitor
-material can register the mailbox. No automatic standalone fallback is implied.
+locator or non-`201` grants no new mailbox acceptance. A transport timeout with
+no valid received locator likewise leaves mailbox acceptance ambiguous even
+when a server deadline exists: retry the same subscription/key material with a
+fresh challenge. Devices without monitor material can register the mailbox. No automatic standalone fallback is implied.
 
 [Deterministic CBOR vectors](vectors/registration-bundle.json) provide legacy,
 v1 request and all response outcomes. Hex is the executable fixture; diagnostic
