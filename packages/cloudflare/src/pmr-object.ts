@@ -1360,6 +1360,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     private async schedulePairEvidenceExpiry(key: PairMailboxKey, expiresAt: number): Promise<void> {
+        // Zero marks a retained anti-rollback watermark after the proof bytes
+        // were cleared. It has no expiry to schedule or fold into a paged scan.
+        if (expiresAt === 0) return
         const next = expiresAt * 1000
         const current = await this.db.getAlarm()
         if (current === null || next < current) await this.db.setAlarm(next)
