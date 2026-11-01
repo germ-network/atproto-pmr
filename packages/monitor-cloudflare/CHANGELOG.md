@@ -1,5 +1,7 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.5.1
+
 ## 0.5.0
 
 ## 0.4.1
