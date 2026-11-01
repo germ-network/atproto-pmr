@@ -119,6 +119,32 @@ describe("a provisioned pair mailbox refuses when full", () => {
         })
     })
 
+    it("keeps a pooled message without proof metadata when the proof cannot fit", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:proof-does-not-fit" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(6),
+            declarationCID: "bafy-too-large",
+            revision: "3333333333333",
+            car: new Uint8Array(1_000_000),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            const cap = parseInt(testEnv.POOL_CAP_BYTES)
+            await pmr.appendToPool("did:plc:proof-budget-filler", ref("filler", cap - 500_000), freshNonce(), T0)
+            const result = await pmr.appendPair(sender, ref("without-proof", 1), freshNonce(), T0, evidence)
+            expect(result.result?.outcome).toBe("pooled")
+            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
+            expect(await pmr.list(sender, 10)).toEqual([])
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
+            await pmr.provisionFromPool(sender, T0)
+            const [provisioned] = await pmr.list(sender, 10)
+            expect(provisioned?.hint).toBeUndefined()
+            expect(provisioned?.pairGeneration).toBeUndefined()
+        })
+    })
+
     it("applies a verified key rotation even when its triggering put is a duplicate", async () => {
         const stub = freshStub()
         const sender = "did:plc:duplicate-rotation" as const
@@ -649,6 +675,31 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
 })
 
 describe("the recovery pool inverts the provisioned mailbox's policy", () => {
+    it("keeps an existing sender's newest ref even if replacement grows past the cap", async () => {
+        const stub = freshStub()
+        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        const sender = "did:plc:near-cap-existing"
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
+            await pmr.appendToPool(sender, ref("old", 1), freshNonce(), T0)
+            const newest = await pmr.appendToPool(sender, ref("new", 2), freshNonce(), T0)
+            expect(newest.outcome).toBe("pooled")
+            expect((await pmr.poolSenders()).find((entry) => entry.did === sender)?.count).toBe(1)
+        })
+    })
+
+    it("accepts a first ref larger than the pool's remaining room while not yet full", async () => {
+        const stub = freshStub()
+        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        const sender = "did:plc:remaining-room"
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
+            const first = await pmr.appendToPool(sender, ref("first", 2), freshNonce(), T0)
+            expect(first.outcome).toBe("pooled")
+            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
+        })
+    })
+
     it("keeps the NEWEST under depth pressure", async () => {
         // The freshest attempt carries current state; stale attempts are
         // worthless. This is the opposite of the provisioned mailbox and must

@@ -144,7 +144,7 @@ distinct name.
 |---|---|
 | `append(mailboxKey, messageRef) -> Appended \| Refused(full)` | **refuses at capacity — never accept-and-evict**; the cap check and the write MUST be one atomic step, or two concurrent puts both see room |
 | `receive(senderKey, messageRef, admission) -> Queued \| Pooled \| Refused(full)` | one atomic step per adjudicated pair put: routes by the sender's standing (none, a device contact, an admitted sender, a blocked sender) and the recipient's verdict; the nonce and pause checks come first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit), then the writes |
-| `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; a pooled message carries its selected proof with its pool refs, charged to the pool byte cap, and transfers it on provisioning |
+| `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; a pooled sender's selected proof is stored when it fits the shared pool budget and transfers on provisioning |
 | `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent** |
@@ -157,9 +157,12 @@ rotation disposal, nonce check, and append MUST be one serialized operation.
 The store retains one verified CAR and its declaration CID per sender-specific
 pair generation while that sender has queued or pooled messages. Pooled proof
 bytes count against the shared pool byte cap, and provisioning transfers the
-proof with the selected pooled refs. Blocked, refused, discarded, duplicate,
-and exhausted outcomes MUST NOT retain proof bytes or expose a mailbox
-descriptor. The proof expires with the accepted message-body retention period.
+proof with the selected pooled refs. If a pool message fits but its proof CAR
+does not fit the remaining proof budget, the message is still accepted without
+`sd`, `dc`, or generation metadata; a later proof that fits may annotate the
+retained pool refs. Blocked, refused, discarded, duplicate, and exhausted
+outcomes MUST NOT retain proof bytes or expose a mailbox descriptor. The proof
+expires with the accepted message-body retention period.
 A small revision/key watermark may remain for a live provisioned mailbox to
 prevent a stale resolver result from rolling the key back. A same-anchor-key
 declaration edit keeps that generation and selected evidence; it MUST NOT
@@ -189,9 +192,11 @@ The pool is bounded two ways, and neither rations sender count directly: a
 *byte cap* applies only when that round never comes. Bytes rather than
 senders is deliberate — width is the property the pool exists to provide —
 so under pressure `appendToPool` reduces per-sender depth before it turns
-any sender away, and only at true exhaustion (cap reached, depth already
-minimal) does it refuse senders not already present, keeping earlier
-arrivals rather than evicting them. Both values are
+any sender away. It refuses a new sender only when a put begins with the cap
+already reached; a put that begins below the cap may cross it, and an existing
+sender continues newest-wins treatment even if its replacement increases total
+bytes. Pooled proof CARs use the same budget but are skipped when they would
+not fit. Both values are
 **implementation-defined**; the reasoning is what transfers, not any
 constant. See
 [`wire-api.md` §Limits](wire-api.md#limits-are-implementation-defined).

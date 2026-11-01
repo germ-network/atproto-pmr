@@ -675,8 +675,7 @@ export interface PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        admission: Admission,
-        additionalPoolBytes?: number
+        admission: Admission
     ): Promise<ReceiveResult>
 
     /**
@@ -719,9 +718,7 @@ export interface PMRStore {
         nonce: Nonce,
         nowSeconds: number,
         /** Recorded as the sender's latest verdict when the put is pooled. */
-        verdict?: PoolVerdict,
-        /** Additional proof bytes reserved atomically with a pair-pool entry. */
-        additionalBytes?: number
+        verdict?: PoolVerdict
     ): Promise<PoolAppendResult>
 
     /**

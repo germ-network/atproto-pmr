@@ -61,6 +61,8 @@ import { webPushSender } from "./push-sender"
 
 const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
+const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
+const PAIR_EVIDENCE_EXPIRY_BATCH_SIZE = 100
 /** The own-DID declaration watch's `WatchState` (`watch.ts`). */
 const KEY_WATCH = "watch"
 const KEY_MONITOR_CONFIRMED = "monitorConfirmed"
@@ -673,15 +675,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                     hint: { senderDID: key, declarationCID: selected.declarationCID },
                 }
                 : baseRef
-            const additionalPoolBytes = !mailboxPresent && admission?.verdict !== "blocked" &&
-                selected.car.byteLength === 0
-                ? evidence.car.byteLength
-                : 0
             const result = admission === undefined
                 ? (await this.hasMailbox(key))
                     ? await this.append(key, boundRef, nonce, nowSeconds)
-                    : await this.appendToPool(key, boundRef, nonce, nowSeconds, undefined, additionalPoolBytes)
-                : await this.receive(key, boundRef, nonce, nowSeconds, admission, additionalPoolBytes)
+                    : await this.appendToPool(key, boundRef, nonce, nowSeconds)
+                : await this.receive(key, boundRef, nonce, nowSeconds, admission)
 
             const accepted = ("persistBody" in result) && result.persistBody &&
                 (result.outcome === "appended" || result.outcome === "queued")
@@ -700,7 +698,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         expiresAt: Math.max(latest?.expiresAt ?? 0, evidence.expiresAt),
                     }
                 await this.db.put(evidenceKey, selected)
-                await this.schedulePairEvidenceExpiry(selected.expiresAt)
+                await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
                 const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
                 if (queue !== undefined) {
                     const updated = queue.map((entry) => entry.messageId === ref.messageId
@@ -739,16 +737,16 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                             hint: { senderDID: key, declarationCID: selected.declarationCID },
                         })))
                     }
-                    await this.schedulePairEvidenceExpiry(selected.expiresAt)
-                } else if (prior !== undefined || generationChanged) {
+                    await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
+                } else if (prior !== undefined || mailboxExisted) {
                     // Keep the small anti-rollback watermark for an existing
                     // mailbox generation, but never reserve unbudgeted CAR bytes.
                     selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
                     await this.db.put(evidenceKey, selected)
-                    await this.schedulePairEvidenceExpiry(selected.expiresAt)
+                    await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
                 }
-            } else if ((prior !== undefined || generationChanged) && selected.car.byteLength === 0) {
-                await this.schedulePairEvidenceExpiry(selected.expiresAt)
+            } else if ((prior !== undefined || mailboxExisted) && selected.car.byteLength === 0) {
+                await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
             }
 
             return {
@@ -931,8 +929,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        admission: Admission,
-        additionalPoolBytes = 0
+        admission: Admission
     ): Promise<ReceiveResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
@@ -964,7 +961,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
             verdict: admission.verdict,
             why: admission.why,
-        }, additionalPoolBytes)
+        })
         return pooled.outcome === "pooled"
             ? { outcome: "pooled", persistBody: pooled.persistBody }
             : pooled
@@ -1130,8 +1127,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        verdict?: PoolVerdict,
-        additionalBytes = 0
+        verdict?: PoolVerdict
     ): Promise<PoolAppendResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) {
@@ -1167,8 +1163,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             if (evicted !== undefined) reclaimed += evicted.byteLength
         }
 
-        if ((wasEmpty && underPressure) ||
-            usedBytes + ref.byteLength - reclaimed + additionalBytes > capBytes) {
+        if (wasEmpty && underPressure) {
             return { outcome: "exhausted" }
         }
 
@@ -1363,16 +1358,25 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
     }
 
-    private async schedulePairEvidenceExpiry(expiresAt: number): Promise<void> {
+    private async schedulePairEvidenceExpiry(key: PairMailboxKey, expiresAt: number): Promise<void> {
         const next = expiresAt * 1000
         const current = await this.db.getAlarm()
         if (current === null || next < current) await this.db.setAlarm(next)
+        const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        if (cursor !== undefined && pairEvidenceKey(key) <= cursor) {
+            await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        }
     }
 
     /** Reclaims selected declaration CARs at their message-retention deadline. */
     async alarm(): Promise<void> {
         const nowSeconds = Math.floor(Date.now() / 1000)
-        const proofs = await this.db.list<StoredPairEvidence>({ prefix: PAIR_EVIDENCE_PREFIX })
+        const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        const proofs = await this.db.list<StoredPairEvidence>({
+            prefix: PAIR_EVIDENCE_PREFIX,
+            ...(cursor !== undefined ? { startAfter: cursor } : {}),
+            limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
+        })
         let nextExpiry = Number.POSITIVE_INFINITY
         for (const [rawKey, proof] of proofs) {
             const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
@@ -1389,7 +1393,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 nextExpiry = Math.min(nextExpiry, proof.expiresAt)
             }
         }
-        if (Number.isFinite(nextExpiry)) await this.db.setAlarm(nextExpiry * 1000)
+        if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
+            const lastKey = [...proofs.keys()].at(-1)
+            if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
+            await this.db.setAlarm(Math.min(nextExpiry * 1000, Date.now() + 1_000))
+        } else {
+            await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+            if (Number.isFinite(nextExpiry)) await this.db.setAlarm(nextExpiry * 1000)
+        }
     }
 
     async unblock(key: MailboxKey): Promise<void> {
