@@ -898,7 +898,7 @@ export async function handlePairEvidenceRead(
     }
     const cid = url.searchParams.get("cid")
     if (cid === null || cid.length === 0) return new Response("Missing CID", { status: 400 })
-    const evidence = await a.auth.store.getPairEvidence(sender, cid)
+    const evidence = await a.auth.store.getPairEvidence(sender, cid, deps.nowSeconds)
     if (evidence === null) return new Response(null, { status: 404 })
 
     return amortize(

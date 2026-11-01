@@ -144,6 +144,7 @@ distinct name.
 |---|---|
 | `append(mailboxKey, messageRef) -> Appended \| Refused(full)` | **refuses at capacity — never accept-and-evict**; the cap check and the write MUST be one atomic step, or two concurrent puts both see room |
 | `receive(senderKey, messageRef, admission) -> Queued \| Pooled \| Refused(full)` | one atomic step per adjudicated pair put: routes by the sender's standing (none, a device contact, an admitted sender, a blocked sender) and the recipient's verdict; the nonce and pause checks come first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit), then the writes |
+| `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; stores CAR bytes only for a queued message and returns recycled body IDs for cleanup |
 | `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent** |
@@ -153,20 +154,28 @@ distinct name.
 `appendPair(senderDID, messageRef, nonce, verifiedEvidence)` is the pair-put
 operation for generation-aware stores. Its key binding, generation selection,
 rotation disposal, nonce check, and append MUST be one serialized operation.
-The store retains one verified CAR and its declaration CID per sender-specific
-pair generation. A same-anchor-key declaration edit keeps that generation and
+The store retains one verified CAR and its declaration CID per provisioned
+sender-specific pair generation, only after a message is queued. Pool-only,
+blocked, refused, discarded, duplicate, and exhausted outcomes MUST NOT
+retain proof bytes or expose a mailbox descriptor. The proof expires with the
+accepted message-body retention period. A small revision/key watermark may
+remain after proof expiry to prevent a stale resolver result from rolling the
+key back. A same-anchor-key declaration edit keeps that generation and
 selected evidence; it MUST NOT create per-message or per-revision proof rows.
-A confirmed different anchor key allocates a new opaque generation, removes
-undelivered queue and pool refs for that sender, clears its replay nonce set,
-and replaces the old proof. It MUST NOT affect another sender. Missing or
-unverifiable evidence cannot call this operation and never establishes a
-rotation.
+A confirmed different anchor key allocates a new opaque generation and
+removes undelivered queue and pool refs for that sender. The nonce set MUST
+survive key rotation so a key changed back cannot replay an old nonce. It MUST
+NOT affect another sender. Missing or unverifiable evidence cannot call this
+operation and never establishes a rotation. A verified rotation is applied
+even when its triggering message is later refused; this prevents future puts
+from being accepted under an obsolete key.
 
-Pair deliveries carry the generation. An acknowledgement removes a pair ref
-only when its generation matches that ref's current generation. Missing or
-stale generations are no-ops; grant mailbox acknowledgements remain unchanged.
-The relay advertises pair-generation support with `pg: true`; on upgraded
-stores, legacy refs without a generation remain distinguishable until drained.
+Pair deliveries may carry the generation. Acknowledgements with a supplied
+generation remove a pair ref only when it matches that ref's current
+generation. A missing generation uses the legacy message-ID acknowledgement
+contract; grant mailbox acknowledgements remain unchanged. The relay
+advertises pair-generation support with `pg: true`, without requiring client
+opt-in or sending a separate generation frame.
 
 **Do not implement the pool by reusing `append` with a different cap.** The
 eviction direction is opposite, and conflating them is how a recovery

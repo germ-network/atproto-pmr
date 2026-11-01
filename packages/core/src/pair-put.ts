@@ -189,19 +189,29 @@ export async function handlePairPut(
             senderDID: mailboxKey,
             anchorKey: declaration.anchorKey.x,
             declarationCID: declaration.declarationCID,
+            revision: declaration.revision,
             car: declaration.evidenceCAR,
+            expiresAt: nowSeconds + config.limits.messageExpirySeconds,
         },
         admission
     )
+    if (pair.rejected !== undefined) return declarationUnverifiable()
+    if (pair.result === undefined || pair.generation === undefined || pair.evidenceCID === undefined) {
+        return declarationUnverifiable()
+    }
     ref.pairGeneration = pair.generation
     ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
     const result = pair.result
     if (result.outcome === "refused") {
+        deps.defer(Promise.allSettled(pair.recycledMessageIds.map((id) => deps.bodies.deleteBody(id))))
         return new Response(null, {
             status: 429,
             headers: { "Retry-After": String(Math.max(0, result.retryAfter - nowSeconds)) },
         })
     }
+    deps.defer(Promise.allSettled(pair.recycledMessageIds
+        .filter((id) => !(("persistBody" in result) && result.persistBody && id === messageId))
+        .map((id) => deps.bodies.deleteBody(id))))
     if (("persistBody" in result) && result.persistBody) {
         deps.defer((async () => {
             await storeBody()

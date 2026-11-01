@@ -109,20 +109,33 @@ export interface PairMailboxEvidence {
     senderDID: PairMailboxKey
     anchorKey: Uint8Array
     declarationCID: string
+    revision: string
     car: Uint8Array
+    expiresAt: number
 }
 
-export interface StoredPairMailboxEvidence extends PairMailboxEvidence {
+/** Small anti-rollback watermark retained after the selected proof expires. */
+export interface PairMailboxMetadata {
+    senderDID: PairMailboxKey
+    anchorKey: Uint8Array
+    declarationCID: string
+    revision: string
     generation: string
+}
+
+export interface StoredPairMailboxEvidence extends PairMailboxMetadata {
+    car: Uint8Array
+    expiresAt: number
 }
 
 export interface PairAppendResult {
-    result: AppendResult | PoolAppendResult | ReceiveResult
-    generation: string
-    evidenceCID: string
+    result?: AppendResult | PoolAppendResult | ReceiveResult
+    generation?: string
+    evidenceCID?: string
     generationChanged: boolean
     /** Accepted refs discarded when a confirmed sender-key change recycled this mailbox. */
     recycledMessageIds: MessageId[]
+    rejected?: "invalidEvidence" | "staleEvidence"
 }
 
 export type AppendResult =
@@ -580,7 +593,7 @@ export interface PMRStore {
     ): Promise<PairAppendResult>
 
     /** Exact selected proof for a sender-specific mailbox, or null on a miss. */
-    getPairEvidence(key: PairMailboxKey, evidenceCID: string): Promise<StoredPairMailboxEvidence | null>
+    getPairEvidence(key: PairMailboxKey, evidenceCID: string, nowSeconds: number): Promise<StoredPairMailboxEvidence | null>
 
     list(key: MailboxKey, limit: number): Promise<MessageRef[]>
 

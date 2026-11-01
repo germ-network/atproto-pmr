@@ -48,7 +48,7 @@ export type DeclarationResolution =
  * `DeclarationResolution` so the PDS resolver cannot be wired into pair put.
  */
 export type SenderDeclarationResolution =
-    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string; evidenceCAR: Uint8Array }
+    | { found: true; anchorKey: OkpEd25519Key; declarationCID: string; revision: string; evidenceCAR: Uint8Array }
     | { found: false; reason: string }
 
 /** A third party's stored proof of a DID's declaration. */
@@ -100,6 +100,7 @@ export function snapshotDeclarationResolver(
                 found: true,
                 anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
                 declarationCID: result.cid,
+                revision: result.rev,
                 evidenceCAR: result.car,
             }
         } catch (error) {

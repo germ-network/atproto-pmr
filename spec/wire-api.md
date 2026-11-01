@@ -1078,13 +1078,14 @@ senders the relay refused or could not decide, with `v` and `r`. A Bsky-blocked
 sender's mail stops appearing in catch-up once the relay has seen the block,
 and earlier deliveries are cleared on the device using the summary's block list.
 
-`GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for known
-pair-mailbox generations, including mailboxes with no queued messages. Clients
-use these descriptors to detect replacement generations during catch-up. A
-proof read returns CBOR `{sd, dc, g, car}` and is scoped to the authenticated
-owner; an unknown or superseded CID returns 404.
+`GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for
+provisioned pair-mailbox generations, including mailboxes with no queued
+messages. Pool-only senders never appear in `gs`. Clients use these descriptors
+to detect replacement generations during catch-up. A proof read returns CBOR
+`{sd, dc, g, car}` and is scoped to the authenticated owner; an expired or
+unknown CID returns 404.
 
-A pair-mailbox delivery carries the relay's **evidence locator**: `sd`, the
+A pair-mailbox delivery MAY carry the relay's **evidence locator**: `sd`, the
 sender DID, `dc`, the selected declaration record CID, and `g`, the opaque
 pair-mailbox generation. `dc` identifies one shared proof selected for the
 sender-specific mailbox generation; it is neither authority nor a claim that
@@ -1143,8 +1144,7 @@ body   = { ... type-specific fields ... }
 |---|---|---|---|
 | `#capabilities` | server → client | `{gr, pg?}` | the grant lifecycle effective *for this registration* and optional pair-generation support |
 | `#delivery` | server → client | `{k, id, m, sd?, dc?, g?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. Pair-generation-aware deliveries carry `g`; pair proof fields `sd`/`dc` appear together |
-| `#pairGeneration` | server → client | `{k, g}` | announces the current generation for one pair mailbox, including when it has no queued messages |
-| `#ack` | client → server | `{k, id, g?}` | acknowledges one message. A generation-aware pair ack MUST echo `g`; stale or missing generations are no-ops |
+| `#ack` | client → server | `{k, id, g?}` | acknowledges one message. A client that received `g` SHOULD echo it; a supplied stale generation is a no-op. Missing `g` remains a legacy ack and removes the matching message ID |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
 
@@ -1172,9 +1172,11 @@ early or duplicate arrival is still safe to act on.
 { "gr": "active" | "draining" | "absent", "pg"?: true }
 ```
 
-`pg: true` advertises pair-generation-aware delivery and acknowledgement.
-Its absence means the client is on the legacy contract and MUST NOT infer
-generation support. A client MUST ignore fields it does not recognize.
+`pg: true` advertises that pair deliveries may include `g`. It does not
+require client opt-in. Clients that do not recognize `g` continue to ack by
+message ID; clients that do recognize it SHOULD echo the received generation
+so a delayed acknowledgement cannot remove a replacement-generation entry.
+The relay does not send a separate generation frame.
 
 A relay **MUST** send it first on connect, and **SHOULD** send it again
 unsolicited when the state changes, so a long-lived connection learns of a

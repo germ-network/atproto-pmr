@@ -7,7 +7,6 @@ import {
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
-    encodePairGenerationFrame,
     handleAckFrame,
     isPairMailboxKey,
     parseGrantLifecycle,
@@ -608,22 +607,30 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         evidence: PairMailboxEvidence,
         admission?: Admission
     ): Promise<PairAppendResult> {
+        // Reject malformed/unbounded proofs before entering the DO input gate;
+        // exceptions inside blockConcurrencyWhile can reset the object.
+        if (
+            evidence === undefined || evidence.senderDID !== key ||
+            !(evidence.anchorKey instanceof Uint8Array) || evidence.anchorKey.byteLength !== 32 ||
+            !(evidence.car instanceof Uint8Array) || evidence.car.byteLength === 0 ||
+            evidence.car.byteLength > MAX_PAIR_EVIDENCE_BYTES ||
+            typeof evidence.revision !== "string" ||
+            !/^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$/.test(evidence.revision) ||
+            !Number.isSafeInteger(evidence.expiresAt) || evidence.expiresAt <= nowSeconds
+        ) return { generationChanged: false, recycledMessageIds: [], rejected: "invalidEvidence" }
         return this.ctx.blockConcurrencyWhile(async () => {
-        if (evidence.senderDID !== key || evidence.anchorKey.byteLength !== 32) {
-            throw new Error("pair evidence does not match sender mailbox")
-        }
-        if (evidence.car.byteLength > MAX_PAIR_EVIDENCE_BYTES) {
-            throw new Error("pair evidence exceeds storage limit")
-        }
-
         const evidenceKey = pairEvidenceKey(key)
         const prior = await this.db.get<StoredPairEvidence>(evidenceKey)
+        if (prior !== undefined && (
+            evidence.revision < prior.revision ||
+            (evidence.revision === prior.revision &&
+                (evidence.declarationCID !== prior.declarationCID || !sameBytes(evidence.anchorKey, prior.anchorKey)))
+        )) return { generationChanged: false, recycledMessageIds: [], rejected: "staleEvidence" }
         let selected: StoredPairEvidence
         let recycledMessageIds: string[] = []
         let generationChanged = false
         if (prior === undefined) {
-            selected = { ...evidence, generation: crypto.randomUUID() }
-            await this.db.put(evidenceKey, selected)
+            selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
             generationChanged = true
         } else if (!sameBytes(prior.anchorKey, evidence.anchorKey)) {
             const [queue, pool] = await Promise.all([
@@ -636,28 +643,21 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             // with the generation that subsequent puts will carry.
             if (queue !== undefined) await this.db.put(mailboxKey(key), [])
             await this.releasePool(key, pool ?? [])
-            await this.db.delete(nonceSetKey(key))
             await this.db.delete(retryHintKey(key))
-            selected = { ...evidence, generation: crypto.randomUUID() }
-            await this.db.put(evidenceKey, selected)
+            selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
             generationChanged = true
         } else {
             // A declaration edit is not a new mailbox generation. Retain one
             // selected proof rather than archiving every same-key revision.
-            selected = prior
+            selected = { ...prior, revision: evidence.revision }
         }
-
-        if (
-            generationChanged &&
-            (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined &&
-            this.ctx.getWebSockets().length > 0
-        ) {
-            this.broadcast(encodePairGenerationFrame(key, selected.generation))
-        }
+        await this.db.put(evidenceKey, selected)
 
         const boundRef: MessageRef = {
             ...ref,
-            pairGeneration: selected.generation,
+            ...((await this.hasMailbox(key)) || admission?.verdict === "yes"
+                ? { pairGeneration: selected.generation }
+                : {}),
             hint: { senderDID: key, declarationCID: selected.declarationCID },
         }
         const result = admission === undefined
@@ -665,6 +665,27 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 ? await this.append(key, boundRef, nonce, nowSeconds)
                 : await this.appendToPool(key, boundRef, nonce, nowSeconds)
             : await this.receive(key, boundRef, nonce, nowSeconds, admission)
+        const accepted = ("persistBody" in result) && result.persistBody &&
+            (result.outcome === "appended" || result.outcome === "queued")
+        if (accepted) {
+            selected = generationChanged || selected.car.byteLength === 0
+                ? { ...selected, ...evidence, generation: selected.generation }
+                : { ...selected, expiresAt: Math.max(selected.expiresAt, evidence.expiresAt) }
+            await this.db.put(evidenceKey, selected)
+            await this.schedulePairEvidenceExpiry(selected.expiresAt)
+            // The append happened with the previous locator when an expired
+            // proof was being refreshed. Keep the durable entry aligned with
+            // the proof now selected for this generation.
+            if (selected.declarationCID !== boundRef.hint?.declarationCID) {
+                const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
+                if (queue !== undefined) {
+                    const updated = queue.map((entry) => entry.messageId === ref.messageId
+                        ? { ...entry, hint: { senderDID: key, declarationCID: selected.declarationCID } }
+                        : entry)
+                    await this.db.put(mailboxKey(key), updated)
+                }
+            }
+        }
         return {
             result,
             generation: selected.generation,
@@ -677,10 +698,17 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     async getPairEvidence(
         key: `did:${string}`,
-        evidenceCID: string
+        evidenceCID: string,
+        nowSeconds: number
     ): Promise<StoredPairMailboxEvidence | null> {
         const evidence = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
-        if (evidence === undefined || evidence.declarationCID !== evidenceCID) return null
+        if (evidence === undefined || evidence.declarationCID !== evidenceCID ||
+            evidence.car.byteLength === 0 ||
+            (await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) return null
+        if (evidence.expiresAt <= nowSeconds) {
+            await this.clearPairProof(key)
+            return null
+        }
         return evidence
     }
 
@@ -822,8 +850,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         if (queue === undefined) return
         const existing = queue.find((r) => r.messageId === messageId)
         if (existing === undefined) return
-        if (isPairMailboxKey(key) && existing.pairGeneration !== undefined &&
-            (pairGeneration === undefined || pairGeneration !== existing.pairGeneration)) return
+        if (isPairMailboxKey(key) && pairGeneration !== undefined && pairGeneration !== existing.pairGeneration) return
         const remaining = queue.filter((r) => r.messageId !== messageId)
         if (remaining.length === queue.length) return
         await this.db.put(mailboxKey(key), remaining)
@@ -978,6 +1005,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         for (const [rawKey, evidence] of proofs) {
             const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as MailboxKey
             const previous = combined.get(key)
+            if (evidence.car.byteLength > 0 && evidence.expiresAt <= Math.floor(Date.now() / 1000)) {
+                await this.db.put(rawKey, { ...evidence, car: new Uint8Array() })
+            }
+            // Pool-only senders have no mailbox descriptor. Proof metadata
+            // alone must never reveal a sender to the owner.
+            if (previous === undefined) continue
             combined.set(key, {
                 key,
                 messages: previous?.messages ?? [],
@@ -1171,12 +1204,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         key: MailboxKey,
         moved: MessageRef[]
     ): Promise<void> {
-        if (isPairMailboxKey(key)) {
-            const generation = moved.find((ref) => ref.pairGeneration !== undefined)?.pairGeneration
-            if (generation !== undefined) {
-                this.broadcast(encodePairGenerationFrame(key, generation))
-            }
-        }
         const bodies = kvBodyStore(this.env)
         for (const ref of moved) {
             const body = await bodies.getBody(ref.messageId)
@@ -1190,6 +1217,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         await this.releasePool(key, pooled)
         await this.db.put(discardKey(key), until)
+        if (isPairMailboxKey(key)) await this.clearPairProof(key)
     }
 
     /** Remove a sender's pool entries and return their bytes to the budget. */
@@ -1214,6 +1242,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // A device block takes over a mirrored one, so it leaves
         // `bs`; the marker is dropped before the early return.
         if (source === "device") await this.db.delete(bskyBlockKey(key))
+        if (isPairMailboxKey(key)) await this.clearPairProof(key)
         if ((await this.db.get(syntheticKey(key))) !== undefined) return
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
@@ -1236,6 +1265,34 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // the shared helper also returns their bytes to the pool budget.
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         if (pooled.length > 0) await this.releasePool(key, pooled)
+    }
+
+    private async clearPairProof(key: PairMailboxKey): Promise<void> {
+        const proof = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
+        if (proof !== undefined) await this.db.put(pairEvidenceKey(key), { ...proof, car: new Uint8Array(), expiresAt: 0 })
+    }
+
+    private async schedulePairEvidenceExpiry(expiresAt: number): Promise<void> {
+        const next = expiresAt * 1000
+        const current = await this.db.getAlarm()
+        if (current === null || next < current) await this.db.setAlarm(next)
+    }
+
+    /** Reclaims selected declaration CARs at their message-retention deadline. */
+    async alarm(): Promise<void> {
+        const nowSeconds = Math.floor(Date.now() / 1000)
+        const proofs = await this.db.list<StoredPairEvidence>({ prefix: PAIR_EVIDENCE_PREFIX })
+        let nextExpiry = Number.POSITIVE_INFINITY
+        for (const [key, proof] of proofs) {
+            if (proof.car.byteLength === 0) continue
+            if (proof.expiresAt <= nowSeconds) {
+                await this.db.put(key, { ...proof, car: new Uint8Array() })
+            } else {
+                nextExpiry = Math.min(nextExpiry, proof.expiresAt)
+            }
+        }
+        if (Number.isFinite(nextExpiry)) await this.db.setAlarm(nextExpiry * 1000)
+        else await this.db.deleteAlarm()
     }
 
     async unblock(key: MailboxKey): Promise<void> {

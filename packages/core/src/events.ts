@@ -289,9 +289,6 @@ export async function drainBacklog(
     do {
         const page = await deps.store.openMailboxes(cursor, pageSize)
         for (const entry of page.entries) {
-            if (entry.pairGeneration !== undefined) {
-                send(encodePairGenerationFrame(entry.key, entry.pairGeneration))
-            }
             for (const ref of entry.messages) {
                 const body = await deps.bodies.getBody(ref.messageId)
                 // Missing (expired, or racing retention) — skip rather than
