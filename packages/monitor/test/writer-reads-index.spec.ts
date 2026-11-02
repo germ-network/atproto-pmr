@@ -124,7 +124,7 @@ describe("the writer never reads the snapshot store", () => {
             }),
         })
         expect(await settle(h.deps, DID)).toBe("stored")
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa", expect.objectContaining({ c: "rotate" }))
         expect(h.completed[0]!.written).toMatchObject({
             cid: "bafyreiheld",
             verifiedWith: NEW_KEY,
@@ -257,7 +257,7 @@ describe("the writer never reads the snapshot store", () => {
         const h = harness(held({ verifiedWith: OLD_KEY }))
         await pushNewlySeenKey(h.deps, DID, NEW_KEY)
         expect(h.held()?.seenKey).toBe(NEW_KEY)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa", expect.objectContaining({ c: "rotate" }))
         expect(h.putRecord).not.toHaveBeenCalled()
     })
 

@@ -117,7 +117,11 @@ export interface IngestDeps {
      * staler than refresh would. Defaults to `SETTLE_RETRY_CAP_MS`.
      */
     retryCapMs?(did: string): Promise<number>
-    /** Own-DID push, where a registration holds this DID. */
+    /**
+     * Own-DID push, where a registration holds this DID. `hint.c` is the kind
+     * of change; `hint.dc` is present only when this change verified and
+     * adopted a record, never for a key seen but not verified.
+     */
     onChange?(did: string, rev: string, hint?: DeclarationPushHint): Promise<void>
     /**
      * Every verified declaration stored (settle, quiet or not, and quiet
@@ -509,7 +513,8 @@ async function settleFetched(
     // not only a rev movement: a key rotation is arguably the single most
     // security-relevant thing this component exists to catch.
     const held = await deps.index.heldDeclarationOf(did)
-    const keyRotated = movement === "unchanged" && held !== null && held.verifiedWith !== verified.key
+    const keyChanged = held !== null && held.verifiedWith !== verified.key
+    const keyRotated = movement === "unchanged" && keyChanged
 
     const observedAtMs = deps.nowMs()
     const evidence = await prepareSnapshotEvidence(deps.index, did, verified, observedAtMs)
@@ -602,7 +607,12 @@ async function settleFetched(
     await raiseSettled(deps, did, settled)
 
     // A DID back from gone is news at whatever rev it returns.
-    if (movement === "advanced" || keyRotated || revived) await deps.onChange?.(did, verified.rev)
+    if (movement === "advanced" || keyRotated || revived) {
+        await deps.onChange?.(did, verified.rev, {
+            c: keyChanged ? "rotate" : "rev",
+            dc: verified.cid,
+        })
+    }
     return "stored"
 }
 
@@ -771,7 +781,7 @@ export async function pushNewlySeenKey(
     const held = await deps.index.heldDeclarationOf(did)
     if (held === null || fetchedKey === held.verifiedWith || fetchedKey === held.seenKey) return
     await deps.index.recordSeenKey(did, fetchedKey)
-    await deps.onChange?.(did, held.rev)
+    await deps.onChange?.(did, held.rev, { c: "rotate" })
 }
 
 /**

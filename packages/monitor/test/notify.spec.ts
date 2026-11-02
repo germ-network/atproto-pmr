@@ -129,6 +129,22 @@ describe("pushDeclarationChange", () => {
 })
 
 describe("pushDeclarationChange hints", () => {
-    it.todo("sends {t:'d', c, dc} when given a hint carrying dc")
-    it.todo("sends exactly {t:'d'} when given no hint")
+    it("sends {t:'d', c, dc} when given a hint carrying dc", async () => {
+        const sender = stubSender({ outcome: "delivered" })
+        await pushDeclarationChange(DID, { registrations: memoryStore(registration()), sender }, {
+            c: "rotate",
+            dc: "bafy-held",
+        })
+        expect(Object.fromEntries(decodeCoseMap(sender.calls[0].plaintext))).toEqual({
+            t: "d",
+            c: "rotate",
+            dc: "bafy-held",
+        })
+    })
+
+    it("sends exactly {t:'d'} when given no hint", async () => {
+        const sender = stubSender({ outcome: "delivered" })
+        await pushDeclarationChange(DID, { registrations: memoryStore(registration()), sender })
+        expect([...decodeCoseMap(sender.calls[0].plaintext)]).toEqual([["t", "d"]])
+    })
 })

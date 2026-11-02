@@ -4724,7 +4724,7 @@ export class MonitorIngest
      * all — it only supplies the authoritative fetch.
      */
     protected onChange(did: string, _rev: string, hint?: DeclarationPushHint): Promise<void> {
-        this.notifyRegistration(did)
+        this.notifyRegistration(did, hint)
         return Promise.resolve()
     }
 
@@ -4745,7 +4745,7 @@ export class MonitorIngest
      */
     protected onRegression(did: string, indexed: string, observed: string): Promise<void> {
         console.log("monitor: rev regression", { did, indexed, observed })
-        this.notifyRegistration(did)
+        this.notifyRegistration(did, { c: "rev" })
         return Promise.resolve()
     }
 
@@ -4753,11 +4753,11 @@ export class MonitorIngest
      * The watched declaration was confirmed deleted at the source. Pushes
      * to a registered device the same as `onChange`/`onRegression` — the
      * device re-fetches, finds nothing, and reacts accordingly; this
-     * object never asserts what the change was, only that one happened.
+     * object says what kind of change it was, never its content.
      */
     protected onDelete(did: string): Promise<void> {
         console.log("monitor: declaration deleted", { did })
-        this.notifyRegistration(did)
+        this.notifyRegistration(did, { c: "gone" })
         return Promise.resolve()
     }
 
@@ -4773,7 +4773,7 @@ export class MonitorIngest
      * in `waitUntil` is a race by construction, not a fixture problem.
      */
     private notifyRegistration(did: string, hint?: DeclarationPushHint): void {
-        this.ctx.waitUntil(this.deliverDeclarationPush(did))
+        this.ctx.waitUntil(this.deliverDeclarationPush(did, hint))
     }
 
     /**
@@ -4804,7 +4804,7 @@ export class MonitorIngest
             const sender = monitorWebPushSender(this.env)
             if (registrations === null || sender === null) return
 
-            const result = await pushDeclarationChange(did, { registrations, sender })
+            const result = await pushDeclarationChange(did, { registrations, sender }, hint)
             if (result?.outcome === "failed") {
                 console.error(
                     `monitor onChange: push service answered ${result.status} for ${did}`

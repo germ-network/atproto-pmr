@@ -1846,11 +1846,12 @@ socket frames use:
 
 | field | meaning |
 |---|---|
-| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed |
+| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed (see below for its hints) |
 | `k` | present when `t` is `"m"`: the mailbox key the message landed in |
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
-| `sd` / `dc` / `g` | present under the same condition as `m`, for a generation-aware pair-mailbox entry: the evidence locator and generation, identical to `#delivery` |
+| `c` | present only when `t` is `"d"`, optionally: the kind of change |
+| `sd` / `dc` / `g` | present under the same condition as `m`, for a generation-aware pair-mailbox entry: the evidence locator and generation, identical to `#delivery`; `dc` also, for `t: "d"`, optionally: the declaration record the monitor just verified |
 
 ```json
 { "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }
@@ -1869,8 +1870,9 @@ ciphertext is twenty bytes or two thousand.
 
 A device that receives the wake form (`{t, k, id}` without `m`) fetches that one message with [`GET /pmr/v1/messages/{k}/{id}`](#fetching-one-message-by-reference).
 
-**`t: "p"` and `t: "d"` are always exactly `{t}` and nothing else — this
-is permanent, not merely the current state of what's implemented.**
+**`t: "p"` is always exactly `{t}` and nothing else, permanently. `t: "d"`
+never carries content, permanently; it MAY carry the two hints below and
+nothing else.**
 
 - `t: "p"` (the pool's adjudication threshold crossed) MUST NOT carry
   content, and MUST NOT be sent on individual pool arrival. Per-arrival
@@ -1889,9 +1891,21 @@ is permanent, not merely the current state of what's implemented.**
   declaration record itself is a signed, self-authenticating commit —
   the risk here is withholding or staleness, not forgery, and no single
   pushed blob can prove the *absence* of a conflicting version elsewhere.
-  A registration watches only its own DID (see [Registration and the
-  own-DID push](key-transparency.md#registration-and-the-own-did-push)),
-  so `t: "d"` carries no DID field: there is only one DID it could mean.
+  A `t: "d"` push MAY carry two hints. `c` is the kind of change: `"rev"`
+  (the repo `rev` moved, either way, or the repo returned from gone),
+  `"rotate"` (the signing key changed), or `"gone"` (the record is
+  unobtainable at the source). `dc` is the CID of the declaration record
+  the monitor verified on this change, in the same format as `#delivery`'s
+  `dc`; it may equal a CID the device already holds, since a key rotation
+  does not change the record. Hints are not content and never save the
+  device any verification: every `t: "d"` push MUST lead to the device's
+  full verification, whatever `c` and `dc` say. A device MAY use `c` to
+  raise urgency, and MUST treat a missing or unknown `c` as a change of
+  unknown kind. Pushes on this topic collapse at the push service, so a
+  later push can replace an earlier one and its hints; that is harmless
+  because hints never suppress verification. `t: "d"` carries no DID (a
+  registration watches only its own DID, see [Registration and the own-DID
+  push](key-transparency.md#registration-and-the-own-did-push)) and no key.
 
 ### The enabler document
 

@@ -8,9 +8,8 @@ import { SEAL_OVERHEAD_BYTES } from "./seal.js"
  * "The sealed payload". One place decides all three shapes, so a future
  * change to any of them has one obvious place to land.
  *
- * `t: "p"` and `t: "d"` are always exactly `{t}` and nothing else,
- * permanently, not merely because nothing produces richer versions of them
- * yet:
+ * `t: "p"` is always exactly `{t}` and nothing else, permanently, and
+ * `t: "d"` never carries content, permanently:
  *
  *   - `t: "p"` (pool threshold crossed): per-arrival content would be
  *     exactly the harassment vector pool adjudication's batching exists to
@@ -23,7 +22,10 @@ import { SEAL_OVERHEAD_BYTES } from "./seal.js"
  *     bypassing the fetch-and-compare-across-monitors step the system
  *     exists to force. This holds even though the declaration record
  *     itself is a signed, self-authenticating commit — the risk here is
- *     withholding/staleness, not forgery.
+ *     withholding/staleness, not forgery. It may carry the two hints of
+ *     `DeclarationPushHint` (the kind of change, and the record the monitor
+ *     verified), which are not content and never spare the device its own
+ *     verification.
  *
  * `t: "m"` (a message arrived) is the one case with a size decision: the
  * message is included when the sealed total still fits the push service's
@@ -57,7 +59,12 @@ export interface DeclarationPushHint {
 }
 
 export function buildDeclarationPushPayload(hint?: DeclarationPushHint): Uint8Array {
-    return encodeCose(new Map<string, CoseValue>([["t", "d"]]))
+    const entries: [string, CoseValue][] = [["t", "d"]]
+    if (hint !== undefined) {
+        entries.push(["c", hint.c])
+        if (hint.dc !== undefined) entries.push(["dc", hint.dc])
+    }
+    return encodeCose(new Map(entries))
 }
 
 export interface BuildMessagePushPayloadOptions {
