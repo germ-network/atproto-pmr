@@ -605,6 +605,15 @@ export interface PMRStore {
     remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void>
 
     /**
+     * The one queued ref `messageId` names in mailbox `key`, or null when the
+     * mailbox is absent or holds no such id. A read only: the entry stays
+     * queued until acked through `remove`. Every miss is the same null,
+     * including a key too long to store, so a caller cannot tell an acked
+     * message from one that never existed.
+     */
+    getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null>
+
+    /**
      * Best-effort live delivery of a message that was just appended and whose
      * body has already been persisted — `spec/wire-api.md`, "New messages MUST
      * be pushed to an attached connection as they arrive".

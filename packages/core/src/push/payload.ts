@@ -37,7 +37,26 @@ export function buildPoolPushPayload(): Uint8Array {
     return encodeCose(new Map<string, CoseValue>([["t", "p"]]))
 }
 
-export function buildDeclarationPushPayload(): Uint8Array {
+/**
+ * What changed about the watched declaration: `rev` (the rev moved, either
+ * way, or the repo came back from gone), `rotate` (the signing key changed),
+ * `gone` (the record is unobtainable at the source).
+ */
+export type DeclarationChangeKind = "rev" | "rotate" | "gone"
+
+/**
+ * Hints on a `t: "d"` push. Never content, and never a reason for a device to
+ * skip verification: every `t: "d"` push leads to a full re-verify. `c` may
+ * raise urgency. `dc` is the declaration record the monitor verified on this
+ * change, and may equal one the device already holds, because a key rotation
+ * leaves the record unchanged.
+ */
+export interface DeclarationPushHint {
+    c: DeclarationChangeKind
+    dc?: string
+}
+
+export function buildDeclarationPushPayload(hint?: DeclarationPushHint): Uint8Array {
     return encodeCose(new Map<string, CoseValue>([["t", "d"]]))
 }
 

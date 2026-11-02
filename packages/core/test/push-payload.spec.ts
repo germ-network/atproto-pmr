@@ -115,3 +115,11 @@ describe("buildPoolPushPayload / buildDeclarationPushPayload", () => {
         expect([...map.entries()]).toEqual([["t", "d"]])
     })
 })
+
+describe("declaration push hints", () => {
+    it.todo("with no hint, the payload is exactly {t:'d'}")
+    it.todo("a hint adds c and, when present, dc, and nothing else (no DID, no anchor key)")
+    it.todo("a hint without dc carries no dc key")
+    it.todo("the largest hinted payload seals well under a 2880-byte ceiling")
+    it.todo("the pool payload is still exactly {t:'p'}")
+})

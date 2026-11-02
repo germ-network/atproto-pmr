@@ -21,6 +21,7 @@ import {
     messagingKeyFingerprint,
     normalizeMessagingKeyFingerprint,
     readRecordFromCar,
+    type DeclarationPushHint,
     type DidDocument,
     type InterestPolicy,
 } from "@germ-network/atproto-pmr-core"
@@ -117,7 +118,7 @@ export interface IngestDeps {
      */
     retryCapMs?(did: string): Promise<number>
     /** Own-DID push, where a registration holds this DID. */
-    onChange?(did: string, rev: string): Promise<void>
+    onChange?(did: string, rev: string, hint?: DeclarationPushHint): Promise<void>
     /**
      * Every verified declaration stored (settle, quiet or not, and quiet
      * refresh) and every one disposed of (deletion, interest leave), after

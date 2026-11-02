@@ -1272,3 +1272,11 @@ describe("declaration messaging-key history", () => {
         expect(history.size).toBe(2)
     })
 })
+
+describe("own-DID push hints", () => {
+    it.todo("an advanced rev raises onChange with {c:'rev', dc: the newly verified record's CID}")
+    it.todo("a revived DID raises onChange with {c:'rev', dc}")
+    it.todo("a verified signing-key change raises onChange with {c:'rotate', dc}, with or without a rev move")
+    it.todo("a verified key rotation at an unchanged record carries dc equal to the previously held CID")
+    it.todo("a newly seen but unverified key raises onChange with {c:'rotate'} and no dc, since the held record did not change")
+})

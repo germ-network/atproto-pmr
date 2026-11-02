@@ -4179,3 +4179,11 @@ describe("messaging-key fingerprint upgrade and rollback aliases", () => {
         })
     })
 })
+
+describe("own-DID push hints on the wire", () => {
+    it.todo("an advance pushes {t:'d', c:'rev', dc}")
+    it.todo("a regression pushes {t:'d', c:'rev'} with no dc")
+    it.todo("a deletion pushes {t:'d', c:'gone'} with no dc")
+    it.todo("an unverified key rotation pushes {t:'d', c:'rotate'} with no dc")
+    it.todo("a verified key rotation pushes {t:'d', c:'rotate', dc}")
+})

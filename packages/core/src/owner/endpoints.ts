@@ -19,7 +19,10 @@ import type {
     Directory,
     ExtensionFields,
     Locator,
+    MailboxKey,
+    MessageId,
     PairMailboxKey,
+    PMRStore,
     RegistrationFields,
 } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
@@ -969,6 +972,58 @@ export async function handleMessagesList(
         a.auth.did,
         deps
     )
+}
+
+/**
+ * The `{k}` and `{id}` of `/pmr/v1/messages/{k}/{id}`, or null when the path
+ * must be refused `400`: not exactly two non-empty segments after the
+ * prefix, a segment that fails to percent-decode, or a `k` matching neither
+ * `did:` nor `grant:`. The raw pathname is split before decoding, and each
+ * segment is decoded exactly once. Decided from the bytes alone.
+ */
+export function parseMessageReadPath(
+    pathname: string
+): { key: MailboxKey; messageId: MessageId } | null {
+    throw new Error("unimplemented")
+}
+
+/**
+ * The one answer for every fetch-one miss: `404`, empty body, `no-store`.
+ * A deployment amortizes it like a hit.
+ */
+export function messageMissResponse(): Response {
+    throw new Error("unimplemented")
+}
+
+/**
+ * One queued message as a catch-up entry (`messageEntryFields`), or null on
+ * any miss: an absent mailbox, an unknown or already-acked id, or a body
+ * that has expired. Reads only; the entry stays queued until acked.
+ *
+ * Exported without auth so a deployment that authenticates owners its own
+ * way can serve the same response.
+ */
+export async function readMessageEntry(
+    store: Pick<PMRStore, "getMessage">,
+    bodies: Pick<BodyStore, "getBody">,
+    key: MailboxKey,
+    messageId: MessageId
+): Promise<Map<string, CoseValue> | null> {
+    throw new Error("unimplemented")
+}
+
+/**
+ * `GET /pmr/v1/messages/{k}/{id}` — fetch the one message a reference push
+ * names, without acking it. `parseMessageReadPath` decides the 400 before
+ * any lookup. Every miss is `messageMissResponse()`, so the response never
+ * says whether a mailbox exists or a message was acked. Bsky blocks are not
+ * synced here, as for a full-form push; the next catch-up applies them.
+ */
+export async function handleMessageRead(
+    request: Request,
+    deps: OwnerDeps & MessagesConfig
+): Promise<Response> {
+    throw new Error("unimplemented")
 }
 
 /**

@@ -1216,3 +1216,14 @@ describe("openMailboxes cursor", () => {
         })
     })
 })
+
+describe("getMessage — read one queued message by mailbox key and id", () => {
+    it.todo("returns the queued ref, including its hint and pair generation")
+    it.todo("leaves the ref queued: list still returns it afterwards")
+    it.todo("returns null for an absent mailbox")
+    it.todo("returns null for an id the mailbox does not hold")
+    it.todo("returns null once the ref has been removed (acked)")
+    it.todo("returns null for a blocked sender, whose queue block() deleted")
+    it.todo("does not read pooled refs: a pool-only sender misses")
+    it.todo("returns null for a key too long to store, rather than throwing")
+})

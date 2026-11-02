@@ -158,6 +158,10 @@ export {
     handleGrantsList,
     handleMessagesAcks,
     handleMessagesList,
+    handleMessageRead,
+    messageMissResponse,
+    parseMessageReadPath,
+    readMessageEntry,
     handlePairEvidenceRead,
     handleSummaryRead,
     handlePoolAdjudication,
@@ -218,6 +222,7 @@ export {
     encodeCapabilitiesFrame,
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
+    messageEntryFields,
     RESERVED_ENTRY_KEYS,
     encodePoolFrame,
     handleAckFrame,
@@ -333,6 +338,8 @@ export {
 } from "./push/deliver"
 export {
     buildDeclarationPushPayload,
+    type DeclarationChangeKind,
+    type DeclarationPushHint,
     buildMessagePushPayload,
     buildPoolPushPayload,
     type BuildMessagePushPayloadOptions,

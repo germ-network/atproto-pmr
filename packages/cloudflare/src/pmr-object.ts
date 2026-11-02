@@ -934,6 +934,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(mailboxKey(key), remaining)
     }
 
+    async getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null> {
+        throw new Error("unimplemented")
+    }
+
     async hasMailbox(key: MailboxKey): Promise<boolean> {
         if ((await this.db.get(mailboxKey(key))) !== undefined) return true
         return (await this.db.get(syntheticKey(key))) !== undefined

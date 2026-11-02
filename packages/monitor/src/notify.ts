@@ -1,5 +1,6 @@
 import {
     buildDeclarationPushPayload,
+    type DeclarationPushHint,
     type DeliverPushResult,
 } from "@germ-network/atproto-pmr-core"
 import type { MonitorRegistration, MonitorRegistrationStore } from "./registration.js"
@@ -49,7 +50,8 @@ export interface NotifyDeps {
  */
 export async function pushDeclarationChange(
     did: string,
-    deps: NotifyDeps
+    deps: NotifyDeps,
+    hint?: DeclarationPushHint
 ): Promise<DeliverPushResult | null> {
     const registration = await deps.registrations.load(did)
     if (registration === null) return null

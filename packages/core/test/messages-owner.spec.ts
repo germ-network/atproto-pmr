@@ -499,3 +499,35 @@ describe("cross-owner isolation", () => {
         expect(map.get("ms")).toEqual([])
     })
 })
+
+describe("GET /pmr/v1/messages/{k}/{id} — fetch one message by reference", () => {
+    it.todo("401 for an unsigned request with a malformed path: auth is decided before the 400")
+    it.todo("a hit returns the catch-up entry for that message: {k, id, m} plus sd/dc/g when the ref carries them")
+    it.todo("a hit's entry is byte-identical to the same message's entry in a catch-up page")
+    it.todo("a hit does not ack: the message is still in the next catch-up page and nothing was removed")
+    it.todo("a hit carries Germ-Next-Challenge and cache-control: no-store")
+    it.todo("a fetch does not sync the owner's Bsky blocks: ownBlocks is never called")
+    it.todo("a grant mailbox key round-trips through percent-encoding")
+    it.todo("absent mailbox, unknown id, acked id and expired body all answer the same 404: empty body, no-store, identical headers apart from Germ-Next-Challenge")
+    it.todo("a DID containing an escaped % (did:web:host%3A8080 sent as %253A) is decoded exactly once")
+    it.todo("a miss also carries Germ-Next-Challenge, so the client keeps its chain")
+    it.todo("another owner's message misses with that same 404")
+    it.todo("400 for a malformed path or a key matching neither did: nor grant:, before any lookup")
+})
+
+describe("parseMessageReadPath", () => {
+    it.todo("splits on / before decoding, so an encoded / inside a segment stays in that segment")
+    it.todo("null for one segment, three segments, or an empty segment")
+    it.todo("null for a segment that fails to percent-decode")
+    it.todo("null for a key matching neither did: nor grant:")
+})
+
+describe("messageMissResponse", () => {
+    it.todo("is 404 with an empty body and cache-control: no-store")
+})
+
+describe("readMessageEntry — the auth-free fetch-one primitive", () => {
+    it.todo("returns the entry map for a queued message whose body is present")
+    it.todo("returns null when the ref is queued but its body has expired")
+    it.todo("returns null when the store has no such ref")
+})

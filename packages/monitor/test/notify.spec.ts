@@ -127,3 +127,8 @@ describe("pushDeclarationChange", () => {
         ).rejects.toThrow("network down")
     })
 })
+
+describe("pushDeclarationChange hints", () => {
+    it.todo("sends {t:'d', c, dc} when given a hint carrying dc")
+    it.todo("sends exactly {t:'d'} when given no hint")
+})
