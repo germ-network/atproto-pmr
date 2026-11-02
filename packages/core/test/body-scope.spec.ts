@@ -175,8 +175,18 @@ describe("body storage stays within its mailbox", () => {
     it("the same bytes put to two grant mailboxes are stored under two ids", async () => {
         const authKey = new Uint8Array(32).fill(7)
         const w = world()
+        const nonces: Uint8Array[] = []
         const deps = {
             ...w.deps,
+            store: (locator: string) => {
+                const store = w.deps.store(locator)
+                return {
+                    append: async (key: string, ref: MessageRef, nonce: Uint8Array) => {
+                        nonces.push(nonce)
+                        return store.append(key as never, ref, nonce, NOW)
+                    },
+                } as unknown as PMRStore
+            },
             directory: {
                 resolveAddress: async () => ({ locator: "loc:grants", closed: false, authKey }),
             } as never,
@@ -201,6 +211,7 @@ describe("body storage stays within its mailbox", () => {
             await w.settle()
         }
 
+        expect(nonces).toEqual([sha256(SECRET), sha256(SECRET)])
         const ids = [...w.bodies.keys()]
         expect(ids).toHaveLength(2)
         expect(new Set(ids)).toEqual(new Set([

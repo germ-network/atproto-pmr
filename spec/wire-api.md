@@ -178,7 +178,13 @@ retried put is naturally deduplicated rather than needing an idempotency
 key. Two constraints on what that derivation covers are stated under
 [Malleability](#malleability) and are security requirements.
 
-Content addresses are algorithm-prefixed and self-describing: an algorithm
+**An identifier MUST bind its destination mailbox, and a body store MUST NOT
+let an operation on one mailbox affect a body held for another.** A put, a
+recycle or a read reaches only the mailbox it was authorized for. An
+identifier computable from the bytes alone would be shared by every mailbox
+holding those bytes, so one mailbox's recycle could delete another's body.
+
+Attachment and other content addresses are algorithm-prefixed and self-describing: an algorithm
 identifier followed by the digest bytes. They are not multihash and not
 CIDs. CIDs are consumed where atproto owns the bytes — CAR blocks and blob
 references inside repo records — and emitted in exactly two places, both
@@ -830,8 +836,9 @@ session-layer property, not a relay one — the residual there is already
 possession of `authKey`, not sequencing application content. What a relay
 still owes against replay is what [Freshness and replay](#freshness-and-replay)
 already states for every challenge-reachable operation — **puts are
-content-addressed and deduplicated** — which is sufficient here because
-`message` is content-addressed exactly as a pair put's payload is.
+deduplicated per mailbox** — which is sufficient here because the relay
+records `bodyDigest` as the put's anti-replay nonce in the grant mailbox, so
+a replay of the same `message` within the challenge TTL is recognized.
 
 **The response contract is stricter than a pair put's, not just
 uniform.** A pair put resolves and verifies before answering, and
@@ -918,10 +925,11 @@ first contact and recovery — states with no session layer yet — so this
 signature is the entire replay boundary, with no session sequence number
 behind it.
 
-**Content-addressed dedup is not a substitute.** Dedup holds only while
-the dedup record lives, so once a message drains, is acked, or reaches its
-retention expiry, the identical signed bytes replay as a fresh handshake,
-and a captured first-contact put could be re-delivered indefinitely.
+**Message-id dedup is not a substitute.** Dedup by identifier holds only
+while the queued message lives, so once a message drains, is acked, or
+reaches its retention expiry, the identical signed bytes replay as a fresh
+handshake, and a captured first-contact put could be re-delivered
+indefinitely.
 
 The payload therefore carries a nonce, and the recipient records the
 nonces it has seen per sender until a session with that sender supersedes
@@ -938,10 +946,10 @@ Nonce width and seen-set retention are [not yet specified](#not-yet-specified).
 #### Malleability
 
 Ed25519 signatures are malleable — a non-canonical `S` is different bytes
-— so content-addressing the signed envelope would let a malleated copy
+— so deriving the identifier from the signed envelope would let a malleated copy
 slip past dedup. Two requirements, and either alone is insufficient:
 
-- Content-address over the **stable message identity** (the sealed
+- Derive the identifier over the **stable message identity** (the sealed
   payload), never over the signature bytes.
 - **Reject non-canonical signatures**
   ([RFC 8032 §5.1.7](https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1.7)).
@@ -1313,8 +1321,8 @@ A client MAY receive the same `#delivery` more than once on a
 connection — a live push can race the connect-time drain, since the drain
 reads the mailbox independently of whatever arrives live in the meantime. A
 client MUST treat `(k, id)` as the identity of a message rather than
-assuming at-most-once delivery. Redelivery is already safe: `id` is a
-content address and acks are idempotent.
+assuming at-most-once delivery. Redelivery is already safe: `id` is stable for a
+given destination and bytes, and acks are idempotent.
 
 **This is deliberately not a durable, resumable event log with a sequence
 cursor**, unlike atproto's own ephemeral commit stream. A message here
@@ -2077,11 +2085,11 @@ Use-once is deliberately not claimed. Strict single-use needs an atomic
 consume that not every backend can provide, and best-effort consumption
 narrows the replay window without closing it. Replay containment therefore
 lives at the operation: **every challenge-reachable operation MUST be
-replay-tolerant within the challenge TTL** — idempotent, content-addressed
-and deduplicated, or independently sequenced. See
+replay-tolerant within the challenge TTL** — idempotent, deduplicated per
+mailbox by an anti-replay nonce, or independently sequenced. See
 [`storage-consistency.md`](storage-consistency.md#2-challenge-freshness-not-exactly-once).
 
-Puts are content-addressed and deduplicated; registration and grant
+Puts are deduplicated per mailbox by an anti-replay nonce; registration and grant
 requests are idempotent or capped. Push-delegation submit is the one
 operation that needs its own containment, since a delivered notification
 is a user-visible side effect with no natural dedup.

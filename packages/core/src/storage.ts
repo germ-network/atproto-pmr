@@ -847,6 +847,13 @@ export interface PMRStore {
 /**
  * Message bodies, kept separate from the queue so the queue stays small
  * regardless of body size. An adapter MAY back both with one table.
+ *
+ * An adapter MUST scope every operation to the mailbox its id was minted for
+ * (`messageIdFor`): an operation on one mailbox MUST NOT affect a body held
+ * for another, even one with identical bytes. Ids come from `messageIdFor`,
+ * which binds the mailbox; a wire-decoded id reaches a body only after the
+ * caller resolves it through that mailbox's queue (`getMessage`, `remove`),
+ * so keying a body by its id is enough.
  */
 export interface BodyStore {
     putBody(id: MessageId, bytes: Uint8Array, expiresAt: number): Promise<void>
