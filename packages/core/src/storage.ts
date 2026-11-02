@@ -57,6 +57,15 @@ export type GrantMailboxKey = `grant:${string}`
 /** Identifier of a stored message; bodies live in a separate store. */
 export type MessageId = string
 
+/**
+ * An id decoded off the wire (an ack, a fetch-one path, a socket `#ack`).
+ * Ids are opaque, so nothing is checked: a malformed id is simply a miss.
+ * Every other `MessageId` comes from `messageIdFor`.
+ */
+export function messageIdFromWire(id: string): MessageId {
+    return id as MessageId
+}
+
 /** The pair-put anti-replay nonce, taken from the signed payload. */
 export type Nonce = Uint8Array
 

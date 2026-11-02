@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js"
+import type { Locator, MailboxKey, MessageId } from "./storage.js"
 
 /**
  * Content-addressed message identity.
@@ -39,4 +40,30 @@ export function deriveMessageId(payload: Uint8Array): string {
     out[0] = DIGEST_ALG_SHA256
     out.set(digest, 1)
     return hex(out)
+}
+
+/** The mailbox a message is stored in: one registration's store, one key in it. */
+export interface MessageDestination {
+    locator: Locator
+    key: MailboxKey
+}
+
+/**
+ * `TypedDigest` of `bytes`: a content address, computable by anyone holding
+ * the bytes. Never a message id — two destinations holding the same bytes
+ * would share it, and the body store's effects would cross between them.
+ */
+export function typedDigest(bytes: Uint8Array): string {
+    throw new Error("not implemented")
+}
+
+/**
+ * The id of `payload` stored at `destination` (`spec/wire-api.md`, "Content
+ * addressing and idempotency"). It binds the destination as well as the
+ * bytes, so two refs share an id only when they are in the same mailbox, and
+ * no operation on one mailbox can reach a body held for another. A retried
+ * put to the same destination gets the same id.
+ */
+export function messageIdFor(destination: MessageDestination, payload: Uint8Array): MessageId {
+    throw new Error("not implemented")
 }
