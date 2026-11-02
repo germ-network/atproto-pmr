@@ -984,7 +984,19 @@ export async function handleMessagesList(
 export function parseMessageReadPath(
     pathname: string
 ): { key: MailboxKey; messageId: MessageId } | null {
-    throw new Error("unimplemented")
+    const prefix = "/pmr/v1/messages/"
+    if (!pathname.startsWith(prefix)) return null
+    const segments = pathname.slice(prefix.length).split("/")
+    if (segments.length !== 2 || segments.some((s) => s.length === 0)) return null
+    let key: string
+    let messageId: string
+    try {
+        key = decodeURIComponent(segments[0])
+        messageId = decodeURIComponent(segments[1])
+        return { key: asMailboxKey(key), messageId }
+    } catch {
+        return null
+    }
 }
 
 /**
@@ -992,7 +1004,7 @@ export function parseMessageReadPath(
  * A deployment amortizes it like a hit.
  */
 export function messageMissResponse(): Response {
-    throw new Error("unimplemented")
+    return new Response(null, { status: 404, headers: { "cache-control": "no-store" } })
 }
 
 /**
@@ -1009,7 +1021,11 @@ export async function readMessageEntry(
     key: MailboxKey,
     messageId: MessageId
 ): Promise<Map<string, CoseValue> | null> {
-    throw new Error("unimplemented")
+    const ref = await store.getMessage(key, messageId)
+    if (ref === null) return null
+    const body = await bodies.getBody(ref.messageId)
+    if (body === null) return null
+    return messageEntryFields(key, ref, body)
 }
 
 /**
@@ -1023,7 +1039,21 @@ export async function handleMessageRead(
     request: Request,
     deps: OwnerDeps & MessagesConfig
 ): Promise<Response> {
-    throw new Error("unimplemented")
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const target = parseMessageReadPath(new URL(request.url).pathname)
+    if (target === null) return new Response("Malformed path", { status: 400 })
+
+    const entry = await readMessageEntry(
+        a.auth.store,
+        deps.bodies,
+        target.key,
+        target.messageId
+    )
+    const response =
+        entry === null ? messageMissResponse() : cbor([...entry])
+    return amortize(response, a.auth.did, deps)
 }
 
 /**

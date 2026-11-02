@@ -181,9 +181,12 @@ key. Two constraints on what that derivation covers are stated under
 Content addresses are algorithm-prefixed and self-describing: an algorithm
 identifier followed by the digest bytes. They are not multihash and not
 CIDs. CIDs are consumed where atproto owns the bytes — CAR blocks and blob
-references inside repo records — and emitted in exactly one place: the
-delivery hint's `dc`, the CID of a sender's declaration record (see
-[Delivery — owner-facing](#delivery--owner-facing)).
+references inside repo records — and emitted in exactly two places, both
+named `dc`: the CID of a sender's declaration record on a delivery (see
+[Delivery — owner-facing](#delivery--owner-facing); the same field rides a
+catch-up entry, a fetch-one response and a full-form push), and the CID of
+the declaration record a monitor just verified, on a `t: "d"` push (see
+[The sealed payload](#the-sealed-payload)).
 
 ### Key material
 
@@ -1132,12 +1135,23 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 | method | path | notes |
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
+| `GET` | `/pmr/v1/messages/{k}/{id}` | fetch one queued message by reference; does not ack |
 | `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the enabler document's limit |
 | `GET` | `/pmr/v1/pair-evidence/{senderDID}?cid=` | fetch the selected proof for a pair-mailbox generation |
 | `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
+
+#### Fetching one message by reference
+
+`GET /pmr/v1/messages/{k}/{id}` returns the one queued message `id` in mailbox `k`. It is owner-authenticated like the rest of this surface, and is how a device resolves a reference push ([The sealed payload](#the-sealed-payload)) without draining every mailbox. `k` and `id` are each exactly one percent-encoded path segment, decoded once. A request with any other number of segments, an empty or undecodable segment, or a `k` matching neither mailbox-key form ([Delivery — peer-facing](#delivery--peer-facing)) MUST be refused `400` before any lookup.
+
+A hit returns `200` with a CBOR map that is exactly the message's entry in a `GET /pmr/v1/messages` page: `{k, id, m}`, plus `sd`/`dc`/`g` when present. Reading does not acknowledge; the message stays queued until acked through `POST /pmr/v1/messages/acks`. Like a full-form push, a fetch does not wait for the relay to see the owner's Bsky blocks; the next catch-up applies them.
+
+Every miss MUST get the identical response — `404`, an empty body, and the same headers apart from `Germ-Next-Challenge` — whether the mailbox does not exist, the message never existed, was already acked, or is no longer retained. A client cannot, and need not, tell these apart. Neither a hit nor a miss may be cached.
+
+A server MAY rate-limit this route per registration, answering `429` with `Retry-After`.
 
 Devices need not recompute admission; it is routing advice, not authority
 ([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
@@ -1852,6 +1866,8 @@ nothing here discloses more than the recipient's own device is already
 entitled to fetch over the events socket or REST catch-up — the push
 service only ever sees opaque ciphertext either way, whether that
 ciphertext is twenty bytes or two thousand.
+
+A device that receives the wake form (`{t, k, id}` without `m`) fetches that one message with [`GET /pmr/v1/messages/{k}/{id}`](#fetching-one-message-by-reference).
 
 **`t: "p"` and `t: "d"` are always exactly `{t}` and nothing else — this
 is permanent, not merely the current state of what's implemented.**

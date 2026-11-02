@@ -1218,12 +1218,88 @@ describe("openMailboxes cursor", () => {
 })
 
 describe("getMessage — read one queued message by mailbox key and id", () => {
-    it.todo("returns the queued ref, including its hint and pair generation")
-    it.todo("leaves the ref queued: list still returns it afterwards")
-    it.todo("returns null for an absent mailbox")
-    it.todo("returns null for an id the mailbox does not hold")
-    it.todo("returns null once the ref has been removed (acked)")
-    it.todo("returns null for a blocked sender, whose queue block() deleted")
-    it.todo("does not read pooled refs: a pool-only sender misses")
-    it.todo("returns null for a key too long to store, rather than throwing")
+    it("returns the queued ref, including its hint and pair generation", async () => {
+        const stub = freshStub()
+        const sender = "did:plc:get-message-hint" as const
+        const evidence = {
+            senderDID: sender,
+            anchorKey: new Uint8Array(32).fill(7),
+            declarationCID: "bafy-get-message",
+            revision: "5555555555555",
+            car: new Uint8Array([7]),
+            expiresAt: T0 + 3600,
+        }
+        await inPMR(stub, async (pmr) => {
+            await pmr.appendPair(sender, ref("pooled"), freshNonce(), T0, evidence)
+            await pmr.provisionFromPool(sender, T0)
+            const queued = (await pmr.list(sender, 10))[0]
+            expect(queued.hint).toBeDefined()
+            expect(queued.pairGeneration).toBeDefined()
+            expect(await pmr.getMessage(sender, "pooled")).toEqual(queued)
+        })
+    })
+
+    it("leaves the ref queued: list still returns it afterwards", async () => {
+        const stub = freshStub()
+        await inPMR(stub, async (pmr) => {
+            await pmr.append("did:plc:a", ref("a1"), freshNonce(), T0)
+            await pmr.append("did:plc:a", ref("a2"), freshNonce(), T0)
+            expect(await pmr.getMessage("did:plc:a", "a1")).toEqual(ref("a1"))
+            expect((await pmr.list("did:plc:a", 10)).map((r) => r.messageId)).toEqual(["a1", "a2"])
+        })
+    })
+
+    it("returns null for an absent mailbox", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            expect(await pmr.getMessage("did:plc:nobody", "a1")).toBeNull()
+        })
+    })
+
+    it("returns null for an id the mailbox does not hold", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append("did:plc:a", ref("a1"), freshNonce(), T0)
+            await pmr.append("did:plc:b", ref("b1"), freshNonce(), T0)
+            expect(await pmr.getMessage("did:plc:a", "nope")).toBeNull()
+            expect(await pmr.getMessage("did:plc:a", "b1")).toBeNull()
+        })
+    })
+
+    it("returns null once the ref has been removed (acked)", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append("did:plc:a", ref("a1"), freshNonce(), T0)
+            await pmr.remove("did:plc:a", "a1")
+            expect(await pmr.getMessage("did:plc:a", "a1")).toBeNull()
+        })
+    })
+
+    it("returns null for a blocked sender, whose queue block() deleted", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append("did:plc:mallory", ref("m1"), freshNonce(), T0)
+            await pmr.block("did:plc:mallory", T0)
+            expect(await pmr.getMessage("did:plc:mallory", "m1")).toBeNull()
+        })
+    })
+
+    it("does not read pooled refs: a pool-only sender misses", async () => {
+        const sender = "did:plc:get-message-pool" as const
+        await inPMR(freshStub(), async (pmr) => {
+            const pooled = await pmr.appendPair(sender, ref("pool-only"), freshNonce(), T0, {
+                senderDID: sender,
+                anchorKey: new Uint8Array(32).fill(7),
+                declarationCID: "bafy-pool",
+                revision: "5555555555555",
+                car: new Uint8Array([7]),
+                expiresAt: T0 + 3600,
+            })
+            expect(pooled.result?.outcome).toBe("pooled")
+            expect(await pmr.getMessage(sender, "pool-only")).toBeNull()
+        })
+    })
+
+    it("returns null for a key too long to store, rather than throwing", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            const long = `grant:${"x".repeat(4096)}` as const
+            expect(await pmr.getMessage(long, "a1")).toBeNull()
+        })
+    })
 })

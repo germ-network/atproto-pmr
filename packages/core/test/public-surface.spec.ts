@@ -24,5 +24,15 @@ describe("core public surface", () => {
 })
 
 describe("fetch-one surface", () => {
-    it.todo("exports handleMessageRead, parseMessageReadPath, messageMissResponse, readMessageEntry and messageEntryFields")
+    it("exports handleMessageRead, parseMessageReadPath, messageMissResponse, readMessageEntry and messageEntryFields", () => {
+        for (const name of [
+            "handleMessageRead",
+            "parseMessageReadPath",
+            "messageMissResponse",
+            "readMessageEntry",
+            "messageEntryFields",
+        ]) {
+            expect(core, name).toHaveProperty(name)
+        }
+    })
 })

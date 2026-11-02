@@ -148,6 +148,7 @@ distinct name.
 | `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent** |
+| `getMessage(mailboxKey, messageId) -> messageRef?` | fetch one by reference; read-only, never acks |
 | `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps |
 | `poolSenders() -> [senderKey, verdict?]` | adjudication; **DIDs only, never bodies** |
 

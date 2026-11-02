@@ -935,7 +935,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     async getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null> {
-        throw new Error("unimplemented")
+        // `db.get` throws on an over-long key; a miss must look like any other.
+        if (new TextEncoder().encode(mailboxKey(key)).length > MAX_KEY_BYTES) return null
+        const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
+        return queue?.find((r) => r.messageId === messageId) ?? null
     }
 
     async hasMailbox(key: MailboxKey): Promise<boolean> {
