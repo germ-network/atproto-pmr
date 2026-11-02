@@ -3,6 +3,7 @@ import {
     binaryToBase64URL,
     type Directory,
     type Locator,
+    type MessageId,
     type MonitorRegistrationNotify,
     type PMRStore,
     type RegistrationFields,
@@ -265,15 +266,15 @@ export function pmrStore<TPMR extends PMRObject>(
 /** A `BodyStore` over a KV namespace, with native TTL for expiry. */
 export function kvBodyStore<TPMR extends PMRObject>(env: PMREnv<TPMR>) {
     return {
-        async putBody(id: string, bytes: Uint8Array, expiresAt: number) {
+        async putBody(id: MessageId, bytes: Uint8Array, expiresAt: number) {
             const ttl = Math.max(60, Math.floor(expiresAt - Date.now() / 1000))
             await env.messages.put(id, bytes, { expirationTtl: ttl })
         },
-        async getBody(id: string): Promise<Uint8Array | null> {
+        async getBody(id: MessageId): Promise<Uint8Array | null> {
             const v = await env.messages.get(id, "arrayBuffer")
             return v === null ? null : new Uint8Array(v)
         },
-        async deleteBody(id: string) {
+        async deleteBody(id: MessageId) {
             await env.messages.delete(id)
         },
     }

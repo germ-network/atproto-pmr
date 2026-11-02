@@ -25,6 +25,7 @@ import type {
     PMRStore,
     RegistrationFields,
 } from "../storage.js"
+import { messageIdFromWire } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import {
     buildSummaryIndex,
@@ -989,10 +990,10 @@ export function parseMessageReadPath(
     const segments = pathname.slice(prefix.length).split("/")
     if (segments.length !== 2 || segments.some((s) => s.length === 0)) return null
     let key: string
-    let messageId: string
+    let messageId: MessageId
     try {
         key = decodeURIComponent(segments[0])
-        messageId = decodeURIComponent(segments[1])
+        messageId = messageIdFromWire(decodeURIComponent(segments[1]))
         return { key: asMailboxKey(key), messageId }
     } catch {
         return null
@@ -1121,7 +1122,7 @@ export async function handleMessagesAcks(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    let acks: { key: string; messageId: string; pairGeneration?: string }[]
+    let acks: { key: string; messageId: MessageId; pairGeneration?: string }[]
     try {
         const map = decodeCoseMap(a.body ?? new Uint8Array(0))
         const raw = map.get("a")
@@ -1138,7 +1139,7 @@ export async function handleMessagesAcks(
                 throw new Error("expected string generation")
             }
             asMailboxKey(k) // throws on a key matching neither prefix
-            return { key: k, messageId: id, ...(generation === undefined ? {} : { pairGeneration: generation }) }
+            return { key: k, messageId: messageIdFromWire(id), ...(generation === undefined ? {} : { pairGeneration: generation }) }
         })
     } catch {
         return new Response("Malformed body", { status: 400 })

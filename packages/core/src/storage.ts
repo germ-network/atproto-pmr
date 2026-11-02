@@ -55,7 +55,7 @@ export type PairMailboxKey = `did:${string}`
 export type GrantMailboxKey = `grant:${string}`
 
 /** Identifier of a stored message; bodies live in a separate store. */
-export type MessageId = string
+export type MessageId = string & { readonly __messageId: unique symbol }
 
 /**
  * An id decoded off the wire (an ack, a fetch-one path, a socket `#ack`).

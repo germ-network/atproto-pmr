@@ -85,5 +85,5 @@ export function messageIdFor(destination: MessageDestination, payload: Uint8Arra
         preimage.set(part, offset)
         offset += part.length
     }
-    return typedDigest(preimage)
+    return typedDigest(preimage) as MessageId
 }

@@ -640,7 +640,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
             const mailboxExisted = (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
             let selected: StoredPairEvidence
-            let recycledMessageIds: string[] = []
+            let recycledMessageIds: MessageId[] = []
             let generationChanged = false
             if (prior === undefined) {
                 selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
