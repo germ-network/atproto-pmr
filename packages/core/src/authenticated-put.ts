@@ -1,6 +1,6 @@
 import { admissionOrUnavailable } from "./admission.js"
 import { RESERVED_ENTRY_KEYS } from "./events.js"
-import { deriveMessageId } from "./message-id.js"
+import { messageIdFor } from "./message-id.js"
 import type { PairPutDeps } from "./pair-put.js"
 import type {
     ExtensionFields,
@@ -90,7 +90,7 @@ export async function ingestAuthenticatedPut(
     const store = deps.store(locator)
 
     const mailboxKey = put.senderDID
-    const messageId = deriveMessageId(put.payload)
+    const messageId = messageIdFor({ locator, key: mailboxKey }, put.payload)
     const ref: MessageRef = {
         messageId,
         byteLength: put.payload.byteLength,

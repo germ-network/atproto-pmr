@@ -303,7 +303,7 @@ export {
     RecordNotFoundError,
     type PDSResolution,
 } from "./atproto-fetch"
-export { deriveMessageId, messageIdFor, typedDigest, type MessageDestination } from "./message-id"
+export { messageIdFor, typedDigest, type MessageDestination } from "./message-id"
 export { messageIdFromWire } from "./storage"
 
 // Grant address and put-tag derivation.

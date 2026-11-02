@@ -3,7 +3,7 @@ import { consumeChallenge } from "./challenge.js"
 import { decodeCoseMap } from "./cose/cbor.js"
 import { verifyGrantPutTag } from "./grant.js"
 import { grantMailboxKey } from "./mailbox-key.js"
-import { deriveMessageId } from "./message-id.js"
+import { messageIdFor } from "./message-id.js"
 import { PMRConfig } from "./config.js"
 import { BodyStore, ChallengeStore, Directory, Locator, PMRStore } from "./storage.js"
 import { BodyTooLargeError, readBodyCapped } from "./util.js"
@@ -122,15 +122,17 @@ async function deliver(
         return
     }
 
-    const messageId = deriveMessageId(message)
+    const messageId = messageIdFor(
+        { locator: resolved.locator, key: grantMailboxKey(address) },
+        message
+    )
     const ref = { messageId, byteLength: message.byteLength }
     const store = deps.store(resolved.locator)
 
-    // Content-addressed dedup stands in for a per-sender anti-replay
-    // nonce here — see `spec/wire-api.md#the-grant-put-payload` for why a
-    // grant put does not need one. `bodyDigest` already exists and is
-    // exactly a content address for `message`, so it doubles as the
-    // "nonce" `append` records rather than introducing a second mechanism.
+    // `bodyDigest` is the anti-replay nonce `append` records: a replayed
+    // put carries the same bytes and so the same digest. See
+    // `spec/wire-api.md#the-grant-put-payload` for why a grant put needs no
+    // per-sender nonce.
     const result = await store.append(
         grantMailboxKey(address),
         ref,

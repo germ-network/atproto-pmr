@@ -58,4 +58,8 @@ describe("messageIdFor", () => {
     it("keeps the 66-hex wire shape", () => {
         expect(messageIdFor(V, PAYLOAD)).toMatch(/^01[0-9a-f]{64}$/)
     })
+
+    it("refuses a destination field too long for its length prefix", () => {
+        expect(() => messageIdFor({ locator: "a".repeat(65536), key: V.key }, PAYLOAD)).toThrow()
+    })
 })
