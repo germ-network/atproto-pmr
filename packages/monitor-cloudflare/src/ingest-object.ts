@@ -165,6 +165,7 @@ import {
     type RepoCollectionsExpectation,
     type VerifiedCollections,
     type WatchedRecord,
+    type DeclarationPushHint,
 } from "@germ-network/atproto-pmr-core"
 import {
     canonicalDidDocumentJson,
@@ -4722,8 +4723,8 @@ export class MonitorIngest
      * (e.g. `GermMonitor`) from needing to know anything about push at
      * all — it only supplies the authoritative fetch.
      */
-    protected onChange(did: string, _rev: string): Promise<void> {
-        this.notifyRegistration(did)
+    protected onChange(did: string, _rev: string, hint?: DeclarationPushHint): Promise<void> {
+        this.notifyRegistration(did, hint)
         return Promise.resolve()
     }
 
@@ -4744,7 +4745,7 @@ export class MonitorIngest
      */
     protected onRegression(did: string, indexed: string, observed: string): Promise<void> {
         console.log("monitor: rev regression", { did, indexed, observed })
-        this.notifyRegistration(did)
+        this.notifyRegistration(did, { c: "rev" })
         return Promise.resolve()
     }
 
@@ -4752,11 +4753,11 @@ export class MonitorIngest
      * The watched declaration was confirmed deleted at the source. Pushes
      * to a registered device the same as `onChange`/`onRegression` — the
      * device re-fetches, finds nothing, and reacts accordingly; this
-     * object never asserts what the change was, only that one happened.
+     * object says what kind of change it was, never its content.
      */
     protected onDelete(did: string): Promise<void> {
         console.log("monitor: declaration deleted", { did })
-        this.notifyRegistration(did)
+        this.notifyRegistration(did, { c: "gone" })
         return Promise.resolve()
     }
 
@@ -4771,8 +4772,8 @@ export class MonitorIngest
      * deferred call sites — asserting on the result of something wrapped
      * in `waitUntil` is a race by construction, not a fixture problem.
      */
-    private notifyRegistration(did: string): void {
-        this.ctx.waitUntil(this.deliverDeclarationPush(did))
+    private notifyRegistration(did: string, hint?: DeclarationPushHint): void {
+        this.ctx.waitUntil(this.deliverDeclarationPush(did, hint))
     }
 
     /**
@@ -4797,13 +4798,13 @@ export class MonitorIngest
      * base-wide-misconfiguration class the PMR's own `deliverPush` guards
      * against for the same reason.
      */
-    private async deliverDeclarationPush(did: string): Promise<void> {
+    private async deliverDeclarationPush(did: string, hint?: DeclarationPushHint): Promise<void> {
         try {
             const registrations = kvMonitorRegistrationStore(this.env)
             const sender = monitorWebPushSender(this.env)
             if (registrations === null || sender === null) return
 
-            const result = await pushDeclarationChange(did, { registrations, sender })
+            const result = await pushDeclarationChange(did, { registrations, sender }, hint)
             if (result?.outcome === "failed") {
                 console.error(
                     `monitor onChange: push service answered ${result.status} for ${did}`
@@ -4854,7 +4855,7 @@ export class MonitorIngest
                         : { reason: failure.reason }),
                     notBefore: new Date(notBeforeMs).toISOString(),
                 }),
-            onChange: (did, rev) => this.onChange(did, rev),
+            onChange: (did, rev, hint) => this.onChange(did, rev, hint),
             onSettled: (did, settled) => this.onSettled(did, settled),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
             onDelete: (did) => this.onDelete(did),

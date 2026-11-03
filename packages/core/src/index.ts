@@ -158,6 +158,10 @@ export {
     handleGrantsList,
     handleMessagesAcks,
     handleMessagesList,
+    handleMessageRead,
+    messageMissResponse,
+    parseMessageReadPath,
+    readMessageEntry,
     handlePairEvidenceRead,
     handleSummaryRead,
     handlePoolAdjudication,
@@ -218,6 +222,7 @@ export {
     encodeCapabilitiesFrame,
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
+    messageEntryFields,
     RESERVED_ENTRY_KEYS,
     encodePoolFrame,
     handleAckFrame,
@@ -298,7 +303,8 @@ export {
     RecordNotFoundError,
     type PDSResolution,
 } from "./atproto-fetch"
-export { deriveMessageId } from "./message-id"
+export { messageIdFor, typedDigest, type MessageDestination } from "./message-id"
+export { messageIdFromWire } from "./storage"
 
 // Grant address and put-tag derivation.
 export {
@@ -333,6 +339,8 @@ export {
 } from "./push/deliver"
 export {
     buildDeclarationPushPayload,
+    type DeclarationChangeKind,
+    type DeclarationPushHint,
     buildMessagePushPayload,
     buildPoolPushPayload,
     type BuildMessagePushPayloadOptions,

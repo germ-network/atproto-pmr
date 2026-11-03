@@ -640,7 +640,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
             const mailboxExisted = (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
             let selected: StoredPairEvidence
-            let recycledMessageIds: string[] = []
+            let recycledMessageIds: MessageId[] = []
             let generationChanged = false
             if (prior === undefined) {
                 selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
@@ -932,6 +932,13 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const remaining = queue.filter((r) => r.messageId !== messageId)
         if (remaining.length === queue.length) return
         await this.db.put(mailboxKey(key), remaining)
+    }
+
+    async getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null> {
+        // `db.get` throws on an over-long key; a miss must look like any other.
+        if (new TextEncoder().encode(mailboxKey(key)).length > MAX_KEY_BYTES) return null
+        const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
+        return queue?.find((r) => r.messageId === messageId) ?? null
     }
 
     async hasMailbox(key: MailboxKey): Promise<boolean> {

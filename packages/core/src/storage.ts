@@ -55,7 +55,16 @@ export type PairMailboxKey = `did:${string}`
 export type GrantMailboxKey = `grant:${string}`
 
 /** Identifier of a stored message; bodies live in a separate store. */
-export type MessageId = string
+export type MessageId = string & { readonly __messageId: unique symbol }
+
+/**
+ * An id decoded off the wire (an ack, a fetch-one path, a socket `#ack`).
+ * Ids are opaque, so nothing is checked: a malformed id is simply a miss.
+ * Every other `MessageId` comes from `messageIdFor`.
+ */
+export function messageIdFromWire(id: string): MessageId {
+    return id as MessageId
+}
 
 /** The pair-put anti-replay nonce, taken from the signed payload. */
 export type Nonce = Uint8Array
@@ -605,6 +614,15 @@ export interface PMRStore {
     remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void>
 
     /**
+     * The one queued ref `messageId` names in mailbox `key`, or null when the
+     * mailbox is absent or holds no such id. A read only: the entry stays
+     * queued until acked through `remove`. Every miss is the same null,
+     * including a key too long to store, so a caller cannot tell an acked
+     * message from one that never existed.
+     */
+    getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null>
+
+    /**
      * Best-effort live delivery of a message that was just appended and whose
      * body has already been persisted — `spec/wire-api.md`, "New messages MUST
      * be pushed to an attached connection as they arrive".
@@ -829,6 +847,13 @@ export interface PMRStore {
 /**
  * Message bodies, kept separate from the queue so the queue stays small
  * regardless of body size. An adapter MAY back both with one table.
+ *
+ * An adapter MUST scope every operation to the mailbox its id was minted for
+ * (`messageIdFor`): an operation on one mailbox MUST NOT affect a body held
+ * for another, even one with identical bytes. Ids come from `messageIdFor`,
+ * which binds the mailbox; a wire-decoded id reaches a body only after the
+ * caller resolves it through that mailbox's queue (`getMessage`, `remove`),
+ * so keying a body by its id is enough.
  */
 export interface BodyStore {
     putBody(id: MessageId, bytes: Uint8Array, expiresAt: number): Promise<void>

@@ -16,6 +16,7 @@ import { gcm } from "@noble/ciphers/aes.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
     binaryToBase64URL,
+    decodeCoseMap,
     declarationAnchorKeyOf,
     messagingKeyFingerprint,
     RecordNotFoundError,
@@ -1300,7 +1301,7 @@ describe("own-DID push", () => {
         ): Promise<ReturnType<typeof vi.fn>> {
             return runInDurableObject(stub, (obj: MonitorIngest) => {
                 const held = obj as unknown as {
-                    deliverDeclarationPush(did: string): Promise<void>
+                    deliverDeclarationPush(did: string, hint?: unknown): Promise<void>
                 }
                 const spy = vi.fn(async () => {})
                 held.deliverDeclarationPush = spy
@@ -1323,7 +1324,7 @@ describe("own-DID push", () => {
                 signingKey: SIGNING_KEY,
             }))
 
-            expect(spy).toHaveBeenCalledWith(did)
+            expect(spy).toHaveBeenCalledWith(did, expect.anything())
         })
 
         it("a regression also calls deliverDeclarationPush", async () => {
@@ -1344,7 +1345,7 @@ describe("own-DID push", () => {
                 signingKey: SIGNING_KEY,
             }))
 
-            expect(spy).toHaveBeenCalledWith(did)
+            expect(spy).toHaveBeenCalledWith(did, expect.anything())
         })
 
         it("an unchanged rev with no key rotation does NOT call deliverDeclarationPush", async () => {
@@ -1388,7 +1389,7 @@ describe("own-DID push", () => {
                 throw new RecordNotFoundError("RepoNotFound", true)
             })
 
-            expect(spy).toHaveBeenCalledWith(did)
+            expect(spy).toHaveBeenCalledWith(did, expect.anything())
         })
     })
 })
@@ -4177,5 +4178,144 @@ describe("messaging-key fingerprint upgrade and rollback aliases", () => {
                 commitCid: "earliest-commit", rev: "earliest-rev", verifiedWith: "earliest-signer",
             })
         })
+    })
+})
+
+describe("own-DID push hints on the wire", () => {
+    const HOST = "monitor.example"
+    const CONTENT_KEY = new Uint8Array(32).fill(5)
+    const ROTATED = "zQ3shRotatedKeyNotARealMultikey00000000000"
+    const b64 = (bytes: Uint8Array) => binaryToBase64URL(bytes)
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+    })
+
+    /** Runs `drive` through the object's real hooks and returns every push it sent, decrypted. */
+    async function pushesFrom(
+        did: string,
+        drive: (obj: MonitorIngest, stub: DurableObjectStub<MonitorIngest>) => Promise<unknown>
+    ): Promise<Record<string, unknown>[]> {
+        const stub = freshStub()
+        const publicKey = crypto.getRandomValues(new Uint8Array(65))
+        publicKey[0] = 0x04
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const held = obj as unknown as { env: MonitorEnv }
+            held.env = {
+                ...held.env,
+                HOST_NAME: HOST,
+                VAPID_PUBLIC_KEY: b64(publicKey),
+                VAPID_PRIVATE_KEY: b64(crypto.getRandomValues(new Uint8Array(32))),
+                VAPID_SUBJECT: "mailto:ops@relay.example",
+                PUSH_MAX_SEALED_BYTES: "2880",
+                PUSH_TTL_SECONDS: "86400",
+            }
+        })
+        await kvMonitorRegistrationStore(testEnv)!.put({
+            did,
+            anchorKey: new Uint8Array([1]),
+            pushSubscription: {
+                endpoint: "https://push.example/sub/1",
+                contentKey: CONTENT_KEY,
+                keyId: 7,
+            },
+            registeredAt: 0,
+        })
+        const bodies: Uint8Array[] = []
+        vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
+            if (init?.body instanceof Uint8Array) bodies.push(init.body)
+            return new Response(null, { status: 201 })
+        })
+        await runInDurableObject(stub, async (obj: MonitorIngest) => {
+            const held = obj as unknown as {
+                deliverDeclarationPush(did: string, hint?: unknown): Promise<void>
+            }
+            const real = held.deliverDeclarationPush.bind(obj)
+            const inflight: Promise<void>[] = []
+            held.deliverDeclarationPush = (d, hint) => {
+                const p = real(d, hint)
+                inflight.push(p)
+                return p
+            }
+            await drive(obj, stub)
+            await Promise.all(inflight)
+        })
+        return bodies.map((body) => {
+            const plaintext = gcm(
+                CONTENT_KEY,
+                body.slice(1, 13),
+                new TextEncoder().encode(HOST)
+            ).decrypt(body.slice(13))
+            return Object.fromEntries(decodeCoseMap(plaintext))
+        })
+    }
+
+    const settleWith = (
+        obj: MonitorIngest,
+        fetched: StubFetched | (() => Promise<StubFetched>),
+        verify: IngestDeps["verify"] = stubVerify
+    ) => {
+        const realDeps = (obj as unknown as { deps(): IngestDeps }).deps()
+        return settleDue({
+            ...realDeps,
+            fetchRecord: typeof fetched === "function" ? fetched : async () => fetched,
+            verify,
+        })
+    }
+    const record = (rev: string, signingKey: string = SIGNING_KEY): StubFetched => ({
+        rev,
+        car: new Uint8Array([1]),
+        source: PDS,
+        signingKey,
+    })
+
+    it("an advance pushes {t:'d', c:'rev', dc}", async () => {
+        const did = "did:plc:hint-advance"
+        const pushes = await pushesFrom(did, async (obj) => {
+            await obj.intake({ did, rev: "3m1" }, "c1")
+            await settleWith(obj, record("3m1"))
+        })
+        expect(pushes).toEqual([{ t: "d", c: "rev", dc: "bafyreistub" }])
+    })
+
+    it("a regression pushes {t:'d', c:'rev'} with no dc", async () => {
+        const did = "did:plc:hint-regression"
+        const pushes = await pushesFrom(did, async (obj) => {
+            await obj.complete(did, "3m9", Date.now(), STUB_VERIFIED)
+            await obj.intake({ did, rev: "3m1" }, "c1")
+            await settleWith(obj, record("3m1"))
+        })
+        expect(pushes).toEqual([{ t: "d", c: "rev" }])
+    })
+
+    it("a deletion pushes {t:'d', c:'gone'} with no dc", async () => {
+        const did = "did:plc:hint-gone"
+        const pushes = await pushesFrom(did, async (obj) => {
+            await obj.intake({ did, rev: "3m1" }, "c1")
+            await settleWith(obj, async () => {
+                throw new RecordNotFoundError("RepoNotFound", true)
+            })
+        })
+        expect(pushes).toEqual([{ t: "d", c: "gone" }])
+    })
+
+    it("an unverified key rotation pushes {t:'d', c:'rotate'} with no dc", async () => {
+        const did = "did:plc:hint-unverified-rotation"
+        const pushes = await pushesFrom(did, async (obj) => {
+            await obj.complete(did, "3m1", Date.now(), STUB_VERIFIED)
+            await obj.intake({ did, rev: "3m2" }, "c1")
+            await settleWith(obj, record("3m2", ROTATED), async () => ({ kind: "unverifiable" }))
+        })
+        expect(pushes).toEqual([{ t: "d", c: "rotate" }])
+    })
+
+    it("a verified key rotation pushes {t:'d', c:'rotate', dc}", async () => {
+        const did = "did:plc:hint-verified-rotation"
+        const pushes = await pushesFrom(did, async (obj) => {
+            await obj.complete(did, "3m1", Date.now(), STUB_VERIFIED)
+            await obj.intake({ did, rev: "3m2" }, "c1")
+            await settleWith(obj, record("3m2", ROTATED))
+        })
+        expect(pushes).toEqual([{ t: "d", c: "rotate", dc: "bafyreistub" }])
     })
 })

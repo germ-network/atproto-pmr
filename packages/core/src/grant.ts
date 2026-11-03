@@ -39,7 +39,7 @@ import { sha256 } from "@noble/hashes/sha2.js"
  *     be a redundant, purely local re-encoding with nothing to check it
  *     against.
  *   - `bodyDigest`: the raw 32-byte SHA-256 digest of the exact message
- *     bytes, computed once and shared with `deriveMessageId`'s dedup use.
+ *     bytes, as `append` records it for anti-replay.
  * `addressString` and `bodyDigest` are fixed-length; `nonce`'s length
  * follows the deployment's own challenge `byteLength` once base64url-
  * encoded, constant within one deployment but not mandated across them.

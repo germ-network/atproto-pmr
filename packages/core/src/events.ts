@@ -3,7 +3,7 @@ import type { GrantLifecycle } from "./config.js"
 import { asMailboxKey } from "./mailbox-key.js"
 import type { BlockEdgeStore } from "./block-edges.js"
 import { syncOwnerBlocks } from "./block-sync.js"
-import type { BodyStore, MessageRef, PMRStore } from "./storage.js"
+import { messageIdFromWire, type BodyStore, type MessageId, type MessageRef, type PMRStore } from "./storage.js"
 
 /**
  * `GET /pmr/v1/events` — `spec/wire-api.md`, "The events socket".
@@ -203,7 +203,7 @@ export function encodeCaughtUpFrame(): Uint8Array {
 
 export interface AckPayload {
     key: string
-    messageId: string
+    messageId: MessageId
     pairGeneration?: string
 }
 
@@ -221,7 +221,7 @@ export function decodeAckFrame(bytes: Uint8Array): AckPayload {
     if (generation !== undefined && typeof generation !== "string") {
         throw new Error("events: malformed ack generation")
     }
-    return { key, messageId: id, ...(generation === undefined ? {} : { pairGeneration: generation }) }
+    return { key, messageId: messageIdFromWire(id), ...(generation === undefined ? {} : { pairGeneration: generation }) }
 }
 
 export interface EventsDeps {

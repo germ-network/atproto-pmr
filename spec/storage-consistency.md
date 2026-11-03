@@ -148,6 +148,7 @@ distinct name.
 | `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent** |
+| `getMessage(mailboxKey, messageId) -> messageRef?` | fetch one by reference; read-only, never acks |
 | `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps |
 | `poolSenders() -> [senderKey, verdict?]` | adjudication; **DIDs only, never bodies** |
 
@@ -215,7 +216,10 @@ constant. See
 Message **bodies** are a separate store — `putBody(id, bytes, expiresAt)`,
 `getBody(id)`, `deleteBody(id)`. An adapter MAY back both with one table;
 the interface keeps them separate so the queue stays small regardless of
-body size.
+body size. **An adapter MUST scope every body operation to the mailbox its id
+was minted for**: the id binds the registration and mailbox key, and a
+`putBody`, `getBody` or `deleteBody` for one mailbox MUST NOT affect a body
+held for another, even one with identical bytes.
 
 A pair-mailbox entry also carries the relay's **verification hint** — the
 sender DID and the CID of the declaration record it validated the payload
@@ -388,7 +392,7 @@ closing it, and an adapter is not required to do better.
 
 The load-bearing requirement lands on the *operations*, not the challenge:
 **every challenge-reachable operation MUST be replay-tolerant within the
-TTL** — idempotent, content-addressed and deduplicated, or independently
+TTL** — idempotent, deduplicated per mailbox by an anti-replay nonce, or independently
 sequenced. Right-size the TTL to that tolerance rather than assuming the
 challenge enforces uniqueness.
 

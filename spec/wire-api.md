@@ -178,12 +178,21 @@ retried put is naturally deduplicated rather than needing an idempotency
 key. Two constraints on what that derivation covers are stated under
 [Malleability](#malleability) and are security requirements.
 
-Content addresses are algorithm-prefixed and self-describing: an algorithm
+**An identifier MUST bind its destination mailbox, and a body store MUST NOT
+let an operation on one mailbox affect a body held for another.** A put, a
+recycle or a read reaches only the mailbox it was authorized for. An
+identifier computable from the bytes alone would be shared by every mailbox
+holding those bytes, so one mailbox's recycle could delete another's body.
+
+Attachment and other content addresses are algorithm-prefixed and self-describing: an algorithm
 identifier followed by the digest bytes. They are not multihash and not
 CIDs. CIDs are consumed where atproto owns the bytes — CAR blocks and blob
-references inside repo records — and emitted in exactly one place: the
-delivery hint's `dc`, the CID of a sender's declaration record (see
-[Delivery — owner-facing](#delivery--owner-facing)).
+references inside repo records — and emitted in exactly two places, both
+named `dc`: the CID of a sender's declaration record on a delivery (see
+[Delivery — owner-facing](#delivery--owner-facing); the same field rides a
+catch-up entry, a fetch-one response and a full-form push), and the CID of
+the declaration record a monitor just verified, on a `t: "d"` push (see
+[The sealed payload](#the-sealed-payload)).
 
 ### Key material
 
@@ -827,8 +836,9 @@ session-layer property, not a relay one — the residual there is already
 possession of `authKey`, not sequencing application content. What a relay
 still owes against replay is what [Freshness and replay](#freshness-and-replay)
 already states for every challenge-reachable operation — **puts are
-content-addressed and deduplicated** — which is sufficient here because
-`message` is content-addressed exactly as a pair put's payload is.
+deduplicated per mailbox** — which is sufficient here because the relay
+records `bodyDigest` as the put's anti-replay nonce in the grant mailbox, so
+a replay of the same `message` within the challenge TTL is recognized.
 
 **The response contract is stricter than a pair put's, not just
 uniform.** A pair put resolves and verifies before answering, and
@@ -915,10 +925,11 @@ first contact and recovery — states with no session layer yet — so this
 signature is the entire replay boundary, with no session sequence number
 behind it.
 
-**Content-addressed dedup is not a substitute.** Dedup holds only while
-the dedup record lives, so once a message drains, is acked, or reaches its
-retention expiry, the identical signed bytes replay as a fresh handshake,
-and a captured first-contact put could be re-delivered indefinitely.
+**Message-id dedup is not a substitute.** Dedup by identifier holds only
+while the queued message lives, so once a message drains, is acked, or
+reaches its retention expiry, the identical signed bytes replay as a fresh
+handshake, and a captured first-contact put could be re-delivered
+indefinitely.
 
 The payload therefore carries a nonce, and the recipient records the
 nonces it has seen per sender until a session with that sender supersedes
@@ -935,10 +946,10 @@ Nonce width and seen-set retention are [not yet specified](#not-yet-specified).
 #### Malleability
 
 Ed25519 signatures are malleable — a non-canonical `S` is different bytes
-— so content-addressing the signed envelope would let a malleated copy
+— so deriving the identifier from the signed envelope would let a malleated copy
 slip past dedup. Two requirements, and either alone is insufficient:
 
-- Content-address over the **stable message identity** (the sealed
+- Derive the identifier over the **stable message identity** (the sealed
   payload), never over the signature bytes.
 - **Reject non-canonical signatures**
   ([RFC 8032 §5.1.7](https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1.7)).
@@ -1132,12 +1143,23 @@ Pool sizing is [implementation-defined](#limits-are-implementation-defined).
 | method | path | notes |
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
+| `GET` | `/pmr/v1/messages/{k}/{id}` | fetch one queued message by reference; does not ack |
 | `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the enabler document's limit |
 | `GET` | `/pmr/v1/pair-evidence/{senderDID}?cid=` | fetch the selected proof for a pair-mailbox generation |
 | `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
+
+#### Fetching one message by reference
+
+`GET /pmr/v1/messages/{k}/{id}` returns the one queued message `id` in mailbox `k`. It is owner-authenticated like the rest of this surface, and is how a device resolves a reference push ([The sealed payload](#the-sealed-payload)) without draining every mailbox. `k` and `id` are each exactly one percent-encoded path segment, decoded once. A request with any other number of segments, an empty or undecodable segment, or a `k` matching neither mailbox-key form ([Delivery — peer-facing](#delivery--peer-facing)) MUST be refused `400` before any lookup.
+
+A hit returns `200` with a CBOR map that is exactly the message's entry in a `GET /pmr/v1/messages` page: `{k, id, m}`, plus `sd`/`dc`/`g` when present. Reading does not acknowledge; the message stays queued until acked through `POST /pmr/v1/messages/acks`. Like a full-form push, a fetch does not wait for the relay to see the owner's Bsky blocks; the next catch-up applies them.
+
+Every miss MUST get the identical response — `404`, an empty body, and the same headers apart from `Germ-Next-Challenge` — whether the mailbox does not exist, the message never existed, was already acked, or is no longer retained. A client cannot, and need not, tell these apart. Neither a hit nor a miss may be cached.
+
+A server MAY rate-limit this route per registration, answering `429` with `Retry-After`.
 
 Devices need not recompute admission; it is routing advice, not authority
 ([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
@@ -1299,8 +1321,8 @@ A client MAY receive the same `#delivery` more than once on a
 connection — a live push can race the connect-time drain, since the drain
 reads the mailbox independently of whatever arrives live in the meantime. A
 client MUST treat `(k, id)` as the identity of a message rather than
-assuming at-most-once delivery. Redelivery is already safe: `id` is a
-content address and acks are idempotent.
+assuming at-most-once delivery. Redelivery is already safe: `id` is stable for a
+given destination and bytes, and acks are idempotent.
 
 **This is deliberately not a durable, resumable event log with a sequence
 cursor**, unlike atproto's own ephemeral commit stream. A message here
@@ -1832,11 +1854,12 @@ socket frames use:
 
 | field | meaning |
 |---|---|
-| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed |
+| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed (see below for its hints) |
 | `k` | present when `t` is `"m"`: the mailbox key the message landed in |
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
-| `sd` / `dc` / `g` | present under the same condition as `m`, for a generation-aware pair-mailbox entry: the evidence locator and generation, identical to `#delivery` |
+| `c` | present only when `t` is `"d"`, optionally: the kind of change |
+| `sd` / `dc` / `g` | present under the same condition as `m`, for a generation-aware pair-mailbox entry: the evidence locator and generation, identical to `#delivery`; `dc` also, for `t: "d"`, optionally: the declaration record the monitor just verified |
 
 ```json
 { "t": "m", "k": "did:plc:...", "id": "...", "m": "<bytes>" }
@@ -1853,8 +1876,11 @@ entitled to fetch over the events socket or REST catch-up — the push
 service only ever sees opaque ciphertext either way, whether that
 ciphertext is twenty bytes or two thousand.
 
-**`t: "p"` and `t: "d"` are always exactly `{t}` and nothing else — this
-is permanent, not merely the current state of what's implemented.**
+A device that receives the wake form (`{t, k, id}` without `m`) fetches that one message with [`GET /pmr/v1/messages/{k}/{id}`](#fetching-one-message-by-reference).
+
+**`t: "p"` is always exactly `{t}` and nothing else, permanently. `t: "d"`
+never carries content, permanently; it MAY carry the two hints below and
+nothing else.**
 
 - `t: "p"` (the pool's adjudication threshold crossed) MUST NOT carry
   content, and MUST NOT be sent on individual pool arrival. Per-arrival
@@ -1873,9 +1899,21 @@ is permanent, not merely the current state of what's implemented.**
   declaration record itself is a signed, self-authenticating commit —
   the risk here is withholding or staleness, not forgery, and no single
   pushed blob can prove the *absence* of a conflicting version elsewhere.
-  A registration watches only its own DID (see [Registration and the
-  own-DID push](key-transparency.md#registration-and-the-own-did-push)),
-  so `t: "d"` carries no DID field: there is only one DID it could mean.
+  A `t: "d"` push MAY carry two hints. `c` is the kind of change: `"rev"`
+  (the repo `rev` moved, either way, or the repo returned from gone),
+  `"rotate"` (the signing key changed), or `"gone"` (the record is
+  unobtainable at the source). `dc` is the CID of the declaration record
+  the monitor verified on this change, in the same format as `#delivery`'s
+  `dc`; it may equal a CID the device already holds, since a key rotation
+  does not change the record. Hints are not content and never save the
+  device any verification: every `t: "d"` push MUST lead to the device's
+  full verification, whatever `c` and `dc` say. A device MAY use `c` to
+  raise urgency, and MUST treat a missing or unknown `c` as a change of
+  unknown kind. Pushes on this topic collapse at the push service, so a
+  later push can replace an earlier one and its hints; that is harmless
+  because hints never suppress verification. `t: "d"` carries no DID (a
+  registration watches only its own DID, see [Registration and the own-DID
+  push](key-transparency.md#registration-and-the-own-did-push)) and no key.
 
 ### The enabler document
 
@@ -2047,11 +2085,11 @@ Use-once is deliberately not claimed. Strict single-use needs an atomic
 consume that not every backend can provide, and best-effort consumption
 narrows the replay window without closing it. Replay containment therefore
 lives at the operation: **every challenge-reachable operation MUST be
-replay-tolerant within the challenge TTL** — idempotent, content-addressed
-and deduplicated, or independently sequenced. See
+replay-tolerant within the challenge TTL** — idempotent, deduplicated per
+mailbox by an anti-replay nonce, or independently sequenced. See
 [`storage-consistency.md`](storage-consistency.md#2-challenge-freshness-not-exactly-once).
 
-Puts are content-addressed and deduplicated; registration and grant
+Puts are deduplicated per mailbox by an anti-replay nonce; registration and grant
 requests are idempotent or capped. Push-delegation submit is the one
 operation that needs its own containment, since a delivered notification
 is a user-visible side effect with no natural dedup.

@@ -19,9 +19,13 @@ import type {
     Directory,
     ExtensionFields,
     Locator,
+    MailboxKey,
+    MessageId,
     PairMailboxKey,
+    PMRStore,
     RegistrationFields,
 } from "../storage.js"
+import { messageIdFromWire } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
 import {
     buildSummaryIndex,
@@ -972,6 +976,88 @@ export async function handleMessagesList(
 }
 
 /**
+ * The `{k}` and `{id}` of `/pmr/v1/messages/{k}/{id}`, or null when the path
+ * must be refused `400`: not exactly two non-empty segments after the
+ * prefix, a segment that fails to percent-decode, or a `k` matching neither
+ * `did:` nor `grant:`. The raw pathname is split before decoding, and each
+ * segment is decoded exactly once. Decided from the bytes alone.
+ */
+export function parseMessageReadPath(
+    pathname: string
+): { key: MailboxKey; messageId: MessageId } | null {
+    const prefix = "/pmr/v1/messages/"
+    if (!pathname.startsWith(prefix)) return null
+    const segments = pathname.slice(prefix.length).split("/")
+    if (segments.length !== 2 || segments.some((s) => s.length === 0)) return null
+    let key: string
+    let messageId: MessageId
+    try {
+        key = decodeURIComponent(segments[0])
+        messageId = messageIdFromWire(decodeURIComponent(segments[1]))
+        return { key: asMailboxKey(key), messageId }
+    } catch {
+        return null
+    }
+}
+
+/**
+ * The one answer for every fetch-one miss: `404`, empty body, `no-store`.
+ * A deployment amortizes it like a hit.
+ */
+export function messageMissResponse(): Response {
+    return new Response(null, { status: 404, headers: { "cache-control": "no-store" } })
+}
+
+/**
+ * One queued message as a catch-up entry (`messageEntryFields`), or null on
+ * any miss: an absent mailbox, an unknown or already-acked id, or a body
+ * that has expired. Reads only; the entry stays queued until acked.
+ *
+ * Exported without auth so a deployment that authenticates owners its own
+ * way can serve the same response.
+ */
+export async function readMessageEntry(
+    store: Pick<PMRStore, "getMessage">,
+    bodies: Pick<BodyStore, "getBody">,
+    key: MailboxKey,
+    messageId: MessageId
+): Promise<Map<string, CoseValue> | null> {
+    const ref = await store.getMessage(key, messageId)
+    if (ref === null) return null
+    const body = await bodies.getBody(ref.messageId)
+    if (body === null) return null
+    return messageEntryFields(key, ref, body)
+}
+
+/**
+ * `GET /pmr/v1/messages/{k}/{id}` — fetch the one message a reference push
+ * names, without acking it. `parseMessageReadPath` decides the 400 before
+ * any lookup. Every miss is `messageMissResponse()`, so the response never
+ * says whether a mailbox exists or a message was acked. Bsky blocks are not
+ * synced here, as for a full-form push; the next catch-up applies them.
+ */
+export async function handleMessageRead(
+    request: Request,
+    deps: OwnerDeps & MessagesConfig
+): Promise<Response> {
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const target = parseMessageReadPath(new URL(request.url).pathname)
+    if (target === null) return new Response("Malformed path", { status: 400 })
+
+    const entry = await readMessageEntry(
+        a.auth.store,
+        deps.bodies,
+        target.key,
+        target.messageId
+    )
+    const response =
+        entry === null ? messageMissResponse() : cbor([...entry])
+    return amortize(response, a.auth.did, deps)
+}
+
+/**
  * `GET /pmr/v1/pair-evidence/{senderDID}?cid=<declarationCID>` — read the
  * single proof selected for a sender-specific pair-mailbox generation. The
  * CID is an exact locator; a miss is not evidence that the generation is
@@ -1036,7 +1122,7 @@ export async function handleMessagesAcks(
     const a = await authed(request, deps)
     if (!a.ok) return a.response
 
-    let acks: { key: string; messageId: string; pairGeneration?: string }[]
+    let acks: { key: string; messageId: MessageId; pairGeneration?: string }[]
     try {
         const map = decodeCoseMap(a.body ?? new Uint8Array(0))
         const raw = map.get("a")
@@ -1053,7 +1139,7 @@ export async function handleMessagesAcks(
                 throw new Error("expected string generation")
             }
             asMailboxKey(k) // throws on a key matching neither prefix
-            return { key: k, messageId: id, ...(generation === undefined ? {} : { pairGeneration: generation }) }
+            return { key: k, messageId: messageIdFromWire(id), ...(generation === undefined ? {} : { pairGeneration: generation }) }
         })
     } catch {
         return new Response("Malformed body", { status: 400 })

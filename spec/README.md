@@ -187,8 +187,8 @@ is an index, not a substitute for the sections it links.
 | 3 | A put to a pair mailbox answers `202`, or `429` with `Retry-After` when the sender's own reservation is full, or `400` for a malformed request decided on the request bytes alone — and **nothing recipient-dependent** | [wire](wire-api.md#delivery--peer-facing) |
 | 4 | The pair-put verification algorithm runs all four steps, in order, none optional; `kid` is diagnostic and never authority | [wire](wire-api.md#the-verification-algorithm) |
 | 5 | The recipient DID is inside the signature, and a verifier MUST reject a put whose signed recipient DID is not this recipient | [wire](wire-api.md#why-the-recipient-did-must-be-signed) |
-| 6 | Pair puts carry an anti-replay nonce the recipient records per sender until a session supersedes it; content-addressed dedup is not a substitute | [wire](wire-api.md#anti-replay) |
-| 7 | Content addressing covers the stable message identity, never the signature bytes, **and** non-canonical Ed25519 signatures are rejected — both, not either | [wire](wire-api.md#malleability) |
+| 6 | Pair puts carry an anti-replay nonce the recipient records per sender until a session supersedes it; message-id dedup is not a substitute | [wire](wire-api.md#anti-replay) |
+| 7 | Message ids cover the stable message identity, never the signature bytes, **and** non-canonical Ed25519 signatures are rejected — both, not either | [wire](wire-api.md#malleability) |
 | 8 | Deterministic CBOR means RFC 8949 §4.2.1; non-conforming input is rejected, and an implementation emitting plain §4.2.1 MUST never be rejected for it | [wire](wire-api.md#deterministic-cbor) |
 | 9 | A blocked sender's view is **synthetic**, stores no bytes, causes no delivery and no push, and matches the real path's response timing and shape | [wire](wire-api.md#blocked-senders) |
 | 10 | An unprovisioned sender is accepted into the recovery pool, never refused; the pool is never pushed per arrival | [wire](wire-api.md#the-recovery-pool) |

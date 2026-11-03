@@ -317,7 +317,7 @@ describe("refreshDue", () => {
         const result = await run(h)
         expect(result.outcomes.changed).toBe(1)
         expect(h.windows).toEqual([DID])
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mcaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mcaaaaaaaaaa", expect.objectContaining({ c: "rev" }))
         expect(h.quiet).toEqual([])
     })
 
@@ -681,7 +681,7 @@ describe("refresh re-verifies", () => {
         const result = await run(h)
         expect(fetchRecord).toHaveBeenCalled()
         expect(result.outcomes.changed).toBe(1)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa", expect.objectContaining({ c: "rotate" }))
     })
 
     it("an unchanged head under an unchanged key is only confirmed", async () => {
@@ -818,7 +818,7 @@ describe("refresh pushes a re-key", () => {
         const result = await run(h)
         expect(result.outcomes.failed).toBe(1)
         expect(h.onChange).toHaveBeenCalledTimes(1)
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mbaaaaaaaaaa", expect.objectContaining({ c: "rotate" }))
         expect((await h.deps.ingest.index.heldDeclarationOf(DID))?.seenKey).toBe(other.multikey)
         expect(h.records.get(DID)!.verifiedWith).toBe(key.multikey)
     })
@@ -1045,6 +1045,6 @@ describe("a declaration gone by RecordNotFound comes back", () => {
         expect(result.outcomes.changed).toBe(1)
         expect(h.records.get(DID)?.rev).toBe("3mdaaaaaaaaaa")
         expect(h.revs.get(DID)).toBe("3mdaaaaaaaaaa")
-        expect(h.onChange).toHaveBeenCalledWith(DID, "3mdaaaaaaaaaa")
+        expect(h.onChange).toHaveBeenCalledWith(DID, "3mdaaaaaaaaaa", expect.objectContaining({ c: "rev" }))
     })
 })

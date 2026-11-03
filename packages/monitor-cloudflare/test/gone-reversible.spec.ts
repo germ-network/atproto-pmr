@@ -300,7 +300,7 @@ describe("the one-time re-owe of DIDs marked deleted before the upgrade", () => 
             expect(deletedRow(sql)).toEqual([])
             expect(holder(sql)).toMatchObject({ state: "held" })
             expect(windowed(sql)).toEqual([{ did: DID }])
-            expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+            expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rev", dc: expect.any(String) })
         })
     })
 

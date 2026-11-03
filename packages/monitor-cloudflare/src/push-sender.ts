@@ -20,8 +20,9 @@ const VAPID_JWT_EXPIRY_SECONDS = 12 * 60 * 60
  * subscription (a hostile or misbehaving PDS churning declaration revs,
  * for instance) collapses at the push service to whichever arrives last,
  * rather than each one separately eating into the subscription's daily
- * push-service quota. Every `t:"d"` push means exactly the same thing —
- * "re-fetch and verify" — so collapsing them loses nothing a device needs.
+ * push-service quota. A later push may replace an earlier one and its
+ * hints; that loses nothing a device needs, because every `t:"d"` push means
+ * "re-fetch and verify" and hints never suppress that.
  */
 const DECLARATION_CHANGE_TOPIC = "d"
 

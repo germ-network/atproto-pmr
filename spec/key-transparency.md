@@ -155,9 +155,11 @@ publication of it, or its disappearance.
   shared with a co-located relay.
 - **Delivery** is [Web Push](wire-api.md#push-delivery--web-push-optional),
   sealed under the device-provisioned content key. **The push is
-  content-free**, exactly `{t:"d"}` ([the sealed payload](wire-api.md#the-sealed-payload)),
-  never the changed DID or `rev`, so a compromised deliverer cannot assert a
-  declaration to the device. The device re-fetches and verifies.
+  content-free**: `{t:"d"}` with at most the `c` and `dc` hints ([the sealed
+  payload](wire-api.md#the-sealed-payload)), which never save the device any
+  verification. It never carries the changed DID, `rev` or key, so a
+  compromised deliverer cannot assert a declaration to the device. The
+  device re-fetches and verifies.
 
 ### The change digest
 

@@ -16,8 +16,12 @@ import { decodeCoseMap, encodeCose, type CoseValue } from "../src/cose/cbor"
 import { encodeOkpEd25519Key } from "../src/cose/key"
 import { signRequest } from "../src/http-sig/sign"
 import {
+    handleMessageRead,
     handleMessagesAcks,
     handleMessagesList,
+    messageMissResponse,
+    parseMessageReadPath,
+    readMessageEntry,
     type MessagesConfig,
     type OwnerDeps,
 } from "../src/owner/endpoints"
@@ -109,6 +113,9 @@ function world() {
                 const queue = mailboxes.get(key)
                 if (queue === undefined) return
                 mailboxes.set(key, queue.filter((r) => r.messageId !== messageId))
+            },
+            async getMessage(key, messageId) {
+                return mailboxes.get(key)?.find((r) => r.messageId === messageId) ?? null
             },
         } as unknown as PMRStore
     }
@@ -497,5 +504,313 @@ describe("cross-owner isolation", () => {
         )
         const map = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
         expect(map.get("ms")).toEqual([])
+    })
+})
+
+const amortizing: Partial<OwnerDeps & MessagesConfig> = {
+    challengeConfig: { ttlSeconds: 600, byteLength: 32 },
+    randomBytes: (n: number) => new Uint8Array(n).fill(7),
+}
+
+const HINT = {
+    senderDID: "did:plc:sender",
+    declarationCID: "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e",
+}
+
+function readUrl(k: string, id: string): string {
+    return `${ORIGIN}/pmr/v1/messages/${encodeURIComponent(k)}/${encodeURIComponent(id)}`
+}
+
+async function fetchOne(
+    w: ReturnType<typeof world>,
+    did: string,
+    secretKey: Uint8Array,
+    url: string,
+    overrides: Partial<OwnerDeps & MessagesConfig> = {}
+): Promise<Response> {
+    return handleMessageRead(
+        signedRequest(url, "GET", secretKey, await challengeFor(w, did)),
+        deps(w, overrides)
+    )
+}
+
+describe("GET /pmr/v1/messages/{k}/{id} — fetch one message by reference", () => {
+    const did = "did:plc:fetch0000000000000000"
+
+    it("401 for an unsigned request with a malformed path: auth is decided before the 400", async () => {
+        const w = world()
+        const response = await handleMessageRead(
+            new Request(`${ORIGIN}/pmr/v1/messages/a/b/c`),
+            deps(w)
+        )
+        expect(response.status).toBe(401)
+    })
+
+    it("a hit returns the catch-up entry for that message: {k, id, m} plus sd/dc/g when the ref carries them", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set(did, [ref("m1", HINT, "generation-2")])
+        w.bodies.set("m1", new TextEncoder().encode("hello"))
+
+        const response = await fetchOne(w, did, secretKey, readUrl(did, "m1"))
+        expect(response.status).toBe(200)
+        expect(response.headers.get("content-type")).toBe("application/cbor")
+        const entry = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        expect(entry.get("k")).toBe(did)
+        expect(entry.get("id")).toBe("m1")
+        expect(entry.get("m")).toEqual(new TextEncoder().encode("hello"))
+        expect(entry.get("sd")).toBe(HINT.senderDID)
+        expect(entry.get("dc")).toBe(HINT.declarationCID)
+        expect(entry.get("g")).toBe("generation-2")
+    })
+
+    it("a hit's entry is byte-identical to the same message's entry in a catch-up page", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set(did, [ref("m1", HINT, "generation-2")])
+        w.bodies.set("m1", new TextEncoder().encode("hello"))
+
+        const one = await fetchOne(w, did, secretKey, readUrl(did, "m1"))
+        const page = await handleMessagesList(
+            signedRequest(MESSAGES_URL, "GET", secretKey, await challengeFor(w, did)),
+            deps(w)
+        )
+        const ms = decodeCoseMap(new Uint8Array(await page.arrayBuffer())).get("ms") as Map<string, CoseValue>[]
+        expect(new Uint8Array(await one.arrayBuffer())).toEqual(new Uint8Array(encodeCose(ms[0])))
+    })
+
+    it("a hit does not ack: the message is still in the next catch-up page and nothing was removed", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set(did, [ref("m1")])
+        w.bodies.set("m1", new Uint8Array([1]))
+
+        await fetchOne(w, did, secretKey, readUrl(did, "m1"))
+        expect(w.removed).toEqual([])
+        const page = await handleMessagesList(
+            signedRequest(MESSAGES_URL, "GET", secretKey, await challengeFor(w, did)),
+            deps(w)
+        )
+        const ms = decodeCoseMap(new Uint8Array(await page.arrayBuffer())).get("ms") as Map<string, CoseValue>[]
+        expect(ms.map((m) => m.get("id"))).toEqual(["m1"])
+    })
+
+    it("a hit carries Germ-Next-Challenge and cache-control: no-store", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set(did, [ref("m1")])
+        w.bodies.set("m1", new Uint8Array([1]))
+
+        const response = await fetchOne(w, did, secretKey, readUrl(did, "m1"), amortizing)
+        expect(response.headers.get("Germ-Next-Challenge")).not.toBeNull()
+        expect(response.headers.get("cache-control")).toBe("no-store")
+    })
+
+    it("a fetch does not sync the owner's Bsky blocks: ownBlocks is never called", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set(did, [ref("m1")])
+        w.bodies.set("m1", new Uint8Array([1]))
+        let calls = 0
+        const blocks = {
+            async ownBlocks() {
+                calls += 1
+                return []
+            },
+        } as unknown as OwnerDeps["blocks"]
+
+        const hit = await fetchOne(w, did, secretKey, readUrl(did, "m1"), { blocks })
+        const miss = await fetchOne(w, did, secretKey, readUrl(did, "nope"), { blocks })
+        expect(hit.status).toBe(200)
+        expect(miss.status).toBe(404)
+        expect(calls).toBe(0)
+    })
+
+    it("a grant mailbox key round-trips through percent-encoding", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        w.mailboxesFor((await w.directory.resolve(did))!).set("grant:addr/with+odd chars", [ref("g1")])
+        w.bodies.set("g1", new Uint8Array([2]))
+
+        const response = await fetchOne(w, did, secretKey, readUrl("grant:addr/with+odd chars", "g1"))
+        expect(response.status).toBe(200)
+        const entry = decodeCoseMap(new Uint8Array(await response.arrayBuffer()))
+        expect(entry.get("k")).toBe("grant:addr/with+odd chars")
+        expect(entry.has("sd")).toBe(false)
+    })
+
+    it("absent mailbox, unknown id, acked id and expired body all answer the same 404: empty body, no-store, identical headers apart from Germ-Next-Challenge", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        const mailboxes = w.mailboxesFor((await w.directory.resolve(did))!)
+        mailboxes.set(did, [ref("expired"), ref("live")])
+        w.bodies.set("live", new Uint8Array([1]))
+        mailboxes.set("did:plc:acked", [ref("a1")])
+        w.bodies.set("a1", new Uint8Array([3]))
+        await w.store((await w.directory.resolve(did))!).remove("did:plc:acked", "a1")
+
+        const urls = [
+            readUrl("did:plc:absent", "live"),
+            readUrl(did, "unknown"),
+            readUrl("did:plc:acked", "a1"),
+            readUrl(did, "expired"),
+        ]
+        const shapes: string[] = []
+        for (const url of urls) {
+            const response = await fetchOne(w, did, secretKey, url, amortizing)
+            expect(response.status).toBe(404)
+            expect(await response.text()).toBe("")
+            const headers = [...response.headers]
+                .filter(([name]) => name.toLowerCase() !== "germ-next-challenge")
+                .sort()
+            shapes.push(JSON.stringify(headers))
+        }
+        expect(new Set(shapes).size).toBe(1)
+        expect(shapes[0]).toContain("no-store")
+    })
+
+    it("a DID containing an escaped % (did:web:host%3A8080 sent as %253A) is decoded exactly once", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        const key = "did:web:host%3A8080"
+        w.mailboxesFor((await w.directory.resolve(did))!).set(key, [ref("m1")])
+        w.bodies.set("m1", new Uint8Array([1]))
+
+        const response = await fetchOne(w, did, secretKey, `${ORIGIN}/pmr/v1/messages/did:web:host%253A8080/m1`)
+        expect(response.status).toBe(200)
+        expect(decodeCoseMap(new Uint8Array(await response.arrayBuffer())).get("k")).toBe(key)
+    })
+
+    it("a miss also carries Germ-Next-Challenge, so the client keeps its chain", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        const response = await fetchOne(w, did, secretKey, readUrl(did, "nope"), amortizing)
+        expect(response.status).toBe(404)
+        expect(response.headers.get("Germ-Next-Challenge")).not.toBeNull()
+    })
+
+    it("another owner's message misses with that same 404", async () => {
+        const w = world()
+        const aliceDid = "did:plc:alice2000000000000000"
+        await registeredOwner(w, aliceDid)
+        const bobDid = "did:plc:bob20000000000000000000"
+        const bob = await registeredOwner(w, bobDid)
+        w.mailboxesFor((await w.directory.resolve(aliceDid))!).set(aliceDid, [ref("alices")])
+        w.bodies.set("alices", new Uint8Array([1]))
+
+        const response = await fetchOne(w, bobDid, bob, readUrl(aliceDid, "alices"))
+        expect(response.status).toBe(404)
+        expect(await response.text()).toBe("")
+    })
+
+    it("400 for a malformed path or a key matching neither did: nor grant:, before any lookup", async () => {
+        const w = world()
+        const secretKey = await registeredOwner(w, did)
+        let lookups = 0
+        const base = w.store
+        const counting = {
+            store: (locator: Locator) => {
+                const inner = base(locator)
+                return Object.assign(Object.create(inner), {
+                    getMessage: async () => {
+                        lookups += 1
+                        return null
+                    },
+                }) as PMRStore
+            },
+        }
+        for (const path of [
+            "/pmr/v1/messages/did:plc:x",
+            "/pmr/v1/messages/did:plc:x/m1/extra",
+            "/pmr/v1/messages//m1",
+            "/pmr/v1/messages/did:plc:x/",
+            "/pmr/v1/messages/%E0%A4%A/m1",
+            "/pmr/v1/messages/plain-key/m1",
+        ]) {
+            const response = await fetchOne(w, did, secretKey, `${ORIGIN}${path}`, counting)
+            expect(response.status, path).toBe(400)
+        }
+        expect(lookups).toBe(0)
+    })
+})
+
+describe("parseMessageReadPath", () => {
+    it("splits on / before decoding, so an encoded / inside a segment stays in that segment", () => {
+        expect(parseMessageReadPath("/pmr/v1/messages/grant:a%2Fb/id%2Fx")).toEqual({
+            key: "grant:a/b",
+            messageId: "id/x",
+        })
+    })
+
+    it("null for one segment, three segments, or an empty segment", () => {
+        for (const path of [
+            "/pmr/v1/messages/did:plc:x",
+            "/pmr/v1/messages/did:plc:x/a/b",
+            "/pmr/v1/messages//a",
+            "/pmr/v1/messages/did:plc:x/",
+            "/pmr/v1/messages/",
+        ]) {
+            expect(parseMessageReadPath(path), path).toBeNull()
+        }
+    })
+
+    it("null for a segment that fails to percent-decode", () => {
+        expect(parseMessageReadPath("/pmr/v1/messages/did:plc:x/%E0%A4%A")).toBeNull()
+        expect(parseMessageReadPath("/pmr/v1/messages/%ZZ/a")).toBeNull()
+    })
+
+    it("null for a key matching neither did: nor grant:", () => {
+        expect(parseMessageReadPath("/pmr/v1/messages/other:x/a")).toBeNull()
+        expect(parseMessageReadPath("/pmr/v1/messages/%64id:plc:x/a")).toEqual({
+            key: "did:plc:x",
+            messageId: "a",
+        })
+    })
+})
+
+describe("messageMissResponse", () => {
+    it("is 404 with an empty body and cache-control: no-store", async () => {
+        const response = messageMissResponse()
+        expect(response.status).toBe(404)
+        expect(await response.text()).toBe("")
+        expect(response.headers.get("cache-control")).toBe("no-store")
+    })
+})
+
+describe("readMessageEntry — the auth-free fetch-one primitive", () => {
+    const store = (refs: MessageRef[]) => ({
+        getMessage: async (_key: string, id: string) => refs.find((r) => r.messageId === id) ?? null,
+    })
+    const bodies = (present: Record<string, Uint8Array>) => ({
+        getBody: async (id: string) => present[id] ?? null,
+    })
+
+    it("returns the entry map for a queued message whose body is present", async () => {
+        const entry = await readMessageEntry(
+            store([ref("m1", HINT, "g1")]),
+            bodies({ m1: new Uint8Array([1]) }),
+            "did:plc:x",
+            "m1"
+        )
+        expect(entry).toEqual(
+            new Map<string, CoseValue>([
+                ["k", "did:plc:x"],
+                ["id", "m1"],
+                ["m", new Uint8Array([1])],
+                ["sd", HINT.senderDID],
+                ["dc", HINT.declarationCID],
+                ["g", "g1"],
+            ])
+        )
+    })
+
+    it("returns null when the ref is queued but its body has expired", async () => {
+        expect(await readMessageEntry(store([ref("m1")]), bodies({}), "did:plc:x", "m1")).toBeNull()
+    })
+
+    it("returns null when the store has no such ref", async () => {
+        expect(
+            await readMessageEntry(store([]), bodies({ m1: new Uint8Array([1]) }), "did:plc:x", "m1")
+        ).toBeNull()
     })
 })

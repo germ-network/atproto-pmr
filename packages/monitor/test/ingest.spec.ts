@@ -302,7 +302,7 @@ describe("settle", () => {
         const onChange = vi.fn(async () => {})
         const h = harness({ onChange })
         await settle(h.deps, DID)
-        expect(onChange).toHaveBeenCalledWith(DID, "3m2")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m2", { c: "rev", dc: CID })
     })
 
     it("fires the change hook on a pure key rotation, even with rev unchanged", async () => {
@@ -332,7 +332,7 @@ describe("settle", () => {
             cid: CID,
         })
         expect(await settle(h.deps, DID)).toBe("stored")
-        expect(onChange).toHaveBeenCalledWith(DID, "3m2")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m2", { c: "rotate", dc: CID })
     })
 
     it("does not fire the change hook when neither rev nor signing key moved", async () => {
@@ -1065,7 +1065,7 @@ describe("settle verifies at ingest", () => {
         await settle(h.deps, DID)
         await settle(h.deps, DID)
         expect(onChange).toHaveBeenCalledTimes(1)
-        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rotate" })
         expect((await h.deps.index.heldDeclarationOf(DID))?.seenKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)?.rev).toBe("3m1")
     })
@@ -1116,7 +1116,7 @@ describe("settle verifies at ingest", () => {
         expect(await settle(h.deps, DID)).toBe("stored")
         expect(verify.mock.calls[0]![1].signingKey).toBe(ROTATED_KEY)
         expect(h.records.get(DID)).toMatchObject({ verifiedWith: ROTATED_KEY })
-        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rotate", dc: CID })
     })
 })
 
@@ -1221,7 +1221,7 @@ describe("settle on a reversible not-found", () => {
         const h = harness({ onChange, rev: "3m1" })
         goneReversibly(h)
         expect(await settle(h.deps, DID)).toBe("stored")
-        expect(onChange).toHaveBeenCalledWith(DID, "3m1")
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rev", dc: CID })
 
         const quiet = vi.fn(async () => {})
         const held = harness({ onChange: quiet, rev: "3m1" })
@@ -1270,5 +1270,83 @@ describe("declaration messaging-key history", () => {
         expect((await observe(1)).messagingKeyFirstSeenAtMs).toBeNull()
         expect((await observe(2)).messagingKeyFirstSeenAtMs).toBe(2000)
         expect(history.size).toBe(2)
+    })
+})
+
+describe("own-DID push hints", () => {
+    const ROTATED_KEY = "zQ3shRotatedKeyNotARealMultikey00000000000"
+    const rotatedRecord = async () => ({
+        car: new Uint8Array([1, 2, 3]),
+        source: PDS,
+        signingKey: ROTATED_KEY,
+    })
+
+    it("an advanced rev raises onChange with {c:'rev', dc: the newly verified record's CID}", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            verify: async (_did, record) => ({
+                kind: "verified",
+                key: record.signingKey!,
+                rev: "3m2",
+                cid: "bafy-new",
+            }),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        await settle(h.deps, DID)
+        expect(onChange).toHaveBeenCalledWith(DID, "3m2", { c: "rev", dc: "bafy-new" })
+    })
+
+    it("a revived DID raises onChange with {c:'rev', dc}", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({ onChange, rev: "3m1" })
+        h.revs.set(DID, "3m1")
+        h.deps.index.holderStateOf = async () => "gone-reversible"
+        await settle(h.deps, DID)
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rev", dc: CID })
+    })
+
+    it("a verified signing-key change raises onChange with {c:'rotate', dc}, with or without a rev move", async () => {
+        for (const rev of ["3m1", "3m2"]) {
+            const onChange = vi.fn(async () => {})
+            const h = harness({ onChange, rev, fetchRecord: rotatedRecord })
+            h.revs.set(DID, "3m1")
+            h.records.set(DID, storedEntry())
+            await settle(h.deps, DID)
+            expect(onChange).toHaveBeenCalledWith(DID, rev, { c: "rotate", dc: CID })
+        }
+    })
+
+    it("a verified key rotation at an unchanged record carries dc equal to the previously held CID", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            fetchRecord: rotatedRecord,
+            verify: async (_did, record) => ({
+                kind: "verified",
+                key: record.signingKey!,
+                rev: "3m1",
+                cid: "bafy-held",
+            }),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry({ cid: "bafy-held" }))
+        await settle(h.deps, DID)
+        expect(onChange).toHaveBeenCalledWith(DID, "3m1", { c: "rotate", dc: "bafy-held" })
+    })
+
+    it("a newly seen but unverified key raises onChange with {c:'rotate'} and no dc, since the held record did not change", async () => {
+        const onChange = vi.fn(async () => {})
+        const h = harness({
+            onChange,
+            fetchRecord: rotatedRecord,
+            verify: async () => ({ kind: "unverifiable" as const }),
+        })
+        h.revs.set(DID, "3m1")
+        h.records.set(DID, storedEntry())
+        await settle(h.deps, DID)
+        expect(onChange).toHaveBeenCalledTimes(1)
+        expect(onChange.mock.calls[0]).toEqual([DID, "3m1", { c: "rotate" }])
     })
 })

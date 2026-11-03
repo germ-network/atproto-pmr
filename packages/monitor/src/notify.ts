@@ -1,14 +1,16 @@
 import {
     buildDeclarationPushPayload,
+    type DeclarationPushHint,
     type DeliverPushResult,
 } from "@germ-network/atproto-pmr-core"
 import type { MonitorRegistration, MonitorRegistrationStore } from "./registration.js"
 
 /**
  * Own-DID push: `spec/key-transparency.md`, §Registration and the own-DID
- * push. Content-free and permanently so — see `buildDeclarationPushPayload`
- * — so this module's only job is finding the registered destination and
- * sending exactly `{t:"d"}` to it.
+ * push. Content-free and permanently so — `{t:"d"}` with at most the
+ * `DeclarationPushHint` hints, see `buildDeclarationPushPayload` — so this
+ * module's only job is finding the registered destination and sending that
+ * to it.
  *
  * Platform-neutral, like the rest of this package: no `fetch`, no
  * `console`. **Throws on a genuine delivery failure** (network error, a
@@ -49,12 +51,13 @@ export interface NotifyDeps {
  */
 export async function pushDeclarationChange(
     did: string,
-    deps: NotifyDeps
+    deps: NotifyDeps,
+    hint?: DeclarationPushHint
 ): Promise<DeliverPushResult | null> {
     const registration = await deps.registrations.load(did)
     if (registration === null) return null
 
-    const plaintext = buildDeclarationPushPayload()
+    const plaintext = buildDeclarationPushPayload(hint)
     const result = await deps.sender.send(registration.pushSubscription, plaintext)
     if (result.outcome === "discard") {
         await deps.registrations.delete(did)

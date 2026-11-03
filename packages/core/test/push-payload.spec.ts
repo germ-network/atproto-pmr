@@ -109,9 +109,33 @@ describe("buildPoolPushPayload / buildDeclarationPushPayload", () => {
         const map = decodeCoseMap(buildPoolPushPayload())
         expect([...map.entries()]).toEqual([["t", "p"]])
     })
+})
 
-    it("declaration payload is exactly {t: 'd'}", () => {
+describe("declaration push hints", () => {
+    const CID = "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e"
+
+    it("with no hint, the payload is exactly {t:'d'}", () => {
         const map = decodeCoseMap(buildDeclarationPushPayload())
         expect([...map.entries()]).toEqual([["t", "d"]])
+    })
+
+    it("a hint adds c and, when present, dc, and nothing else (no DID, no anchor key)", () => {
+        const map = decodeCoseMap(buildDeclarationPushPayload({ c: "rotate", dc: CID }))
+        expect(Object.fromEntries(map)).toEqual({ t: "d", c: "rotate", dc: CID })
+    })
+
+    it("a hint without dc carries no dc key", () => {
+        const map = decodeCoseMap(buildDeclarationPushPayload({ c: "gone" }))
+        expect(Object.fromEntries(map)).toEqual({ t: "d", c: "gone" })
+        expect(map.has("dc")).toBe(false)
+    })
+
+    it("the largest hinted payload seals well under a 2880-byte ceiling", () => {
+        const bytes = buildDeclarationPushPayload({ c: "rotate", dc: CID.padEnd(100, "a") })
+        expect(bytes.byteLength + SEAL_OVERHEAD_BYTES).toBeLessThan(2880 / 2)
+    })
+
+    it("the pool payload is still exactly {t:'p'}", () => {
+        expect([...decodeCoseMap(buildPoolPushPayload()).entries()]).toEqual([["t", "p"]])
     })
 })

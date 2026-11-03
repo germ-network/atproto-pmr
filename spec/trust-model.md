@@ -181,13 +181,13 @@ security role.
 
 **A pair put MUST carry an anti-replay nonce, and a recipient MUST record
 the nonces it has seen per sender until a session with that sender
-supersedes the handshake.** Content-addressed dedup MUST NOT be treated as
+supersedes the handshake.** Message-id dedup MUST NOT be treated as
 a substitute: dedup records expire, and once a message drains, is acked, or
 reaches retention expiry, the same signed bytes replay as a fresh
 handshake.
 
 Two supporting requirements travel with it, and either alone is
-insufficient: content-address over the **stable message identity**, never
+insufficient: derive the message id over the **stable message identity**, never
 the signature bytes; and reject non-canonical Ed25519 signatures
 (RFC 8032 §5.1.7). Signature malleability would otherwise let a malleated
 copy slip past dedup.
@@ -320,7 +320,7 @@ repo-authenticated.
 |---|---|---|
 | read content | end-to-end encryption, key-blind relay | none |
 | forge a message into an established session | session-layer authentication and sequencing | none |
-| replay a session message | session sequencing; content-addressed ack dedup | none |
+| replay a session message | session sequencing; `(k, id)` ack dedup | none |
 | replay a pre-session pair put (first contact, recovery) | recipient-tracked per-sender nonce until a session supersedes it ([P6](#p6--anti-replay-on-pre-session-puts)) | a replay in the window before the seen-set exists, e.g. a device restoring from backup |
 | insert forged atproto state | CAR exchange + signature verification ([P2](#p2--relayed-repo-records-are-car)) | none |
 | **replay stale atproto state** | monotonic `rev` tracking; spot checks; multiple observers | a withheld update is indistinguishable from no update |

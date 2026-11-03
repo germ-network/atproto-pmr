@@ -22,3 +22,17 @@ describe("core public surface", () => {
         expect(core).not.toHaveProperty("GRAPH_EDGE_KEYS")
     })
 })
+
+describe("fetch-one surface", () => {
+    it("exports handleMessageRead, parseMessageReadPath, messageMissResponse, readMessageEntry and messageEntryFields", () => {
+        for (const name of [
+            "handleMessageRead",
+            "parseMessageReadPath",
+            "messageMissResponse",
+            "readMessageEntry",
+            "messageEntryFields",
+        ]) {
+            expect(core, name).toHaveProperty(name)
+        }
+    })
+})
