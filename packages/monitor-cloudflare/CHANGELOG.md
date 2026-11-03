@@ -1,5 +1,15 @@
 # @germ-network/atproto-pmr-monitor-cloudflare
 
+## 0.6.0
+
+### Minor Changes
+
+- [#102](https://github.com/germ-network/atproto-pmr/pull/102) [`973a501`](https://github.com/germ-network/atproto-pmr/commit/973a501c482a27b75904b8c761222cef6a21372b) Thanks [@germ-mark](https://github.com/germ-mark)! - Bind message ids to their destination mailbox, so a recycle in one mailbox can no longer delete a body held for another. `deriveMessageId` is removed: use `messageIdFor({ locator, key }, payload)` for message ids and `typedDigest(bytes)` for plain content addresses. `MessageId` is now a branded type that only `messageIdFor` and `messageIdFromWire` produce, and `BodyStore` and `PMRStore` take it. The spec now requires ids to bind their destination and body stores to scope every operation to one mailbox.
+
+- [#102](https://github.com/germ-network/atproto-pmr/pull/102) [`bf79a3d`](https://github.com/germ-network/atproto-pmr/commit/bf79a3dd2bacb50f2cb2e64332b76c90dfdb4941) Thanks [@germ-mark](https://github.com/germ-mark)! - Add `GET /pmr/v1/messages/{k}/{id}`: an owner-authenticated fetch of one queued message, returned as its catch-up entry, without acking it. Every miss gets the identical `404`. Core exports `handleMessageRead`, `parseMessageReadPath`, `messageMissResponse`, `readMessageEntry` and `messageEntryFields`. `PMRStore.getMessage` is a new required member, so other `PMRStore` implementers must add it.
+
+  The `{t:"d"}` own-DID push now carries a `c` hint (`rev`, `rotate` or `gone`) and, when the monitor verified a record on that change, a `dc` hint. Hints never replace the device's own verification. `IngestDeps.onChange` gains an optional trailing `hint`; a subclass that overrides `onChange` without forwarding it sends a bare `{t:"d"}`, which still means a change of unknown kind.
+
 ## 0.5.1
 
 ## 0.5.0
