@@ -33,8 +33,10 @@ new_sqlite_classes = ["PMRObject"]
 # once the monitor does. Subclass `SenderHoldObject`, export the subclass from
 # your entry point, wire `senderHolds(env)` into `PairPutDeps.senderHold`, and
 # await `releaseSenderHold(...)` in your monitor's `onSettled`. The class MUST
-# be SQLite-backed (`new_sqlite_classes`), never `new_classes`. Sound only
-# where the monitor settles every sender it admits (interest policy `everyone`).
+# be SQLite-backed (`new_sqlite_classes`), never `new_classes`. Senders with a
+# snapshot are held under any interest policy; wire `unsnapshottedHoldBudget`
+# to hold senders with none only where the monitor's interest policy is
+# `everyone`.
 #
 # [durable_objects]
 # bindings = [

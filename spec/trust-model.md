@@ -215,7 +215,9 @@ Three limits keep the read from being a probe:
 A put naming a DID with **no** snapshot at all costs a directory read, a PDS
 read and a hold, and anyone can send one, so a relay MUST bound such
 consultations as a whole, and answers `409` once the bound is spent (a relay
-with no such bound answers `409` for every such put).
+with no such bound answers `409` for every such put). A relay whose monitor
+does not settle every declaration holder MUST NOT hold such a put (see
+below).
 
 The 10 minutes a put waits is the bound after which the monitor itself counts
 the DID as lagging ([key-transparency](key-transparency.md#the-firehose-coverage-rule)),
@@ -228,10 +230,15 @@ use. A dishonest PDS that withholds only delays or loses its own user's
 messages; it learns of puts naming that user, which is the exposure listed in
 [what a relay necessarily learns](#what-a-relay-necessarily-learns).
 
-The hold is sound only where the monitor settles every sender the relay
-admits, that is, an interest policy that keeps every declaration holder
-([messaging-appview](messaging-appview.md)). A put held for a DID the monitor
-never settles is never delivered.
+A relay holds a put only for a sender its monitor will settle. For a sender
+with a snapshot that is true under any interest policy, because the monitor
+keeps a snapshot only for a DID in its interest set and disposes of it when
+the DID leaves. A sender with no snapshot is settled only where the monitor's
+interest policy keeps every declaration holder
+([messaging-appview](messaging-appview.md)); under a narrower policy the
+monitor never fetches that DID's declaration, so the relay answers `409` for
+it instead of holding. A put held for a DID the monitor never settles is
+never delivered.
 
 This verification serves the relay's abuse control and policy tiers, not
 the recipient's end-to-end security — the device authenticates

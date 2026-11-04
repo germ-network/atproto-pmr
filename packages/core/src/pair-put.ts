@@ -43,16 +43,19 @@ export interface PairPutDeps {
     /**
      * The sender's hold, consulted only when the put fails under the
      * monitor's snapshot (no snapshot, or a signature failure). Omitted, such
-     * a put answers `409` as before. Sound only where the monitor settles
-     * every sender the hold admits (interest policy `everyone`): a held put
-     * from a DID the monitor ignores is never released.
+     * a put answers `409` as before. A sender with a snapshot is always one
+     * the monitor settles, so holding it is sound under any interest policy.
+     * A sender with none is settled only under interest policy `everyone`;
+     * see `unsnapshottedHoldBudget`.
      */
     senderHold?: (senderDID: PairMailboxKey) => SenderHold
     /**
      * Spends one hold consultation for a sender with no snapshot at all;
      * false answers `409` without consulting the hold. Typically one
      * isolate-wide `perMinuteBudget(UNSNAPSHOTTED_HOLD_CONSULTS_PER_MINUTE)`.
-     * Omitted, such a sender is never held.
+     * Omitted, such a sender is never held. Wire it only where the monitor's
+     * interest policy is `everyone`: a put held for a DID the monitor never
+     * settles is never released.
      */
     unsnapshottedHoldBudget?: (nowSeconds: number) => boolean
     /**
