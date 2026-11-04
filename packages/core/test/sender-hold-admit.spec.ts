@@ -164,6 +164,7 @@ describe("verifying a put the snapshot could not", () => {
                 }),
         })
         const first = t.admit(t.keyB.secretKey)
+        await vi.waitFor(() => expect(t.readDirect).toHaveBeenCalledTimes(1))
         const second = t.admit(t.keyB.secretKey)
         await vi.waitFor(() => expect(t.readDirect).toHaveBeenCalledTimes(2))
         release(resolution(t.keyB.publicKey, REV.new))
@@ -231,6 +232,20 @@ describe("verifying a put the snapshot could not", () => {
         const t = setup()
         const bytes = envelope(t.keyB.secretKey, { recipient: "did:plc:someoneelse0000000000000" })
         expect(await t.admit(t.keyB.secretKey, { envelope: bytes })).toEqual({ outcome: "accepted" })
+        expect(t.storage.state.held).toEqual([])
+    })
+
+    it("an interim key no newer than the stored settled revision is not used", async () => {
+        const t = setup({ direct: { found: false, reason: "pds down" } })
+        t.storage.state.settled = storedSettled(keyPair().publicKey, REV.new, NOW - 5)
+        t.storage.state.interim = {
+            anchorKey: t.keyB.publicKey,
+            declarationCID: "cid",
+            revision: REV.new,
+            readAtSeconds: NOW - 5,
+        }
+        expect(await t.admit(t.keyB.secretKey)).toEqual({ outcome: "unverifiable" })
+        expect(t.readDirect).toHaveBeenCalledTimes(1)
         expect(t.storage.state.held).toEqual([])
     })
 
@@ -308,6 +323,7 @@ describe("holding a verified put", () => {
                 }),
         })
         const first = t.admit(t.keyB.secretKey)
+        await vi.waitFor(() => expect(t.readDirect).toHaveBeenCalledTimes(1))
         const second = t.admit(t.keyB.secretKey)
         await vi.waitFor(() => expect(t.readDirect).toHaveBeenCalledTimes(2))
         release(resolution(t.keyB.publicKey, REV.new))

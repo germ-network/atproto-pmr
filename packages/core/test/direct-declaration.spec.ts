@@ -165,8 +165,8 @@ describe("direct declaration read", () => {
             hang,
             duringResolution.signal
         )
-        duringResolution.abort()
-        await expect(resolving).rejects.toThrow()
+        duringResolution.abort(new Error("caller gave up"))
+        await expect(resolving).rejects.toThrow("caller gave up")
 
         const calls: string[] = []
         const pdsThenHang = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -197,8 +197,8 @@ describe("direct declaration read", () => {
             duringRecord.signal
         )
         await vi.waitFor(() => expect(calls).toHaveLength(2))
-        duringRecord.abort()
-        await expect(fetching).rejects.toThrow()
+        duringRecord.abort(new Error("caller gave up"))
+        await expect(fetching).rejects.toThrow("caller gave up")
         expect(calls[1]).toContain("https://pds.example/xrpc/com.atproto.sync.getRecord")
     })
 })

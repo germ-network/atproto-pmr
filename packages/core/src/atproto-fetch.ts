@@ -52,10 +52,10 @@ const MAX_RESPONSE_BYTES = 64 * 1024
 function abortWith(controller: AbortController, signal: AbortSignal | undefined): () => void {
     if (signal === undefined) return () => {}
     if (signal.aborted) {
-        controller.abort()
+        controller.abort(signal.reason)
         return () => {}
     }
-    const onAbort = () => controller.abort()
+    const onAbort = () => controller.abort(signal.reason)
     signal.addEventListener("abort", onAbort, { once: true })
     return () => signal.removeEventListener("abort", onAbort)
 }

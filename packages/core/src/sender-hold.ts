@@ -124,7 +124,8 @@ export interface SenderHold {
 
 /**
  * Durable state of one sender's hold. Single-writer: the caller serializes
- * calls for a sender (a Durable Object per sender DID does).
+ * calls for a sender (a Durable Object per sender DID does), except that puts
+ * resuming from one shared read are serialized by `admitToHold` itself.
  */
 export interface SenderHoldStorage {
     /**
@@ -147,6 +148,7 @@ export interface SenderHoldStorage {
 
 export interface AdmitToHoldDeps {
     senderDID: PairMailboxKey
+    /** The same object for every call for this sender: it keys the critical section that enforces the cap. */
     storage: SenderHoldStorage
     /**
      * The sender's declaration straight from its PDS (`directDeclarationResolver`).
@@ -154,7 +156,7 @@ export interface AdmitToHoldDeps {
      * while a read is in flight waits for it rather than meeting the memo.
      */
     readDirect: (senderDID: string) => Promise<SenderDeclarationResolution>
-    /** Cap on held puts for this sender, across all recipients. */
+    /** Cap on held puts for this sender, across all recipients; at least 1. */
     maxHeld: number
 }
 
