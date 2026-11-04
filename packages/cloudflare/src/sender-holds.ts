@@ -1,9 +1,26 @@
 import type {
+    HoldAdmission,
+    HoldRequest,
     PairMailboxKey,
+    ReleaseSummary,
     SenderHold,
     SettledSenderDeclaration,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
+
+/** The RPC surface of `SenderHoldObject`. */
+interface SenderHoldStub {
+    admit(senderDID: string, request: HoldRequest): Promise<HoldAdmission>
+    settle(
+        senderDID: string,
+        settled: SettledSenderDeclaration | null,
+        nowSeconds: number
+    ): Promise<ReleaseSummary>
+}
+
+function holdFor(namespace: DurableObjectNamespace, senderDID: string): SenderHoldStub {
+    return namespace.get(namespace.idFromName(senderDID)) as unknown as SenderHoldStub
+}
 
 /**
  * `PairPutDeps.senderHold` over the `SENDER_HOLDS` namespace, one object per
@@ -13,8 +30,11 @@ import type { PMREnv } from "./env"
 export function senderHolds(
     env: Pick<PMREnv, "SENDER_HOLDS">
 ): ((senderDID: PairMailboxKey) => SenderHold) | undefined {
-    void env
-    throw new Error("senderHolds: not implemented")
+    const namespace = env.SENDER_HOLDS
+    if (namespace === undefined) return undefined
+    return (senderDID) => ({
+        admit: (request) => holdFor(namespace, senderDID).admit(senderDID, request),
+    })
 }
 
 /**
@@ -28,9 +48,11 @@ export async function releaseSenderHold(
     settled: SettledSenderDeclaration | null,
     nowSeconds: number
 ): Promise<void> {
-    void env
-    void senderDID
-    void settled
-    void nowSeconds
-    throw new Error("releaseSenderHold: not implemented")
+    const namespace = env.SENDER_HOLDS
+    if (namespace === undefined) return
+    try {
+        await holdFor(namespace, senderDID).settle(senderDID, settled, nowSeconds)
+    } catch (err) {
+        console.warn(`releaseSenderHold: settle failed for ${senderDID}:`, err)
+    }
 }
