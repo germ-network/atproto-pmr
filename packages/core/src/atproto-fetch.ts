@@ -875,8 +875,11 @@ export async function fetchRecordProofCar(
     did: string,
     collection: string,
     rkey: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    /** Aborts both the PDS resolution and the record fetch, beside each fetch's own timeout. */
+    signal?: AbortSignal
 ): Promise<Uint8Array> {
+    void signal
     const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
     const url = new URL(`${endpoint}/xrpc/com.atproto.sync.getRecord`)
     url.searchParams.set("did", did)

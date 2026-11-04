@@ -210,6 +210,30 @@ export {
     type AuthenticatedPutOutcome,
 } from "./authenticated-put"
 
+// Holding a put whose sender just published a declaration the monitor has not settled.
+export {
+    admitToHold,
+    releaseHeld,
+    sweepExpiredHolds,
+    SENDER_HOLD_TTL_SECONDS,
+    DIRECT_READ_TIMEOUT_MS,
+    DIRECT_READ_MEMO_SECONDS,
+    UNSNAPSHOTTED_HOLD_CONSULTS_PER_MINUTE,
+    perMinuteBudget,
+    type AdmitToHoldDeps,
+    type HeldPairPut,
+    type HoldAdmission,
+    type HoldRequest,
+    type InterimDeclaration,
+    type ReleaseDeps,
+    type ReleaseSummary,
+    type SenderHold,
+    type SenderHoldStorage,
+    type SettledSenderDeclaration,
+    type StoredSettledDeclaration,
+    type VerifiedSenderDeclaration,
+} from "./sender-hold"
+
 // The grant-put endpoint.
 export { handleGrantPut, type GrantPutDeps } from "./grant-put"
 
@@ -268,6 +292,7 @@ export {
 export {
     DECLARATION_COLLECTION_NSID,
     declarationAnchorKeyOf,
+    directDeclarationResolver,
     messagingKeyFingerprint,
     normalizeMessagingKeyFingerprint,
     resolveDeclaration,
@@ -278,6 +303,7 @@ export {
     type SenderDeclarationResolution,
     type SnapshotDeclarationDeps,
     type DeclarationWithRev,
+    type DirectDeclarationDeps,
 } from "./declaration"
 // Shared with the key monitor: the SSRF guards are the security boundary
 // for every consumer, so they are reused rather than reimplemented.

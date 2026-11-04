@@ -9,6 +9,7 @@ compatibility_date = "2026-07-01"
 bindings = [
 	{ name = "pmrs", class_name = "PMRObject" },
 	{ name = "MONITOR_INGEST", class_name = "MonitorIngestStub" },
+	{ name = "SENDER_HOLDS", class_name = "TestSenderHold" },
 ]
 
 [[migrations]]
@@ -18,6 +19,10 @@ new_sqlite_classes = ["PMRObject"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["MonitorIngestStub"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TestSenderHold"]
 
 # Illustrative values, matching wrangler.example.toml. These are
 # implementation-defined; tests read them from env rather than hardcoding,

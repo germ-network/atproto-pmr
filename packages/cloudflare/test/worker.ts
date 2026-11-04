@@ -1,7 +1,41 @@
 /** Test-only entry so wrangler can find the Durable Object classes. */
 import { DurableObject } from "cloudflare:workers"
+import type {
+    AuthenticatedPutDeps,
+    SenderDeclarationResolution,
+} from "@germ-network/atproto-pmr-core"
+import { SenderHoldObject } from "../src/sender-hold-object"
 
 export { PMRObject } from "../src/pmr-object"
+
+/**
+ * The hold under test. `readDirect` answers what `setDirect` scripted and
+ * counts its calls; releases store through this worker's own `pmrs`,
+ * `pmrDirectory` and `messages`.
+ */
+export class TestSenderHold extends SenderHoldObject {
+    async setDirect(answer: SenderDeclarationResolution): Promise<void> {
+        await this.ctx.storage.put("test:direct", answer)
+    }
+
+    async directReads(): Promise<number> {
+        return (await this.ctx.storage.get<number>("test:directReads")) ?? 0
+    }
+
+    protected async readDirect(): Promise<SenderDeclarationResolution> {
+        await this.ctx.storage.put("test:directReads", (await this.directReads()) + 1)
+        return (
+            (await this.ctx.storage.get<SenderDeclarationResolution>("test:direct")) ?? {
+                found: false,
+                reason: "not scripted",
+            }
+        )
+    }
+
+    protected releaseDeps(): AuthenticatedPutDeps {
+        throw new Error("TestSenderHold.releaseDeps: not implemented")
+    }
+}
 
 /** Stands in for a monitor's ingest object: records the calls it receives. */
 export class MonitorIngestStub extends DurableObject {

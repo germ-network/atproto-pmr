@@ -4,6 +4,7 @@ import { SenderDeclarationResolution } from "./declaration.js"
 import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { PMRConfig } from "./config.js"
+import type { SenderHold } from "./sender-hold.js"
 import {
     BodyStore,
     Directory,
@@ -39,6 +40,21 @@ export interface PairPutDeps {
      * relay adjudicates nothing: unprovisioned senders pool without a verdict.
      */
     admission?: AdmissionSource
+    /**
+     * The sender's hold, consulted only when the put fails under the
+     * monitor's snapshot (no snapshot, or a signature failure). Omitted, such
+     * a put answers `409` as before. Sound only where the monitor settles
+     * every sender the hold admits (interest policy `everyone`): a held put
+     * from a DID the monitor ignores is never released.
+     */
+    senderHold?: (senderDID: PairMailboxKey) => SenderHold
+    /**
+     * Spends one hold consultation for a sender with no snapshot at all;
+     * false answers `409` without consulting the hold. Typically one
+     * isolate-wide `perMinuteBudget(UNSNAPSHOTTED_HOLD_CONSULTS_PER_MINUTE)`.
+     * Omitted, such a sender is never held.
+     */
+    unsnapshottedHoldBudget?: (nowSeconds: number) => boolean
     /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.

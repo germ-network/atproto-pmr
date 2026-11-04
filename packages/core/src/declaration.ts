@@ -409,3 +409,28 @@ export async function resolveDeclarationWithRev(
     return { resolution, headRev }
 }
 
+
+export interface DirectDeclarationDeps {
+    /** `com.atproto.sync.getRecord` proof CAR from the DID's own PDS (`fetchRecordProofCar`). */
+    fetchProofCar: (did: string, collection: string, rkey: string, signal: AbortSignal) => Promise<Uint8Array>
+    /** The DID document's `#atproto` multikey, or null. */
+    resolveSigningKey: (did: string) => Promise<string | null>
+    /** Past this the read answers `found: false`; `DIRECT_READ_TIMEOUT_MS` in the hold. */
+    timeoutMs: number
+}
+
+/**
+ * A sender's declaration read straight from its PDS, with the commit
+ * signature and record path verified as for a monitor snapshot. For the
+ * sender hold only: it admits a put to wait for the monitor and is never the
+ * evidence a put is delivered under. A timeout, an unreachable PDS, an
+ * absent record or a failed verification all answer `found: false`.
+ */
+export function directDeclarationResolver(
+    deps: DirectDeclarationDeps
+): (senderDID: string) => Promise<SenderDeclarationResolution> {
+    void deps
+    return async () => {
+        throw new Error("directDeclarationResolver: not implemented")
+    }
+}
