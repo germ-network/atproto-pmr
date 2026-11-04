@@ -350,6 +350,9 @@ export async function releaseHeld(
         car.cid !== settled.cid ||
         (stored !== null && compareRev(stored.declaration.revision, settled.rev) === "regressed")
     ) {
+        if (car === null || car.did !== senderDID || car.rev !== settled.rev || car.cid !== settled.cid) {
+            console.warn("sender hold: ignoring a settled declaration that does not match its sender")
+        }
         summary.kept = (await storage.held()).length
         return summary
     }

@@ -131,9 +131,21 @@ function setup(
 
 afterEach(() => vi.restoreAllMocks())
 
+const t0Key = () => keyPair().publicKey
+
 describe("releasing held puts on a monitor settle", () => {
     it("a held put that verifies under the settled key is ingested with the settled CID, rev, CAR and anchor key as evidence", async () => {
-        const t = setup({ held: [{}] })
+        const t = setup({
+            held: [{ heldUnder: REV.mid }],
+            storage: {
+                interim: {
+                    anchorKey: t0Key(),
+                    declarationCID: "cid-interim",
+                    revision: REV.mid,
+                    readAtSeconds: NOW - 5,
+                },
+            },
+        })
         const settled = settledDeclaration(t.key.publicKey, REV.new)
         const summary = await t.release(settled)
         expect(summary).toEqual({ released: 1, dropped: 0, kept: 0 })
