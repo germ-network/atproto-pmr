@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { OkpEd25519Key, encodeOkpEd25519Key, parseOkpEd25519Key } from "./cose/key"
+import { verifyRecordProof } from "./repo-proof"
 import { snapshotRecordReader, type RecordSnapshot } from "./snapshot-read"
 
 /**
@@ -89,23 +90,32 @@ export function snapshotDeclarationResolver(
         const result = await read(senderDID)
         if (!result.found) return result
 
-        const currentKey = (result.record as { currentKey?: unknown } | null)
-            ?.currentKey
-        if (!(currentKey instanceof Uint8Array)) {
-            return { found: false, reason: "declaration has no currentKey bytes" }
+        return declarationResolutionOf(result)
+    }
+}
+
+/** A verified declaration record as pair put takes it, or `found: false` when its `currentKey` is unreadable. */
+function declarationResolutionOf(verified: {
+    record: unknown
+    cid: string
+    rev: string
+    car: Uint8Array
+}): SenderDeclarationResolution {
+    const currentKey = (verified.record as { currentKey?: unknown } | null)?.currentKey
+    if (!(currentKey instanceof Uint8Array)) {
+        return { found: false, reason: "declaration has no currentKey bytes" }
+    }
+    try {
+        const frozen = parseFrozenAnchorKeyField(currentKey)
+        return {
+            found: true,
+            anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
+            declarationCID: verified.cid,
+            revision: verified.rev,
+            evidenceCAR: verified.car,
         }
-        try {
-            const frozen = parseFrozenAnchorKeyField(currentKey)
-            return {
-                found: true,
-                anchorKey: parseOkpEd25519Key(encodeOkpEd25519Key(frozen)),
-                declarationCID: result.cid,
-                revision: result.rev,
-                evidenceCAR: result.car,
-            }
-        } catch (error) {
-            return { found: false, reason: `malformed currentKey: ${String(error)}` }
-        }
+    } catch (error) {
+        return { found: false, reason: `malformed currentKey: ${String(error)}` }
     }
 }
 
@@ -412,7 +422,12 @@ export async function resolveDeclarationWithRev(
 
 export interface DirectDeclarationDeps {
     /** `com.atproto.sync.getRecord` proof CAR from the DID's own PDS (`fetchRecordProofCar`). */
-    fetchProofCar: (did: string, collection: string, rkey: string, signal: AbortSignal) => Promise<Uint8Array>
+    fetchProofCar: (
+        did: string,
+        collection: string,
+        rkey: string,
+        signal: AbortSignal
+    ) => Promise<Uint8Array>
     /** The DID document's `#atproto` multikey, or null. */
     resolveSigningKey: (did: string) => Promise<string | null>
     /** Past this the read answers `found: false`; `DIRECT_READ_TIMEOUT_MS` in the hold. */
@@ -429,8 +444,49 @@ export interface DirectDeclarationDeps {
 export function directDeclarationResolver(
     deps: DirectDeclarationDeps
 ): (senderDID: string) => Promise<SenderDeclarationResolution> {
-    void deps
-    return async () => {
-        throw new Error("directDeclarationResolver: not implemented")
+    return async (senderDID) => {
+        const signal = AbortSignal.timeout(deps.timeoutMs)
+        try {
+            const signingKey = await untilAborted(deps.resolveSigningKey(senderDID), signal)
+            if (signingKey === null) {
+                return { found: false, reason: "no #atproto signing key for the DID" }
+            }
+            const car = await untilAborted(
+                deps.fetchProofCar(senderDID, DECLARATION_COLLECTION_NSID, "self", signal),
+                signal
+            )
+            const verified = verifyRecordProof(car, {
+                did: senderDID,
+                signingKey,
+                collection: DECLARATION_COLLECTION_NSID,
+                rkey: "self",
+            })
+            return declarationResolutionOf({ ...verified, car })
+        } catch (error) {
+            return { found: false, reason: `direct read failed: ${String(error)}` }
+        }
     }
+}
+
+/** Rejects once `signal` aborts, even if `work` ignores it. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        if (signal.aborted) {
+            reject(signal.reason)
+            work.catch(() => {})
+            return
+        }
+        const onAbort = () => reject(signal.reason)
+        signal.addEventListener("abort", onAbort, { once: true })
+        work.then(
+            (value) => {
+                signal.removeEventListener("abort", onAbort)
+                resolve(value)
+            },
+            (error) => {
+                signal.removeEventListener("abort", onAbort)
+                reject(error)
+            }
+        )
+    })
 }

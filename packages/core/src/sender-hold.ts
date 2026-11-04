@@ -1,6 +1,14 @@
-import type { AuthenticatedPutDeps } from "./authenticated-put.js"
-import type { SenderDeclarationResolution } from "./declaration.js"
+import { ingestAuthenticatedPut, type AuthenticatedPutDeps } from "./authenticated-put.js"
+import { parseOkpEd25519Key } from "./cose/key.js"
+import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
+import {
+    DECLARATION_COLLECTION_NSID,
+    declarationAnchorKeyOf,
+    type SenderDeclarationResolution,
+} from "./declaration.js"
 import { FIREHOSE_COVERAGE_MAX_LAG_MS } from "./firehose-coverage.js"
+import { readRecordFromCar } from "./repo-proof.js"
+import { compareRev } from "./rev.js"
 import type { PairMailboxKey } from "./storage.js"
 
 /**
@@ -40,9 +48,17 @@ export const UNSNAPSHOTTED_HOLD_CONSULTS_PER_MINUTE = 60
 
 /** A per-minute budget: true while this minute has budget left, and spends one. */
 export function perMinuteBudget(perMinute: number): (nowSeconds: number) => boolean {
-    void perMinute
-    return () => {
-        throw new Error("perMinuteBudget: not implemented")
+    let minute = -1
+    let spent = 0
+    return (nowSeconds) => {
+        const current = Math.floor(nowSeconds / 60)
+        if (current !== minute) {
+            minute = current
+            spent = 0
+        }
+        if (spent >= perMinute) return false
+        spent += 1
+        return true
     }
 }
 
@@ -69,7 +85,7 @@ export interface HeldPairPut {
     envelope: Uint8Array
     /**
      * Hex of the envelope nonce; a repeat while held is absorbed. Scoped to
-     * the sender across recipients, narrower than the relay's per-recipient
+     * the sender across recipients, coarser than the relay's per-recipient
      * seen set; clients draw nonces at random.
      */
     nonceHex: string
@@ -155,9 +171,112 @@ export async function admitToHold(
     request: HoldRequest,
     deps: AdmitToHoldDeps
 ): Promise<HoldAdmission> {
-    void request
-    void deps
-    throw new Error("admitToHold: not implemented")
+    let envelope: ReturnType<typeof decodePairPutEnvelope>
+    try {
+        envelope = decodePairPutEnvelope(request.envelope)
+    } catch {
+        return { outcome: "unverifiable" }
+    }
+    if (envelope.payload.senderDID !== deps.senderDID) return { outcome: "unverifiable" }
+    const { storage } = deps
+    const now = request.nowSeconds
+
+    const settledVerdict = async (): Promise<HoldAdmission | null> => {
+        const settled = await storage.settled()
+        if (settled === null) return null
+        const declaration = settled.declaration
+        if (compareRev(request.snapshotRevision, declaration.revision) !== "advanced") return null
+        const outcome = verifyPairPut(envelope, declaration.anchorKey.x, request.recipientDID)
+        if (outcome.valid) return { outcome: "settled", declaration }
+        return outcome.code === "recipient" ? { outcome: "accepted" } : null
+    }
+
+    const settledFirst = await settledVerdict()
+    if (settledFirst !== null) return settledFirst
+
+    const viaInterim = async (interim: InterimDeclaration): Promise<HoldAdmission | null> => {
+        const outcome = verifyPairPut(envelope, interim.anchorKey, request.recipientDID)
+        if (outcome.valid) return holdVerified(request, envelope, interim, deps)
+        return outcome.code === "recipient" ? { outcome: "accepted" } : null
+    }
+
+    const settledRevision = (await storage.settled())?.declaration.revision ?? null
+    const cached = await storage.interim()
+    if (
+        cached !== null &&
+        now - cached.readAtSeconds < SENDER_HOLD_TTL_SECONDS &&
+        compareRev(request.snapshotRevision, cached.revision) === "advanced" &&
+        compareRev(settledRevision, cached.revision) === "advanced"
+    ) {
+        const verdict = await viaInterim(cached)
+        if (verdict !== null) return verdict
+    }
+
+    const lastRead = await storage.lastDirectReadAt()
+    if (lastRead !== null && now - lastRead < DIRECT_READ_MEMO_SECONDS) {
+        return { outcome: "unverifiable" }
+    }
+    const read = await deps.readDirect(deps.senderDID)
+    await storage.setLastDirectReadAt(now)
+    if (!read.found) return { outcome: "unverifiable" }
+
+    const settledAfterRead = await settledVerdict()
+    if (settledAfterRead !== null) return settledAfterRead
+    const settledRevisionAfterRead = (await storage.settled())?.declaration.revision ?? null
+    if (
+        compareRev(request.snapshotRevision, read.revision) !== "advanced" ||
+        compareRev(settledRevisionAfterRead, read.revision) !== "advanced"
+    ) {
+        return { outcome: "unverifiable" }
+    }
+    const interim: InterimDeclaration = {
+        anchorKey: read.anchorKey.x,
+        declarationCID: read.declarationCID,
+        revision: read.revision,
+        readAtSeconds: now,
+    }
+    await storage.setInterim(interim)
+    return (await viaInterim(interim)) ?? { outcome: "unverifiable" }
+}
+
+const lockTails = new WeakMap<object, Promise<unknown>>()
+
+/** Runs `work` after every earlier call for the same `key` has finished. */
+function serialized<T>(key: object, work: () => Promise<T>): Promise<T> {
+    const result = (lockTails.get(key) ?? Promise.resolve()).then(work, work)
+    lockTails.set(key, result.catch(() => {}))
+    return result
+}
+
+/**
+ * Holds a put that verified under `interim`: absorbed if its nonce is already
+ * held, refused at the cap, else appended. The check and the append are one
+ * critical section, because puts that shared a direct read resume together.
+ */
+function holdVerified(
+    request: HoldRequest,
+    envelope: ReturnType<typeof decodePairPutEnvelope>,
+    interim: InterimDeclaration,
+    deps: AdmitToHoldDeps
+): Promise<HoldAdmission> {
+    const nonceHex = Array.from(envelope.payload.nonce, (b) => b.toString(16).padStart(2, "0")).join("")
+    return serialized(deps.storage, async () => {
+        const held = await deps.storage.held()
+        if (held.some((put) => put.nonceHex === nonceHex)) return { outcome: "accepted" }
+        if (held.length >= deps.maxHeld) {
+            const retryAfter = Math.min(...held.map((put) => put.expiresAtSeconds))
+            return { outcome: "full", retryAfter }
+        }
+        await deps.storage.append({
+            recipientDID: request.recipientDID,
+            envelope: request.envelope,
+            nonceHex,
+            heldUnderRevision: interim.revision,
+            heldAtSeconds: request.nowSeconds,
+            expiresAtSeconds: request.nowSeconds + SENDER_HOLD_TTL_SECONDS,
+        })
+        return { outcome: "accepted" }
+    })
 }
 
 /** The monitor's settled declaration (`SettledDeclaration` in the monitor package). */
@@ -205,10 +324,120 @@ export async function releaseHeld(
     deps: ReleaseDeps,
     nowSeconds: number
 ): Promise<ReleaseSummary> {
-    void settled
-    void deps
-    void nowSeconds
-    throw new Error("releaseHeld: not implemented")
+    const { storage, senderDID } = deps
+    const summary: ReleaseSummary = { released: 0, dropped: 0, kept: 0 }
+
+    if (settled === null) {
+        const held = await storage.held()
+        await storage.remove(held.map((put) => put.nonceHex))
+        await storage.setInterim(null)
+        await storage.setSettled(null)
+        summary.dropped = held.length
+        return summary
+    }
+
+    let car: ReturnType<typeof readRecordFromCar> = null
+    try {
+        car = readRecordFromCar(settled.car, DECLARATION_COLLECTION_NSID, "self")
+    } catch {}
+    const stored = await storage.settled()
+    if (
+        car === null ||
+        car.did !== senderDID ||
+        car.rev !== settled.rev ||
+        car.cid !== settled.cid ||
+        (stored !== null && compareRev(stored.declaration.revision, settled.rev) === "regressed")
+    ) {
+        summary.kept = (await storage.held()).length
+        return summary
+    }
+
+    let anchorKey: Uint8Array | null = null
+    const keyBlob = declarationAnchorKeyOf(car.record)
+    if (keyBlob !== null) {
+        try {
+            anchorKey = parseOkpEd25519Key(keyBlob).x
+        } catch {}
+    }
+    if (anchorKey !== null) {
+        await storage.setSettled({
+            declaration: {
+                found: true,
+                anchorKey: { x: anchorKey },
+                declarationCID: settled.cid,
+                revision: settled.rev,
+                evidenceCAR: settled.car,
+            },
+            settledAtSeconds: nowSeconds,
+        })
+    }
+
+    const interim = await storage.interim()
+    if (interim !== null && compareRev(interim.revision, settled.rev) !== "regressed") {
+        await storage.setInterim(null)
+    }
+
+    const tasks: Promise<unknown>[] = []
+    const ingestDeps: AuthenticatedPutDeps = { ...deps, defer: (work) => void tasks.push(work) }
+    const processed: string[] = []
+    for (const put of await storage.held()) {
+        if (put.expiresAtSeconds <= nowSeconds) {
+            processed.push(put.nonceHex)
+            summary.dropped += 1
+            continue
+        }
+        let verdict: "verifies" | "fails" | "undecodable" = "undecodable"
+        let envelope: ReturnType<typeof decodePairPutEnvelope> | null = null
+        try {
+            envelope = decodePairPutEnvelope(put.envelope)
+        } catch {}
+        if (envelope !== null && anchorKey !== null) {
+            verdict = verifyPairPut(envelope, anchorKey, put.recipientDID).valid ? "verifies" : "fails"
+        } else if (envelope !== null) {
+            verdict = "fails"
+        }
+        if (verdict === "verifies" && envelope !== null && anchorKey !== null) {
+            try {
+                const result = await ingestAuthenticatedPut(
+                    {
+                        recipientDID: put.recipientDID,
+                        senderDID,
+                        declarationCID: settled.cid,
+                        payload: envelope.payload.payload,
+                        replayKey: envelope.payload.nonce,
+                        evidence: {
+                            senderDID,
+                            anchorKey,
+                            declarationCID: settled.cid,
+                            revision: settled.rev,
+                            car: settled.car,
+                            expiresAt: nowSeconds + deps.config.limits.messageExpirySeconds,
+                        },
+                    },
+                    ingestDeps,
+                    nowSeconds
+                )
+                processed.push(put.nonceHex)
+                if (result.outcome === "accepted") summary.released += 1
+                else summary.dropped += 1
+            } catch (error) {
+                console.error("sender hold: release of a held put failed", error)
+                summary.kept += 1
+            }
+        } else if (verdict === "undecodable" || compareRev(put.heldUnderRevision, settled.rev) !== "regressed") {
+            processed.push(put.nonceHex)
+            summary.dropped += 1
+        } else {
+            summary.kept += 1
+        }
+    }
+    for (const outcome of await Promise.allSettled(tasks)) {
+        if (outcome.status === "rejected") {
+            console.error("sender hold: deferred work for a released put failed", outcome.reason)
+        }
+    }
+    await storage.remove(processed)
+    return summary
 }
 
 /** Drops expired held puts and an expired interim or settled declaration. Returns the earliest remaining expiry, or null. */
@@ -216,7 +445,22 @@ export async function sweepExpiredHolds(
     storage: SenderHoldStorage,
     nowSeconds: number
 ): Promise<number | null> {
-    void storage
-    void nowSeconds
-    throw new Error("sweepExpiredHolds: not implemented")
+    const held = await storage.held()
+    const expired = held.filter((put) => put.expiresAtSeconds <= nowSeconds)
+    if (expired.length > 0) await storage.remove(expired.map((put) => put.nonceHex))
+    const expiries = held.filter((put) => put.expiresAtSeconds > nowSeconds).map((put) => put.expiresAtSeconds)
+
+    const interim = await storage.interim()
+    if (interim !== null) {
+        const expiresAt = interim.readAtSeconds + SENDER_HOLD_TTL_SECONDS
+        if (expiresAt <= nowSeconds) await storage.setInterim(null)
+        else expiries.push(expiresAt)
+    }
+    const settled = await storage.settled()
+    if (settled !== null) {
+        const expiresAt = settled.settledAtSeconds + SENDER_HOLD_TTL_SECONDS
+        if (expiresAt <= nowSeconds) await storage.setSettled(null)
+        else expiries.push(expiresAt)
+    }
+    return expiries.length === 0 ? null : Math.min(...expiries)
 }

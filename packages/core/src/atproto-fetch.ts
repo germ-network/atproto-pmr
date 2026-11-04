@@ -48,6 +48,18 @@ import { BodyTooLargeError } from "./util"
 const FETCH_TIMEOUT_MS = 5_000
 const MAX_RESPONSE_BYTES = 64 * 1024
 
+/** Aborts `controller` when `signal` does. Returns the listener's removal. */
+function abortWith(controller: AbortController, signal: AbortSignal | undefined): () => void {
+    if (signal === undefined) return () => {}
+    if (signal.aborted) {
+        controller.abort()
+        return () => {}
+    }
+    const onAbort = () => controller.abort()
+    signal.addEventListener("abort", onAbort, { once: true })
+    return () => signal.removeEventListener("abort", onAbort)
+}
+
 /**
  * The endpoint confirmed a terminal state — a caller-recognized signal
  * that this does not exist (or is not currently reachable through this
@@ -164,6 +176,8 @@ export async function guardedFetchJSON(
         maxBytes?: number
         /** Request cache mode for freshness-sensitive callers. */
         cache?: "no-store"
+        /** Aborts the fetch, beside its own timeout. */
+        signal?: AbortSignal
     } = {}
 ): Promise<unknown> {
     let parsed: URL
@@ -178,6 +192,7 @@ export async function guardedFetchJSON(
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+    const unlink = abortWith(controller, options.signal)
     try {
         const response = await fetchImpl(url, {
             signal: controller.signal,
@@ -239,6 +254,7 @@ export async function guardedFetchJSON(
         return JSON.parse(text) as unknown
     } finally {
         clearTimeout(timer)
+        unlink()
     }
 }
 
@@ -362,6 +378,8 @@ export async function guardedFetchBytes(
          * not a silent narrowing of what counts as gone.
          */
         permanentErrorNames?: readonly string[]
+        /** Aborts the fetch, beside its own timeout. */
+        signal?: AbortSignal
     } = {}
 ): Promise<Uint8Array> {
     let parsed: URL
@@ -376,6 +394,7 @@ export async function guardedFetchBytes(
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+    const unlink = abortWith(controller, options.signal)
     try {
         const response = await fetchImpl(url, {
             signal: controller.signal,
@@ -402,6 +421,7 @@ export async function guardedFetchBytes(
         return await readCappedBytes(response, options.maxBytes ?? MAX_CAR_BYTES)
     } finally {
         clearTimeout(timer)
+        unlink()
     }
 }
 
@@ -613,14 +633,15 @@ const PLC_TOMBSTONE_MESSAGE_PREFIX = "DID not available: "
  */
 export async function fetchDidDocument(
     did: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
     let doc: unknown
     if (did.startsWith("did:plc:")) {
         doc = await guardedFetchJSON(
             `https://plc.directory/${encodeURIComponent(did)}`,
             fetchImpl,
-            { terminalMessagePrefixes: [PLC_TOMBSTONE_MESSAGE_PREFIX] }
+            { terminalMessagePrefixes: [PLC_TOMBSTONE_MESSAGE_PREFIX], signal }
         )
     } else if (did.startsWith("did:web:")) {
         // No terminal detection here, unlike the did:plc branch above: a
@@ -630,7 +651,7 @@ export async function fetchDidDocument(
         // proving nothing (see `RecordNotFoundError`'s own doc comment).
         // A 404 here stays genuinely ambiguous: gone, or the host is
         // merely down.
-        doc = await guardedFetchJSON(didWebDocumentURL(did), fetchImpl)
+        doc = await guardedFetchJSON(didWebDocumentURL(did), fetchImpl, { signal })
     } else {
         throw new Error(`unsupported DID method: ${did}`)
     }
@@ -666,9 +687,10 @@ export function fetchPlcAuditLog(did: string, fetchImpl: typeof fetch): Promise<
 
 export async function resolvePDSEndpoint(
     did: string,
-    fetchImpl: typeof fetch
+    fetchImpl: typeof fetch,
+    signal?: AbortSignal
 ): Promise<PDSResolution> {
-    return pdsResolutionFromDocument(await fetchDidDocument(did, fetchImpl))
+    return pdsResolutionFromDocument(await fetchDidDocument(did, fetchImpl, signal))
 }
 
 /**
@@ -879,8 +901,7 @@ export async function fetchRecordProofCar(
     /** Aborts both the PDS resolution and the record fetch, beside each fetch's own timeout. */
     signal?: AbortSignal
 ): Promise<Uint8Array> {
-    void signal
-    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl)
+    const { endpoint } = await resolvePDSEndpoint(did, fetchImpl, signal)
     const url = new URL(`${endpoint}/xrpc/com.atproto.sync.getRecord`)
     url.searchParams.set("did", did)
     url.searchParams.set("collection", collection)
@@ -893,6 +914,7 @@ export async function fetchRecordProofCar(
             "RepoSuspended",
             "RepoDeactivated",
         ],
+        signal,
     })
 }
 
