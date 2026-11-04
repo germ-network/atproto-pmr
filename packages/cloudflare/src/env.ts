@@ -91,4 +91,9 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     MONITOR_INGEST?: DurableObjectNamespace
     /** The name the monitor's singleton ingest object is addressed by. */
     MONITOR_INGEST_NAME?: string
+    /**
+     * A `SenderHoldObject` subclass, one object per sender DID. Absent means
+     * a put from a sender the monitor has not settled answers `409`.
+     */
+    SENDER_HOLDS?: DurableObjectNamespace
 }

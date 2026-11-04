@@ -28,6 +28,26 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["PMRObject"]
 
+# OPTIONAL: the sender hold, which answers `202` for a pair put from a sender
+# whose new declaration the key monitor has not yet settled, and delivers it
+# once the monitor does. Subclass `SenderHoldObject`, export the subclass from
+# your entry point, wire `senderHolds(env)` into `PairPutDeps.senderHold`, and
+# await `releaseSenderHold(...)` in your monitor's `onSettled`. The class MUST
+# be SQLite-backed (`new_sqlite_classes`), never `new_classes`. Senders with a
+# snapshot are held under any interest policy; wire `unsnapshottedHoldBudget`
+# to hold senders with none only where the monitor's interest policy is
+# `everyone`.
+#
+# [durable_objects]
+# bindings = [
+#   { name = "pmrs", class_name = "PMRObject" },
+#   { name = "SENDER_HOLDS", class_name = "MySenderHold" },
+# ]
+#
+# [[migrations]]
+# tag = "v2"
+# new_sqlite_classes = ["MySenderHold"]
+
 # ─────────────────────────────────────────────────────────────────────────
 # All values below are IMPLEMENTATION-DEFINED. The specification fixes none
 # of them; these are illustrative round numbers, not a recommendation. See

@@ -1,9 +1,10 @@
 import type { AdmissionSource } from "./admission.js"
-import { decodePairPutEnvelope, verifyPairPut } from "./cose/sign1.js"
+import { decodePairPutEnvelope, verifyPairPut, type VerifyOutcome } from "./cose/sign1.js"
 import { SenderDeclarationResolution } from "./declaration.js"
 import { ingestAuthenticatedPut } from "./authenticated-put.js"
 import { asPairMailboxKey } from "./mailbox-key.js"
 import { PMRConfig } from "./config.js"
+import type { SenderHold } from "./sender-hold.js"
 import {
     BodyStore,
     Directory,
@@ -40,6 +41,24 @@ export interface PairPutDeps {
      */
     admission?: AdmissionSource
     /**
+     * The sender's hold, consulted only when the put fails under the
+     * monitor's snapshot (no snapshot, or a signature failure). Omitted, such
+     * a put answers `409` as before. A sender with a snapshot is always one
+     * the monitor settles, so holding it is sound under any interest policy.
+     * A sender with none is settled only under interest policy `everyone`;
+     * see `unsnapshottedHoldBudget`.
+     */
+    senderHold?: (senderDID: PairMailboxKey) => SenderHold
+    /**
+     * Spends one hold consultation for a sender with no snapshot at all;
+     * false answers `409` without consulting the hold. Typically one
+     * isolate-wide `perMinuteBudget(UNSNAPSHOTTED_HOLD_CONSULTS_PER_MINUTE)`.
+     * Omitted, such a sender is never held. Wire it only where the monitor's
+     * interest policy is `everyone`: a put held for a DID the monitor never
+     * settles is never released.
+     */
+    unsnapshottedHoldBudget?: (nowSeconds: number) => boolean
+    /**
      * Run work after the response has been produced. On Workers this is
      * `ctx.waitUntil`; elsewhere it can be a plain fire-and-forget.
      *
@@ -69,7 +88,8 @@ export const DECLARATION_RETRY_AFTER_SECONDS = 60
  *    limits, before any lookup.
  *  - `409` + `Retry-After`: the relay has no verifiable declaration for the
  *    sender (none held, out of date, or unverifiable), or the signature fails under
- *    the one it has. Nothing is stored. The two causes are deliberately not
+ *    the one it has, and `senderHold`, where wired, does not verify the put
+ *    either. Nothing is stored. The two causes are deliberately not
  *    distinguished: a sender who has just rotated its key sees the same
  *    answer as one whose declaration the relay has not yet ingested, and
  *    both normally clear by waiting; one that persists is the sender's to surface. Decided after sender resolution and before any
@@ -78,10 +98,14 @@ export const DECLARATION_RETRY_AFTER_SECONDS = 60
  *    declaration — is public already (the monitor serves it per DID).
  *  - `429` + `Retry-After`: this sender's own provisioned mailbox is full,
  *    the one recipient-side fact per-sender reservation makes
- *    self-referential.
+ *    self-referential; or this sender's own hold is.
  *  - `202`: everything else — a validly signed put whether or not the
  *    recipient exists, names another recipient, is blocked, discarded or a
- *    duplicate. `5xx` is reserved for genuine relay faults.
+ *    duplicate, and a put the sender hold holds (or already holds), which may
+ *    never be delivered: it expires, a later rotation supersedes it, the
+ *    monitor stops tracking the DID, or the sender's PDS withholds the record
+ *    from the firehose.
+ *    `5xx` is reserved for genuine relay faults.
  *
  * `413` is kept distinct from `400` because the two are differently
  * actionable: `400` says the sender's encoder is wrong, `413` says only
@@ -98,13 +122,14 @@ export async function handlePairPut(
     // --- Address-independent and synchronous. Malformed input is real
     // client error and safe to report distinctly. ---
     let envelope: ReturnType<typeof decodePairPutEnvelope>
+    let bodyBytes: Uint8Array
     // The mailbox key is the sender's DID, from the SIGNED headers — the
     // same value verification runs against, never a routing hint. Narrowed
     // here, in request-bytes-only territory, because a non-DID sender is a
     // malformed envelope and nothing below may answer 400.
     let senderKey: PairMailboxKey
     try {
-        const bodyBytes = await readBodyCapped(
+        bodyBytes = await readBodyCapped(
             request,
             config.limits.messageMaxBytes + config.limits.framingAllowanceBytes
         )
@@ -131,23 +156,47 @@ export async function handlePairPut(
     // Step 1: sender DID from the SIGNED headers, never from routing.
     // `decodePairPutEnvelope` parsed it out of the protected header map, so
     // there is no routing hint in scope to prefer by construction.
-    const declaration = await deps.resolveDeclaration(envelope.payload.senderDID)
+    let declaration = await deps.resolveDeclaration(envelope.payload.senderDID)
+    let outcome: VerifyOutcome = { valid: false, code: "signature", reason: "no declaration" }
+    if (declaration.found) {
+        // Steps 2–4: verify against the RESOLVED key and confirm the signed
+        // recipient. `verifyPairPut` takes the key as a parameter and has no
+        // access to a resolver, so resolve-before-verify cannot be reordered.
+        outcome = verifyPairPut(envelope, declaration.anchorKey.x, recipientDID)
+    }
+    if (!outcome.valid && outcome.code === "signature") {
+        // The snapshot cannot verify the put. A sender with no snapshot at
+        // all is consulted only within the isolate-wide budget.
+        const hold = deps.senderHold
+        if (
+            hold === undefined ||
+            (!declaration.found && deps.unsnapshottedHoldBudget?.(nowSeconds) !== true)
+        ) {
+            return declarationUnverifiable()
+        }
+        const admission = await hold(senderKey).admit({
+            recipientDID,
+            envelope: bodyBytes,
+            snapshotRevision: declaration.found ? declaration.revision : null,
+            nowSeconds,
+        })
+        if (admission.outcome === "accepted") return new Response(null, { status: 202 })
+        if (admission.outcome === "full") {
+            return new Response(null, {
+                status: 429,
+                headers: { "Retry-After": String(Math.max(0, admission.retryAfter - nowSeconds)) },
+            })
+        }
+        if (admission.outcome === "unverifiable") return declarationUnverifiable()
+        declaration = admission.declaration
+        outcome = verifyPairPut(envelope, declaration.anchorKey.x, recipientDID)
+        if (!outcome.valid && outcome.code === "signature") return declarationUnverifiable()
+    }
     if (!declaration.found) return declarationUnverifiable()
-
-    // Steps 2–4: verify against the RESOLVED key and confirm the signed
-    // recipient. `verifyPairPut` takes the key as a parameter and has no
-    // access to a resolver, so resolve-before-verify cannot be reordered.
-    const outcome = verifyPairPut(
-        envelope,
-        declaration.anchorKey.x,
-        recipientDID
-    )
     if (!outcome.valid) {
         // A wrong recipient is not declaration state: waiting would not
         // help, so it stays the uniform 202.
-        return outcome.code === "signature"
-            ? declarationUnverifiable()
-            : new Response(null, { status: 202 })
+        return new Response(null, { status: 202 })
     }
 
     const locator = await deps.directory.resolve(recipientDID)

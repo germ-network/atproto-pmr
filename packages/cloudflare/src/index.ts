@@ -18,6 +18,10 @@
  *         protected synthetic = MY_BEHAVIOR
  *     }
  *
+ * The optional sender hold is the same: subclass `SenderHoldObject`, supply its
+ * `readDirect` and `releaseDeps`, and re-export the subclass from your entry
+ * point under the class name bound as `SENDER_HOLDS`.
+ *
  * `PMRObject.fetch` serves `GET /pmr/v1/events` and authenticates nothing:
  * it accepts any upgrade request reaching it and drains that relay's
  * backlog. A router MUST verify the RFC 9421 signature over the upgrade
@@ -36,4 +40,6 @@ export { monitorVerifiedAnchor } from "./monitor-verified-anchor"
 export { monitorOwnBlocks } from "./monitor-own-blocks"
 export { monitorOwnGraph } from "./monitor-own-graph"
 export { kvChallengeStore } from "./challenge-store"
+export { SenderHoldObject } from "./sender-hold-object"
+export { senderHolds, releaseSenderHold } from "./sender-holds"
 export type { PMREnv } from "./env"

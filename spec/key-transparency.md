@@ -390,10 +390,15 @@ A **relay** relies on a held snapshot for a pair put while the snapshot's
 freshness is within 24 hours. Past that, the monitor has fallen behind, and
 the relay checks the DID's PDS, comparing the record's CID only. If the PDS
 cannot be read, the older snapshot stands. If the record changed or is gone,
-the put is refused until the monitor catches up
+the put is refused until the monitor catches up, or held for it
 ([trust-model P5](trust-model.md#p5--sender-verification)). With continuous
 coverage this never fires; it bounds a monitor whose stream has broken for a
 day and whose resync has not yet reached that DID.
+
+A relay that holds a put for a sender who has just published a new
+declaration reads that sender's PDS once per minute at most, and delivers
+only on the declaration the monitor settles; a held put waits no longer than
+the lagging bound above ([trust-model P5](trust-model.md#p5--sender-verification)).
 
 A **device read** does not wait: a lapsed declaration is served as held, and
 the monitor is asked to move that DID forward in its resync. The read that

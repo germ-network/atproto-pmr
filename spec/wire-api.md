@@ -663,13 +663,16 @@ For a pair put, the permitted responses are exhaustive:
   for a sender inside a discard window, for a
   [blocked sender](#blocked-senders) whose synthetic state has room, and for
   a validly signed put whose recipient is unknown to this relay or is not
-  the recipient the sender signed.
+  the recipient the sender signed. A relay that implements the
+  [sender hold](#the-sender-hold) also answers `202` for a put it holds, and
+  for a repeat of one it holds.
 - **`409 Conflict` with `Retry-After`** — when the relay cannot verify the
   sender: it holds no current, verifiable declaration for the sender DID, or
   the put's signature does not verify under the anchor key that declaration
-  names. Nothing is stored.
+  names, and, where the relay implements the sender hold, the hold does not
+  verify it either. Nothing is stored.
 - **`429 Too Many Requests` with `Retry-After`** — when *the sender's own*
-  reservation is full.
+  reservation is full, or the sender's own hold is.
 - **`400`** or **`413`**, under the conditions below, for a request refused
   on its own bytes.
 
@@ -687,9 +690,38 @@ cannot tell from a forged put until it catches up; a
 causes — no usable declaration, and a signature that fails under the one the
 relay holds — are deliberately not distinguished: a sender who has just
 rotated its anchor key sees the same answer as one whose declaration has not
-been observed, and both normally clear on their own. What the answer
+been observed, and both normally clear on their own (a relay with the
+[sender hold](#the-sender-hold) bridges the first, while the monitor catches up). What the answer
 reveals — whether this relay's monitor observes the sender's declaration —
 the monitor already publishes per DID.
+
+#### The sender hold
+
+A relay MAY hold a put that fails verification under its monitor's snapshot,
+so that a sender who has just published a new declaration is not refused
+while the monitor catches up. The hold is decided on the sender alone, after
+the request has passed its checks on its own bytes and before any recipient
+lookup, so no answer it gives varies with the recipient. The rules, and what
+the read of the sender's PDS may learn, are in
+[trust model P5](trust-model.md#p5--sender-verification).
+
+- A put that verifies under a declaration the monitor has settled and the
+  snapshot does not yet show is delivered as if the snapshot had shown it.
+- Otherwise a put that verifies under the declaration on the sender's PDS,
+  when that is newer than the snapshot's and than any the monitor has
+  settled, is held and answered `202`. A hold at its cap answers `429` with
+  `Retry-After`. Anything else is `409`.
+- A held put MUST NOT be stored in a mailbox. It is delivered, with the monitor's
+  settled declaration as its evidence, when the monitor settles a declaration
+  whose key verifies it. It is dropped when the monitor settles a declaration at
+  least as new as the one it was held under whose key does not verify it,
+  when it has waited ten minutes, or when the monitor stops tracking the DID.
+
+A `202` for a held put is therefore a promise to try, not to deliver: the put
+may never be delivered (expiry, a further rotation, the monitor ceasing to track the DID, or a PDS that
+withholds the record from the firehose). A sender that needs to know sends
+again once its declaration has settled. The sender's own state decides all of
+this, so the answer reveals nothing about the recipient.
 
 A sender that receives `409` SHOULD retry after `Retry-After` with backoff.
 A `409` that persists beyond the monitor's coverage lag (a stream gap plus
@@ -886,10 +918,14 @@ In order, no step optional:
    ([trust](trust-model.md#p2--relayed-repo-records-are-car)). The relay
    verifies a CAR the key monitor holds — the commit signature under the DID
    document's signing key, and the record's path through the commit's
-   tree. It does not take the declaration from the sender's PDS; the one
-   exception is a lapsed snapshot, which it checks against the PDS for
-   change only ([trust model P5](trust-model.md#p5--sender-verification)). A
-   sender whose declaration cannot be so resolved gets `409`.
+   tree. It does not deliver on a declaration taken from the sender's PDS.
+   The PDS is read in two cases: a lapsed snapshot, checked for change only,
+   and, for the [sender hold](#the-sender-hold), a put that failed under the
+   snapshot, whose verification under the PDS's declaration admits it to wait
+   for the monitor and never delivers it
+   ([trust model P5](trust-model.md#p5--sender-verification)). A sender whose
+   declaration cannot be so resolved, and whom the hold does not admit, gets
+   `409`.
 3. Verify the `COSE_Sign1` against **that** key — the declaration's, not
    any key or thumbprint carried in the message.
 4. Confirm the signed recipient DID is this recipient, and that the nonce
@@ -940,6 +976,12 @@ which is legitimately long-delayed (a device offline for an extended
 period); one long enough for recovery leaves replay open just as long.
 Scoping to the pre-session handshake resolves this. A plain freshness
 window MUST NOT be substituted for the nonce.
+
+A held put's nonce is recorded when the put is released, because only then is
+it stored. While the put is held, a repeat of its nonce from the same sender
+is absorbed (answered `202`, held once). The hold's check is keyed by
+sender alone, across recipients, coarser than the per-recipient seen set,
+which is the only check at release.
 
 Nonce width and seen-set retention are [not yet specified](#not-yet-specified).
 
@@ -1373,8 +1415,10 @@ verifies what it is served.
 A relay resolving a counterpart declaration to check a pair-put signature is
 likewise: it parses and verifies the CAR it takes from the monitor, rather than relying on the monitor's check
 (commit signature under the DID document's signing key, and the record's
-path through the commit's tree), and does not take the declaration from the
-sender's PDS.
+path through the commit's tree), and does not deliver on a declaration taken
+from the sender's PDS. A relay with the [sender hold](#the-sender-hold) reads
+that PDS only to admit a put to wait for the monitor
+([trust model P5](trust-model.md#p5--sender-verification)).
 
 ### Device reads — records and summary
 
@@ -2105,7 +2149,7 @@ Three populations, and what each may learn is a security property:
 | audience | answer |
 |---|---|
 | peer, grant put | `202` for every address-dependent outcome — no other code, no timing difference. `400` or `413` only where the refusal is decided on the request bytes and advertised limits alone |
-| peer, pair put | `202`; `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
+| peer, pair put | `202`, including for a put held by the [sender hold](#the-sender-hold); `409` + `Retry-After` when the relay cannot verify the sender (a fact about the sender, decided before any recipient lookup); `429` + `Retry-After` when their own reservation or hold is full; or `400` / `413` where the refusal is decided on the request bytes and advertised limits alone. Nothing recipient-dependent — not whether the recipient is active, not whether they were blocked |
 | owner | real, actionable codes — `401`, `404`, `409`, `413`, `429` — because client retry logic depends on distinguishing transient from terminal |
 
 An owner `409` on summary is transient, with `Retry-After`; on registration

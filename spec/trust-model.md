@@ -120,7 +120,7 @@ reproduces the gap the algorithm closes. Self-authentication establishes
 is payload → anchor key → declaration → DID, and no link is optional. See
 [`wire-api.md` §The verification algorithm](wire-api.md#the-verification-algorithm).
 
-**The declaration comes from a third party, never from the sender's PDS.**
+**The declaration a put is delivered under comes from a third party, never from the sender's PDS.**
 The relay verifies the CAR a key monitor holds for the sender — the commit
 signature under the DID document's signing key, and the declaration record's
 path through the commit's tree — and, on an ordinary put, contacts only the monitor's snapshot
@@ -145,8 +145,8 @@ stream's lag, plus the propagation delay of about a minute)
 a `did:web` document, or a `did:plc` document without that coverage, for ten
 minutes, after which the relay asks the directory as above, with the same
 stale-if-error behaviour.
-It does not take the
-declaration from the sender's PDS on a put, for two reasons: an inline fetch
+It does not deliver a put
+on a declaration taken from the sender's PDS, for two reasons: an inline fetch
 tells the sender's PDS when the sender sends, and a read from the party
 whose claim is being checked is not independent of it. The cost is
 freshness: the relay's view is the monitor's view, current as of the
@@ -154,22 +154,91 @@ monitor's firehose coverage
 ([key-transparency](key-transparency.md#freshness-comes-from-coverage-not-polling)).
 A rotation or revocation the monitor has not yet observed is accepted until it is.
 
-**One bounded exception.** A held snapshot whose freshness (the monitor's
+A relay that has already received the monitor's settled declaration for the
+sender (the sender hold below keeps each one), whose snapshot read has not yet
+caught up, MAY verify under that declaration as it would under the snapshot.
+It is the monitor's own view, so this changes nothing above but the
+propagation delay.
+
+**Two bounded exceptions.**
+
+*The 24-hour read.* A held snapshot whose freshness (the monitor's
 coverage watermark, or that DID's last direct fetch if later) is more than
 24 hours old means the monitor has fallen behind. The relay then reads the
 sender's PDS to check whether the declaration record is still the same
 — it compares the record CID and nothing else, and never takes the PDS's
 bytes as the declaration. Unchanged, the snapshot stands. Changed or gone,
 the snapshot is out of date and the put answers `409` until the monitor
-catches up. If the PDS cannot be read, the older snapshot stands rather than
+catches up, unless the sender hold below applies. If the PDS cannot be read, the older snapshot stands rather than
 refusing the sender. The answer is remembered for ten minutes, so repeated or
 forged puts naming a lapsed DID do not each cost a read. That read does tell
 that DID's PDS that a put naming it arrived (anyone can send one), but only
 for senders whose monitor snapshot has already lapsed. A pair
-put with no held snapshot at all answers `409`,
-[wire-api.md](wire-api.md#delivery--peer-facing). The
+put with no held snapshot at all answers `409`, unless the sender hold below
+applies ([wire-api.md](wire-api.md#delivery--peer-facing)). The
 device's defence is its own PLC-verified view of the sender's declaration,
 not the hint.
+
+*The sender hold.* A sender that has just published a new declaration (a new
+device, a rotated key) fails verification under the monitor's snapshot until
+the monitor settles it (fetches and stores the record, per the
+[firehose coverage rule](key-transparency.md#the-firehose-coverage-rule)) and
+the snapshot propagates, about a minute. A relay
+MAY, instead of answering `409`, **hold** a put that fails under the
+snapshot, or that has no snapshot, and answer `202`
+([wire-api.md](wire-api.md#delivery--peer-facing)). Only a put that is
+well-formed and within the advertised limits is held. To decide, the relay
+reads the sender's PDS. The read verifies the commit signature and the
+declaration's path through the commit's tree, as for a snapshot, and counts
+only if the revision is newer than the snapshot's and than any declaration
+the monitor has settled for that sender. The put is held only if it verifies
+under the key that declaration names.
+
+That read admits the put to wait. A relay MUST NOT deliver a put on that
+read or store it with that read as evidence: a held put is delivered only
+when the monitor settles a declaration whose key verifies it; the relay then verifies the put again
+under the key in the monitor's settled record and stores it with that
+record as evidence, exactly as for a snapshot put. The sender's PDS can
+therefore delay delivery or cause a drop, and cannot cause a put to be
+delivered that the monitor's own view would not.
+
+Three limits keep the read from being a probe:
+
+- It happens only on a put the snapshot does not verify (a failed signature,
+  or no snapshot), so a put that verifies under the snapshot never causes a
+  read.
+- It completes at most once per sender per minute, and concurrent puts for
+  one sender share one read; later puts meet the declaration it found.
+- Its overall time, including resolving the signing key, is bounded to a few
+  seconds. A slower PDS gets the `409`.
+
+A put naming a DID with **no** snapshot at all costs a directory read, a PDS
+read and a hold, and anyone can send one, so a relay MUST bound such
+consultations as a whole, and answers `409` once the bound is spent (a relay
+with no such bound answers `409` for every such put). A relay whose monitor
+does not settle every declaration holder MUST NOT hold such a put (see
+below).
+
+The 10 minutes a put waits is the bound after which the monitor itself counts
+the DID as lagging ([key-transparency](key-transparency.md#the-firehose-coverage-rule)),
+so waiting longer buys nothing. A held put's `202` therefore **promises
+nothing about delivery**: the put is dropped if it expires, if the sender
+rotated again before the monitor settled the declaration it verified under,
+if the monitor stopped tracking the DID, or if the sender's PDS withholds the
+record from the firehose. The honest case is a record just written and in
+use. A dishonest PDS that withholds only delays or loses its own user's
+messages; it learns of puts naming that user, which is the exposure listed in
+[what a relay necessarily learns](#what-a-relay-necessarily-learns).
+
+A relay holds a put only for a sender its monitor will settle. For a sender
+with a snapshot that is true under any interest policy, because the monitor
+keeps a snapshot only for a DID in its interest set and disposes of it when
+the DID leaves. A sender with no snapshot is settled only where the monitor's
+interest policy keeps every declaration holder
+([messaging-appview](messaging-appview.md)); under a narrower policy the
+monitor never fetches that DID's declaration, so the relay answers `409` for
+it instead of holding. A put held for a DID the monitor never settles is
+never delivered.
 
 This verification serves the relay's abuse control and policy tiers, not
 the recipient's end-to-end security — the device authenticates
@@ -253,6 +322,7 @@ move. This is the only structural answer to a relay that misbehaves.
 | sender DID on a pair-mailbox put | **Yes** | the direct cost of requiring authenticated puts: a signed put names the sender |
 | counterpart identity on a grant-addressed put | No | grant addresses are derived and opaque, and name nobody. This is why steady-state traffic offloads to them |
 | timing, sizes, message and attachment counts | Yes | unavoidable for a store-and-forward mailbox |
+| that a put naming a DID arrived, to that DID's PDS | Only with a sender hold, and only for a put the monitor's snapshot does not verify | the hold's read of the sender's PDS; one per sender per minute ([P5](#p5--sender-verification)) |
 | the user's social graph and interest set | Only if non-public data is an input | |
 | platform push token | Only if it does not delegate | a delegating relay holds a capability instead ([P7](#p7--no-push-custody-where-a-relay-delegates)) |
 | push payload content | No | sealed under a device ↔ relay key before any delegated push service sees it |
