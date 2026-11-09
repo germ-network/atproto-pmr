@@ -49,6 +49,11 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     POOL_DEPTH_PER_SENDER: string
     POOL_DEPTH_UNDER_PRESSURE: string
 
+    /** Entries one sender's request mailbox holds before it refuses. */
+    REQUEST_DEPTH_PER_SENDER: string
+    /** One byte quota across all request mailboxes, proof bytes included. */
+    REQUEST_SHARED_CAP_BYTES: string
+
     /**
      * `active`, `draining`, or `absent` — deployment-wide policy for grant
      * issuance. Operating mailboxes is not configurable: a relay serves

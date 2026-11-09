@@ -54,3 +54,13 @@ The hex was produced independently of the TypeScript encoder; the monitor
 bundle test decodes and re-encodes every fixture and executes the request
 fixtures against the authenticated handler. Request signatures cover the whole
 body through RFC 9421; these are body vectors, not signed HTTP transcripts.
+
+## request-mailboxes.json
+
+Wire vectors for [request mailboxes](../wire-api.md#request-mailboxes): a
+request listing page with two senders (one holding several entries), a
+paged listing, an empty listing, a drop ack, and a fetched request entry.
+Produced by the reference implementation's own encoders (named in the
+file's `generatedBy`) and checked by
+`packages/core/test/request-vectors.spec.ts`. CBOR is lowercase hex. The
+`n` cursor in the paged vector is opaque; a client passes it back verbatim.

@@ -54,6 +54,17 @@ export interface PoolLimits {
     discardWindowSeconds: number
 }
 
+export interface RequestMailboxLimits {
+    /** Entries one sender's request mailbox holds before it refuses `429`. */
+    depthPerSender: number
+    /**
+     * One byte quota across all of a recipient's request mailboxes, counting
+     * entry bytes and the proof bytes held for request senders. Full keeps
+     * nothing more and refuses nothing.
+     */
+    sharedCapBytes: number
+}
+
 /**
  * Grants are the one thing a relay vends to third parties, so they are the
  * one thing whose retirement a peer can observe: peers hold addresses they

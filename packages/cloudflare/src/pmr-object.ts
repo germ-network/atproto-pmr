@@ -33,6 +33,8 @@ import {
     type PoolSender,
     type PoolAppendResult,
     type RegistrationFields,
+    type RequestAppendResult,
+    type RequestMailboxesPage,
     SUMMARY_TOKENS_KEPT,
     type SummaryIndex,
     type SyntheticBehavior,
@@ -1118,6 +1120,24 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             entries,
             nextCursor: hasMore && rows.length > 0 ? `@${rows[rows.length - 1]!.key}` : null,
         }
+    }
+
+    // MARK: - Request mailboxes
+
+    async appendToRequest(
+        _key: PairMailboxKey,
+        _ref: MessageRef,
+        _nonce: Nonce,
+        _nowSeconds: number
+    ): Promise<RequestAppendResult> {
+        throw new Error("appendToRequest: not implemented")
+    }
+
+    async requestMailboxes(
+        _cursor: string | null,
+        _limit: number
+    ): Promise<RequestMailboxesPage> {
+        throw new Error("requestMailboxes: not implemented")
     }
 
     // MARK: - The recovery pool

@@ -39,6 +39,9 @@ export type {
     PoolAppendResult,
     PoolSender,
     ReceiveResult,
+    RequestAppendResult,
+    RequestMailbox,
+    RequestMailboxesPage,
     BlockSource,
     RegistrationFields,
     ResolvedAddress,
@@ -98,6 +101,7 @@ export {
     type PMRConfig,
     type PMRLimits,
     type PoolLimits,
+    type RequestMailboxLimits,
     type ServedCapabilities,
 } from "./config"
 
@@ -166,6 +170,8 @@ export {
     handleSummaryRead,
     handlePoolAdjudication,
     handlePoolList,
+    handleRequestsList,
+    requestListingFields,
     handleRegistrationCreate,
     handleRegistrationDelete,
     handleRegistrationRead,

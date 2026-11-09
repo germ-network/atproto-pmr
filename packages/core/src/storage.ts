@@ -142,7 +142,7 @@ export interface StoredPairMailboxEvidence extends PairMailboxMetadata {
 }
 
 export interface PairAppendResult {
-    result?: AppendResult | PoolAppendResult | ReceiveResult
+    result?: AppendResult | PoolAppendResult | RequestAppendResult | ReceiveResult
     generation?: string
     evidenceCID?: string
     generationChanged: boolean
@@ -256,6 +256,48 @@ export type ReceiveResult =
     | { outcome: "duplicate" }
     | { outcome: "refused"; retryAfter: number }
     | { outcome: "exhausted" }
+    /** Held in the sender's request mailbox; store the body, never deliver it. */
+    | { outcome: "held" }
+    /** The shared request quota could not hold it: nothing kept, no body. */
+    | { outcome: "dropped" }
+
+/**
+ * What `appendToRequest` did with a put from a sender admission did not
+ * admit. Like a pair mailbox, a request mailbox refuses when full and keeps
+ * its oldest entries; unlike one, it never wakes the device.
+ */
+export type RequestAppendResult =
+    /** Held in the sender's request mailbox. The caller stores the body and delivers nothing. */
+    | { outcome: "held" }
+    /** Same reasoning as `AppendResult`'s `duplicate`. */
+    | { outcome: "duplicate" }
+    /**
+     * The sender's request mailbox is at its depth. `retryAfter` is absolute
+     * and MUST come from the same mechanism a full pair mailbox and the
+     * synthetic path use (`SyntheticBehavior.nextRetryInstant`), so a `429`
+     * does not say which tier, or whether a block, produced it.
+     */
+    | { outcome: "refused"; retryAfter: number }
+    /**
+     * The recipient's shared request quota cannot hold the entry with any
+     * proof bytes it would newly retain. Nothing is kept — no entry, proof,
+     * evidence row or nonce — and the caller writes no body. Invisible to the
+     * sender: the put still answers `202`.
+     */
+    | { outcome: "dropped" }
+
+/** One sender's request mailbox, as the owner lists it: never bodies. */
+export interface RequestMailbox {
+    key: PairMailboxKey
+    /** Entry ids, oldest first. Never empty: an empty request mailbox does not exist. */
+    messageIds: MessageId[]
+}
+
+export interface RequestMailboxesPage {
+    entries: RequestMailbox[]
+    /** Opaque — pass back verbatim to continue. `null` past the last page. */
+    nextCursor: string | null
+}
 
 /**
  * Who set a relay block. A `bsky` marker mirrors the owner's Bsky block and
@@ -610,12 +652,17 @@ export interface PMRStore {
 
     list(key: MailboxKey, limit: number): Promise<MessageRef[]>
 
-    /** CONSISTENCY CONTRACT (6): MUST succeed on an already-removed record. */
+    /**
+     * CONSISTENCY CONTRACT (6): MUST succeed on an already-removed record.
+     * Reaches the sender's request entries under the same key; removing the
+     * last one deletes the request mailbox.
+     */
     remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void>
 
     /**
-     * The one queued ref `messageId` names in mailbox `key`, or null when the
-     * mailbox is absent or holds no such id. A read only: the entry stays
+     * The one queued ref `messageId` names in mailbox `key` — its pair or
+     * grant mailbox, or the sender's request mailbox — or null when no
+     * mailbox under `key` holds such an id. A read only: the entry stays
      * queued until acked through `remove`. Every miss is the same null,
      * including a key too long to store, so a caller cannot tell an acked
      * message from one that never existed.
@@ -713,6 +760,38 @@ export interface PMRStore {
      * treating an empty page as the end.
      */
     openMailboxes(cursor: string | null, limit: number): Promise<OpenMailboxesPage>
+
+    /**
+     * Hold a put from a sender admission did not admit (or, with no
+     * admission source, any sender without a pair mailbox) in that sender's
+     * request mailbox — `spec/wire-api.md` §Request mailboxes.
+     *
+     * Order: the nonce check (shared with `append` for the same key, since a
+     * nonce belongs to the sender and envelope, not the tier), then the
+     * sender's depth (`refused` at `RequestMailboxLimits.depthPerSender`,
+     * keeping the oldest), then the shared byte quota (`dropped` when the
+     * ref's bytes do not fit). Only `held` records the nonce.
+     *
+     * Request entries never reach `openMailboxes`, `list`, `deliverLive` or
+     * `deliverPush`. `getMessage` and `remove` reach them under the same key.
+     * Removing a sender's last entry deletes its request mailbox outright.
+     *
+     * CONSISTENCY CONTRACT (3): the shared byte accounting is
+     * read-modify-write and needs real atomicity under contention.
+     */
+    appendToRequest(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number
+    ): Promise<RequestAppendResult>
+
+    /**
+     * The owner's request listing — DIDs and entry ids, never bodies or
+     * relay reasons — paged in key order. As with `openMailboxes`, a page
+     * may come back empty with a non-null `nextCursor`.
+     */
+    requestMailboxes(cursor: string | null, limit: number): Promise<RequestMailboxesPage>
 
     /**
      * The recovery pool. Do NOT implement by reusing `append` with a

@@ -24,6 +24,7 @@ import type {
     PairMailboxKey,
     PMRStore,
     RegistrationFields,
+    RequestMailboxesPage,
 } from "../storage.js"
 import { messageIdFromWire } from "../storage.js"
 import { mintChallenge, type ChallengeConfig } from "../challenge.js"
@@ -607,6 +608,42 @@ export async function handleBlockSet(
     // Idempotent both ways — blocking an already-blocked sender, or
     // unblocking one who is not blocked, both succeed.
     return amortize(new Response(null, { status: 204 }), a.auth.did, deps)
+}
+
+// MARK: - Request mailboxes
+
+/**
+ * `GET /pmr/v1/requests?cursor=` — the request listing: `{rq: [{k, id}], n}`,
+ * one row per request mailbox with its entry ids oldest first, never bodies or
+ * relay reasons. Paged by `catchUpPageMailboxes`; the first page (no cursor)
+ * mirrors the owner's Bsky blocks before it reads.
+ */
+export async function handleRequestsList(
+    request: Request,
+    deps: OwnerDeps & Pick<MessagesConfig, "catchUpPageMailboxes">
+): Promise<Response> {
+    void request
+    void deps
+    throw new Error("handleRequestsList: not implemented")
+}
+
+/**
+ * One request-listing page as its CBOR map: `{rq: [{k, id}], n}`. A row's
+ * count is its `id` array's length; no relay verdict, reason or generation.
+ */
+export function requestListingFields(page: RequestMailboxesPage): Map<string, CoseValue> {
+    return new Map<string, CoseValue>([
+        [
+            "rq",
+            page.entries.map(
+                (entry) => new Map<string, CoseValue>([
+                    ["k", entry.key],
+                    ["id", [...entry.messageIds]],
+                ])
+            ),
+        ],
+        ["n", page.nextCursor],
+    ])
 }
 
 // MARK: - Pool
