@@ -148,7 +148,7 @@ distinct name.
 | `append(mailboxKey, messageRef) -> Appended \| Refused(full)` | **refuses at capacity — never accept-and-evict**; the cap check and the write MUST be one atomic step, or two concurrent puts both see room |
 | `receive(senderKey, messageRef, admission) -> Queued \| Held \| Dropped \| Refused(full)` | one atomic step per judged pair put: a blocked sender is absorbed synthetically; otherwise the recipient's verdict alone routes the put, `yes` to the pair mailbox and anything else to the request mailbox; the nonce check comes first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit; a `yes` whose message id a request mailbox already holds is a duplicate), then the writes. A `yes` moves the sender's request entries into the pair mailbox ahead of the new message, oldest first, as far as capacity allows |
 | `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; a request sender's selected proof is held under the shared request quota together with its entry, or not at all |
-| `appendToRequest(senderKey, messageRef, nonce) -> Held \| Duplicate \| Refused(full) \| Dropped` | **refuses at the sender's depth and keeps its oldest entries — never accept-and-evict**; `Dropped` when the shared quota cannot hold the entry with any proof bytes it would newly retain, keeping nothing and recording no nonce; the nonce check, the depth check, the quota check and the write MUST be one atomic step |
+| `appendToRequest(senderKey, messageRef, nonce) -> Held \| Duplicate \| Refused(full) \| Dropped` | `Duplicate` for a repeated nonce or a message id the sender's pair mailbox already holds; **refuses at the sender's depth and keeps its oldest entries — never accept-and-evict**; `Dropped` when the shared quota cannot hold the entry with any proof bytes it would newly retain, keeping nothing and recording no nonce; the nonce check, the depth check, the quota check and the write MUST be one atomic step |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
 | `remove(mailboxKey, messageId)` | ack; **idempotent**; reaches a sender's request entries as well as its pair entries, and removing the last request entry deletes the request mailbox |
 | `getMessage(mailboxKey, messageId) -> messageRef?` | fetch one by reference; read-only, never acks; reaches request entries under the sender's key, with the same answer on every miss |
@@ -164,17 +164,25 @@ request sender's proof counts against the shared request quota together with
 its first entry: both are held in one decision, or neither is kept — the put
 is dropped, with no entry, no proof and, for a first contact, no evidence row.
 A sender whose live proof is already held is charged only its entry bytes.
-The proof leaves the quota with the sender's last request entry; when it
-expires with the accepted message-body retention period, at which point a
-sender with no pair mailbox also loses its request entries, whose bodies
-expired with it; when admission moves every request entry into a pair mailbox,
-whose proof it then becomes, charged to no quota; and on a sender key change.
-A request entry held with no proof row has no such trigger and stays until
-acked, moved or blocked. Blocked, refused, duplicate and dropped outcomes MUST
-NOT retain proof bytes or expose a mailbox descriptor.
-A small latest-observed revision/CID/key watermark may remain for a live
-pair mailbox or a blocked sender to prevent a stale resolver result from rolling the key
-back. This tuple is independent of the selected proof's CID and revision:
+The proof leaves the quota when:
+
+- the sender's last request entry leaves;
+- it expires with the accepted message-body retention period, at which point
+  a sender with no pair mailbox also loses its request entries, whose bodies
+  expired with it;
+- admission moves every request entry into a pair mailbox, whose proof it
+  then becomes, charged to no quota; or
+- the sender's key changes.
+
+A request entry of a sender that holds a pair mailbox, or one held with no
+proof row, has no such trigger and stays until acked, moved or blocked; its
+body still expires, so a fetch may miss. An adapter that reclaims nothing on
+its own MUST still release the quota when it meets an expired proof.
+
+Blocked, refused, duplicate and dropped outcomes MUST NOT retain proof bytes or
+expose a mailbox descriptor. A small latest-observed revision/CID/key
+watermark may remain for a live pair mailbox or a blocked sender to prevent a
+stale resolver result from rolling the key back. This tuple is independent of the selected proof's CID and revision:
 a same-anchor-key declaration edit advances the watermark while keeping that
 generation and selected evidence. Repeated puts under the edited declaration
 remain valid; equal-revision different CID/key evidence remains refused. This
@@ -484,6 +492,4 @@ any of it to satisfy the contract:
 - **Whether the observation cache belongs in this interface at all**, given
   an adapter may drop it entirely. The argument for keeping it is that
   adopters who *do* persist it should not each invent the shape.
-- **Whether request mailboxes need a cap across senders beyond the byte
-  quota**, and what they would refuse or drop when they hit one, is open.
 - **Migration and versioning of the stored shapes**, once there is a v2.
