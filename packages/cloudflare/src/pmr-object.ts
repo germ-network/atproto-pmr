@@ -31,6 +31,7 @@ import {
     type PMRStore,
     type RegistrationFields,
     type RequestAppendResult,
+    type RequestMailbox,
     type RequestMailboxesPage,
     SUMMARY_TOKENS_KEPT,
     type SummaryIndex,
@@ -61,6 +62,21 @@ import { webPushSender } from "./push-sender"
 const KEY_REGISTRATION = "reg"
 /** Bytes held across every request mailbox: entries and, once accounted, their proofs. */
 const KEY_REQUEST_BYTES = "reqBytes"
+/** Used when `REQUEST_DEPTH_PER_SENDER` or `REQUEST_SHARED_CAP_BYTES` is unset or not a positive integer. */
+const DEFAULT_REQUEST_DEPTH_PER_SENDER = 5
+const DEFAULT_REQUEST_SHARED_CAP_BYTES = 5_000_000
+/** When the next sweep of request entries whose bodies have expired is due, in seconds. */
+const KEY_REQUEST_SWEEP_AT = "reqSweepAt"
+const KEY_REQUEST_SWEEP_CURSOR = "reqSweepCursor"
+const REQUEST_SWEEP_INTERVAL_SECONDS = 86_400
+const REQUEST_SWEEP_BATCH_SIZE = 50
+/**
+ * A request entry's body is written after its put is answered, and the body
+ * store is eventually consistent, so an entry is judged by its body only once
+ * it is older than this.
+ */
+const REQUEST_BODY_GRACE_SECONDS = 300
+const requestJudgementCutoff = () => Math.floor(Date.now() / 1000) - REQUEST_BODY_GRACE_SECONDS
 const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
 const KEY_PAIR_EVIDENCE_EXPIRY_MIN = "pairEvidenceExpiryMin"
 const PAIR_EVIDENCE_EXPIRY_BATCH_SIZE = 100
@@ -170,6 +186,29 @@ type StoredPairEvidence = StoredPairMailboxEvidence & {
 const NONCE_SEEN_SET_SIZE = 256
 const MAX_PAIR_EVIDENCE_BYTES = 1_000_000
 
+/** What `judgeRequestSweep` decided before the object was held. */
+interface RequestSweepPass {
+    /** Absent when no sweep is armed. */
+    dueAt: number | undefined
+    /** Present when the sweep is due now. */
+    senders?: Array<{ key: MailboxKey; dead: Set<MessageId> }>
+    full?: boolean
+}
+
+/** A request entry as stored: the ref plus when this object held it. */
+type HeldRef = MessageRef & { heldAt?: number }
+
+const unheld = (ref: HeldRef): MessageRef => {
+    const { heldAt: _heldAt, ...bare } = ref
+    return bare
+}
+
+/** A tunable that is missing or malformed must not unbound the tier it limits. */
+function positiveInteger(raw: string | undefined, fallback: number): number {
+    const n = Number(raw)
+    return Number.isSafeInteger(n) && n > 0 ? n : fallback
+}
+
 const nonceHex = (n: Nonce) =>
     [...n].map((b) => b.toString(16).padStart(2, "0")).join("")
 
@@ -207,7 +246,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     private requestDepth(): number {
-        return parseInt(this.env.REQUEST_DEPTH_PER_SENDER)
+        return positiveInteger(this.env.REQUEST_DEPTH_PER_SENDER, DEFAULT_REQUEST_DEPTH_PER_SENDER)
+    }
+
+    private requestCapBytes(): number {
+        return positiveInteger(this.env.REQUEST_SHARED_CAP_BYTES, DEFAULT_REQUEST_SHARED_CAP_BYTES)
     }
 
     /**
@@ -684,9 +727,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                     hint: { senderDID: key, declarationCID: selected.declarationCID },
                 }
                 : baseRef
-            // A request entry keeps its sender's proof with it, in one quota
-            // decision: nothing already held for a sender with a mailbox or a
-            // live proof, the whole CAR otherwise.
+            // A request entry keeps its sender's proof with it. Its CAR is
+            // charged to the request quota in the same decision as the entry,
+            // unless a live proof is already held or the sender has a pair
+            // mailbox, whose proof is not budgeted.
             const proofBytes = mailboxPresent || selected.car.byteLength > 0 ? 0 : evidence.car.byteLength
             const result = admission === undefined
                 ? (await this.hasMailbox(key))
@@ -696,7 +740,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
             const accepted = ("persistBody" in result) && result.persistBody &&
                 (result.outcome === "appended" || result.outcome === "queued")
-            const held = result.outcome === "held" && !mailboxPresent
+            const held = result.outcome === "held"
             if (accepted) {
                 const latest = await this.db.get<StoredPairEvidence>(evidenceKey)
                 selected = generationChanged || latest?.car.byteLength === 0
@@ -875,6 +919,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             await this.db.get(requestKey(key))
             await this.db.get(KEY_REQUEST_BYTES)
             await this.db.get(mailboxKey(key))
+            await this.db.get(KEY_REQUEST_SWEEP_AT)
         }
         const retryInstant = await this.retryInstant(key, nowSeconds)
         const { state, accepted } = this.synthetic.advance(
@@ -1003,8 +1048,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
         const deep = queue?.find((r) => r.messageId === messageId)
         if (deep !== undefined) return deep
-        const requests = await this.db.get<MessageRef[]>(requestKey(key))
-        return requests?.find((r) => r.messageId === messageId) ?? null
+        const requests = await this.db.get<HeldRef[]>(requestKey(key))
+        const held = requests?.find((r) => r.messageId === messageId)
+        return held === undefined ? null : unheld(held)
     }
 
     async hasMailbox(key: MailboxKey): Promise<boolean> {
@@ -1073,7 +1119,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         queue: MessageRef[],
         seen: string[]
     ): Promise<ReceiveResult> {
-        const requests = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+        const requests = (await this.db.get<HeldRef[]>(requestKey(key))) ?? []
         // A message id names one entry in exactly one tier.
         if (requests.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
         const capacity = this.capacity()
@@ -1083,7 +1129,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 retryAfter: await this.retryInstant(key, nowSeconds),
             }
         }
-        const moved = requests.slice(0, capacity - queue.length - 1)
+        const moved = requests.slice(0, capacity - queue.length - 1).map(unheld)
         await this.db.put(mailboxKey(key), [...queue, ...moved, ref])
         if (moved.length > 0) await this.writeRequest(key, requests, requests.slice(moved.length))
         await this.recordNonce(key, nonce, seen)
@@ -1193,7 +1239,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * Depth is judged before the shared quota, so a full sender refuses
      * whatever the quota's state. Every read happens before any decision,
      * so a dropped put issues the same reads as a held one and skips only
-     * the writes.
+     * the writes. There is no I/O outside this object's storage between the
+     * reads and the writes, which keeps the whole put atomic.
      *
      * `extraBytes` is what the caller will newly account alongside the entry
      * (a proof it holds for this sender), reserved in the same decision so
@@ -1210,9 +1257,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const seen = preloadedNonces ?? (await this.loadNonces(key))
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
 
-        const queue = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+        const queue = (await this.db.get<HeldRef[]>(requestKey(key))) ?? []
         const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
         const deep = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
+        const sweepAt = await this.db.get<number>(KEY_REQUEST_SWEEP_AT)
         // A message id names one entry in exactly one tier.
         if (deep.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
 
@@ -1223,33 +1271,109 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             }
         }
         const total = ref.byteLength + extraBytes
-        if (used + total > parseInt(this.env.REQUEST_SHARED_CAP_BYTES)) {
+        if (used + total > this.requestCapBytes()) {
             return { outcome: "dropped" }
         }
 
-        queue.push(ref)
+        queue.push({ ...ref, heldAt: Math.floor(Date.now() / 1000) })
         await this.db.put(requestKey(key), queue)
         await this.db.put(KEY_REQUEST_BYTES, used + total)
         await this.recordNonce(key, nonce, seen)
+        await this.armRequestSweep(sweepAt)
         return { outcome: "held" }
+    }
+
+    /**
+     * The ids among `refs` whose bodies are no longer stored: the retention
+     * that governs a body is the entry's too. An entry too young for its body
+     * to be written, and propagated to wherever this reads, is not judged; nor
+     * is one whose body store cannot be read. This awaits the body store, so
+     * a caller must not hold a read of `req:` across it: judge first, then
+     * `dropExpired` against fresh storage.
+     */
+    private async deadEntries(refs: HeldRef[]): Promise<Set<MessageId>> {
+        const old = refs.filter((r) => (r.heldAt ?? 0) <= requestJudgementCutoff())
+        const dead = new Set<MessageId>()
+        await Promise.all(
+            old.map(async (r) => {
+                if (!(await this.bodyStored(r.messageId))) dead.add(r.messageId)
+            })
+        )
+        return dead
+    }
+
+    /**
+     * Whether the body for `id` is still stored; a request entry whose body
+     * is gone has expired. This reads `env.messages`, the namespace
+     * `kvBodyStore` writes bodies to. A deployment that writes them anywhere
+     * else MUST override this to read that store, or every request entry is
+     * dropped once it is older than the grace window. A read that fails
+     * reports the body as stored.
+     */
+    protected async bodyStored(id: MessageId): Promise<boolean> {
+        try {
+            const body = await this.env.messages.get(id, "stream")
+            if (body === null) return false
+            await body.cancel()
+            return true
+        } catch {
+            // Unreadable, including past the platform's per-request read limit.
+            return true
+        }
+    }
+
+    /**
+     * Removes the entries of `key` that `deadEntries` found dead, re-reading
+     * storage so nothing that changed while the body store was consulted is
+     * overwritten, and returns their bytes, and the proof's with the last, to
+     * the quota. Storage operations only: atomic.
+     */
+    private async dropExpired(key: MailboxKey, dead: ReadonlySet<MessageId>): Promise<void> {
+        if (dead.size === 0) return
+        const refs = await this.db.get<HeldRef[]>(requestKey(key))
+        if (refs === undefined) return
+        const cutoff = requestJudgementCutoff()
+        const alive = refs.filter((r) => !(dead.has(r.messageId) && (r.heldAt ?? 0) <= cutoff))
+        if (alive.length !== refs.length) await this.writeRequest(key, refs, alive)
+    }
+
+    /** Arms the sweep for a day out when none is due, and re-arms one whose alarm was lost. */
+    private async armRequestSweep(dueAt: number | undefined): Promise<void> {
+        const nowMs = Date.now()
+        if (dueAt === undefined) {
+            const next = Math.floor(nowMs / 1000) + REQUEST_SWEEP_INTERVAL_SECONDS
+            await this.db.put(KEY_REQUEST_SWEEP_AT, next)
+            const current = await this.db.getAlarm()
+            if (current === null || next * 1000 < current) await this.db.setAlarm(next * 1000)
+        } else if (dueAt * 1000 <= nowMs && (await this.db.getAlarm()) === null) {
+            await this.db.setAlarm(nowMs + 1_000)
+        }
     }
 
     async requestMailboxes(
         cursor: string | null,
         limit: number
     ): Promise<RequestMailboxesPage> {
-        const rows = await this.db.list<MessageRef[]>({
+        const rows = await this.db.list<HeldRef[]>({
             prefix: REQUEST_PREFIX,
             startAfter: cursor === null || cursor === "" ? undefined : cursor,
             limit: limit + 1,
         })
         const all = [...rows]
         const page = all.slice(0, limit)
+        // Judge every entry before changing any: the body store is awaited,
+        // and no read of this object's own storage may span it.
+        const judged = await Promise.all(page.map(async ([, refs]) => this.deadEntries(refs)))
+        const entries: RequestMailbox[] = []
+        for (const [i, [raw, refs]] of page.entries()) {
+            const key = raw.slice(REQUEST_PREFIX.length) as PairMailboxKey
+            const dead = judged[i]!
+            await this.dropExpired(key, dead)
+            const alive = refs.filter((r) => !dead.has(r.messageId))
+            if (alive.length > 0) entries.push({ key, messageIds: alive.map((r) => r.messageId) })
+        }
         return {
-            entries: page.map(([raw, refs]) => ({
-                key: raw.slice(REQUEST_PREFIX.length) as PairMailboxKey,
-                messageIds: refs.map((r) => r.messageId),
-            })),
+            entries,
             nextCursor: all.length > limit && page.length > 0 ? page[page.length - 1]![0] : null,
         }
     }
@@ -1319,40 +1443,99 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
     }
 
-    /** Reclaims selected declaration CARs at their message-retention deadline. */
+    /**
+     * Reclaims selected declaration CARs at their message-retention deadline,
+     * and, when its time comes, sweeps request entries whose bodies expired.
+     */
     async alarm(): Promise<void> {
+        const nowSeconds = Math.floor(Date.now() / 1000)
+        // The body store is consulted before the object is held.
+        const requestPass = await this.judgeRequestSweep(nowSeconds)
         await this.ctx.blockConcurrencyWhile(async () => {
-            const nowSeconds = Math.floor(Date.now() / 1000)
-            const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-            const proofs = await this.db.list<StoredPairEvidence>({
-                prefix: PAIR_EVIDENCE_PREFIX,
-                ...(cursor !== undefined ? { startAfter: cursor } : {}),
-                limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
-            })
-            let nextExpiry = Number.POSITIVE_INFINITY
-            for (const [rawKey, proof] of proofs) {
-                const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
-                if (proof.expiresAt === 0) continue
-                if (proof.expiresAt <= nowSeconds) {
-                    await this.expireProof(key, (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined)
-                } else {
-                    nextExpiry = Math.min(nextExpiry, proof.expiresAt)
-                }
-            }
-            const previousMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-            const passMin = Math.min(previousMin ?? Number.POSITIVE_INFINITY, nextExpiry)
-            if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
-                const lastKey = [...proofs.keys()].at(-1)
-                if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
-                if (Number.isFinite(passMin)) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, passMin)
-                else await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-                await this.db.setAlarm(Math.min(passMin * 1000, Date.now() + 1_000))
-            } else {
-                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-                if (Number.isFinite(passMin)) await this.db.setAlarm(passMin * 1000)
-            }
+            const proofAlarmMs = await this.sweepExpiredProofs(nowSeconds)
+            const sweepAlarmMs = await this.applyRequestSweep(requestPass, nowSeconds)
+            const next = Math.min(proofAlarmMs ?? Number.POSITIVE_INFINITY, sweepAlarmMs ?? Number.POSITIVE_INFINITY)
+            if (Number.isFinite(next)) await this.db.setAlarm(next)
         })
+    }
+
+    /** One bounded pass over the proof rows; the alarm time it wants next, if any. */
+    private async sweepExpiredProofs(nowSeconds: number): Promise<number | null> {
+        const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        const proofs = await this.db.list<StoredPairEvidence>({
+            prefix: PAIR_EVIDENCE_PREFIX,
+            ...(cursor !== undefined ? { startAfter: cursor } : {}),
+            limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
+        })
+        let nextExpiry = Number.POSITIVE_INFINITY
+        for (const [rawKey, proof] of proofs) {
+            const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
+            if (proof.expiresAt === 0) continue
+            if (proof.expiresAt <= nowSeconds) {
+                await this.expireProof(key, (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined)
+            } else {
+                nextExpiry = Math.min(nextExpiry, proof.expiresAt)
+            }
+        }
+        const previousMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+        const passMin = Math.min(previousMin ?? Number.POSITIVE_INFINITY, nextExpiry)
+        if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
+            const lastKey = [...proofs.keys()].at(-1)
+            if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
+            if (Number.isFinite(passMin)) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, passMin)
+            else await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+            return Math.min(passMin * 1000, Date.now() + 1_000)
+        }
+        await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+        return Number.isFinite(passMin) ? passMin * 1000 : null
+    }
+
+    /** When the next request sweep is due, and if it is due now, the senders it covers and their dead entries. */
+    private async judgeRequestSweep(nowSeconds: number): Promise<RequestSweepPass> {
+        const dueAt = await this.db.get<number>(KEY_REQUEST_SWEEP_AT)
+        if (dueAt === undefined || dueAt > nowSeconds) return { dueAt }
+
+        const cursor = await this.db.get<string>(KEY_REQUEST_SWEEP_CURSOR)
+        const rows = await this.db.list<HeldRef[]>({
+            prefix: REQUEST_PREFIX,
+            ...(cursor !== undefined ? { startAfter: cursor } : {}),
+            limit: REQUEST_SWEEP_BATCH_SIZE,
+        })
+        const senders = [...rows]
+        const dead = await Promise.all(senders.map(async ([, refs]) => this.deadEntries(refs)))
+        return {
+            dueAt,
+            senders: senders.map(([raw], i) => ({
+                key: raw.slice(REQUEST_PREFIX.length) as MailboxKey,
+                dead: dead[i]!,
+            })),
+            full: rows.size === REQUEST_SWEEP_BATCH_SIZE,
+        }
+    }
+
+    /**
+     * Applies a request sweep pass; the alarm time it wants next, if any.
+     * Not due, it only reports when it will be; with no request entry left
+     * it disarms.
+     */
+    private async applyRequestSweep(pass: RequestSweepPass, nowSeconds: number): Promise<number | null> {
+        if (pass.dueAt === undefined) return null
+        if (pass.senders === undefined) return pass.dueAt * 1000
+
+        for (const { key, dead } of pass.senders) await this.dropExpired(key, dead)
+        if (pass.full) {
+            await this.db.put(KEY_REQUEST_SWEEP_CURSOR, requestKey(pass.senders.at(-1)!.key))
+            return Date.now() + 1_000
+        }
+        await this.db.delete(KEY_REQUEST_SWEEP_CURSOR)
+        if ((await this.db.list({ prefix: REQUEST_PREFIX, limit: 1 })).size === 0) {
+            await this.db.delete(KEY_REQUEST_SWEEP_AT)
+            return null
+        }
+        const next = nowSeconds + REQUEST_SWEEP_INTERVAL_SECONDS
+        await this.db.put(KEY_REQUEST_SWEEP_AT, next)
+        return next * 1000
     }
 
     async unblock(key: MailboxKey): Promise<void> {

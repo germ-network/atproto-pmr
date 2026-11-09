@@ -170,13 +170,13 @@ describe("synthetic capacity follows the tier", () => {
 
     it("a blocked sender's put reads the request mailbox, quota and pair mailbox as an unblocked sender's does", async () => {
         await inPMR(freshStub(), async (pmr) => {
-            const families = ["req", "reqBytes", "mbox"]
+            const families = ["req", "reqBytes", "mbox", "reqSweepAt"]
             const reads = (ops: string[]) => ops.filter((op) => op.startsWith("get:") && families.includes(op.slice(4))).sort()
             const unblocked = await traceStorage(pmr, () => pmr.receive(did("a"), ref("m1"), freshNonce(), T0, NO))
             await pmr.block(did("b"), T0)
             const blocked = await traceStorage(pmr, () => pmr.receive(did("b"), ref("m1"), freshNonce(), T0, NO))
             expect(reads(blocked)).toEqual(reads(unblocked))
-            expect(reads(unblocked)).toHaveLength(3)
+            expect(reads(unblocked)).toHaveLength(4)
         })
     })
 

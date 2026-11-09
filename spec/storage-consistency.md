@@ -164,6 +164,9 @@ request sender's proof counts against the shared request quota together with
 its first entry: both are held in one decision, or neither is kept — the put
 is dropped, with no entry, no proof and, for a first contact, no evidence row.
 A sender whose live proof is already held is charged only its entry bytes.
+A sender that holds a pair mailbox has the proof of a held entry stored, or its
+expiry extended, like any held entry, but charged to no quota, as a pair
+mailbox's proof is not.
 The proof leaves the quota when:
 
 - the sender's last request entry leaves;
@@ -174,10 +177,14 @@ The proof leaves the quota when:
   then becomes, charged to no quota; or
 - the sender's key changes.
 
-A request entry of a sender that holds a pair mailbox, or one held with no
-proof row, has no such trigger and stays until acked, moved or blocked; its
-body still expires, so a fetch may miss. An adapter that reclaims nothing on
-its own MUST still release the quota when it meets an expired proof.
+Every request entry also leaves, whatever its sender holds, once the
+retention that governs its body expires
+([`wire-api.md` §Request mailboxes](wire-api.md#request-mailboxes)): the store
+never lists it, and returns its bytes, and the proof's if it was the last, to
+the quota. A sender's own put need not purge, so a sender whose entries have
+expired may still be refused at its depth, or dropped at the quota, until the
+next listing or periodic sweep frees them. An adapter that reclaims nothing on
+its own MUST still do this when it meets an expired entry.
 
 Blocked, refused, duplicate and dropped outcomes MUST NOT retain proof bytes or
 expose a mailbox descriptor. A small latest-observed revision/CID/key
