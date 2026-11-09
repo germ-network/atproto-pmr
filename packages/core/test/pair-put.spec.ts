@@ -43,7 +43,7 @@ function world(resolution: (did: string) => SenderDeclarationResolution) {
             return {
                 result: hasMailbox
                     ? { outcome: "appended", persistBody: true }
-                    : { outcome: "pooled", persistBody: true },
+                    : { outcome: "held" },
                 generation: "generation-1",
                 evidenceCID: DC,
                 recycledMessageIds,

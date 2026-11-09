@@ -175,7 +175,6 @@ export function summaryWorld(options: { watched?: SummaryPageDeps["watched"] } =
         resolveLocator: (did) => directory.resolve(did),
         store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         graph: {
             ownGraph: async (did) => {
                 order.push("index")

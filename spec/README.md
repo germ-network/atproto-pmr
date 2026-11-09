@@ -191,7 +191,7 @@ is an index, not a substitute for the sections it links.
 | 7 | Message ids cover the stable message identity, never the signature bytes, **and** non-canonical Ed25519 signatures are rejected — both, not either | [wire](wire-api.md#malleability) |
 | 8 | Deterministic CBOR means RFC 8949 §4.2.1; non-conforming input is rejected, and an implementation emitting plain §4.2.1 MUST never be rejected for it | [wire](wire-api.md#deterministic-cbor) |
 | 9 | A blocked sender's view is **synthetic**, stores no bytes, causes no delivery and no push, and matches the real path's response timing and shape | [wire](wire-api.md#blocked-senders) |
-| 10 | An unprovisioned sender is accepted into the recovery pool, never refused; the pool is never pushed per arrival | [wire](wire-api.md#the-recovery-pool) |
+| 10 | A non-blocked sender admission does not admit is accepted into its request mailbox, refused only when that mailbox is full; a request mailbox never wakes the device | [wire](wire-api.md#request-mailboxes) |
 | 11 | Relayed atproto repo records are exchanged as CAR — signed commit plus inclusion proof — never as JSON | [trust](trust-model.md#p2--relayed-repo-records-are-car) |
 | 12 | The seven items of the storage consistency contract hold, whatever the backend | [storage](storage-consistency.md#the-consistency-contract) |
 | 13 | The relay's verification verdict is delivered to the device as a hint and never as evidence; the device re-verifies | [trust](trust-model.md#p8--the-relays-verdict-is-a-hint) |
@@ -215,7 +215,7 @@ Each document carries its own "Not yet specified" section:
   interoperating today; the rest are edges where divergence is survivable.
 - [`storage-consistency.md`](storage-consistency.md#not-yet-specified) —
   the blob interface, the observation cache's place in the interface, the
-  recovery pool's cross-sender cap, stored-shape versioning.
+  stored-shape versioning.
 - [`trust-model.md`](trust-model.md#not-yet-specified) — which flows get
   spot checks, `rev` staleness tolerance, quota exhaustion as a
   denial-of-service surface against the owner.

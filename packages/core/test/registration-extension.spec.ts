@@ -82,7 +82,6 @@ function deps(w: World, registrationExtension?: RegistrationExtension) {
         resolveLocator: (did: string) => w.directory.resolve(did),
         store: w.store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         resolveAnchorKey: async () => declaredKey,
         ...(registrationExtension !== undefined ? { registrationExtension } : {}),
     } satisfies OwnerDeps & { resolveAnchorKey: () => Promise<Uint8Array> }

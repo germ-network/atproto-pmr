@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { BlockEdge } from "../src/block-edges"
 import { BLOCK_SYNC_DEADLINE_MS, syncOwnerBlocks } from "../src/block-sync"
 import { drainBacklog } from "../src/events"
-import { handleMessagesList, handlePoolList } from "../src/owner/endpoints"
+import { handleMessagesList, handleRequestsList } from "../src/owner/endpoints"
 import type { PMRStore } from "../src/storage"
 import { ownerWorld, OWNER } from "./owner-harness"
 
@@ -28,9 +28,9 @@ function recordingStore(log: string[] = []) {
             log.push("openMailboxes")
             return { entries: [], nextCursor: null }
         },
-        poolSenders: async () => {
-            log.push("poolSenders")
-            return []
+        requestMailboxes: async () => {
+            log.push("requestMailboxes")
+            return { entries: [], nextCursor: null }
         },
     } as unknown as PMRStore
     return { store, synced, log }
@@ -179,12 +179,12 @@ describe("catch-up mirrors blocks first", () => {
         expect(log).toEqual(["openMailboxes"])
     })
 
-    it("GET /pmr/v1/pool syncs before listing, so a bsky-blocked pooled sender is not listed", async () => {
+    it("GET /pmr/v1/requests syncs before listing, so a bsky-blocked request sender is not listed", async () => {
         const log: string[] = []
         const { store } = recordingStore(log)
         const w = await ownerWorld(store, { blocks })
-        await handlePoolList(await w.request("/pmr/v1/pool"), w.deps)
-        expect(log).toEqual(["sync", "poolSenders"])
+        await handleRequestsList(await w.request("/pmr/v1/requests"), { ...w.deps, catchUpPageMailboxes: 2 })
+        expect(log).toEqual(["sync", "requestMailboxes"])
         expect(asked).toEqual([OWNER])
     })
 })

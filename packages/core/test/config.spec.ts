@@ -40,11 +40,9 @@ function config(overrides: Partial<PMRConfig> = {}): PMRConfig {
             maxGrantsPerRequest: 20,
             maxAcksPerRequest: 64,
         },
-        pool: {
-            capBytes: 5_000_000,
-            depthPerSender: 2,
-            depthUnderPressure: 1,
-            discardWindowSeconds: 604_800,
+        requests: {
+            depthPerSender: 5,
+            sharedCapBytes: 5_000_000,
         },
         ...overrides,
     }
@@ -280,11 +278,12 @@ describe("buildEnablerDocument", () => {
         expect(rotated).not.toBe(keyed)
     })
 
-    it("publishes nothing about pool sizing or blocked-sender behavior", () => {
+    it("publishes nothing about request-mailbox sizing or blocked-sender behavior", () => {
         // The first is implementation-defined; the second is unpublished on
         // purpose, since a published simulation is a fingerprint.
         const serialized = JSON.stringify(buildEnablerDocument(config()))
-        expect(serialized).not.toContain("pool")
+        expect(serialized).not.toContain("depthPerSender")
+        expect(serialized).not.toContain("sharedCapBytes")
         expect(serialized).not.toContain("synthetic")
     })
 })

@@ -28,7 +28,7 @@ export interface PMRLimits {
      * implementation-defined").
      */
     attachmentMaxBytes?: number
-    /** Per-sender capacity of a provisioned pair mailbox. */
+    /** Per-sender capacity of a pair mailbox. */
     maxMessagesPerPairSender: number
     /** Challenge TTL, seconds. */
     challengeExpirySeconds: number
@@ -40,18 +40,15 @@ export interface PMRLimits {
     maxAcksPerRequest: number
 }
 
-export interface PoolLimits {
-    /**
-     * The pool is bounded by BYTES, never by sender count: width is the
-     * property it exists to provide, and a sender-count cap rations exactly
-     * the thing the design says not to pre-judge.
-     */
-    capBytes: number
+export interface RequestMailboxLimits {
+    /** Entries one sender's request mailbox holds before it refuses `429`. */
     depthPerSender: number
-    /** Under pressure, depth gives and width holds. */
-    depthUnderPressure: number
-    /** How long a discarded sender is suppressed before lapsing, seconds. */
-    discardWindowSeconds: number
+    /**
+     * One byte quota across all of a recipient's request mailboxes, counting
+     * entry bytes and the proof bytes held for request senders. Full keeps
+     * nothing more and refuses nothing.
+     */
+    sharedCapBytes: number
 }
 
 /**
@@ -235,7 +232,7 @@ export interface PMRConfig {
      */
     hostName: string
     limits: PMRLimits
-    pool: PoolLimits
+    requests: RequestMailboxLimits
     /** What this deployment serves, and under which prefix. */
     serves: ServedCapabilities
     /**
@@ -309,9 +306,10 @@ function contentState(stamp: string, body: Omit<EnablerDocument, "state">): stri
  * Generated from the enforcing config rather than written alongside it, so
  * a published value and the one actually enforced cannot drift.
  *
- * Deliberately publishes nothing about pool sizing or the blocked-sender
- * behavior: the first is implementation-defined and the second is
- * unpublished on purpose, since a published simulation is a fingerprint.
+ * Deliberately publishes nothing about request-mailbox sizing or the
+ * blocked-sender behavior: the first is implementation-defined and the
+ * second is unpublished on purpose, since a published simulation is a
+ * fingerprint.
  */
 export function buildEnablerDocument(config: PMRConfig): EnablerDocument {
     const { serves, limits } = config

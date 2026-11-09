@@ -103,7 +103,7 @@ concealing the block. Full statement in
 
 One transition is exempt from timing parity: when a relay first applies a
 block the recipient made on Bsky, the put that finds it also clears the
-sender's queued and pooled state, and may take measurably longer. The block
+sender's queued and request state, and may take measurably longer. The block
 record is public, so the sender could read the block directly and learns
 nothing from the delay.
 
@@ -397,7 +397,7 @@ repo-authenticated.
 | drop or selectively censor | nothing structural | availability loss; recourse is to move ([P9](#p9--user-controlled-discovery)) |
 | reveal that a recipient blocked a sender | synthetic behavior, no bytes, no push, decoupled from real activity, answering on the real path's timing profile ([P4](#p4--blocking-indistinguishability)) | the real→synthetic transition may be noticeable to a sender who was measuring; accepted |
 | impersonate a sender on a pair put | the four-step verification algorithm ([P5](#p5--sender-verification)); the device re-verifies | none, provided both halves run |
-| ring a stranger's phone by minting DIDs | the pool is adjudicated in batch and never pushed per arrival | one wake per adjudication round for an absent device |
+| ring a stranger's phone by minting DIDs | a put from a sender admission does not admit is held in a request mailbox that never wakes the device; the device reads the request listing when it chooses | none: no wake per arrival, and none per batch |
 | delay or reorder | the session layer tolerates reordering | timing manipulation |
 | correlate senders to recipients | grant offload limits the window | the pair-mailbox contact graph is visible |
 | exhaust the user's quota | caps and budgets | denial of service against the owner |

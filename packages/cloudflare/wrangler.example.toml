@@ -71,16 +71,15 @@ HOST_NAME = "my-relay.example"
 # retirement a peer can observe.
 GRANT_LIFECYCLE = "active"
 
-# Per-sender capacity of a provisioned pair mailbox. The mailbox refuses at
+# Per-sender capacity of a pair mailbox. The mailbox refuses at
 # this point rather than evicting.
 MAX_MESSAGES_PER_PAIR_SENDER = "25"
 
-# Recovery pool. Bounded by BYTES, never by sender count: width is the
-# property the pool exists to provide, so under pressure depth gives and
-# width holds.
-POOL_CAP_BYTES = "4000000"
-POOL_DEPTH_PER_SENDER = "3"
-POOL_DEPTH_UNDER_PRESSURE = "1"
+# Request mailboxes: senders admission does not admit. Per-sender depth
+# refuses (429) when full; the shared byte quota, proof bytes included,
+# keeps nothing more when full and never refuses.
+REQUEST_DEPTH_PER_SENDER = "5"
+REQUEST_SHARED_CAP_BYTES = "5000000"
 
 # Web Push delegation (spec/wire-api.md, "Push delivery — Web Push"). Set
 # ALL FIVE of these together ONLY if this deployment cannot reach a push

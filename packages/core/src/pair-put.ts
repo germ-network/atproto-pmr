@@ -37,7 +37,7 @@ export interface PairPutDeps {
     /**
      * Whether the recipient accepts this sender, read once per put that
      * reaches a registered store and before anything is stored. Omitted, the
-     * relay adjudicates nothing: unprovisioned senders pool without a verdict.
+     * relay admits nobody: a sender with no pair mailbox is held in its request mailbox.
      */
     admission?: AdmissionSource
     /**
@@ -96,12 +96,12 @@ export const DECLARATION_RETRY_AFTER_SECONDS = 60
  *    recipient lookup, so it reveals nothing about the recipient. What it
  *    does reveal — whether the relay's monitor holds the sender's
  *    declaration — is public already (the monitor serves it per DID).
- *  - `429` + `Retry-After`: this sender's own provisioned mailbox is full,
+ *  - `429` + `Retry-After`: this sender's own reservation, pair or request mailbox, is full,
  *    the one recipient-side fact per-sender reservation makes
  *    self-referential; or this sender's own hold is.
  *  - `202`: everything else — a validly signed put whether or not the
- *    recipient exists, names another recipient, is blocked, discarded or a
- *    duplicate, and a put the sender hold holds (or already holds), which may
+ *    recipient exists, names another recipient, is blocked, held in a request mailbox, dropped
+ *    for the shared request quota or a duplicate, and a put the sender hold holds (or already holds), which may
  *    never be delivered: it expires, a later rotation supersedes it, the
  *    monitor stops tracking the DID, or the sender's PDS withholds the record
  *    from the firehose.

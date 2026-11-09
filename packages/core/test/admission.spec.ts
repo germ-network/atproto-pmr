@@ -1,6 +1,6 @@
 /**
  * A failed or slow admission read never fails or stalls a put: it becomes an
- * unknown verdict the device can judge from the pool.
+ * unknown verdict the device can judge from its request mailbox.
  */
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {

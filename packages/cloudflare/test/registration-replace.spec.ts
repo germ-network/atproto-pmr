@@ -91,7 +91,6 @@ function deps(challenges: ChallengeStore, resolveAnchorKey: () => Promise<Uint8A
         resolveLocator: (did: string) => directory.resolve(did),
         store: (locator: Locator) => pmrStore(locator, testEnv),
         directory,
-        discardWindowSeconds: 3600,
         nowSeconds: T0,
         resolveAnchorKey,
     }

@@ -5,7 +5,7 @@
  * A 500 here IS reachable on a peer-facing put — e.g. a KV or DO binding
  * failure partway through handlePairPut — and that is fine, not a closure
  * violation: infrastructure failures fire independent of any recipient-side
- * state (blocked, full, discarded), so a 500's mere existence discloses
+ * state (blocked, full, held), so a 500's mere existence discloses
  * nothing about the recipient. What actually must never happen is a
  * DISTINGUISHABLE answer correlated with recipient state on the paths this
  * wraps — that discipline lives in pair-put.ts's own branches (see its

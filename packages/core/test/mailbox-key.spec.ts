@@ -78,7 +78,7 @@ describe("the narrowing helpers", () => {
     })
 
     it("asPairMailboxKey refuses a grant key", () => {
-        // Pair-only operations — blocking, the recovery pool — must not
+        // Pair-only operations — blocking, request mailboxes — must not
         // silently accept an address. An owner blocks a sender DID and
         // suppresses a grant by closing it; the two are not interchangeable.
         expect(() => asPairMailboxKey("grant:abc")).toThrow(/not a DID/)
