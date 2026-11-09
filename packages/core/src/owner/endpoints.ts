@@ -139,7 +139,7 @@ export interface OwnerDeps extends OwnerAuthDeps {
     discardWindowSeconds: number
     /**
      * The owner's Bsky blocks, mirrored (`syncOwnerBlocks`) before the
-     * message catch-up's first page and the pool listing.
+     * message catch-up's first page and the request and pool listings.
      */
     blocks?: Pick<BlockEdgeStore, "ownBlocks">
     /**
@@ -615,16 +615,21 @@ export async function handleBlockSet(
 /**
  * `GET /pmr/v1/requests?cursor=` — the request listing: `{rq: [{k, id}], n}`,
  * one row per request mailbox with its entry ids oldest first, never bodies or
- * relay reasons. Paged by `catchUpPageMailboxes`; the first page (no cursor)
- * mirrors the owner's Bsky blocks before it reads.
+ * relay reasons. Paged by `catchUpPageMailboxes`; the first page (no cursor, or an
+ * empty one) mirrors the owner's Bsky blocks before it reads.
  */
 export async function handleRequestsList(
     request: Request,
     deps: OwnerDeps & Pick<MessagesConfig, "catchUpPageMailboxes">
 ): Promise<Response> {
-    void request
-    void deps
-    throw new Error("handleRequestsList: not implemented")
+    const a = await authed(request, deps)
+    if (!a.ok) return a.response
+
+    const cursor = new URL(request.url).searchParams.get("cursor")
+    const firstPage = cursor === null || cursor === ""
+    if (firstPage) await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
+    const page = await a.auth.store.requestMailboxes(firstPage ? null : cursor, deps.catchUpPageMailboxes)
+    return amortize(cbor([...requestListingFields(page)]), a.auth.did, deps)
 }
 
 /**
