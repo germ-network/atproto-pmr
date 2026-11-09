@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import type { Admission, PairMailboxEvidence } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
-import { inPMR } from "./helpers"
+import { inPMR, openPairMailbox } from "./helpers"
 
 const testEnv = env as unknown as PMREnv
 const NOW = Math.floor(Date.now() / 1000)
@@ -38,7 +38,7 @@ async function rejectConflicts(pmr: PMRObject, latest: PairMailboxEvidence) {
 describe("latest declaration watermark versus selected proof", () => {
     it("accepts repeats and replay after same-key edits, retaining one selected CAR and generation", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const firstNonce = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), firstNonce, NOW, A)
             const editedNonce = nonce()
@@ -65,7 +65,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it.each(["live", "cleared"] as const)("migrates consistent %s legacy rows lazily without replacing their generation", async state => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const first = await pmr.appendPair(SENDER, ref("a"), nonce(), NOW, A)
             const storage = storageOf(pmr)
             const { watermark: _, ...legacy } = (await rowOf(pmr))!
@@ -84,7 +84,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it("keeps an ambiguous legacy row fail-closed until a newer verified revision recovers it", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const replay = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), replay, NOW, A)
             const { watermark: _, ...legacy } = (await rowOf(pmr))!
@@ -143,7 +143,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it("rotates keys on a duplicate, keeps replay protection, and binds the new tuple independently", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const replay = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), replay, NOW, A)
             await pmr.appendPair(SENDER, ref("b"), nonce(), NOW, B)

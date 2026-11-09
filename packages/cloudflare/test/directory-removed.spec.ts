@@ -58,7 +58,6 @@ async function register(did: string, secretKey: Uint8Array, directory: KVDirecto
             resolveLocator: (d: string) => directory.resolve(d),
             store: (locator: Locator) => pmrStore(locator, testEnv),
             directory,
-            discardWindowSeconds: 3600,
             nowSeconds: T0,
             resolveAnchorKey: async () => ed25519.getPublicKey(secretKey),
         }

@@ -46,7 +46,7 @@ import {
 } from "./authenticate.js"
 
 /**
- * The owner-facing surface: registrations, blocks, and pool adjudication.
+ * The owner-facing surface: registrations, blocks, grants, and the request listing.
  *
  * PROVISIONAL BODY SHAPES, as with the challenge mint — concrete CBOR
  * schemas are not yet published. Single-letter keys follow the wire
@@ -135,11 +135,9 @@ export interface OwnerDeps extends OwnerAuthDeps {
     /** Retain the monitor attempt past the response (e.g. Worker waitUntil).
      * Receives a promise whose rejection is already handled. */
     deferRegistrationMonitor?: (work: Promise<void>) => void
-    /** How long a discard suppresses a sender, in seconds. */
-    discardWindowSeconds: number
     /**
      * The owner's Bsky blocks, mirrored (`syncOwnerBlocks`) before the
-     * message catch-up's first page and the request and pool listings.
+     * message catch-up's first page and the request listing.
      */
     blocks?: Pick<BlockEdgeStore, "ownBlocks">
     /**
@@ -315,7 +313,7 @@ export async function handleRegistrationCreate(
         lastActive: deps.nowSeconds,
     }
     // A Web Push subscription may accompany the registration: a capability
-    // URL and a device-provisioned content key, never a push token. Present
+    // URL and a content key the device supplies, never a push token. Present
     // fields are validated as a unit — a malformed-but-present subscription
     // answers 400 rather than being silently dropped, since a client typo
     // would otherwise produce a registration that looks fine and never
@@ -407,8 +405,8 @@ export async function handleRegistrationCreate(
     // proof ties the new key to the old (continuity proofs are GER-2447, deferred).
     // Treat it as a fresh registration that deactivates the prior one: unlink it so
     // `create` allocates a new Durable Object under the new key, dropping the prior
-    // registration's mail, grants, pool, blocks and watch state. Sound to drop —
-    // the old anchor key is gone, so anything queued under it is undecryptable; and
+    // registration's mail, grants, request mailboxes, blocks and watch state.
+    // Sound to drop — the old anchor key is gone, so anything queued under it is undecryptable; and
     // only DoS (fresh empty registration), never takeover of the prior contents, is
     // reachable by whoever controls the declaration. The continuity path that KEEPS
     // the registration is gated on GER-2447. `directory.delete` now tears down the
@@ -651,115 +649,6 @@ export function requestListingFields(page: RequestMailboxesPage): Map<string, Co
     ])
 }
 
-// MARK: - Pool
-
-/**
- * `GET /pmr/v1/pool` — DIDs only, never bodies. An entry the relay judged
- * carries `v` (`no` | `unknown`) and `r` (reason codes).
- */
-export async function handlePoolList(
-    request: Request,
-    deps: OwnerDeps
-): Promise<Response> {
-    const a = await authed(request, deps)
-    if (!a.ok) return a.response
-
-    await syncOwnerBlocks(a.auth.store, a.auth.did, deps.blocks)
-    const senders = await a.auth.store.poolSenders()
-    return amortize(
-        cbor([
-        [
-            "p",
-            senders.map(
-                (s) => new Map<string, CoseValue>([
-                    ["did", s.did],
-                    ["n", s.count],
-                    ...(s.verdict !== undefined
-                        ? ([
-                              ["v", s.verdict.verdict],
-                              ["r", [...s.verdict.why]],
-                          ] as [string, CoseValue][])
-                        : []),
-                ])
-            ),
-        ],
-        ]),
-        a.auth.did,
-        deps
-    )
-}
-
-/**
- * `POST /pmr/v1/pool/adjudication` — provision-or-discard, per DID.
- *
- * The server pooled these senders precisely because it could not evaluate
- * them, so it does not act as though it can: it offers the device the only
- * judgement that exists and acts on the answer. Two structural consequences
- * — "no open DMs" stops being an unstated client-side filter and becomes a
- * protocol step, and the pool becomes self-clearing.
- *
- * Body: `{ "prov": [did…], "disc": [did…] }`.
- */
-export async function handlePoolAdjudication(
-    request: Request,
-    deps: OwnerDeps
-): Promise<Response> {
-    const a = await authed(request, deps)
-    if (!a.ok) return a.response
-    if (a.body === null) return new Response("Missing body", { status: 400 })
-
-    let provision: PairMailboxKey[] = []
-    let discard: PairMailboxKey[] = []
-    try {
-        const map = decodeCoseMap(a.body)
-        provision = stringList(map.get("prov")).map(asPairMailboxKey)
-        discard = stringList(map.get("disc")).map(asPairMailboxKey)
-    } catch {
-        return new Response("Malformed body", { status: 400 })
-    }
-
-    // A DID named in both is a contradiction the device has to resolve, not
-    // something to silently pick a winner for.
-    const overlap = provision.filter((d) => discard.includes(d))
-    if (overlap.length > 0) {
-        return new Response("A DID appears in both lists", { status: 409 })
-    }
-
-    let provisioned = 0
-    for (const did of provision) {
-        const moved = await a.auth.store.provisionFromPool(did, deps.nowSeconds)
-        provisioned += moved.length
-    }
-    for (const did of discard) {
-        // Time-bounded, never standing: the device discards a DID it does
-        // not recognize *at that moment*, and the pool exists for exactly
-        // the case where its own knowledge is behind.
-        await a.auth.store.discardFromPool(
-            did,
-            deps.nowSeconds + deps.discardWindowSeconds
-        )
-    }
-
-    return amortize(
-        cbor([
-            ["pr", provision.length],
-            ["di", discard.length],
-            ["m", provisioned],
-        ]),
-        a.auth.did,
-        deps
-    )
-}
-
-function stringList(v: CoseValue | undefined): string[] {
-    if (v === undefined) return []
-    if (!Array.isArray(v)) throw new Error("expected an array")
-    return v.map((x) => {
-        if (typeof x !== "string") throw new Error("expected strings")
-        return x
-    })
-}
-
 // MARK: - Grants
 
 /**
@@ -951,7 +840,7 @@ export interface MessagesConfig {
     bodies: BodyStore
     /**
      * Mailboxes per catch-up page — bounds mailboxes, NOT messages, since
-     * that is the unit `openMailboxes` paginates on. A provisioned mailbox
+     * that is the unit `openMailboxes` paginates on. A pair mailbox
      * can hold its full per-sender byte cap, so this must stay small
      * enough that one page cannot approach the platform's own
      * subrequest/response-size ceilings.
@@ -1146,8 +1035,7 @@ export async function handlePairEvidenceRead(
  * frame body verbatim (`events.ts`'s `decodeAckFrame`), so a client's ack
  * logic is the same shape on either surface.
  *
- * Validate-then-execute, matching `handlePoolAdjudication`: a malformed
- * `k` (or a non-string `id`) fails the WHOLE batch with 400 before
+ * Validate-then-execute: a malformed `k` (or a non-string `id`) fails the WHOLE batch with 400 before
  * anything is removed. This composes cleanly because `remove` cannot fail
  * on an unknown record (`storage.ts` contract 6) — the only way an entry
  * can be "bad" is a request-shape problem decidable from the bytes alone,

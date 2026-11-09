@@ -93,9 +93,6 @@ describe("entry extension fields", () => {
             async openMailboxes(): Promise<OpenMailboxesPage> {
                 return { entries: [{ key: KEY, messages: [r] }], nextCursor: null }
             },
-            async poolSenders() {
-                return []
-            },
         } as unknown as PMRStore
         const bodies: BodyStore = {
             async putBody() {},
@@ -172,7 +169,6 @@ async function restEntry(r: MessageRef): Promise<Map<string, CoseValue>> {
         resolveLocator: async () => "loc",
         store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         bodies: {
             async putBody() {},
             async getBody() {

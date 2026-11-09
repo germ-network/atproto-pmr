@@ -2,12 +2,10 @@
  * The pair mailbox's storage semantics, which are security properties rather
  * than convenience choices:
  *
- *   - a provisioned mailbox REFUSES at capacity and keeps the oldest;
- *   - the recovery pool INVERTS that — it evicts and keeps the newest;
+ *   - a pair mailbox REFUSES at capacity and keeps the oldest;
  *   - a blocked sender sees fill-then-drain and no stored bytes;
- *   - a discard lapses rather than standing;
  *   - a replayed envelope is a no-op, identically on the real, blocked, and
- *     pool paths, and a REFUSED attempt never consumes its nonce.
+ *     request paths, and a REFUSED attempt never consumes its nonce.
  *
  * Time is injected as a parameter throughout, so nothing here measures elapsed
  * wall-clock time.
@@ -16,7 +14,7 @@ import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
 import { PMRObject } from "../src/pmr-object"
 import type { MessageRef, Nonce } from "@germ-network/atproto-pmr-core"
-import { inPMR, withSyntheticBehavior } from "./helpers"
+import { inPMR, openPairMailbox, withSyntheticBehavior } from "./helpers"
 import type { PMREnv } from "../src/env"
 
 const testEnv = env as unknown as PMREnv
@@ -43,7 +41,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
     return testEnv.pmrs.get(id)
 }
 
-describe("a provisioned pair mailbox refuses when full", () => {
+describe("a pair mailbox refuses when full", () => {
     it("keeps request-only senders out of the mailbox listing and rejects stale declaration revisions", async () => {
         const stub = freshStub()
         const sender = "did:plc:review-watermark" as const
@@ -138,7 +136,7 @@ describe("a provisioned pair mailbox refuses when full", () => {
         }
         const nonce = freshNonce()
         await inPMR(stub, async (pmr) => {
-            await pmr.provisionFromPool(sender, T0)
+            await openPairMailbox(pmr, sender)
             const first = await pmr.appendPair(sender, ref("old-key-message"), nonce, T0, evidence)
             const rotated = await pmr.appendPair(sender, ref("new-key-duplicate"), nonce, T0, {
                 ...evidence,
@@ -168,7 +166,7 @@ describe("a provisioned pair mailbox refuses when full", () => {
         const nonce = (value: number) => new Uint8Array(16).fill(value)
 
         await inPMR(stub, async (pmr) => {
-            await pmr.provisionFromPool(sender, T0)
+            await openPairMailbox(pmr, sender)
             const first = await pmr.appendPair(sender, ref("same-id"), nonce(1), T0, firstEvidence)
             expect(first.generationChanged).toBe(true)
             const sameKey = await pmr.appendPair(
@@ -253,11 +251,9 @@ describe("a provisioned pair mailbox refuses when full", () => {
             expiresAt: T0 + 3600,
         })
         await inPMR(stub, async (pmr) => {
-            const a = await pmr.appendPair(first, ref("a"), nonce(5), T0, evidence(first))
-            await pmr.provisionFromPool(first, T0)
+            const a = await pmr.appendPair(first, ref("a"), nonce(5), T0, evidence(first), { verdict: "yes" })
             await pmr.remove(first, "a")
-            const b = await pmr.appendPair(second, ref("b"), nonce(6), T0, evidence(second))
-            await pmr.provisionFromPool(second, T0)
+            const b = await pmr.appendPair(second, ref("b"), nonce(6), T0, evidence(second), { verdict: "yes" })
             await pmr.remove(second, "b")
 
             const one = await pmr.openMailboxes(null, 1)
@@ -516,17 +512,12 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         })
     })
 
-    it("does not list a sender who merely has a mailbox or pool entry", async () => {
+    it("does not list a sender who merely has a mailbox or request entry", async () => {
         // `syn:` is the blocked family; nothing else may leak into it.
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.append("did:plc:alice", ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool(
-                "did:plc:stranger",
-                ref("m2"),
-                freshNonce(),
-                T0
-            )
+            await pmr.appendToRequest("did:plc:stranger", ref("m2"), freshNonce(), T0)
             expect(await pmr.listBlocked()).toEqual([])
         })
     })
@@ -630,184 +621,31 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         })
     })
 
-    it("a replayed nonce in the POOL is a no-op, not a second entry", async () => {
+    it("a replayed nonce in a request mailbox is a no-op, not a second entry", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const first = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
-            expect(first.outcome).toBe("pooled")
+            const first = await pmr.appendToRequest("did:plc:stranger", ref("m1"), nonce, T0)
+            expect(first.outcome).toBe("held")
 
-            const replay = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
+            const replay = await pmr.appendToRequest("did:plc:stranger", ref("m1"), nonce, T0)
             expect(replay.outcome).toBe("duplicate")
         })
     })
 
-    it("shares its nonce set across the pool and the pair mailbox for the same key", async () => {
+    it("shares its nonce set across the request and pair mailboxes for the same key", async () => {
         // A nonce is a property of (sender, envelope), not of which storage
-        // tier absorbed it — otherwise a sender who gets provisioned mid-flight
-        // could replay the same pooled envelope into their new mailbox.
+        // tier absorbed it — otherwise a sender admitted mid-flight could
+        // replay the same held envelope into their new mailbox.
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             const nonce = freshNonce()
-            const pooled = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
-            expect(pooled.outcome).toBe("pooled")
+            const held = await pmr.appendToRequest("did:plc:stranger", ref("m1"), nonce, T0)
+            expect(held.outcome).toBe("held")
 
-            // Same sender is now provisioned; the SAME envelope replays.
+            // The SAME envelope replays against the pair mailbox.
             const replay = await pmr.append("did:plc:stranger", ref("m1"), nonce, T0)
             expect(replay.outcome).toBe("duplicate")
-        })
-    })
-})
-
-describe("the recovery pool inverts the provisioned mailbox's policy", () => {
-    it("keeps an existing sender's newest ref even if replacement grows past the cap", async () => {
-        const stub = freshStub()
-        const cap = parseInt(testEnv.POOL_CAP_BYTES)
-        const sender = "did:plc:near-cap-existing"
-        await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
-            await pmr.appendToPool(sender, ref("old", 1), freshNonce(), T0)
-            const newest = await pmr.appendToPool(sender, ref("new", 2), freshNonce(), T0)
-            expect(newest.outcome).toBe("pooled")
-            expect((await pmr.poolSenders()).find((entry) => entry.did === sender)?.count).toBe(1)
-        })
-    })
-
-    it("accepts a first ref larger than the pool's remaining room while not yet full", async () => {
-        const stub = freshStub()
-        const cap = parseInt(testEnv.POOL_CAP_BYTES)
-        const sender = "did:plc:remaining-room"
-        await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:cap-filler", ref("filler", cap - 1), freshNonce(), T0)
-            const first = await pmr.appendToPool(sender, ref("first", 2), freshNonce(), T0)
-            expect(first.outcome).toBe("pooled")
-            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
-        })
-    })
-
-    it("keeps the NEWEST under depth pressure", async () => {
-        // The freshest attempt carries current state; stale attempts are
-        // worthless. This is the opposite of the provisioned mailbox and must
-        // not be implemented by reusing its append with a different cap.
-        const stub = freshStub()
-        const depth = parseInt(testEnv.POOL_DEPTH_PER_SENDER)
-        await inPMR(stub, async (pmr) => {
-            for (let i = 0; i < depth + 3; i++) {
-                const r = await pmr.appendToPool("did:plc:stranger", ref(`m${i}`), freshNonce(), T0)
-                expect(r.outcome).toBe("pooled")
-            }
-            const senders = await pmr.poolSenders()
-            expect(senders.map((s) => s.did)).toContain("did:plc:stranger")
-            // Adjudication must name a sender the device can decide about.
-            expect(senders[0].did).toBe("did:plc:stranger")
-            expect(senders[0].count).toBe(depth)
-        })
-    })
-
-    it("never refuses a sender that already holds entries", async () => {
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            const big = parseInt(testEnv.POOL_CAP_BYTES)
-            await pmr.appendToPool("did:plc:recovering", ref("first", big), freshNonce(), T0)
-            const second = await pmr.appendToPool("did:plc:recovering", ref("second"), freshNonce(), T0)
-            expect(second.outcome).toBe("pooled")
-        })
-    })
-
-    it("turns away only unknown senders at true exhaustion", async () => {
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            const big = parseInt(testEnv.POOL_CAP_BYTES)
-            await pmr.appendToPool("did:plc:early", ref("fills-the-pool", big), freshNonce(), T0)
-            const late = await pmr.appendToPool("did:plc:late", ref("m1"), freshNonce(), T0)
-            expect(late.outcome).toBe("exhausted")
-        })
-    })
-
-    it("lists senders without exposing bodies", async () => {
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:a", ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool("did:plc:b", ref("m2"), freshNonce(), T0)
-            const senders = (await pmr.poolSenders()).map((s) => s.did)
-            expect(senders.sort()).toEqual(["did:plc:a", "did:plc:b"])
-        })
-    })
-
-    it("recovers each sender's DID exactly, colons and all", async () => {
-        // The listing reads the pool's own keys rather than joining against
-        // a table that records the DID separately, so there is no entry
-        // whose DID can go missing and leave the sender unadjudicable. A
-        // `did:web` with path segments is the shape that would break a
-        // prefix stripped by splitting on `:` instead of by length.
-        const stub = freshStub()
-        const did = "did:web:relay.example:users:eve"
-        await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool(did, ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool(did, ref("m2"), freshNonce(), T0)
-            expect(await pmr.poolSenders()).toEqual([{ did, count: 2 }])
-
-            // And the recovered DID round-trips as a key: adjudicating with
-            // exactly what the listing returned finds the entries.
-            const moved = await pmr.provisionFromPool(did, T0)
-            expect(moved.map((r) => r.messageId)).toEqual(["m1", "m2"])
-        })
-    })
-
-    it("does not mistake the pool byte counter for a pooled sender", async () => {
-        // `poolBytes` sits one character from the `pool:` family.
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:a", ref("m1"), freshNonce(), T0)
-            expect(await pmr.poolSenders()).toEqual([
-                { did: "did:plc:a", count: 1 },
-            ])
-        })
-    })
-})
-
-describe("discard is time-bounded, not standing", () => {
-    it("suppresses inside the window and lapses after it", async () => {
-        // A permanent discard would draw a permanent consequence from a
-        // judgement made on incomplete information — the device discards a DID
-        // it does not recognise *at that moment*, and the pool exists for
-        // exactly the case where its knowledge is behind.
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
-            expect(await pmr.isDiscarded("did:plc:stranger", T0)).toBe(true)
-            expect(await pmr.isDiscarded("did:plc:stranger", T0 + 101)).toBe(false)
-        })
-    })
-
-    it("appendToPool answers pooled/persistBody:false for a discarded sender, storing nothing", async () => {
-        // Pins the discard-RPC-count fix: the discard check runs INSIDE
-        // appendToPool now, not as a separate isDiscarded call the Worker
-        // branches on before deciding whether to call this at all.
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
-            const result = await pmr.appendToPool("did:plc:stranger", ref("m1"), freshNonce(), T0)
-            expect(result).toEqual({ outcome: "pooled", persistBody: false })
-            // Never actually entered — poolSenders() must not list it.
-            expect((await pmr.poolSenders()).map((s) => s.did)).not.toContain("did:plc:stranger")
-        })
-    })
-
-    it("a fresh envelope succeeds once the discard window lapses, same nonce or not", async () => {
-        const stub = freshStub()
-        await inPMR(stub, async (pmr) => {
-            await pmr.setDiscarded("did:plc:stranger", T0 + 100)
-            const nonce = freshNonce()
-            const discarded = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0)
-            if (discarded.outcome !== "pooled") throw new Error("unreachable")
-            expect(discarded.persistBody).toBe(false)
-
-            // Discard didn't consume the nonce either, matching `refused`'s
-            // reasoning: a retry once the window lapses is evaluated fresh.
-            const afterLapse = await pmr.appendToPool("did:plc:stranger", ref("m1"), nonce, T0 + 101)
-            expect(afterLapse).toEqual({ outcome: "pooled", persistBody: true })
-            expect((await pmr.poolSenders()).map((s) => s.did)).toContain("did:plc:stranger")
         })
     })
 })
@@ -825,50 +663,36 @@ describe("removal is idempotent", () => {
     })
 })
 
-describe("blocking a pooled sender closes both surfaces", () => {
-    it("purges their pool entries, so adjudication cannot resurrect them", async () => {
-        // Otherwise a sender pooled BEFORE being blocked still shows up in
-        // the owner's pool listing, and provisioning them would create a
-        // live mailbox holding a blocked sender's messages.
+describe("blocking a request sender closes both surfaces", () => {
+    it("purges its request entries, so the owner's listing cannot show them", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool(
-                "did:plc:mallory",
-                ref("m1", 500),
-                freshNonce(),
-                T0
-            )
-            expect((await pmr.poolSenders()).map((s) => s.did)).toContain("did:plc:mallory")
+            await pmr.appendToRequest("did:plc:mallory", ref("m1", 500), freshNonce(), T0)
+            expect((await pmr.requestMailboxes(null, 10)).entries.map((e) => e.key)).toContain("did:plc:mallory")
 
             await pmr.block("did:plc:mallory", T0)
 
-            expect(await pmr.poolSenders()).toEqual([])
-            // And provisioning is refused even if a stale key reaches it.
-            expect(await pmr.provisionFromPool("did:plc:mallory", T0)).toEqual([])
+            expect((await pmr.requestMailboxes(null, 10)).entries).toEqual([])
             expect(await pmr.list("did:plc:mallory", 10)).toEqual([])
+            expect(await pmr.getMessage("did:plc:mallory", "m1")).toBeNull()
         })
     })
 
-    it("returns the purged bytes to the pool budget", async () => {
-        // A blocked sender's bytes must not permanently consume the cap —
-        // that would let repeated block cycles starve the pool's width.
+    it("returns the purged bytes to the shared quota", async () => {
+        // A blocked sender's bytes must not permanently consume the quota.
         const stub = freshStub()
-        const cap = parseInt(testEnv.POOL_CAP_BYTES)
+        const cap = parseInt(testEnv.REQUEST_SHARED_CAP_BYTES)
         await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:a", ref("big", cap), freshNonce(), T0)
-            // Pool is now at capacity: a new sender is turned away.
+            await pmr.appendToRequest("did:plc:a", ref("big", cap), freshNonce(), T0)
             expect(
-                (await pmr.appendToPool("did:plc:b", ref("m"), freshNonce(), T0))
-                    .outcome
-            ).toBe("exhausted")
+                (await pmr.appendToRequest("did:plc:b", ref("m"), freshNonce(), T0)).outcome
+            ).toBe("dropped")
 
             await pmr.block("did:plc:a", T0)
 
-            // Budget released, so an unrelated sender fits again.
             expect(
-                (await pmr.appendToPool("did:plc:c", ref("m"), freshNonce(), T0))
-                    .outcome
-            ).toBe("pooled")
+                (await pmr.appendToRequest("did:plc:c", ref("m"), freshNonce(), T0)).outcome
+            ).toBe("held")
         })
     })
 })
@@ -974,18 +798,13 @@ describe("PMRObject grant records", () => {
         })
     })
 
-    it("lists multiple grants without leaking into the pool/synthetic families", async () => {
+    it("lists multiple grants without leaking into the request/synthetic families", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.issueGrant("addr-a", new Uint8Array(32), T0 + 100)
             await pmr.issueGrant("addr-b", new Uint8Array(32), T0 + 200)
             await pmr.block("did:plc:unrelated", T0)
-            await pmr.appendToPool(
-                "did:plc:unrelated-pool",
-                ref("m"),
-                freshNonce(),
-                T0
-            )
+            await pmr.appendToRequest("did:plc:unrelated-request", ref("m"), freshNonce(), T0)
 
             const addresses = (await pmr.listGrants()).map((g) => g.address).sort()
             expect(addresses).toEqual(["addr-a", "addr-b"])
@@ -1010,20 +829,20 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         })
     })
 
-    it("omits a provisioned mailbox with nothing queued", async () => {
+    it("omits a pair mailbox with nothing queued", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            // provisionFromPool's empty-sender case writes an empty queue.
-            await pmr.provisionFromPool("did:plc:empty", T0)
+            await pmr.append("did:plc:empty", ref("m"), freshNonce(), T0)
+            await pmr.remove("did:plc:empty", "m")
             const page = await pmr.openMailboxes(null, 100)
             expect(page.entries).toEqual([])
         })
     })
 
-    it("does not leak pool or synthetic-block state into the listing", async () => {
+    it("does not leak request or synthetic-block state into the listing", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            await pmr.appendToPool("did:plc:pooled", ref("m"), freshNonce(), T0)
+            await pmr.appendToRequest("did:plc:held", ref("m"), freshNonce(), T0)
             await pmr.block("did:plc:blocked", T0)
             const page = await pmr.openMailboxes(null, 100)
             expect(page.entries).toEqual([])
@@ -1033,10 +852,11 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
     it("paginates via a cursor, and a page filtered to empty still advances", async () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
-            // "a" has content, "b" is empty (provisioned via the pool path),
+            // "a" has content, "b" is an empty mailbox,
             // "c" has content — a filtered-empty middle page must not stall.
             await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
-            await pmr.provisionFromPool("did:plc:b", T0)
+            await pmr.append("did:plc:b", ref("m"), freshNonce(), T0)
+            await pmr.remove("did:plc:b", "m")
             await pmr.append("did:plc:c", ref("m2"), freshNonce(), T0)
 
             const first = await pmr.openMailboxes(null, 1)
@@ -1053,7 +873,7 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         })
     })
 
-    it("a forged cursor cannot escape the mailbox key family into pool/synthetic/grant-row state", async () => {
+    it("a forged cursor cannot escape the mailbox key family into request/synthetic/grant-row state", async () => {
         // The cursor is now a wire-visible value (GER-2214's REST catch-up
         // publishes it verbatim), so a caller can hand back an arbitrary
         // string, not just one this object issued. `openMailboxes` passes
@@ -1064,13 +884,13 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool("did:plc:pooled", ref("m2"), freshNonce(), T0)
+            await pmr.appendToRequest("did:plc:held", ref("m2"), freshNonce(), T0)
             await pmr.block("did:plc:blocked", T0)
 
             // Sorts after every real "mbox:" key and lands inside the
-            // "pool:"/"syn:" key ranges — the forgery a caller who read the
+            // "req:"/"syn:" key ranges — the forgery a caller who read the
             // key layout off a real cursor could construct.
-            const forged = "pool:"
+            const forged = "req:"
             const page = await pmr.openMailboxes(forged, 100)
             expect(page.entries).toEqual([])
             expect(page.nextCursor).toBeNull()
@@ -1081,7 +901,7 @@ describe("openMailboxes — reconnect-drain's primitive", () => {
         const stub = freshStub()
         await inPMR(stub, async (pmr) => {
             await pmr.append("did:plc:a", ref("m1"), freshNonce(), T0)
-            await pmr.appendToPool("did:plc:pooled", ref("m2"), freshNonce(), T0)
+            await pmr.appendToRequest("did:plc:held", ref("m2"), freshNonce(), T0)
 
             // "grantrow:" sorts BEFORE "mbox:", so startAfter alone (with
             // no prefix filter) would include the grant-row family too.

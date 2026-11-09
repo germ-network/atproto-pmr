@@ -108,7 +108,7 @@ export const POLICY_NOT_ENABLED = "policy-not-enabled"
  * sender can cost: `bsky-follows`, which admits people the recipient follows.
  * A yes admitted only by a policy that admits strangers (`open`), or by one
  * the relay does not know, is held back as unknown until the relay bounds
- * admitted senders (mailbox depth and push wakes) as the recovery pool does.
+ * admitted senders' mailbox depth and push wakes.
  * Every surface that reports a yes, and receive-time admission, applies this.
  */
 export function admitsThroughBoundedPolicy(via: readonly string[]): boolean {

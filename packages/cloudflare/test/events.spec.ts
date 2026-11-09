@@ -1,7 +1,7 @@
 /**
  * The events socket end to end: hibernation accept, backlog drain on
- * connect, ack over the socket, and the "pool notice is the last frame
- * before caughtUp, only if non-empty" ordering property.
+ * connect, ack over the socket, and the property that request entries never
+ * ride the drain.
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it, vi } from "vitest"
@@ -97,7 +97,7 @@ function ackFrame(key: string, messageId: string): Uint8Array {
 }
 
 describe("connect and drain", () => {
-    it("delivers everything queued across mailbox kinds, then caughtUp, no pool", async () => {
+    it("delivers everything queued across mailbox kinds, then caughtUp", async () => {
         const stub = freshStub()
         await inPMR(stub, (pmr) =>
             pmr.append("did:plc:alice", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]), 0)
@@ -119,7 +119,6 @@ describe("connect and drain", () => {
         expect(new TextDecoder().decode(byId.get("m2")!.get("m") as Uint8Array)).toBe(
             "world"
         )
-        expect(frames.filter((f) => f.type === "pool")).toHaveLength(0)
         expect(frames[frames.length - 1].type).toBe("caughtUp")
     })
 
@@ -129,18 +128,15 @@ describe("connect and drain", () => {
         expect(typesAfterCapabilities(frames)).toEqual(["caughtUp"])
     })
 
-    it("the pool notice rides out as the LAST frame before caughtUp", async () => {
+    it("request entries never ride the drain: no delivery and no notice", async () => {
         const stub = freshStub()
         await inPMR(stub, (pmr) =>
-            pmr.append("did:plc:alice", { messageId: "m1", byteLength: 5 }, new Uint8Array([1]), 0)
+            pmr.appendToRequest("did:plc:stranger", { messageId: "p1", byteLength: 1 }, new Uint8Array([9]), 0)
         )
-        await testEnv.messages.put("m1", new TextEncoder().encode("hi"))
-        await inPMR(stub, (pmr) =>
-            pmr.appendToPool("did:plc:stranger", { messageId: "p1", byteLength: 1 }, new Uint8Array([9]), 0)
-        )
+        await testEnv.messages.put("p1", new TextEncoder().encode("hi"))
 
         const { frames } = await connectAndDrain(stub)
-        expect(typesAfterCapabilities(frames)).toEqual(["delivery", "pool", "caughtUp"])
+        expect(typesAfterCapabilities(frames)).toEqual(["caughtUp"])
     })
 })
 
@@ -467,67 +463,6 @@ describe("live push", () => {
         await expect.poll(() => viaLive.length).toBe(1)
 
         expect([...viaLive[0].body.entries()]).toEqual([...viaDrain.body.entries()])
-    })
-})
-
-describe("live push on pool provisioning", () => {
-    it("pushes provisioned messages to an attached socket without a reconnect", async () => {
-        const stub = freshStub()
-        await inPMR(stub, (pmr) =>
-            pmr.appendToPool(
-                "did:plc:recovering",
-                { messageId: "m1", byteLength: 5 },
-                new Uint8Array([1]),
-                0
-            )
-        )
-        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
-
-        const { ws } = await connectAndDrain(stub)
-        const delivered: DecodedFrame[] = []
-        ws.addEventListener("message", (event) => {
-            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
-        })
-
-        const moved = await inPMR(stub, (pmr) =>
-            pmr.provisionFromPool("did:plc:recovering", 0)
-        )
-        expect(moved).toHaveLength(1)
-
-        await expect.poll(() => delivered.length).toBe(1)
-        expect(delivered[0].type).toBe("delivery")
-        expect(delivered[0].body.get("k")).toBe("did:plc:recovering")
-        expect(delivered[0].body.get("id")).toBe("m1")
-    })
-
-    it("is a no-op with nothing attached, and does not throw", async () => {
-        const stub = freshStub()
-        await inPMR(stub, (pmr) =>
-            pmr.appendToPool(
-                "did:plc:recovering",
-                { messageId: "m1", byteLength: 5 },
-                new Uint8Array([1]),
-                0
-            )
-        )
-        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
-
-        await expect(
-            inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:recovering", 0))
-        ).resolves.toEqual([{ messageId: "m1", byteLength: 5 }])
-    })
-
-    it("provisioning an empty sender pushes nothing", async () => {
-        const stub = freshStub()
-        const { ws } = await connectAndDrain(stub)
-        const delivered: DecodedFrame[] = []
-        ws.addEventListener("message", (event) => {
-            delivered.push(decodeFrame(new Uint8Array(event.data as ArrayBuffer)))
-        })
-
-        await inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:nobody", 0))
-        await new Promise((r) => setTimeout(r, 10))
-        expect(delivered).toHaveLength(0)
     })
 })
 

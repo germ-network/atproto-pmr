@@ -36,8 +36,6 @@ export type {
     PairMailboxEvidence,
     PairMailboxKey,
     PMRStore,
-    PoolAppendResult,
-    PoolSender,
     ReceiveResult,
     RequestAppendResult,
     RequestMailbox,
@@ -100,7 +98,6 @@ export {
     type MailboxCapability,
     type PMRConfig,
     type PMRLimits,
-    type PoolLimits,
     type RequestMailboxLimits,
     type ServedCapabilities,
 } from "./config"
@@ -168,8 +165,6 @@ export {
     readMessageEntry,
     handlePairEvidenceRead,
     handleSummaryRead,
-    handlePoolAdjudication,
-    handlePoolList,
     handleRequestsList,
     requestListingFields,
     handleRegistrationCreate,
@@ -197,7 +192,6 @@ export {
     RECIPIENT_NOT_HELD,
     type Admission,
     type AdmissionSource,
-    type PoolVerdict,
 } from "./admission"
 export { syncOwnerBlocks } from "./block-sync"
 
@@ -254,7 +248,6 @@ export {
     encodeDeliveryFrame,
     messageEntryFields,
     RESERVED_ENTRY_KEYS,
-    encodePoolFrame,
     handleAckFrame,
     type AckPayload,
     type DecodedFrame,
@@ -374,7 +367,6 @@ export {
     type DeclarationChangeKind,
     type DeclarationPushHint,
     buildMessagePushPayload,
-    buildPoolPushPayload,
     type BuildMessagePushPayloadOptions,
 } from "./push/payload"
 

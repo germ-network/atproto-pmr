@@ -114,7 +114,6 @@ function deps(w: ReturnType<typeof world>) {
         resolveLocator: (did: string) => w.directory.resolve(did),
         store: w.store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         resolveAnchorKey: async () => declaredKey,
     }
 }

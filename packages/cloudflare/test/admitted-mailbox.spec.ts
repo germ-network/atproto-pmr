@@ -1,5 +1,5 @@
 /**
- * The store routes each adjudicated pair put in one step. Admission is
+ * The store routes each judged pair put in one step. Admission is
  * judged again on every put: a yes goes to the pair mailbox, anything else to
  * the request mailbox (see request-routing.spec.ts). This file covers the
  * outcomes around that routing: replays, blocks, refusals and drain.

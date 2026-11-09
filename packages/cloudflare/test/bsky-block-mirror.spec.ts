@@ -1,6 +1,6 @@
 /**
  * The owner's Bsky blocks are mirrored into the relay block: a blocked sender's
- * queued and pooled mail is cleared and their puts go synthetic, and only a
+ * queued and request mail is cleared and their puts go synthetic, and only a
  * device unblock lifts the block: the relay's view of a Bsky unblock is
  * unproven, so it never lifts anything.
  */

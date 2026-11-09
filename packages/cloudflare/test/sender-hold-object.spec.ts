@@ -4,8 +4,8 @@
  * same mailbox store a pair put uses.
  *
  * Harness: the `SENDER_HOLDS` binding (`TestSenderHold` in `test/worker.ts`),
- * scripted with `setDirect`; recipients registered in the directory with a
- * provisioned sender; `runInDurableObject` to read storage and
+ * scripted with `setDirect`; recipients registered in the directory, a pair
+ * mailbox opened for the sender; `runInDurableObject` to read storage and
  * `runDurableObjectAlarm` to fire the alarm.
  */
 import {
@@ -30,7 +30,7 @@ import {
     settledDeclaration,
     REV,
 } from "../../core/test/fixtures/sender-hold"
-import { inPMR } from "./helpers"
+import { inPMR, openPairMailbox } from "./helpers"
 import type { TestSenderHold } from "./worker"
 
 const testEnv = env as unknown as PMREnv
@@ -183,7 +183,7 @@ describe("sender hold object", () => {
         const locator = testEnv.pmrs.newUniqueId().toString()
         await testEnv.pmrDirectory.put(recipient, locator)
         const mailbox = testEnv.pmrs.get(testEnv.pmrs.idFromString(locator)) as unknown as DurableObjectStub<PMRObject>
-        await inPMR(mailbox, (pmr) => pmr.provisionFromPool(sender, nowSeconds()))
+        await inPMR(mailbox, (pmr) => openPairMailbox(pmr, sender))
 
         const key = keyPair()
         await scripted(sender, key.publicKey)

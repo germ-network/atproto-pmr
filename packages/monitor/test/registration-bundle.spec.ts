@@ -54,7 +54,7 @@ function world() {
     }
     const resolveAnchorKey = vi.fn(async (_did: string): Promise<Uint8Array | null> => declared)
     const deps = { challenges, directory, store, resolveLocator: directory.resolve,
-        resolveAnchorKey, nowSeconds: 100, discardWindowSeconds: 10,
+        resolveAnchorKey, nowSeconds: 100,
         registrationMonitor: monitorRegistrationHook(registrations) }
     async function request(body: Map<string | number, CoseValue> = fullBody(), signer: Uint8Array = secret, subject = DID, tamper?: Uint8Array) {
         const nonce = `nonce-${seq++}`

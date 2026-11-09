@@ -321,6 +321,18 @@ describe("PMRObject.requestMailboxes", () => {
         })
     })
 
+    it("recovers each sender's DID exactly, colons and all", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            const web = "did:web:relay.example:users:eve" as PairMailboxKey
+            await pmr.appendToRequest(web, ref("e1"), freshNonce(), T0)
+            await pmr.appendToRequest(web, ref("e2"), freshNonce(), T0)
+            expect(await pmr.requestMailboxes(null, 10)).toEqual({
+                entries: [{ key: web, messageIds: ["e1", "e2"] }],
+                nextCursor: null,
+            })
+        })
+    })
+
     it("lists nothing for a recipient with no request entries", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.append(did("deep"), ref("m1"), freshNonce(), T0)

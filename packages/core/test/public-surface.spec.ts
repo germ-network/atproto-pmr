@@ -23,6 +23,19 @@ describe("core public surface", () => {
     })
 })
 
+describe("request mailboxes replaced the recovery pool", () => {
+    it("exports no pool listing, adjudication, frame or push payload builder", () => {
+        for (const name of ["handlePoolList", "handlePoolAdjudication", "encodePoolFrame", "buildPoolPushPayload"]) {
+            expect(core).not.toHaveProperty(name)
+        }
+    })
+
+    it("exports the request listing", () => {
+        expect(core).toHaveProperty("handleRequestsList")
+        expect(core).toHaveProperty("requestListingFields")
+    })
+})
+
 describe("fetch-one surface", () => {
     it("exports handleMessageRead, parseMessageReadPath, messageMissResponse, readMessageEntry and messageEntryFields", () => {
         for (const name of [

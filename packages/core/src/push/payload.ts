@@ -5,27 +5,21 @@ import { SEAL_OVERHEAD_BYTES } from "./seal.js"
 
 /**
  * The plaintext sealed inside a Web Push payload — `spec/wire-api.md`,
- * "The sealed payload". One place decides all three shapes, so a future
- * change to any of them has one obvious place to land.
+ * "The sealed payload". One place decides both shapes, so a future
+ * change to either has one obvious place to land.
  *
- * `t: "p"` is always exactly `{t}` and nothing else, permanently, and
- * `t: "d"` never carries content, permanently:
- *
- *   - `t: "p"` (pool threshold crossed): per-arrival content would be
- *     exactly the harassment vector pool adjudication's batching exists to
- *     prevent — same reasoning as the events socket's `#pool` frame.
- *   - `t: "d"` (the device's own watched declaration changed): a
- *     key-transparency monitor's whole purpose is catching a hostile or
- *     buggy source that lies by omission or serves something stale.
- *     Bundling "here's what changed" into the push would let a
- *     compromised deliverer assert a declaration directly to the device,
- *     bypassing the fetch-and-compare-across-monitors step the system
- *     exists to force. This holds even though the declaration record
- *     itself is a signed, self-authenticating commit — the risk here is
- *     withholding/staleness, not forgery. It may carry the two hints of
- *     `DeclarationPushHint` (the kind of change, and the record the monitor
- *     verified), which are not content and never spare the device its own
- *     verification.
+ * `t: "d"` (the device's own watched declaration changed) never carries
+ * content, permanently: a key-transparency monitor's whole purpose is
+ * catching a hostile or buggy source that lies by omission or serves
+ * something stale. Bundling "here's what changed" into the push would let a
+ * compromised deliverer assert a declaration directly to the device,
+ * bypassing the fetch-and-compare-across-monitors step the system
+ * exists to force. This holds even though the declaration record
+ * itself is a signed, self-authenticating commit — the risk here is
+ * withholding/staleness, not forgery. It may carry the two hints of
+ * `DeclarationPushHint` (the kind of change, and the record the monitor
+ * verified), which are not content and never spare the device its own
+ * verification.
  *
  * `t: "m"` (a message arrived) is the one case with a size decision: the
  * message is included when the sealed total still fits the push service's
@@ -34,10 +28,6 @@ import { SEAL_OVERHEAD_BYTES } from "./seal.js"
  * opaque ciphertext either way, and the recipient's device is already
  * entitled to this exact content over the socket or REST catch-up.
  */
-
-export function buildPoolPushPayload(): Uint8Array {
-    return encodeCose(new Map<string, CoseValue>([["t", "p"]]))
-}
 
 /**
  * What changed about the watched declaration: `rev` (the rev moved, either

@@ -13,7 +13,6 @@ import {
     reconcileWatchState,
     type AppendResult,
     type Admission,
-    type PoolVerdict,
     type BlockSource,
     type ReceiveResult,
     type PairMailboxKey,
@@ -30,8 +29,6 @@ import {
     type Nonce,
     type OpenMailboxesPage,
     type PMRStore,
-    type PoolSender,
-    type PoolAppendResult,
     type RegistrationFields,
     type RequestAppendResult,
     type RequestMailboxesPage,
@@ -62,7 +59,6 @@ import { webPushSender } from "./push-sender"
  */
 
 const KEY_REGISTRATION = "reg"
-const KEY_POOL_BYTES = "poolBytes"
 /** Bytes held across every request mailbox: entries and, once accounted, their proofs. */
 const KEY_REQUEST_BYTES = "reqBytes"
 const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
@@ -110,14 +106,14 @@ interface SummaryOrder {
 /** Durable Object storage rejects a key longer than 2 KiB. */
 const MAX_KEY_BYTES = 2048
 
-/**
+/*
  * The key families — which *kind of record* this is, an axis orthogonal to
  * the `MailboxKey` it is about. A prefixed listing is therefore also the
  * key listing, with no side table to disagree with the family it describes.
  *
  * Keys contain `:` themselves — a DID always, and a grant key by its own
  * prefix — which is harmless: every read slices a fixed prefix length
- * rather than splitting, so `pool:did:plc:alice` recovers `did:plc:alice`
+ * rather than splitting, so `req:did:plc:alice` recovers `did:plc:alice`
  * and `mbox:grant:abc` recovers `grant:abc`, both exactly.
  *
  * `GRANT_ROW_PREFIX` is NOT the wire-level `grant:` mailbox-kind prefix,
@@ -126,31 +122,18 @@ const MAX_KEY_BYTES = 2048
  * out of an address. A grant's queue lives under `mbox:grant:<address>`
  * and its metadata under `grantrow:<address>`.
  */
-const POOL_PREFIX = "pool:"
 /** A sender's request mailbox: a non-empty `MessageRef[]`, deleted when it empties. */
 const REQUEST_PREFIX = "req:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
 const PAIR_EVIDENCE_PREFIX = "pairEvidence:"
-/** A pooled sender's latest receive-time verdict, kept as long as its `pool:` entries. */
-const POOL_VERDICT_PREFIX = "poolv:"
-/**
- * Marks a pair mailbox the relay opened for a sender the recipient's policy
- * admitted; absent for a device contact. A relay that stops adjudicating
- * treats every mailbox, marked or not, as a device contact's.
- */
-const ADMITTED_PREFIX = "adm:"
 /** Marks a relay block (`syn:`) that mirrors a Bsky block, so a device takeover or unblock can tell it from a device block. */
 const BSKY_BLOCK_PREFIX = "bsky:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
-const discardKey = (k: MailboxKey) => `discard:${k}`
 const requestKey = (k: MailboxKey) => `${REQUEST_PREFIX}${k}`
-const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
-const poolVerdictKey = (k: MailboxKey) => `${POOL_VERDICT_PREFIX}${k}`
-const admittedKey = (k: MailboxKey) => `${ADMITTED_PREFIX}${k}`
 const bskyBlockKey = (k: MailboxKey) => `${BSKY_BLOCK_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
@@ -786,7 +769,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     /**
-     * Appends to a provisioned pair mailbox, or advances the synthetic
+     * Appends to a pair mailbox, or advances the synthetic
      * mailbox if the sender is blocked. The caller cannot tell which
      * happened, and neither can the sender.
      *
@@ -1271,211 +1254,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
     }
 
-    // MARK: - The recovery pool
-
-    /**
-     * Shallow per sender, wide in sender count, newest-wins on overflow —
-     * the inverse of a provisioned mailbox, because a recovery attempt is
-     * not a thread and the freshest attempt carries current state.
-     *
-     * Under pressure **depth gives and width holds**: the bound is bytes
-     * rather than sender count, since width is the property the pool exists
-     * to provide. Only at true exhaustion is a sender not already present
-     * turned away.
-     *
-     * **The discard check runs here, not in the caller.** A caller that
-     * checks discard status separately and skips this call for a discarded
-     * sender makes discard observable by round-trip count and timing even
-     * though the response bytes are identical. Folding it in means exactly
-     * one call either way, with the discarded branch doing the same reads
-     * before skipping only the write.
-     *
-     * **Anti-replay** shares its nonce set with `append` for the same key,
-     * deliberately: a nonce is a property of the (sender, envelope) pair,
-     * not of which tier absorbed it. Otherwise a sender provisioned
-     * mid-flight could replay a pooled envelope into their new mailbox.
-     */
-    async appendToPool(
-        key: MailboxKey,
-        ref: MessageRef,
-        nonce: Nonce,
-        nowSeconds: number,
-        verdict?: PoolVerdict
-    ): Promise<PoolAppendResult> {
-        const seen = await this.loadNonces(key)
-        if (seen.includes(nonceHex(nonce))) {
-            return { outcome: "duplicate" }
-        }
-
-        const discardedUntil = await this.db.get<number>(discardKey(key))
-        const discarded =
-            discardedUntil !== undefined && discardedUntil > nowSeconds
-
-        const capBytes = parseInt(this.env.POOL_CAP_BYTES)
-        const depth = parseInt(this.env.POOL_DEPTH_PER_SENDER)
-        const depthUnderPressure = parseInt(this.env.POOL_DEPTH_UNDER_PRESSURE)
-
-        const usedBytes = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-        const underPressure = usedBytes >= capBytes
-        const effectiveDepth = underPressure ? depthUnderPressure : depth
-
-        const existing = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        const wasEmpty = existing.length === 0
-
-        if (discarded) {
-            // Nothing kept and no nonce recorded, so a fresh attempt once
-            // the window lapses is evaluated on its own terms — the same
-            // reasoning `append`'s refusal relies on.
-            return { outcome: "pooled", persistBody: false }
-        }
-
-        existing.push(ref)
-        let reclaimed = 0
-        while (existing.length > effectiveDepth) {
-            const evicted = existing.shift()
-            if (evicted !== undefined) reclaimed += evicted.byteLength
-        }
-
-        if (wasEmpty && underPressure) {
-            return { outcome: "exhausted" }
-        }
-
-        await this.db.put(poolKey(key), existing)
-        if (verdict !== undefined) await this.db.put(poolVerdictKey(key), verdict)
-        await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
-        await this.recordNonce(key, nonce, seen)
-        return { outcome: "pooled", persistBody: true }
-    }
-
-    /**
-     * DIDs only, never bodies.
-     *
-     * A projection of the pool's own keys — not a join. Because the key is
-     * the DID, there is no entry whose DID can go missing and leave the
-     * sender unadjudicable until retention expiry.
-     */
-    async poolSenders(): Promise<PoolSender[]> {
-        const entries = await this.db.list<MessageRef[]>({ prefix: POOL_PREFIX })
-        const verdicts = await this.db.list<PoolVerdict>({
-            prefix: POOL_VERDICT_PREFIX,
-        })
-        return [...entries].map(([k, refs]) => {
-            const did = k.slice(POOL_PREFIX.length)
-            const verdict = verdicts.get(poolVerdictKey(did as MailboxKey))
-            return {
-                did,
-                count: refs.length,
-                ...(verdict !== undefined ? { verdict } : {}),
-            }
-        })
-    }
-
-    /**
-     * Move a pooled sender's entries into a real pair mailbox.
-     *
-     * Capacity is applied on the way in, so provisioning a sender who
-     * flooded the pool cannot overfill their new mailbox — and the entries
-     * kept are the OLDEST, matching what a provisioned mailbox does under
-     * pressure. The pool's own newest-wins policy governed which attempts
-     * survived to be provisioned; it does not follow them across.
-     */
-    async provisionFromPool(
-        key: MailboxKey,
-        _nowSeconds: number
-    ): Promise<MessageRef[]> {
-        // A blocked sender is never provisionable. `block` already purges
-        // the pool, so this is belt-and-braces against a future caller that
-        // reaches here with a stale key — provisioning a blocked sender
-        // would undo the block by creating them a live mailbox.
-        if ((await this.db.get(syntheticKey(key))) !== undefined) return []
-
-        // A device contact is judged only by blocks from here on.
-        await this.db.delete(admittedKey(key))
-
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        if (pooled.length === 0) {
-            // Provisioning an empty sender still creates the mailbox, so
-            // their next put lands normally rather than pooling again.
-            const existing = await this.db.get<MessageRef[]>(mailboxKey(key))
-            if (existing === undefined) await this.db.put(mailboxKey(key), [])
-            return []
-        }
-
-        const queue = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
-        const room = Math.max(0, this.capacity() - queue.length)
-        const moved = pooled.slice(0, room)
-
-        await this.db.put(mailboxKey(key), [...queue, ...moved])
-        await this.releasePool(key, pooled)
-
-        // Live push and Web Push, both deferred past this RPC's own
-        // response. Unlike `deliverLive`/`deliverPush`'s pair/grant-put
-        // callers, there's no body-write race to avoid here: these bodies
-        // were persisted when each message was first pooled
-        // (`pair-put.ts`), well before this adjudication call, so a KV
-        // read-back is safe.
-        if (moved.length > 0) {
-            // Gated on socket attachment — correct here, since a live
-            // broadcast to zero sockets does nothing. Do NOT nest the Web
-            // Push call below inside this same gate: Web Push exists
-            // precisely for the case where no socket is attached, so
-            // gating it on socket presence would silently suppress it in
-            // exactly the case it's for.
-            if (this.ctx.getWebSockets().length > 0) {
-                this.ctx.waitUntil(this.pushProvisioned(key, moved))
-            }
-            // One push per adjudication batch, not one per moved ref —
-            // per-ref pushes burn germ-service's 200/day budget for no
-            // benefit, since `Topic` collapse at APNs does not conserve
-            // it. A single wake is enough: the device's own catch-up
-            // (REST or reconnect-drain) recovers every provisioned
-            // message regardless of how many this one mentions.
-            const bodies = kvBodyStore(this.env)
-            const [first] = moved
-            this.ctx.waitUntil(
-                (async () => {
-                    const body = await bodies.getBody(first.messageId)
-                    if (body !== null) await this.deliverPush(key, first, body)
-                })()
-            )
-        }
-
-        return moved
-    }
-
-    private async pushProvisioned(
-        key: MailboxKey,
-        moved: MessageRef[]
-    ): Promise<void> {
-        const bodies = kvBodyStore(this.env)
-        for (const ref of moved) {
-            const body = await bodies.getBody(ref.messageId)
-            if (body === null) continue
-            this.broadcast(encodeDeliveryFrame(key, ref, body))
-        }
-    }
-
-    /** Drop the pooled entries and suppress the sender until `until`. */
-    async discardFromPool(key: MailboxKey, until: number): Promise<void> {
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        await this.releasePool(key, pooled)
-        await this.db.put(discardKey(key), until)
-        if (isPairMailboxKey(key)) await this.clearPairProof(key)
-    }
-
-    /** Remove a sender's pool entries and return their bytes to the budget. */
-    private async releasePool(
-        key: MailboxKey,
-        pooled: MessageRef[]
-    ): Promise<void> {
-        const freed = pooled.reduce((n, r) => n + r.byteLength, 0)
-        const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-        await this.db.delete(poolKey(key))
-        await this.db.delete(poolVerdictKey(key))
-        await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
-    }
-
-    // MARK: - Blocking and discard
+    // MARK: - Blocking
 
     async block(
         key: MailboxKey,
@@ -1503,15 +1282,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // Dropping the queue is the point, not a side effect: no bytes are
         // kept for a blocked sender.
         await this.db.delete(mailboxKey(key))
-        await this.db.delete(admittedKey(key))
 
         // And the request mailbox, for the same reason: a blocked sender
         // would otherwise still surface in the owner's request listing. The
         // quota gets its bytes back.
         await this.releaseRequest(key)
-
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        if (pooled.length > 0) await this.releasePool(key, pooled)
     }
 
     private async clearPairProof(key: PairMailboxKey): Promise<void> {
@@ -1588,9 +1363,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     async syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void> {
         const held = new Set<string>()
         for (const [prefix, family] of [
-            [POOL_PREFIX, "pool"],
             [REQUEST_PREFIX, "req"],
-            [ADMITTED_PREFIX, "adm"],
             [MAILBOX_PREFIX, "mbox"],
         ] as const) {
             const keys = await this.db.list({ prefix })
@@ -1618,26 +1391,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             prefix: SYNTHETIC_PREFIX,
         })
         return [...entries.keys()].map((k) => k.slice(SYNTHETIC_PREFIX.length))
-    }
-
-    async setDiscarded(key: MailboxKey, until: number): Promise<void> {
-        await this.db.put(discardKey(key), until)
-    }
-
-    /**
-     * For owner-facing queries only — never the put path.
-     *
-     * A put must NOT branch on this: `appendToPool` checks discard status
-     * internally so that a discarded sender costs the same round trip a
-     * pooled one does. Calling this first and skipping the append would
-     * reintroduce exactly the timing oracle that folding it in removed.
-     *
-     * Expiry is an observability rule, so a lapsed window reads as absent
-     * even before anything reclaims it.
-     */
-    async isDiscarded(key: MailboxKey, nowSeconds: number): Promise<boolean> {
-        const until = await this.db.get<number>(discardKey(key))
-        return until !== undefined && until > nowSeconds
     }
 
     // MARK: - Grants

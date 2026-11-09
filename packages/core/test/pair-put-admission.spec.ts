@@ -283,7 +283,7 @@ describe("handlePairPut with admission", () => {
         expect(w.events).toEqual(expect.arrayContaining(["live:m2", `live:${id}`, `push:${id}`]))
     })
 
-    it("without an admission source, a provisioned mailbox appends and everyone else is held in a request mailbox", async () => {
+    it("without an admission source, a pair mailbox appends and everyone else is held in a request mailbox", async () => {
         const { secretKey, publicKey } = keyPair()
         const w = world({ publicKey, withoutSource: true })
         await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)

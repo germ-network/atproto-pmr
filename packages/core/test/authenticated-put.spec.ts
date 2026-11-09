@@ -209,20 +209,20 @@ describe("ingestAuthenticatedPut", () => {
         expect(dropped.bodies).toEqual([])
     })
 
-    it("without admission, a provisioned mailbox appends and an unprovisioned sender is held in a request mailbox", async () => {
-        const provisioned = world({ hasMailbox: true })
-        await ingestAuthenticatedPut(put(), provisioned.deps, NOW)
-        await provisioned.settle()
-        expect(provisioned.stored.map((s) => s.via)).toEqual(["append"])
-        expect(provisioned.stored[0]!.replay).toEqual(REPLAY)
-        expect(provisioned.events).toEqual(["body", "live", "push"])
+    it("without admission, a pair mailbox appends and a sender without one is held in a request mailbox", async () => {
+        const paired = world({ hasMailbox: true })
+        await ingestAuthenticatedPut(put(), paired.deps, NOW)
+        await paired.settle()
+        expect(paired.stored.map((s) => s.via)).toEqual(["append"])
+        expect(paired.stored[0]!.replay).toEqual(REPLAY)
+        expect(paired.events).toEqual(["body", "live", "push"])
 
-        const unprovisioned = world({ hasMailbox: false })
-        await ingestAuthenticatedPut(put(), unprovisioned.deps, NOW)
-        await unprovisioned.settle()
-        expect(unprovisioned.stored.map((s) => s.via)).toEqual(["request"])
-        expect(unprovisioned.stored[0]!.replay).toEqual(REPLAY)
-        expect(unprovisioned.events).toEqual(["body"])
+        const unpaired = world({ hasMailbox: false })
+        await ingestAuthenticatedPut(put(), unpaired.deps, NOW)
+        await unpaired.settle()
+        expect(unpaired.stored.map((s) => s.via)).toEqual(["request"])
+        expect(unpaired.stored[0]!.replay).toEqual(REPLAY)
+        expect(unpaired.events).toEqual(["body"])
     })
 
     it("ext and the hint (senderDID, declarationCID) are stored on the ref", async () => {

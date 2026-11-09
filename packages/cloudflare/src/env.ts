@@ -41,13 +41,8 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
      */
     HOST_NAME: string
 
-    /** Per-sender capacity of a provisioned pair mailbox. */
+    /** Per-sender capacity of a pair mailbox. */
     MAX_MESSAGES_PER_PAIR_SENDER: string
-
-    /** Recovery pool: bounded by bytes, never by sender count. */
-    POOL_CAP_BYTES: string
-    POOL_DEPTH_PER_SENDER: string
-    POOL_DEPTH_UNDER_PRESSURE: string
 
     /** Entries one sender's request mailbox holds before it refuses. */
     REQUEST_DEPTH_PER_SENDER: string

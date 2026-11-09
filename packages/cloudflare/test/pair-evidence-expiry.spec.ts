@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest"
 import type { Admission, PairMailboxEvidence, PairMailboxKey } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
-import { inPMR } from "./helpers"
+import { inPMR, openPairMailbox } from "./helpers"
 
 const testEnv = env as unknown as PMREnv
 const NOW = Math.floor(Date.now() / 1000)
@@ -70,7 +70,7 @@ describe("cleared pair-proof watermarks", () => {
         const proof = evidence(sender)
         const replay = nonce()
         await inPMR(stub, async pmr => {
-            await pmr.provisionFromPool(sender, NOW)
+            await openPairMailbox(pmr, sender)
             const first = await pmr.appendPair(sender, ref("same-id"), replay, NOW, proof)
             const storage = storageOf(pmr)
             await storage.deleteAlarm()
@@ -106,7 +106,7 @@ describe("cleared pair-proof watermarks", () => {
         const clearedSender = "did:plc:watermark-cleared" as const
         const liveSender = "did:plc:watermark-live" as const
         await inPMR(stub, async pmr => {
-            await pmr.provisionFromPool(clearedSender, NOW)
+            await openPairMailbox(pmr, clearedSender)
             const clearedProof = evidence(clearedSender)
             await pmr.appendPair(clearedSender, ref("clear-me"), nonce(), NOW, clearedProof)
             await pmr.block(clearedSender, NOW)

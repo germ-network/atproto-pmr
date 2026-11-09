@@ -101,7 +101,7 @@ describe("summary index storage", () => {
                 await pmr.putSummaryIndex(`t${i}`, index(i), 1000 + i)
             }
             expect(await pmr.readWatchState()).toEqual({ paused: true, lastCheckAt: 5 })
-            for (const name of ["watch", "reg", "poolBytes", "summaryOrder"]) {
+            for (const name of ["watch", "reg", "summaryOrder"]) {
                 expect(await pmr.getSummaryIndex(name)).toBeNull()
             }
         })

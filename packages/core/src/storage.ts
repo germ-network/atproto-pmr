@@ -9,7 +9,7 @@
  * requirement is stated on the operation rather than left to be inferred.
  */
 
-import type { Admission, PoolVerdict } from "./admission.js"
+import type { Admission } from "./admission.js"
 import type { SummaryIndex } from "./summary.js"
 
 /**
@@ -46,8 +46,8 @@ export type MailboxKey = PairMailboxKey | GrantMailboxKey
  * construction, and saying so in the type is free. Blocking is the clearest
  * case: an owner blocks a *sender DID*, and suppresses a grant address by
  * closing the grant instead — the asymmetry `spec/wire-api.md`'s closure
- * exception spells out. The recovery pool is likewise DID-shaped; a grant
- * address never pools, because holding one already means being provisioned.
+ * exception spells out. Request mailboxes are likewise DID-shaped: a grant
+ * address never has one.
  */
 export type PairMailboxKey = `did:${string}`
 
@@ -142,7 +142,7 @@ export interface StoredPairMailboxEvidence extends PairMailboxMetadata {
 }
 
 export interface PairAppendResult {
-    result?: AppendResult | PoolAppendResult | RequestAppendResult | ReceiveResult
+    result?: AppendResult | RequestAppendResult | ReceiveResult
     generation?: string
     evidenceCID?: string
     generationChanged: boolean
@@ -190,28 +190,6 @@ export type AppendResult =
      */
     | { outcome: "refused"; retryAfter: number }
 
-export type PoolAppendResult =
-    /**
-     * `persistBody` mirrors `AppendResult`'s field, with one more case:
-     * `false` when the sender is inside a discard window, since the caller
-     * must not write bytes for an entry that was never pooled.
-     *
-     * This outcome MUST be reached by the same number of round trips and
-     * comparable work whether the sender is discarded or genuinely pooled.
-     * A discard check that lets the *caller* skip this call makes discard
-     * status observable by round-trip count and timing alone.
-     */
-    | { outcome: "pooled"; persistBody: boolean }
-    /** Same reasoning as `AppendResult`'s `duplicate`. */
-    | { outcome: "duplicate" }
-    /**
-     * True exhaustion only: byte cap reached, depth already minimal, and
-     * this sender holds no entries yet. Existing senders keep their slots,
-     * preserving earlier arrivals rather than letting a late flood displace
-     * them. Invisible to the sender — the put still answers `202`.
-     */
-    | { outcome: "exhausted" }
-
 /** One mailbox and everything currently queued in it. */
 export interface MailboxSnapshot {
     key: MailboxKey
@@ -226,19 +204,6 @@ export interface OpenMailboxesPage {
     nextCursor: string | null
 }
 
-export interface PoolSender {
-    /** The sender's DID, for the device to decide about. */
-    did: string
-    /** How many entries are waiting. Never their contents. */
-    count: number
-    /**
-     * The receive-time verdict the sender's latest pooled put carried, so the
-     * device judges with the relay's reason rather than recomputing it.
-     * Absent for an entry pooled without one.
-     */
-    verdict?: PoolVerdict
-}
-
 /**
  * What `receive` did with a pair put. As with `AppendResult`, the caller
  * cannot tell a synthetic (blocked) absorption from a real append: both are
@@ -247,15 +212,12 @@ export interface PoolSender {
 export type ReceiveResult =
     /**
      * Appended to the sender's mailbox; deliver it if `persistBody`. `moved`
-     * holds pooled entries a `yes` moved into the mailbox ahead of it, older
+     * holds request entries a `yes` moved into the mailbox ahead of it, older
      * first, whose bodies are already stored — deliver them before this one.
      */
     | { outcome: "queued"; persistBody: boolean; moved?: MessageRef[] }
-    /** Pooled (or dropped inside a discard window, `persistBody: false`); never delivered. */
-    | { outcome: "pooled"; persistBody: boolean }
     | { outcome: "duplicate" }
     | { outcome: "refused"; retryAfter: number }
-    | { outcome: "exhausted" }
     /** Held in the sender's request mailbox; store the body, never deliver it. */
     | { outcome: "held" }
     /** The shared request quota could not hold it: nothing kept, no body. */
@@ -324,7 +286,7 @@ export interface RegistrationFields {
     pushSubscription?: {
         /** RFC 8030 capability URL. Opaque; never parsed except for its origin. */
         endpoint: string
-        /** 32 bytes, AES-256-GCM. Device-provisioned; rotates by registration update. */
+        /** 32 bytes, AES-256-GCM. Supplied by the device; rotates by registration update. */
         contentKey: Uint8Array
         /** Device-assigned, 0..255, device-global across deliverers. */
         keyId: number
@@ -607,7 +569,7 @@ export interface PMRStore {
     ): Promise<void>
 
     /**
-     * Appends to a provisioned pair mailbox, or advances the synthetic
+     * Appends to a pair mailbox, or advances the synthetic
      * mailbox if the sender is blocked. **The caller cannot tell which
      * happened, and neither can the sender.**
      *
@@ -635,8 +597,9 @@ export interface PMRStore {
 
     /**
      * Pair-put variant that atomically reconciles the sender key generation
-     * and then appends to the provisioned mailbox or recovery pool. A changed
-     * key is supplied only after independent declaration verification.
+     * and then appends to the pair mailbox or, for a sender admission does
+     * not admit, the request mailbox. A changed key is supplied only after
+     * independent declaration verification.
      */
     appendPair(
         key: PairMailboxKey,
@@ -711,11 +674,11 @@ export interface PMRStore {
      */
     deliverPush?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
 
-    /** True for a provisioned mailbox *or* a blocked sender. */
+    /** True for a pair mailbox *or* a blocked sender. */
     hasMailbox(key: MailboxKey): Promise<boolean>
 
     /**
-     * Route one adjudicated pair put in a single atomic step, by the sender's
+     * Route one judged pair put in a single atomic step, by the sender's
      * standing and the recipient's `admission`:
      *
      *  - a `blocked` admission mirrors the Bsky block (`block(key, now,
@@ -753,7 +716,7 @@ export interface PMRStore {
      * hook retention sweeps will use once scheduling exists
      * (`spec/storage-consistency.md` §Scheduling).
      *
-     * An empty, provisioned mailbox — awaiting its first message, or
+     * An empty pair mailbox — awaiting its first message, or
      * fully drained since — is NOT returned: there is nothing to drain.
      * A page CAN legitimately come back with zero entries despite
      * `nextCursor` being non-null, if everything on that page happened to
@@ -795,63 +758,6 @@ export interface PMRStore {
     requestMailboxes(cursor: string | null, limit: number): Promise<RequestMailboxesPage>
 
     /**
-     * The recovery pool. Do NOT implement by reusing `append` with a
-     * different cap: the eviction direction is opposite, and conflating
-     * them is how a recovery attempt gets refused or a first-contact
-     * message silently dropped.
-     *
-     * A provisioned mailbox refuses and keeps the OLDEST — first contact is
-     * what it is for. The pool keeps the NEWEST, because the freshest
-     * attempt carries current state.
-     *
-     * CONSISTENCY CONTRACT (3): the byte accounting is read-modify-write
-     * and needs real atomicity under contention.
-     *
-     * CONSISTENCY CONTRACT (7) applies here too, and the discard check MUST
-     * run inside this call — see `PoolAppendResult`.
-     *
-     * A paused registration pools as an active one does.
-     */
-    appendToPool(
-        key: PairMailboxKey,
-        ref: MessageRef,
-        nonce: Nonce,
-        nowSeconds: number,
-        /** Recorded as the sender's latest verdict when the put is pooled. */
-        verdict?: PoolVerdict
-    ): Promise<PoolAppendResult>
-
-    /**
-     * Who is waiting in the pool — **DIDs only, never bodies.**
-     *
-     * The owner-facing listing must name senders the device can actually
-     * adjudicate, which is why the key is the DID: the listing is a
-     * projection of the pool's own keys rather than a join against a table
-     * that maps them back.
-     *
-     * This is not a new disclosure: the trust model already states that a
-     * relay learns the sender DID on a pair-mailbox put — that is the
-     * direct cost of requiring authenticated puts.
-     */
-    poolSenders(): Promise<PoolSender[]>
-
-    /**
-     * Adjudication, the device's verdict on a pooled sender.
-     *
-     * Provisioning moves the pooled entries into a real pair mailbox, so
-     * the sender's future puts land normally and the waiting messages are
-     * delivered rather than discarded. Returns what moved, so the caller
-     * can deliver it.
-     */
-    provisionFromPool(key: PairMailboxKey, nowSeconds: number): Promise<MessageRef[]>
-
-    /**
-     * Discard drops the pooled entries and suppresses the sender until
-     * `until`. Time-bounded rather than standing — see `setDiscarded`.
-     */
-    discardFromPool(key: PairMailboxKey, until: number): Promise<void>
-
-    /**
      * Blocking is reversible — the pair-mailbox counterpart of
      * close/reopen on a grant address — and a blocked sender is never told.
      * The behavior this switches on comes from `SyntheticBehavior`.
@@ -865,7 +771,7 @@ export interface PMRStore {
 
     /**
      * Mirror the owner's current Bsky blocks: block (`bsky`) every sender in
-     * `blocked` the relay holds a mailbox or pool entry for. Never lifts a
+     * `blocked` the relay holds a mailbox or request entry for. Never lifts a
      * marker: absence from `blocked` proves nothing. Walks the relay's own keys,
      * not `blocked`, so the cost follows what the relay holds rather than how
      * many the owner blocks.
@@ -884,19 +790,10 @@ export interface PMRStore {
     listBlocked(): Promise<string[]>
 
     /**
-     * Suppress an unprovisioned sender until `until`, after which it lapses
-     * and the sender pools normally again. Time-bounded rather than
-     * standing: the device discards a DID it does not recognize *at that
-     * moment*, and the pool exists precisely for the case where the
-     * device's own knowledge is behind.
-     */
-    setDiscarded(key: PairMailboxKey, until: number): Promise<void>
-
-    /**
      * The owner's own record of a grant they issued — `issue`, `close`,
      * `reopen`, `invalidate` from `spec/storage-consistency.md` §Grants,
      * split into the four operations below rather than one mutating call,
-     * matching the shape blocking and discard already use.
+     * matching the shape blocking already uses.
      *
      * This is the record `GET /pmr/v1/grants` lists from, and — just as
      * important — what a `PATCH`/`DELETE` checks BEFORE touching the

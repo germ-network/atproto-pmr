@@ -118,16 +118,6 @@ export function encodeDeliveryFrame(
 }
 
 /**
- * The wake with no list — `wire-api.md`'s own framing for why: naming
- * pooled senders here would be a per-arrival push identifying who, exactly
- * what pool adjudication's batching exists to prevent. The device already
- * has `GET /pmr/v1/pool` to fetch one.
- */
-export function encodePoolFrame(): Uint8Array {
-    return encodeFrame("pool", new Map())
-}
-
-/**
  * What this deployment currently serves **for this registration**.
  *
  * Per-registration rather than deployment-wide because a grant drain ends
@@ -188,8 +178,8 @@ export function decodeCapabilitiesFrame(
 }
 
 /**
- * Unconditional "your connect-time backlog is finished" — sent whether or
- * not `#pool` was.
+ * Unconditional "your connect-time backlog is finished" — sent after
+ * every drain, whatever it held.
  *
  * NOT to be confused with the grant lifecycle's `draining` state, which
  * says the deployment has stopped vending grants
@@ -236,10 +226,10 @@ const DEFAULT_DRAIN_PAGE_SIZE = 50
 
 /**
  * Reconnect-drain: `#capabilities` first, then every pending message
- * across every mailbox oldest page first, then the pool notice (only if
- * there is one), then `#caughtUp` — always last, always sent, so the
- * client has an unconditional signal that backlog is over even when the
- * pool is empty.
+ * across every pair and grant mailbox oldest page first, then `#caughtUp`
+ * — always last, always sent, so the client has an unconditional signal
+ * that backlog is over even when nothing was queued. Request mailboxes
+ * never appear here: the device reads them from the request listing.
  *
  * When `deps.blocks` is set the owner's Bsky blocks are mirrored first, so a
  * newly blocked sender's queue is cleared before it is read.
@@ -290,10 +280,6 @@ export async function drainBacklog(
         cursor = page.nextCursor
     } while (cursor !== null)
 
-    const pool = await deps.store.poolSenders()
-    if (pool.length > 0) {
-        send(encodePoolFrame())
-    }
     send(encodeCaughtUpFrame())
 }
 
