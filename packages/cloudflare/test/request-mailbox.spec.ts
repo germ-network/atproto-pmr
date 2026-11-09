@@ -171,19 +171,160 @@ describe("PMRObject.appendToRequest", () => {
 })
 
 describe("request entries under the sender's key", () => {
-    it.todo("getMessage finds a request entry by sender DID and id")
-    it.todo("getMessage misses identically for an acked request entry, an unknown id and an absent sender")
-    it.todo("getMessage and remove reach both tiers when one sender holds pair and request entries")
-    it.todo("never holds one message id in both tiers")
-    it.todo("remove applies the same pair-generation rule to a request entry as to a pair entry")
-    it.todo("remove deletes a request entry idempotently and refunds its bytes")
-    it.todo("removing the last request entry leaves no request mailbox key")
-    it.todo("request entries never appear in openMailboxes or list, and do not make hasMailbox true")
-    it.todo("a request-only sender with a proof row yields no openMailboxes descriptor")
+    const held = (pmr: PMRObject, who: string, id: string, bytes = 100, extra: Partial<MessageRef> = {}) =>
+        pmr.appendToRequest(did(who), { ...ref(id, bytes), ...extra }, freshNonce(), T0)
+
+    it("getMessage finds a request entry by sender DID and id", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1")
+            await held(pmr, "a", "m2", 7)
+            expect(await pmr.getMessage(did("a"), "m2")).toEqual(ref("m2", 7))
+        })
+    })
+
+    it("getMessage misses identically for an acked request entry, an unknown id and an absent sender", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1")
+            await held(pmr, "a", "m2")
+            await pmr.remove(did("a"), "m1")
+            expect(await pmr.getMessage(did("a"), "m1")).toBeNull()
+            expect(await pmr.getMessage(did("a"), "unknown")).toBeNull()
+            expect(await pmr.getMessage(did("nobody"), "m2")).toBeNull()
+            // Storage rejects a key over 2 KiB in production, so an over-long key must never reach it.
+            const ops = await traceStorage(pmr, async () => {
+                expect(await pmr.getMessage(`did:web:${"x".repeat(3000)}` as PairMailboxKey, "m2")).toBeNull()
+            })
+            expect(ops).toEqual([])
+        })
+    })
+
+    it("getMessage and remove reach both tiers when one sender holds pair and request entries", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append(did("a"), ref("deep"), freshNonce(), T0)
+            await held(pmr, "a", "shallow")
+            expect(await pmr.getMessage(did("a"), "deep")).toEqual(ref("deep"))
+            expect(await pmr.getMessage(did("a"), "shallow")).toEqual(ref("shallow"))
+
+            await pmr.remove(did("a"), "shallow")
+            expect(await pmr.getMessage(did("a"), "shallow")).toBeNull()
+            expect(await pmr.getMessage(did("a"), "deep")).toEqual(ref("deep"))
+            await pmr.remove(did("a"), "deep")
+            expect(await pmr.getMessage(did("a"), "deep")).toBeNull()
+        })
+    })
+
+    it("never holds one message id in both tiers", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append(did("a"), ref("same"), freshNonce(), T0)
+            expect(await pmr.appendToRequest(did("a"), ref("same"), freshNonce(), T0)).toEqual({
+                outcome: "duplicate",
+            })
+            expect(await storageOf(pmr).get(`req:${did("a")}`)).toBeUndefined()
+            expect(await storageOf(pmr).get("reqBytes")).toBeUndefined()
+        })
+    })
+
+    it("remove applies the same pair-generation rule to a request entry as to a pair entry", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1", 100, { pairGeneration: "g1" })
+            await held(pmr, "a", "m2", 100, { pairGeneration: "g1" })
+            await pmr.remove(did("a"), "m1", "g2")
+            expect(await pmr.getMessage(did("a"), "m1")).not.toBeNull()
+            await pmr.remove(did("a"), "m1", "g1")
+            expect(await pmr.getMessage(did("a"), "m1")).toBeNull()
+            await pmr.remove(did("a"), "m2")
+            expect(await pmr.getMessage(did("a"), "m2")).toBeNull()
+        })
+    })
+
+    it("remove deletes a request entry idempotently and refunds its bytes", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            // The same payload replayed past the nonce window holds one id twice.
+            await held(pmr, "a", "m1", 10)
+            await held(pmr, "a", "m1", 10)
+            await held(pmr, "a", "m2", 20)
+            expect(await storageOf(pmr).get("reqBytes")).toBe(40)
+            await pmr.remove(did("a"), "m1")
+            expect(await storageOf(pmr).get("reqBytes")).toBe(20)
+            await pmr.remove(did("a"), "m1")
+            await pmr.remove(did("nobody"), "m1")
+            expect(await storageOf(pmr).get("reqBytes")).toBe(20)
+            expect(await storageOf(pmr).get(`req:${did("a")}`)).toEqual([ref("m2", 20)])
+        })
+    })
+
+    it("removing the last request entry leaves no request mailbox key", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1", 10)
+            await held(pmr, "a", "m2", 20)
+            await pmr.remove(did("a"), "m1")
+            await pmr.remove(did("a"), "m2")
+            expect(await storageOf(pmr).get(`req:${did("a")}`)).toBeUndefined()
+            expect(await storageOf(pmr).get("reqBytes")).toBe(0)
+            expect((await pmr.requestMailboxes(null, 10)).entries).toEqual([])
+        })
+    })
+
+    it("request entries never appear in openMailboxes or list, and do not make hasMailbox true", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1")
+            expect(await pmr.openMailboxes(null, 10)).toEqual({ entries: [], nextCursor: null })
+            expect(await pmr.list(did("a"), 10)).toEqual([])
+            expect(await pmr.hasMailbox(did("a"))).toBe(false)
+        })
+    })
+
+    it("a request-only sender with a proof row yields no openMailboxes descriptor", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await held(pmr, "a", "m1")
+            await storageOf(pmr).put(`pairEvidence:${did("a")}`, {
+                senderDID: did("a"),
+                anchorKey: new Uint8Array(32),
+                declarationCID: "bafy-decl",
+                revision: "3kaaaaaaaaaaa",
+                car: new Uint8Array(8),
+                expiresAt: T0 + 3600,
+                generation: "g1",
+            })
+            expect(await pmr.openMailboxes(null, 10)).toEqual({ entries: [], nextCursor: null })
+        })
+    })
 })
 
 describe("PMRObject.requestMailboxes", () => {
-    it.todo("lists each request mailbox's DID with its entry ids oldest first, in key order")
-    it.todo("pages by limit and resumes from nextCursor, ending with null")
-    it.todo("lists nothing for a recipient with no request entries")
+    it("lists each request mailbox's DID with its entry ids oldest first, in key order", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            for (const [who, id] of [["b", "b1"], ["a", "a1"], ["b", "b2"], ["a", "a2"]] as const) {
+                await pmr.appendToRequest(did(who), ref(id), freshNonce(), T0)
+            }
+            expect(await pmr.requestMailboxes(null, 10)).toEqual({
+                entries: [
+                    { key: did("a"), messageIds: ["a1", "a2"] },
+                    { key: did("b"), messageIds: ["b1", "b2"] },
+                ],
+                nextCursor: null,
+            })
+        })
+    })
+
+    it("pages by limit and resumes from nextCursor, ending with null", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            for (const who of ["c", "a", "b"]) {
+                await pmr.appendToRequest(did(who), ref(`${who}1`), freshNonce(), T0)
+            }
+            const first = await pmr.requestMailboxes(null, 2)
+            expect(first.entries.map((e) => e.key)).toEqual([did("a"), did("b")])
+            expect(first.nextCursor).not.toBeNull()
+            const second = await pmr.requestMailboxes(first.nextCursor, 2)
+            expect(second.entries.map((e) => e.key)).toEqual([did("c")])
+            expect(second.nextCursor).toBeNull()
+        })
+    })
+
+    it("lists nothing for a recipient with no request entries", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await pmr.append(did("deep"), ref("m1"), freshNonce(), T0)
+            expect(await pmr.requestMailboxes(null, 10)).toEqual({ entries: [], nextCursor: null })
+        })
+    })
 })

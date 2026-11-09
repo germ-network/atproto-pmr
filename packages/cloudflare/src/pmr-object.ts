@@ -929,23 +929,39 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return queue.slice(0, limit)
     }
 
-    /** Idempotent: the client's ack path retries (contract 6). */
+    /**
+     * Idempotent: the client's ack path retries (contract 6). A sender's
+     * pair and request entries share its key, so both tiers are searched.
+     */
     async remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void> {
+        const removable = (existing: MessageRef) =>
+            !(isPairMailboxKey(key) && pairGeneration !== undefined && pairGeneration !== existing.pairGeneration)
+
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        if (queue === undefined) return
-        const existing = queue.find((r) => r.messageId === messageId)
-        if (existing === undefined) return
-        if (isPairMailboxKey(key) && pairGeneration !== undefined && pairGeneration !== existing.pairGeneration) return
-        const remaining = queue.filter((r) => r.messageId !== messageId)
-        if (remaining.length === queue.length) return
-        await this.db.put(mailboxKey(key), remaining)
+        const existing = queue?.find((r) => r.messageId === messageId)
+        if (queue !== undefined && existing !== undefined && removable(existing)) {
+            await this.db.put(mailboxKey(key), queue.filter((r) => r.messageId !== messageId))
+        }
+
+        const requests = await this.db.get<MessageRef[]>(requestKey(key))
+        const request = requests?.find((r) => r.messageId === messageId)
+        if (requests === undefined || request === undefined || !removable(request)) return
+        const remaining = requests.filter((r) => r.messageId !== messageId)
+        const freed = requests.reduce((n, r) => n + r.byteLength, 0) - remaining.reduce((n, r) => n + r.byteLength, 0)
+        if (remaining.length === 0) await this.db.delete(requestKey(key))
+        else await this.db.put(requestKey(key), remaining)
+        const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+        await this.db.put(KEY_REQUEST_BYTES, Math.max(0, used - freed))
     }
 
     async getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null> {
         // `db.get` throws on an over-long key; a miss must look like any other.
         if (new TextEncoder().encode(mailboxKey(key)).length > MAX_KEY_BYTES) return null
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        return queue?.find((r) => r.messageId === messageId) ?? null
+        const deep = queue?.find((r) => r.messageId === messageId)
+        if (deep !== undefined) return deep
+        const requests = await this.db.get<MessageRef[]>(requestKey(key))
+        return requests?.find((r) => r.messageId === messageId) ?? null
     }
 
     async hasMailbox(key: MailboxKey): Promise<boolean> {
@@ -1160,6 +1176,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
         const queue = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
         const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+        const deep = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
+        // A message id names one entry in exactly one tier.
+        if (deep.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
 
         if (queue.length >= parseInt(this.env.REQUEST_DEPTH_PER_SENDER)) {
             return {
@@ -1180,10 +1199,23 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     }
 
     async requestMailboxes(
-        _cursor: string | null,
-        _limit: number
+        cursor: string | null,
+        limit: number
     ): Promise<RequestMailboxesPage> {
-        throw new Error("requestMailboxes: not implemented")
+        const rows = await this.db.list<MessageRef[]>({
+            prefix: REQUEST_PREFIX,
+            startAfter: cursor === null || cursor === "" ? undefined : cursor,
+            limit: limit + 1,
+        })
+        const all = [...rows]
+        const page = all.slice(0, limit)
+        return {
+            entries: page.map(([raw, refs]) => ({
+                key: raw.slice(REQUEST_PREFIX.length) as PairMailboxKey,
+                messageIds: refs.map((r) => r.messageId),
+            })),
+            nextCursor: all.length > limit && page.length > 0 ? page[page.length - 1]![0] : null,
+        }
     }
 
     // MARK: - The recovery pool
