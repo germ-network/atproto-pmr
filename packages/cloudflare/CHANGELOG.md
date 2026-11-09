@@ -1,5 +1,19 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.7.0
+
+### Minor Changes
+
+- [#106](https://github.com/germ-network/atproto-pmr/pull/106) [`47e5089`](https://github.com/germ-network/atproto-pmr/commit/47e50895387dc1c8301949ac0b261c23b38a0c75) Thanks [@germ-mark](https://github.com/germ-mark)! - Hold a pair put from a sender whose new declaration the key monitor has not yet settled. A put that fails under the monitor's snapshot but verifies under the declaration on the sender's PDS is answered `202` instead of `409`, and delivered when the monitor settles a declaration whose key verifies it, so a user who just signed in on a new device can message right away. The PDS read only admits a put to wait; delivery still rests on the monitor's declaration. Opt in with `PairPutDeps.senderHold`, a `SenderHoldObject` subclass bound as `SENDER_HOLDS`, and `releaseSenderHold` in the monitor's `onSettled`; without them a failing put still answers `409`. The spec describes the hold, and the conformance summary now lists `409` for a pair put.
+
+- [#108](https://github.com/germ-network/atproto-pmr/pull/108) [`c7c18da`](https://github.com/germ-network/atproto-pmr/commit/c7c18dac737e1e13b504233a21e24a4c33ac2e28) Thanks [@germ-mark](https://github.com/germ-mark)! - Replace the recovery pool, `prov`/`disc` adjudication and the discard window with per-sender request mailboxes. A put from a sender that is not blocked and that receive-time admission does not admit is held in its request mailbox: `429` at the sender's depth, `202` with nothing kept when the shared byte quota is full, and no wake of the device. Admission `yes` moves the sender's request entries into its pair mailbox, and a blocked sender's synthetic capacity follows the tier its put would meet. The owner lists them with `GET /pmr/v1/requests` (`handleRequestsList`) and reads and acks entries through the existing fetch-one and ack routes.
+
+  `PMRStore` adopters implement `appendToRequest` and `requestMailboxes` and handle the `held` and `dropped` `ReceiveResult` outcomes; `appendToPool`, `poolSenders`, `provisionFromPool`, `discardFromPool` and `setDiscarded` are removed, along with `GET /pmr/v1/pool`, `POST /pmr/v1/pool/adjudication`, the `#pool` frame, the `t: "p"` push payload, `PoolLimits` and `OwnerDeps.discardWindowSeconds`. `PMRConfig.pool` becomes `PMRConfig.requests`, and the Cloudflare adapter reads `REQUEST_DEPTH_PER_SENDER` and `REQUEST_SHARED_CAP_BYTES` instead of `POOL_*`.
+
+### Patch Changes
+
+- [#109](https://github.com/germ-network/atproto-pmr/pull/109) [`fc8f207`](https://github.com/germ-network/atproto-pmr/commit/fc8f207219a89fd2538e908e498725bae8bf9713) Thanks [@germ-mark](https://github.com/germ-mark)! - `REQUEST_DEPTH_PER_SENDER` and `REQUEST_SHARED_CAP_BYTES` set the request-mailbox limits; unset, or not a positive integer, they default to 5 and 5000000 instead of leaving the tier unbounded (the old `POOL_*` variables are ignored). A request entry from a sender that already has a pair mailbox now stores and extends its proof, so `GET /pmr/v1/pair-evidence/{senderDID}` serves it while it is held. Request entries leave when their body expires, including those of a sender that also holds a pair mailbox and those held without a proof; a periodic sweep returns their bytes to the shared quota. `PMRObject` judges an entry by whether its body is still in the `messages` namespace; a deployment that stores bodies elsewhere must override `PMRObject.bodyStored`, or its request entries are dropped after five minutes.
+
 ## 0.6.0
 
 ### Minor Changes
