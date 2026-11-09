@@ -198,6 +198,45 @@ describe("request-sender pair evidence", () => {
         })
     })
 
+    it("a held put extends its sender's held proof expiry and never shortens it", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await heldBy(pmr, did("a"), "m1", undefined, { expiresAt: T0 + 100 })
+            await heldBy(pmr, did("a"), "m2", undefined, { expiresAt: T0 + 7_200 })
+            expect((await row(pmr, did("a")))?.expiresAt).toBe(T0 + 7_200)
+            await heldBy(pmr, did("a"), "m3", undefined, { expiresAt: T0 + 50 })
+            expect((await row(pmr, did("a")))?.expiresAt).toBe(T0 + 7_200)
+        })
+    })
+
+    it("a request entry from a sender that holds a pair mailbox gets its cleared proof stored", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await heldBy(pmr, did("a"), "deep", YES)
+            await pmr.remove(did("a"), "deep")
+            await expireProof(pmr, did("a"))
+            await pmr.alarm()
+            expect((await row(pmr, did("a")))?.car.byteLength).toBe(0)
+
+            const held = await heldBy(pmr, did("a"), "m1", NO)
+            expect(held.result).toEqual({ outcome: "held" })
+            expect((await pmr.getPairEvidence(did("a"), "bafy-selected", T0))?.car.byteLength).toBe(1000)
+            expect((await row(pmr, did("a")))?.expiresAt).toBe(T0 + 3_600)
+            // The pair mailbox's proof rides outside the request quota.
+            expect((await row(pmr, did("a")))?.requestAccountedBytes ?? 0).toBe(0)
+            expect(await reqBytes(pmr)).toBe(100)
+        })
+    })
+
+    it("a request entry from a sender that holds a pair mailbox extends its live proof's expiry", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await heldBy(pmr, did("a"), "deep", YES)
+            expect((await row(pmr, did("a")))?.expiresAt).toBe(T0 + 3_600)
+            await heldBy(pmr, did("a"), "m1", NO, { expiresAt: T0 + 7_200 })
+            expect((await row(pmr, did("a")))?.expiresAt).toBe(T0 + 7_200)
+            expect((await row(pmr, did("a")))?.car.byteLength).toBe(1000)
+            expect(await reqBytes(pmr)).toBe(100)
+        })
+    })
+
     it("moving every request entry on admission releases the proof from the shared quota", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await heldBy(pmr, did("other"), "o1")
@@ -230,7 +269,7 @@ describe("request-sender pair evidence", () => {
         })
     })
 
-    it("a request entry held without evidence stays until acked, moved or blocked", async () => {
+    it("a request entry held without evidence stays until acked, moved, blocked or its body expires", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.appendToRequest(did("a"), ref("m1"), freshNonce(), T0)
             expect(await row(pmr, did("a"))).toBeUndefined()

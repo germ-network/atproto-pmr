@@ -44,10 +44,10 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     /** Per-sender capacity of a pair mailbox. */
     MAX_MESSAGES_PER_PAIR_SENDER: string
 
-    /** Entries one sender's request mailbox holds before it refuses. */
-    REQUEST_DEPTH_PER_SENDER: string
-    /** One byte quota across all request mailboxes, proof bytes included. */
-    REQUEST_SHARED_CAP_BYTES: string
+    /** Entries one sender's request mailbox holds before it refuses. Default 5 when unset or not a positive integer. */
+    REQUEST_DEPTH_PER_SENDER?: string
+    /** One byte quota across all request mailboxes, proof bytes included. Default 5000000 when unset or not a positive integer. */
+    REQUEST_SHARED_CAP_BYTES?: string
 
     /**
      * `active`, `draining`, or `absent` — deployment-wide policy for grant

@@ -78,6 +78,7 @@ MAX_MESSAGES_PER_PAIR_SENDER = "25"
 # Request mailboxes: senders admission does not admit. Per-sender depth
 # refuses (429) when full; the shared byte quota, proof bytes included,
 # keeps nothing more when full and never refuses.
+# Unset, or not a positive integer, they default to 5 and 5000000.
 REQUEST_DEPTH_PER_SENDER = "5"
 REQUEST_SHARED_CAP_BYTES = "5000000"
 

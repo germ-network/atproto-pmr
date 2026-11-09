@@ -39,6 +39,12 @@ function freshStub(): DurableObjectStub<PMRObject> {
 
 const storageOf = (pmr: PMRObject) => (pmr as unknown as { db: DurableObjectStorage }).db
 
+/** A sender's stored request entries without the bookkeeping the object keeps beside them. */
+async function storedRequest(pmr: PMRObject, who: PairMailboxKey): Promise<MessageRef[] | undefined> {
+    const refs = await storageOf(pmr).get<Array<MessageRef & { heldAt?: number }>>(`req:${who}`)
+    return refs?.map(({ heldAt: _heldAt, ...bare }) => bare)
+}
+
 /** Every storage operation the object issues while `fn` runs, as `op:keyFamily`. */
 async function traceStorage(pmr: PMRObject, fn: () => Promise<unknown>): Promise<string[]> {
     const target = storageOf(pmr)
@@ -69,7 +75,7 @@ describe("PMRObject.appendToRequest", () => {
         await inPMR(freshStub(), async (pmr) => {
             const nonce = freshNonce()
             expect(await pmr.appendToRequest(did("a"), ref("m1"), nonce, T0)).toEqual({ outcome: "held" })
-            expect(await storageOf(pmr).get(`req:${did("a")}`)).toEqual([ref("m1")])
+            expect(await storedRequest(pmr, did("a"))).toEqual([ref("m1")])
             expect(await pmr.appendToRequest(did("a"), ref("m1"), nonce, T0)).toEqual({ outcome: "duplicate" })
         })
     })
@@ -84,7 +90,7 @@ describe("PMRObject.appendToRequest", () => {
                 })
             })
             expect(ops.filter((op) => op.startsWith("put") || op.startsWith("delete"))).toEqual([])
-            expect(await storageOf(pmr).get(`req:${did("a")}`)).toEqual([ref("m1", 40)])
+            expect(await storedRequest(pmr, did("a"))).toEqual([ref("m1", 40)])
             expect(await storageOf(pmr).get("reqBytes")).toBe(40)
         })
     })
@@ -163,7 +169,7 @@ describe("PMRObject.appendToRequest", () => {
             })
             expect(outcome).toBe("dropped")
             // Only the reads are compared: a dropped put skips the writes by design.
-            const reads = (ops: string[]) => ops.filter((op) => op.startsWith("get"))
+            const reads = (ops: string[]) => ops.filter((op) => op.startsWith("get:"))
             expect(reads(droppedOps)).toEqual(reads(heldOps))
             expect(reads(heldOps).length).toBeGreaterThan(0)
         })
@@ -249,7 +255,7 @@ describe("request entries under the sender's key", () => {
             await pmr.remove(did("a"), "m1")
             await pmr.remove(did("nobody"), "m1")
             expect(await storageOf(pmr).get("reqBytes")).toBe(20)
-            expect(await storageOf(pmr).get(`req:${did("a")}`)).toEqual([ref("m2", 20)])
+            expect(await storedRequest(pmr, did("a"))).toEqual([ref("m2", 20)])
         })
     })
 
@@ -339,4 +345,42 @@ describe("PMRObject.requestMailboxes", () => {
             expect(await pmr.requestMailboxes(null, 10)).toEqual({ entries: [], nextCursor: null })
         })
     })
+})
+
+describe("request mailbox limits from the environment", () => {
+    const withEnv = (pmr: PMRObject, over: Record<string, string | undefined>) => {
+        const base = (pmr as unknown as { env: Record<string, unknown> }).env
+        Object.defineProperty(pmr, "env", { value: { ...base, ...over }, configurable: true })
+    }
+
+    it("uses the configured depth and shared cap", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            withEnv(pmr, { REQUEST_DEPTH_PER_SENDER: "2", REQUEST_SHARED_CAP_BYTES: "250" })
+            expect((await pmr.appendToRequest(did("a"), ref("m1", 100), freshNonce(), T0)).outcome).toBe("held")
+            expect((await pmr.appendToRequest(did("a"), ref("m2", 100), freshNonce(), T0)).outcome).toBe("held")
+            expect((await pmr.appendToRequest(did("a"), ref("m3", 100), freshNonce(), T0)).outcome).toBe("refused")
+            expect((await pmr.appendToRequest(did("b"), ref("m4", 100), freshNonce(), T0)).outcome).toBe("dropped")
+        })
+    })
+
+    it.each([undefined, "", "abc", "0", "-3", "1.5"])(
+        "bounds the request tier with defaults when a variable is %j",
+        async (bad) => {
+            await inPMR(freshStub(), async (pmr) => {
+                withEnv(pmr, { REQUEST_DEPTH_PER_SENDER: bad, REQUEST_SHARED_CAP_BYTES: bad })
+                for (let i = 0; i < 5; i++) {
+                    expect((await pmr.appendToRequest(did("a"), ref(`m${i}`, 1), freshNonce(), T0)).outcome).toBe("held")
+                }
+                expect((await pmr.appendToRequest(did("a"), ref("late", 1), freshNonce(), T0)).outcome).toBe("refused")
+                expect((await pmr.appendToRequest(did("big"), ref("big", 5_000_001), freshNonce(), T0)).outcome).toBe("dropped")
+                expect((await pmr.appendToRequest(did("fits"), ref("fits", 4_999_995), freshNonce(), T0)).outcome).toBe("held")
+                await pmr.block(did("b"), T0)
+                let accepted = 0
+                for (; accepted < 8; accepted++) {
+                    if ((await pmr.receive(did("b"), ref(`b${accepted}`, 1), freshNonce(), T0, { verdict: "no", why: [] })).outcome === "refused") break
+                }
+                expect(accepted).toBe(5)
+            })
+        }
+    )
 })
