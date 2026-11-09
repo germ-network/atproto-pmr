@@ -137,8 +137,8 @@ export interface PairMailboxMetadata {
 export interface StoredPairMailboxEvidence extends PairMailboxMetadata {
     car: Uint8Array
     expiresAt: number
-    /** Portion of the recovery-pool byte budget reserved for this proof CAR. */
-    poolAccountedBytes?: number
+    /** Portion of the shared request quota this proof CAR is charged, while request entries of the sender are held. */
+    requestAccountedBytes?: number
 }
 
 export interface PairAppendResult {

@@ -44,7 +44,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
 }
 
 describe("a provisioned pair mailbox refuses when full", () => {
-    it("keeps request-only senders private and rejects stale declaration revisions", async () => {
+    it("keeps request-only senders out of the mailbox listing and rejects stale declaration revisions", async () => {
         const stub = freshStub()
         const sender = "did:plc:review-watermark" as const
         const evidence = {
@@ -58,7 +58,7 @@ describe("a provisioned pair mailbox refuses when full", () => {
         await inPMR(stub, async (pmr) => {
             const held = await pmr.appendPair(sender, ref("request-only"), freshNonce(), T0, evidence)
             expect(held.result?.outcome).toBe("held")
-            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
+            expect((await pmr.getPairEvidence(sender, evidence.declarationCID, T0))?.car).toEqual(evidence.car)
             expect((await pmr.openMailboxes(null, 20)).entries).toEqual([])
 
             const accepted = await pmr.appendPair(sender, ref("accepted"), freshNonce(), T0, evidence, { verdict: "yes" })
@@ -231,7 +231,8 @@ describe("a provisioned pair mailbox refuses when full", () => {
             expect(await pmr.list(sender, 10)).toHaveLength(1)
             await pmr.remove(sender, "same-id", legacy.generation)
             expect(await pmr.list(sender, 10)).toHaveLength(0)
-            expect(await pmr.getPairEvidence(other, "bafy-first", T0)).toBeNull()
+            // The other sender's request-held proof is untouched by this sender's rotation.
+            expect((await pmr.getPairEvidence(other, "bafy-first", T0))?.car).toEqual(new Uint8Array([1, 2, 3]))
             expect(await pmr.getPairEvidence(sender, "bafy-rotated", T0 + 3600)).toBeNull()
             await pmr.block(sender, T0)
             expect(await pmr.getPairEvidence(sender, "bafy-rotated", T0)).toBeNull()
