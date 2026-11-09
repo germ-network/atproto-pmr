@@ -22,7 +22,12 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     pmrDirectory: KVNamespace
     /** Grant address → locator. Resolves before any relay is known. */
     addresses: KVNamespace
-    /** Message bodies, kept out of the queue. */
+    /**
+     * Message bodies, kept out of the queue. `PMRObject` also reads this to
+     * tell whether a request entry's body has expired, so it must be the
+     * store the deployment writes bodies to (or `PMRObject.bodyStored`
+     * overridden).
+     */
     messages: KVNamespace
     /**
      * Server-issued challenges. Global rather than per-relay: a challenge

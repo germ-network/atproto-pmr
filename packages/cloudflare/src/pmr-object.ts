@@ -1302,7 +1302,15 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return dead
     }
 
-    private async bodyStored(id: MessageId): Promise<boolean> {
+    /**
+     * Whether the body for `id` is still stored; a request entry whose body
+     * is gone has expired. This reads `env.messages`, the namespace
+     * `kvBodyStore` writes bodies to. A deployment that writes them anywhere
+     * else MUST override this to read that store, or every request entry is
+     * dropped once it is older than the grace window. A read that fails
+     * reports the body as stored.
+     */
+    protected async bodyStored(id: MessageId): Promise<boolean> {
         try {
             const body = await this.env.messages.get(id, "stream")
             if (body === null) return false

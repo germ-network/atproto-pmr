@@ -180,9 +180,11 @@ The proof leaves the quota when:
 Every request entry also leaves, whatever its sender holds, once the
 retention that governs its body expires
 ([`wire-api.md` §Request mailboxes](wire-api.md#request-mailboxes)): the store
-neither lists it nor judges the sender's next put against it, and returns its
-bytes, and the proof's if it was the last, to the quota. An adapter that
-reclaims nothing on its own MUST still do this when it meets an expired entry.
+never lists it, and returns its bytes, and the proof's if it was the last, to
+the quota. A sender's own put need not purge, so a sender whose entries have
+expired may still be refused at its depth, or dropped at the quota, until the
+next listing or periodic sweep frees them. An adapter that reclaims nothing on
+its own MUST still do this when it meets an expired entry.
 
 Blocked, refused, duplicate and dropped outcomes MUST NOT retain proof bytes or
 expose a mailbox descriptor. A small latest-observed revision/CID/key

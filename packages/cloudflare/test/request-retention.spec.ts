@@ -1,8 +1,9 @@
 /**
  * A request entry leaves once the retention that governs its body expires,
- * whatever else its sender holds: the owner's listing never shows one, the
- * sender's own puts are not judged against one, and a periodic sweep returns
- * their bytes to the shared quota.
+ * whatever else its sender holds: the owner's listing never shows one and a
+ * periodic sweep returns their bytes to the shared quota. A sender's own put
+ * does not purge, so its depth and quota are freed by the next listing or
+ * sweep.
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
@@ -158,6 +159,15 @@ describe("request entries and body retention", () => {
         })
     })
 
+    it("judges entries by an overridden body probe", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await hold(pmr, did("a"), "m1")
+            await age(pmr, did("a"))
+            ;(pmr as unknown as { bodyStored: (id: string) => Promise<boolean> }).bodyStored = async () => true
+            expect(await listed(pmr)).toEqual([[did("a"), ["m1"]]])
+        })
+    })
+
     it("hands out no internal bookkeeping on a fetched or moved entry", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await hold(pmr, did("a"), "m1")
@@ -222,6 +232,17 @@ describe("the request sweep", () => {
             expect(await storageOf(pmr).get(`req:${did("a")}`)).toBeDefined()
             const alarm = (await storageOf(pmr).getAlarm())!
             expect(alarm).toBeLessThanOrEqual((NOW() + 3_600) * 1000)
+        })
+    })
+
+    it("keeps the sweep scheduled when an alarm fires before it is due and no proof is left", async () => {
+        await inPMR(freshStub(), async (pmr) => {
+            await hold(pmr, did("a"), "m1")
+            const dueAt = (await storageOf(pmr).get<number>("reqSweepAt"))!
+            await storageOf(pmr).deleteAlarm()
+            await pmr.alarm()
+            expect(await storageOf(pmr).getAlarm()).toBe(dueAt * 1000)
+            expect(await storageOf(pmr).get(`req:${did("a")}`)).toBeDefined()
         })
     })
 
