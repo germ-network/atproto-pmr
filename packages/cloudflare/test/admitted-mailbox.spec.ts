@@ -1,7 +1,8 @@
 /**
- * The store routes each adjudicated pair put in one step. A server-admitted
- * mailbox delivers like a provisioned one but is judged again on every put
- * until the device provisions the sender, which makes it a device contact.
+ * The store routes each adjudicated pair put in one step. Admission is
+ * judged again on every put: a yes goes to the pair mailbox, anything else to
+ * the request mailbox (see request-routing.spec.ts). This file covers the
+ * outcomes around that routing: replays, blocks, refusals and drain.
  */
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
@@ -45,89 +46,15 @@ const put = (pmr: PMRObject, id: string, admission: Admission, now = T0, nonce =
 const ids = async (pmr: PMRObject) => (await pmr.list(B, 100)).map((r) => r.messageId)
 
 describe("PMRObject.receive", () => {
-    it("yes with nothing held opens a mailbox marked admitted and queues the ref", async () => {
+    it("yes with nothing held opens a mailbox and queues the ref", async () => {
         await inPMR(freshStub(), async (pmr) => {
             expect(await put(pmr, "m1", YES)).toEqual({ outcome: "queued", persistBody: true })
             expect(await ids(pmr)).toEqual(["m1"])
-            expect(await raw(pmr, `adm:${B}`)).toBeDefined()
         })
     })
 
-    it("yes moves the sender's pooled entries into the admitted queue ahead of the new ref, returns them as moved, and drops their verdict", async () => {
+    it("a replayed nonce is a duplicate on the pair and synthetic paths", async () => {
         await inPMR(freshStub(), async (pmr) => {
-            await put(pmr, "p1", NO)
-            await put(pmr, "p2", NO)
-            const result = await put(pmr, "m1", YES)
-            expect(result).toEqual({
-                outcome: "queued",
-                persistBody: true,
-                moved: [ref("p1"), ref("p2")],
-            })
-            expect(await ids(pmr)).toEqual(["p1", "p2", "m1"])
-            expect(await pmr.poolSenders()).toEqual([])
-            expect(await raw(pmr, `poolv:${B}`)).toBeUndefined()
-            expect(await raw(pmr, "poolBytes")).toBe(0)
-        })
-    })
-
-    it("yes inside a live discard window still queues", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.setDiscarded(B, T0 + 100)
-            expect((await put(pmr, "m1", YES)).outcome).toBe("queued")
-            expect(await ids(pmr)).toEqual(["m1"])
-        })
-    })
-
-    it("no or unknown with nothing held pools the ref with its verdict", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            expect(await put(pmr, "m1", NO)).toEqual({ outcome: "pooled", persistBody: true })
-            expect(await pmr.poolSenders()).toEqual([
-                { did: B, count: 1, verdict: { verdict: "no", why: ["not-admitted"] } },
-            ])
-            await put(pmr, "m2", UNKNOWN)
-            expect(await pmr.poolSenders()).toEqual([
-                { did: B, count: 2, verdict: { verdict: "unknown", why: ["admission-unavailable"] } },
-            ])
-            expect(await ids(pmr)).toEqual([])
-            expect(await raw(pmr, `mbox:${B}`)).toBeUndefined()
-        })
-    })
-
-    it("no or unknown inside a live discard window is dropped as pooled, persistBody false", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.setDiscarded(B, T0 + 100)
-            for (const admission of [NO, UNKNOWN]) {
-                expect(await put(pmr, "m1", admission)).toEqual({ outcome: "pooled", persistBody: false })
-            }
-            expect(await pmr.poolSenders()).toEqual([])
-        })
-    })
-
-    it("no or unknown from an admitted sender pools the ref and leaves its queue as it is", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await put(pmr, "m1", YES)
-            expect((await put(pmr, "m2", NO)).outcome).toBe("pooled")
-            expect(await ids(pmr)).toEqual(["m1"])
-            expect((await pmr.poolSenders())[0]).toMatchObject({ did: B, count: 1 })
-            expect(await raw(pmr, `adm:${B}`)).toBeDefined()
-        })
-    })
-
-    it("a device-provisioned sender is queued whatever the verdict", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.provisionFromPool(B, T0)
-            for (const [i, admission] of [NO, UNKNOWN, YES].entries()) {
-                expect(await put(pmr, `m${i}`, admission)).toEqual({ outcome: "queued", persistBody: true })
-            }
-            expect(await ids(pmr)).toEqual(["m0", "m1", "m2"])
-            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
-            expect(await pmr.poolSenders()).toEqual([])
-        })
-    })
-
-    it("a replayed nonce is a duplicate on the provisioned and synthetic paths", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.provisionFromPool(B, T0)
             const nonce = freshNonce()
             await put(pmr, "m1", YES, T0, nonce)
             expect(await put(pmr, "m1", YES, T0, nonce)).toEqual({ outcome: "duplicate" })
@@ -140,9 +67,8 @@ describe("PMRObject.receive", () => {
         })
     })
 
-    it("a bsky block of a device-provisioned sender clears its queue and goes synthetic", async () => {
+    it("a bsky block of an admitted sender clears its queue and goes synthetic", async () => {
         await inPMR(freshStub(), async (pmr) => {
-            await pmr.provisionFromPool(B, T0)
             await put(pmr, "m1", YES)
             expect(await put(pmr, "m2", BLOCKED)).toEqual({ outcome: "queued", persistBody: false })
             expect(await ids(pmr)).toEqual([])
@@ -168,19 +94,16 @@ describe("PMRObject.receive", () => {
                 expect(await put(pmr, `m${i}`, admission)).toEqual({ outcome: "queued", persistBody: false })
             }
             expect(await ids(pmr)).toEqual([])
-            expect(await pmr.poolSenders()).toEqual([])
+            expect((await pmr.requestMailboxes(null, 10)).entries).toEqual([])
             expect(await pmr.listBlocked()).toEqual([B])
         })
     })
 
-    it("blocked mirrors a bsky block, clearing queue, pool and admitted mark, and absorbs the put synthetically", async () => {
+    it("blocked mirrors a bsky block, clearing the queue, and absorbs the put synthetically", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await put(pmr, "m1", YES)
-            await put(pmr, "p1", NO)
             expect(await put(pmr, "m2", BLOCKED)).toEqual({ outcome: "queued", persistBody: false })
             expect(await ids(pmr)).toEqual([])
-            expect(await pmr.poolSenders()).toEqual([])
-            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
             expect(await raw(pmr, `bsky:${B}`)).toBeDefined()
             expect(await pmr.listBlocked()).toEqual([B])
         })
@@ -192,7 +115,6 @@ describe("PMRObject.receive", () => {
             expect(await put(pmr, "m2", YES)).toEqual({ outcome: "queued", persistBody: false })
             expect(await pmr.listBlocked()).toEqual([B])
             expect(await raw(pmr, `bsky:${B}`)).toBeDefined()
-            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
             expect(await ids(pmr)).toEqual([])
         })
     })
@@ -215,7 +137,7 @@ describe("PMRObject.receive", () => {
             }
             expect(await pmr.listBlocked()).toEqual([B])
             expect(await raw(pmr, `bsky:${B}`)).toBeDefined()
-            expect(await pmr.poolSenders()).toEqual([])
+            expect((await pmr.requestMailboxes(null, 10)).entries).toEqual([])
         })
     })
 
@@ -237,7 +159,7 @@ describe("PMRObject.receive", () => {
         })
     })
 
-    it("a yes is refused only when the new ref does not fit, and that refusal writes no mailbox, mark or move", async () => {
+    it("a yes is refused only when the new ref does not fit, and that refusal writes no mailbox or move", async () => {
         await inPMR(freshStub(), async (pmr) => {
             for (let i = 0; i < CAPACITY; i++) await put(pmr, `q${i}`, YES)
             await put(pmr, "p1", NO)
@@ -245,32 +167,13 @@ describe("PMRObject.receive", () => {
             expect(result.outcome).toBe("refused")
             expect(await ids(pmr)).toHaveLength(CAPACITY)
             expect(await ids(pmr)).not.toContain("p1")
-            expect((await pmr.poolSenders())[0]).toMatchObject({ did: B, count: 1 })
+            expect((await pmr.requestMailboxes(null, 10)).entries).toEqual([{ key: B, messageIds: ["p1"] }])
         })
         await inPMR(freshStub(), async (pmr) => {
             // One slot short of full: the new ref still fits.
             for (let i = 0; i < CAPACITY - 1; i++) await put(pmr, `q${i}`, YES)
             expect((await put(pmr, "last", YES)).outcome).toBe("queued")
             expect(await ids(pmr)).toHaveLength(CAPACITY)
-        })
-    })
-
-    it("a yes with more pooled entries than room moves the oldest that fit and leaves the rest pooled with their verdict", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            for (let i = 0; i < CAPACITY - 3; i++) await put(pmr, `q${i}`, YES)
-            await put(pmr, "p1", NO)
-            await put(pmr, "p2", NO)
-            await put(pmr, "p3", NO)
-            const result = await put(pmr, "new", YES)
-            expect(result).toMatchObject({ outcome: "queued", moved: [ref("p1"), ref("p2")] })
-            const queue = await ids(pmr)
-            expect(queue.slice(-3)).toEqual(["p1", "p2", "new"])
-            expect(queue).toHaveLength(CAPACITY)
-            expect(await pmr.poolSenders()).toEqual([
-                { did: B, count: 1, verdict: { verdict: "no", why: ["not-admitted"] } },
-            ])
-            // Moved bytes returned to the pool budget; the leftover's stay.
-            expect(await raw(pmr, "poolBytes")).toBe(100)
         })
     })
 
@@ -286,24 +189,7 @@ describe("PMRObject.receive", () => {
         })
     })
 
-    it("provisionFromPool clears the admitted mark, with or without pooled entries", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await put(pmr, "m1", YES)
-            await put(pmr, "p1", NO)
-            await pmr.provisionFromPool(B, T0)
-            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
-            // From here the sender is a device contact: policy is ignored.
-            expect((await put(pmr, "m2", NO)).outcome).toBe("queued")
-            expect(await ids(pmr)).toEqual(["m1", "p1", "m2"])
-        })
-        await inPMR(freshStub(), async (pmr) => {
-            await put(pmr, "m1", YES)
-            await pmr.provisionFromPool(B, T0)
-            expect(await raw(pmr, `adm:${B}`)).toBeUndefined()
-        })
-    })
-
-    it("an admitted mailbox's messages drain and ack like a provisioned mailbox's", async () => {
+    it("an admitted mailbox's messages drain and ack like any pair mailbox's", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await put(pmr, "m1", YES)
             await put(pmr, "m2", YES)

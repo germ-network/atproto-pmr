@@ -1,7 +1,7 @@
 /**
  * A pair put is judged by the recipient's receive-time admission and routed by
  * the store in one step, so devices receive what the recipient's policy admits
- * and judge the rest from the pool. Every outcome keeps the 202/429 vocabulary.
+ * and judge the rest from request mailboxes. Every outcome keeps the 202/429 vocabulary.
  */
 import { ed25519 } from "@noble/curves/ed25519.js"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -50,7 +50,6 @@ function world(opts: {
     const events: string[] = []
     const received: Array<{ key: string; ref: MessageRef; admission: Admission }> = []
     const reads: Array<[string, string]> = []
-    const poolVerdicts: unknown[] = []
     const bodies = new Map<string, Uint8Array>()
     let recipientKnown = true
     const store = {
@@ -64,7 +63,7 @@ function world(opts: {
                 ? await store.receive(key, ref, nonce, now, admission)
                 : await store.hasMailbox()
                     ? await store.append(key, ref, nonce, now)
-                    : await store.appendToPool(key, ref, nonce, now)
+                    : await store.appendToRequest(key, ref, nonce, now)
             return {
                 result, generation: "generation-1", evidenceCID: evidence.declarationCID,
                 generationChanged: true, recycledMessageIds: [],
@@ -72,7 +71,7 @@ function world(opts: {
         },
         receive: async (key: string, ref: MessageRef, _n: unknown, _now: number, admission: Admission) => {
             received.push({ key, ref, admission })
-            return opts.result ?? { outcome: "pooled", persistBody: true }
+            return opts.result ?? { outcome: "held" }
         },
         hasMailbox: async () => opts.hasMailbox ?? true,
         unblock: async () => void events.push("unblock"),
@@ -80,9 +79,9 @@ function world(opts: {
             events.push("append")
             return { outcome: "appended", persistBody: true }
         },
-        appendToPool: async (_k: string, _r: MessageRef, _n: unknown, _t: number, verdict?: unknown) => {
-            poolVerdicts.push(verdict)
-            return { outcome: "pooled", persistBody: true }
+        appendToRequest: async () => {
+            events.push("request")
+            return { outcome: "held" }
         },
         deliverLive: async (_k: string, ref: MessageRef) => void events.push(`live:${ref.messageId}`),
         deliverPush: async (_k: string, ref: MessageRef) => void events.push(`push:${ref.messageId}`),
@@ -124,7 +123,6 @@ function world(opts: {
         events,
         received,
         reads,
-        poolVerdicts,
         bodies,
         settle: () => Promise.all(deferred),
         setRecipientKnown: (known: boolean) => void (recipientKnown = known),
@@ -145,7 +143,6 @@ describe("handlePairPut with admission", () => {
         expect(w.received[0]!.key).toBe(SENDER)
         expect(w.received[0]!.admission).toEqual({ verdict: "yes" })
         expect(w.events).not.toContain("append")
-        expect(w.poolVerdicts).toEqual([])
     })
 
     it("does not read admission for a 400, 413, 409, wrong-recipient or unknown-recipient put", async () => {
@@ -220,20 +217,20 @@ describe("handlePairPut with admission", () => {
         expect(w.events).toEqual([])
     })
 
-    it("a pooled outcome with persistBody stores the body and delivers nothing", async () => {
+    it("a held outcome stores the body and delivers nothing; a dropped one stores nothing", async () => {
         const { secretKey, publicKey } = keyPair()
-        const w = world({ publicKey, result: { outcome: "pooled", persistBody: true } })
+        const w = world({ publicKey, result: { outcome: "held" } })
         await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)
         await w.settle()
         const id = w.received[0]!.ref.messageId
         expect(w.events).toEqual([`body:${id}`])
-        const dropped = world({ publicKey, result: { outcome: "pooled", persistBody: false } })
+        const dropped = world({ publicKey, result: { outcome: "dropped" } })
         await handlePairPut(put(secretKey), RECIPIENT, dropped.deps, NOW)
         await dropped.settle()
         expect(dropped.events).toEqual([])
     })
 
-    it("refused answers 429 with Retry-After; queued, pooled, duplicate and exhausted answer 202", async () => {
+    it("refused answers 429 with Retry-After; queued, held, duplicate and dropped answer 202", async () => {
         const { secretKey, publicKey } = keyPair()
         const refused = world({ publicKey, result: { outcome: "refused", retryAfter: NOW + 30 } })
         const r = await handlePairPut(put(secretKey), RECIPIENT, refused.deps, NOW)
@@ -243,9 +240,9 @@ describe("handlePairPut with admission", () => {
         expect(refused.events).toEqual([])
         for (const result of [
             { outcome: "queued", persistBody: true },
-            { outcome: "pooled", persistBody: true },
+            { outcome: "held" },
             { outcome: "duplicate" },
-            { outcome: "exhausted" },
+            { outcome: "dropped" },
         ] as ReceiveResult[]) {
             const w = world({ publicKey, result })
             expect((await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)).status).toBe(202)
@@ -286,7 +283,7 @@ describe("handlePairPut with admission", () => {
         expect(w.events).toEqual(expect.arrayContaining(["live:m2", `live:${id}`, `push:${id}`]))
     })
 
-    it("without an admission source, behaves as before: provisioned appends, everything else pools without a verdict", async () => {
+    it("without an admission source, a provisioned mailbox appends and everyone else is held in a request mailbox", async () => {
         const { secretKey, publicKey } = keyPair()
         const w = world({ publicKey, withoutSource: true })
         await handlePairPut(put(secretKey), RECIPIENT, w.deps, NOW)
@@ -294,10 +291,10 @@ describe("handlePairPut with admission", () => {
         expect(w.received).toEqual([])
         expect(w.events[0]).toBe("append")
 
-        const pooled = world({ publicKey, withoutSource: true, hasMailbox: false })
-        await handlePairPut(put(secretKey), RECIPIENT, pooled.deps, NOW)
-        await pooled.settle()
-        expect(pooled.poolVerdicts).toEqual([undefined])
-        expect(pooled.events).not.toContain("append")
+        const held = world({ publicKey, withoutSource: true, hasMailbox: false })
+        await handlePairPut(put(secretKey), RECIPIENT, held.deps, NOW)
+        await held.settle()
+        expect(held.events).toContain("request")
+        expect(held.events).not.toContain("append")
     })
 })

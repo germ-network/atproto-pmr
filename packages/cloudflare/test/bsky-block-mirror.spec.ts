@@ -47,30 +47,25 @@ const YES: Admission = { verdict: "yes" }
 const NO: Admission = { verdict: "no", why: ["not-admitted"] }
 
 describe("PMRObject Bsky block mirror", () => {
-    it("block with source bsky sets the marker, clears queue and pool, and lists the sender in listBlocked and listBskyBlocked", async () => {
+    it("block with source bsky sets the marker, clears the queue, and lists the sender in listBlocked and listBskyBlocked", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await put(pmr, B, "m1", YES)
-            await put(pmr, B, "p1", NO)
             await pmr.block(B, T0, "bsky")
             expect(await pmr.listBlocked()).toEqual([B])
             expect(await pmr.listBskyBlocked()).toEqual([B])
             expect(await pmr.list(B, 10)).toEqual([])
-            expect(await pmr.poolSenders()).toEqual([])
         })
     })
 
-    it("syncBskyBlocks blocks a sender in the set the relay holds a mailbox or pool entry for", async () => {
+    it("syncBskyBlocks blocks a sender in the set the relay holds a mailbox for", async () => {
         await inPMR(freshStub(), async (pmr) => {
             const D = "did:plc:dave"
             await put(pmr, B, "m1", YES)
-            await put(pmr, C, "p1", NO)
-            // A device contact: a mailbox with no admitted mark.
             await pmr.append(D, ref("d1"), freshNonce(), T0)
-            await pmr.syncBskyBlocks(new Set([B, C, D]))
-            expect((await pmr.listBskyBlocked()).sort()).toEqual([B, C, D])
+            await pmr.syncBskyBlocks(new Set([B, D]))
+            expect((await pmr.listBskyBlocked()).sort()).toEqual([B, D])
             expect(await pmr.list(B, 10)).toEqual([])
             expect(await pmr.list(D, 10)).toEqual([])
-            expect(await pmr.poolSenders()).toEqual([])
         })
     })
 

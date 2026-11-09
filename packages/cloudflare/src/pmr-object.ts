@@ -700,12 +700,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             const result = admission === undefined
                 ? (await this.hasMailbox(key))
                     ? await this.append(key, boundRef, nonce, nowSeconds)
-                    : await this.appendToPool(key, boundRef, nonce, nowSeconds)
+                    : await this.appendToRequest(key, boundRef, nonce, nowSeconds)
                 : await this.receive(key, boundRef, nonce, nowSeconds, admission)
 
             const accepted = ("persistBody" in result) && result.persistBody &&
                 (result.outcome === "appended" || result.outcome === "queued")
-            const pooled = result.outcome === "pooled" && result.persistBody && !mailboxPresent
+            const held = result.outcome === "held" && !mailboxPresent
             if (accepted) {
                 const latest = await this.db.get<StoredPairEvidence>(evidenceKey)
                 selected = generationChanged || latest?.car.byteLength === 0
@@ -732,9 +732,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         : entry)
                     await this.db.put(mailboxKey(key), updated)
                 }
-            } else if (pooled) {
-                const held = await this.db.get<StoredPairEvidence>(evidenceKey)
-                if (held !== undefined && held.car.byteLength > 0 && held.expiresAt <= nowSeconds) {
+            } else if (held) {
+                const stored = await this.db.get<StoredPairEvidence>(evidenceKey)
+                if (stored !== undefined && stored.car.byteLength > 0 && stored.expiresAt <= nowSeconds) {
                     await this.clearPairProof(key)
                 }
                 const current = await this.db.get<StoredPairEvidence>(evidenceKey)
@@ -751,9 +751,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         : { ...selected, ...evidence, generation: selected.generation, poolAccountedBytes: proofBytes }
                     await this.db.put(evidenceKey, selected)
                     if (proofBytes > 0) await this.db.put(KEY_POOL_BYTES, used + proofBytes)
-                    const pooledRefs = await this.db.get<MessageRef[]>(poolKey(key))
-                    if (pooledRefs !== undefined) {
-                        await this.db.put(poolKey(key), pooledRefs.map((entry) => ({
+                    const heldRefs = await this.db.get<MessageRef[]>(requestKey(key))
+                    if (heldRefs !== undefined) {
+                        await this.db.put(requestKey(key), heldRefs.map((entry) => ({
                             ...entry,
                             pairGeneration: selected.generation,
                             hint: { senderDID: key, declarationCID: selected.declarationCID },
@@ -946,10 +946,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const requests = await this.db.get<MessageRef[]>(requestKey(key))
         const request = requests?.find((r) => r.messageId === messageId)
         if (requests === undefined || request === undefined || !removable(request)) return
-        const remaining = requests.filter((r) => r.messageId !== messageId)
-        const freed = requests.reduce((n, r) => n + r.byteLength, 0) - remaining.reduce((n, r) => n + r.byteLength, 0)
-        if (remaining.length === 0) await this.db.delete(requestKey(key))
-        else await this.db.put(requestKey(key), remaining)
+        await this.writeRequest(
+            key,
+            requests,
+            requests.filter((r) => r.messageId !== messageId)
+        )
+    }
+
+    /** Persists a request mailbox's new contents: gone when empty, with the bytes it no longer holds refunded. */
+    private async writeRequest(key: MailboxKey, before: MessageRef[], after: MessageRef[]): Promise<void> {
+        if (after.length === 0) await this.db.delete(requestKey(key))
+        else await this.db.put(requestKey(key), after)
+        const freed = before.reduce((n, r) => n + r.byteLength, 0) - after.reduce((n, r) => n + r.byteLength, 0)
         const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
         await this.db.put(KEY_REQUEST_BYTES, Math.max(0, used - freed))
     }
@@ -990,33 +998,20 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             return toReceiveResult(result)
         }
 
-        const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        const admitted = (await this.db.get(admittedKey(key))) !== undefined
-        if (queue !== undefined && !admitted) {
-            const result = await this.appendReal(key, ref, nowSeconds)
-            if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
-            return toReceiveResult(result)
-        }
-
         if (admission.verdict === "yes") {
+            const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
             return this.admit(key, ref, nonce, nowSeconds, queue ?? [], seen)
         }
         // A blocked verdict always ends on the synthetic path above.
         if (admission.verdict === "blocked") throw new Error("unreachable")
-        const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
-            verdict: admission.verdict,
-            why: admission.why,
-        })
-        return pooled.outcome === "pooled"
-            ? { outcome: "pooled", persistBody: pooled.persistBody }
-            : pooled
+        return this.appendRequest(key, ref, nonce, nowSeconds, 0, seen)
     }
 
     /**
-     * Queue a put the recipient's policy admitted, opening and marking the
-     * sender's mailbox if need be. Refused, writing nothing, only when the new
-     * ref itself does not fit; the oldest pooled entries that fit ahead of it
-     * move in and the rest stay pooled with their verdict.
+     * Queue a put the recipient's policy admitted, opening the sender's pair
+     * mailbox if need be. Refused, writing nothing, only when the new ref
+     * itself does not fit; the oldest request entries that fit ahead of it
+     * move in, with their ids and fields, and the rest stay held.
      */
     private async admit(
         key: MailboxKey,
@@ -1026,6 +1021,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         queue: MessageRef[],
         seen: string[]
     ): Promise<ReceiveResult> {
+        const requests = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+        // A message id names one entry in exactly one tier.
+        if (requests.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
         const capacity = this.capacity()
         if (queue.length >= capacity) {
             return {
@@ -1033,21 +1031,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 retryAfter: await this.retryInstant(key, nowSeconds),
             }
         }
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        const moved = pooled.slice(0, capacity - queue.length - 1)
+        const moved = requests.slice(0, capacity - queue.length - 1)
         await this.db.put(mailboxKey(key), [...queue, ...moved, ref])
-        await this.db.put(admittedKey(key), true)
-        if (moved.length > 0) {
-            const rest = pooled.slice(moved.length)
-            if (rest.length === 0) {
-                await this.releasePool(key, pooled)
-            } else {
-                await this.db.put(poolKey(key), rest)
-                const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-                const freed = moved.reduce((n, r) => n + r.byteLength, 0)
-                await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
-            }
-        }
+        if (moved.length > 0) await this.writeRequest(key, requests, requests.slice(moved.length))
         await this.recordNonce(key, nonce, seen)
         return { outcome: "queued", persistBody: true, ...(moved.length > 0 ? { moved } : {}) }
     }
@@ -1169,9 +1155,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        extraBytes: number
+        extraBytes: number,
+        preloadedNonces?: string[]
     ): Promise<RequestAppendResult> {
-        const seen = await this.loadNonces(key)
+        const seen = preloadedNonces ?? (await this.loadNonces(key))
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
 
         const queue = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []

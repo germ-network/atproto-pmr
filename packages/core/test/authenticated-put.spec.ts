@@ -47,7 +47,7 @@ function world(opts: {
                 ? await store.receive(key, ref, replay, now, verdict)
                 : await store.hasMailbox()
                     ? await store.append(key, ref, replay)
-                    : await store.appendToPool(key, ref, replay)
+                    : await store.appendToRequest(key, ref, replay)
             return {
                 result, generation: "generation-1", evidenceCID: evidence.declarationCID,
                 generationChanged: true, recycledMessageIds: [],
@@ -63,9 +63,9 @@ function world(opts: {
             stored.push({ via: "append", key, ref, replay })
             return opts.appendResult ?? { outcome: "appended", persistBody: true }
         },
-        appendToPool: async (key: string, ref: MessageRef, replay: Uint8Array) => {
-            stored.push({ via: "pool", key, ref, replay })
-            return { outcome: "pooled", persistBody: true }
+        appendToRequest: async (key: string, ref: MessageRef, replay: Uint8Array) => {
+            stored.push({ via: "request", key, ref, replay })
+            return { outcome: "held" }
         },
         deliverLive: async () => void events.push("live"),
         deliverPush: async () => void events.push("push"),
@@ -155,15 +155,15 @@ describe("ingestAuthenticatedPut", () => {
         expect(w.bodyWrites).toEqual([[w.stored[0]!.ref.messageId, NOW + 1000]])
     })
 
-    it("with admission, a pooled put stores the body; a blocked sender's put stores no body", async () => {
-        const pooled = world({ withAdmission: true, receive: { outcome: "pooled", persistBody: true } })
-        await ingestAuthenticatedPut(put(), pooled.deps, NOW)
-        await pooled.settle()
-        expect(pooled.events).toEqual(["body"])
+    it("with admission, a held put stores the body; a blocked sender's put stores no body", async () => {
+        const held = world({ withAdmission: true, receive: { outcome: "held" } })
+        await ingestAuthenticatedPut(put(), held.deps, NOW)
+        await held.settle()
+        expect(held.events).toEqual(["body"])
 
         for (const receive of [
             { outcome: "queued", persistBody: false },
-            { outcome: "pooled", persistBody: false },
+            { outcome: "dropped" },
         ] as const) {
             const blocked = world({ withAdmission: true, receive })
             expect(await ingestAuthenticatedPut(put(), blocked.deps, NOW)).toEqual({
@@ -201,15 +201,15 @@ describe("ingestAuthenticatedPut", () => {
         expect(w.bodies).toEqual([])
         expect(w.stored[0]!.replay).toEqual(REPLAY)
 
-        const exhausted = world({ withAdmission: true, receive: { outcome: "exhausted" } })
-        expect(await ingestAuthenticatedPut(put(), exhausted.deps, NOW)).toEqual({
+        const dropped = world({ withAdmission: true, receive: { outcome: "dropped" } })
+        expect(await ingestAuthenticatedPut(put(), dropped.deps, NOW)).toEqual({
             outcome: "accepted",
         })
-        await exhausted.settle()
-        expect(exhausted.bodies).toEqual([])
+        await dropped.settle()
+        expect(dropped.bodies).toEqual([])
     })
 
-    it("without admission, a provisioned mailbox appends and an unprovisioned sender pools", async () => {
+    it("without admission, a provisioned mailbox appends and an unprovisioned sender is held in a request mailbox", async () => {
         const provisioned = world({ hasMailbox: true })
         await ingestAuthenticatedPut(put(), provisioned.deps, NOW)
         await provisioned.settle()
@@ -220,7 +220,7 @@ describe("ingestAuthenticatedPut", () => {
         const unprovisioned = world({ hasMailbox: false })
         await ingestAuthenticatedPut(put(), unprovisioned.deps, NOW)
         await unprovisioned.settle()
-        expect(unprovisioned.stored.map((s) => s.via)).toEqual(["pool"])
+        expect(unprovisioned.stored.map((s) => s.via)).toEqual(["request"])
         expect(unprovisioned.stored[0]!.replay).toEqual(REPLAY)
         expect(unprovisioned.events).toEqual(["body"])
     })

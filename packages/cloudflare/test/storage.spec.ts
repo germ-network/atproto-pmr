@@ -44,7 +44,7 @@ function freshStub(): DurableObjectStub<PMRObject> {
 }
 
 describe("a provisioned pair mailbox refuses when full", () => {
-    it("keeps pool-only senders private and rejects stale declaration revisions", async () => {
+    it("keeps request-only senders private and rejects stale declaration revisions", async () => {
         const stub = freshStub()
         const sender = "did:plc:review-watermark" as const
         const evidence = {
@@ -56,25 +56,25 @@ describe("a provisioned pair mailbox refuses when full", () => {
             expiresAt: T0 + 3600,
         }
         await inPMR(stub, async (pmr) => {
-            const pooled = await pmr.appendPair(sender, ref("pool-only"), freshNonce(), T0, evidence)
-            expect(pooled.result?.outcome).toBe("pooled")
+            const held = await pmr.appendPair(sender, ref("request-only"), freshNonce(), T0, evidence)
+            expect(held.result?.outcome).toBe("held")
             expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
             expect((await pmr.openMailboxes(null, 20)).entries).toEqual([])
 
-            await pmr.provisionFromPool(sender, T0)
+            const accepted = await pmr.appendPair(sender, ref("accepted"), freshNonce(), T0, evidence, { verdict: "yes" })
+            expect(accepted.result?.outcome).toBe("queued")
             expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toMatchObject({
                 declarationCID: evidence.declarationCID,
                 car: evidence.car,
             })
             expect(await pmr.list(sender, 20)).toEqual([
                 expect.objectContaining({
-                    messageId: "pool-only",
+                    messageId: "request-only",
                     hint: { senderDID: sender, declarationCID: evidence.declarationCID },
                     pairGeneration: expect.any(String),
                 }),
+                expect.objectContaining({ messageId: "accepted" }),
             ])
-            const accepted = await pmr.appendPair(sender, ref("accepted"), freshNonce(), T0, evidence)
-            expect(accepted.result?.outcome).toBe("appended")
             const stale = await pmr.appendPair(sender, ref("stale"), freshNonce(), T0, {
                 ...evidence,
                 anchorKey: new Uint8Array(32).fill(8),
@@ -82,66 +82,7 @@ describe("a provisioned pair mailbox refuses when full", () => {
                 revision: "4444444444444",
             })
             expect(stale.rejected).toBe("staleEvidence")
-            expect(await pmr.list(sender, 20)).toEqual([
-                expect.objectContaining({ messageId: "pool-only" }),
-                expect.objectContaining({ messageId: "accepted" }),
-            ])
-        })
-    })
-
-    it("charges a pooled proof CAR against the shared byte cap", async () => {
-        const stub = freshStub()
-        const sender = "did:plc:pool-proof-budget" as const
-        const evidence = {
-            senderDID: sender,
-            anchorKey: new Uint8Array(32).fill(4),
-            declarationCID: "bafy-budgeted",
-            revision: "2222222222222",
-            car: new Uint8Array(1_000_000),
-            expiresAt: T0 + 3600,
-        }
-        await inPMR(stub, async (pmr) => {
-            for (let i = 0; i < 3; i++) {
-                const result = await pmr.appendPair(sender, ref(`large-${i}`, 1_000_000), freshNonce(), T0, evidence)
-                expect(result.result?.outcome).toBe("pooled")
-            }
-            const other = "did:plc:pool-proof-budget-other" as const
-            const exhausted = await pmr.appendPair(other, ref("not-kept"), freshNonce(), T0, {
-                senderDID: other,
-                anchorKey: new Uint8Array(32).fill(5),
-                declarationCID: "bafy-other",
-                revision: "2222222222222",
-                car: new Uint8Array([5]),
-                expiresAt: T0 + 3600,
-            })
-            expect(exhausted.result?.outcome).toBe("exhausted")
-            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([sender])
-        })
-    })
-
-    it("keeps a pooled message without proof metadata when the proof cannot fit", async () => {
-        const stub = freshStub()
-        const sender = "did:plc:proof-does-not-fit" as const
-        const evidence = {
-            senderDID: sender,
-            anchorKey: new Uint8Array(32).fill(6),
-            declarationCID: "bafy-too-large",
-            revision: "3333333333333",
-            car: new Uint8Array(1_000_000),
-            expiresAt: T0 + 3600,
-        }
-        await inPMR(stub, async (pmr) => {
-            const cap = parseInt(testEnv.POOL_CAP_BYTES)
-            await pmr.appendToPool("did:plc:proof-budget-filler", ref("filler", cap - 500_000), freshNonce(), T0)
-            const result = await pmr.appendPair(sender, ref("without-proof", 1), freshNonce(), T0, evidence)
-            expect(result.result?.outcome).toBe("pooled")
-            expect(await pmr.getPairEvidence(sender, evidence.declarationCID, T0)).toBeNull()
-            expect(await pmr.list(sender, 10)).toEqual([])
-            expect((await pmr.poolSenders()).map((entry) => entry.did)).toContain(sender)
-            await pmr.provisionFromPool(sender, T0)
-            const [provisioned] = await pmr.list(sender, 10)
-            expect(provisioned?.hint).toBeUndefined()
-            expect(provisioned?.pairGeneration).toBeUndefined()
+            expect(await pmr.list(sender, 20)).toHaveLength(2)
         })
     })
 
@@ -181,7 +122,6 @@ describe("a provisioned pair mailbox refuses when full", () => {
             const nextAlarm = await storage.getAlarm()
             expect(nextAlarm).not.toBeNull()
             expect(nextAlarm).toBeGreaterThan(Date.now() + 3_500_000)
-            expect((await pmr.poolSenders()).map((entry) => entry.did)).toEqual([future])
         })
     })
 
@@ -1230,12 +1170,11 @@ describe("getMessage — read one queued message by mailbox key and id", () => {
             expiresAt: T0 + 3600,
         }
         await inPMR(stub, async (pmr) => {
-            await pmr.appendPair(sender, ref("pooled"), freshNonce(), T0, evidence)
-            await pmr.provisionFromPool(sender, T0)
-            const queued = (await pmr.list(sender, 10))[0]
+            await pmr.appendPair(sender, ref("queued"), freshNonce(), T0, evidence, { verdict: "yes" })
+            const queued = (await pmr.list(sender, 10))[0]!
             expect(queued.hint).toBeDefined()
             expect(queued.pairGeneration).toBeDefined()
-            expect(await pmr.getMessage(sender, "pooled")).toEqual(queued)
+            expect(await pmr.getMessage(sender, "queued")).toEqual(queued)
         })
     })
 
@@ -1280,19 +1219,19 @@ describe("getMessage — read one queued message by mailbox key and id", () => {
         })
     })
 
-    it("does not read pooled refs: a pool-only sender misses", async () => {
-        const sender = "did:plc:get-message-pool" as const
+    it("reads a request entry under the sender's DID", async () => {
+        const sender = "did:plc:get-message-request" as const
         await inPMR(freshStub(), async (pmr) => {
-            const pooled = await pmr.appendPair(sender, ref("pool-only"), freshNonce(), T0, {
+            const held = await pmr.appendPair(sender, ref("request-only"), freshNonce(), T0, {
                 senderDID: sender,
                 anchorKey: new Uint8Array(32).fill(7),
-                declarationCID: "bafy-pool",
+                declarationCID: "bafy-request",
                 revision: "5555555555555",
                 car: new Uint8Array([7]),
                 expiresAt: T0 + 3600,
             })
-            expect(pooled.result?.outcome).toBe("pooled")
-            expect(await pmr.getMessage(sender, "pool-only")).toBeNull()
+            expect(held.result?.outcome).toBe("held")
+            expect(await pmr.getMessage(sender, "request-only")).toMatchObject({ messageId: "request-only" })
         })
     })
 

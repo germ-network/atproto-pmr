@@ -29,7 +29,7 @@ const freshStub = (): DurableObjectStub<PMRObject> => {
 const nonce = (n: number) => new Uint8Array(16).fill(n)
 
 describe("entry extension fields in storage", () => {
-    it("ext on a pooled ref survives admission into the mailbox", async () => {
+    it("ext on a held ref survives admission into the mailbox", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.receive(B, ref("p1"), nonce(1), T0, NO)
             const result = await pmr.receive(B, { ...ref("m1"), ext: undefined }, nonce(2), T0, YES)
@@ -38,14 +38,6 @@ describe("entry extension fields in storage", () => {
             )
             const listed = await pmr.list(B, 10)
             expect(listed.find((r) => r.messageId === "p1")).toEqual(ref("p1"))
-        })
-    })
-
-    it("ext on a pooled ref survives provisioning from the pool", async () => {
-        await inPMR(freshStub(), async (pmr) => {
-            await pmr.receive(B, ref("p1"), nonce(1), T0, NO)
-            await pmr.provisionFromPool(B, T0)
-            expect(await pmr.list(B, 10)).toEqual([ref("p1")])
         })
     })
 })

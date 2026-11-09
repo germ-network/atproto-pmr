@@ -724,18 +724,19 @@ export interface PMRStore {
      *  - no verdict lifts a block marker: a Bsky-blocked sender stays
      *    synthetic until the device unblocks it;
      *  - a device-blocked sender is absorbed synthetically;
-     *  - a device-provisioned sender is appended, whatever the verdict;
-     *  - `yes` appends to a mailbox marked admitted, opened if none is held,
-     *    moving any pooled entries into it — even inside a discard window;
-     *  - `no` / `unknown` pools the put with its verdict, as `appendToPool`
-     *    (so a live discard window drops it).
+     *  - every other put is judged on its own, whatever mailboxes the sender
+     *    already holds: `yes` queues in the sender's pair mailbox, opened if
+     *    none is held, after moving its request entries in oldest first as
+     *    capacity allows; `no` / `unknown` goes to the request mailbox, as
+     *    `appendToRequest` (`held`, `refused` or `dropped`).
      *
      * Order: the nonce check first (nothing at all is written for a
      * duplicate), then the block-marker transition,
      * then capacity: a `yes` is refused only when the new ref itself does not
-     * fit (a refusal writes no mailbox, mark or move); otherwise the oldest
-     * pooled entries that fit ahead of it move in and the rest stay pooled
-     * with their verdict. Then the writes.
+     * fit (a refusal writes no mailbox or move); otherwise the oldest request
+     * entries that fit ahead of it move in and the rest stay held. A `yes`
+     * whose message id a request mailbox already holds is a `duplicate`. Then
+     * the writes.
      */
     receive(
         key: PairMailboxKey,
