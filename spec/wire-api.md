@@ -1163,7 +1163,10 @@ catch-up point for Bsky blocks ([Blocked senders](#blocked-senders)).
 
 The device fetches the bodies of the senders it chooses, one entry at a
 time, and drops a sender it does not want by acking that sender's entry ids
-without fetching them: `{a: [{k, id}…]}` with `k` the sender DID and no `g`. A device that wants no further mail from a sender
+without fetching them: `{a: [{k, id}…]}` with `k` the sender DID and no `g`. Acks of request entries follow the
+[generation rule](#the-events-socket) of any ack: an echoed current `g` or no
+`g` removes the entry, a stale `g` is a no-op; a drop from the listing omits
+`g`, since rows carry none. A device that wants no further mail from a sender
 [blocks](#blocked-senders) it. A fetched request entry has the same shape as any other
 (`{k, id, m}`, plus `sd`/`dc`/`g` when present), and its proof is served by
 `GET /pmr/v1/pair-evidence/{senderDID}` while the entry is held.

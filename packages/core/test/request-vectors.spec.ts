@@ -4,11 +4,13 @@
  * wire, which is a contract change, not a reason to regenerate the vectors.
  */
 import { readFileSync } from "node:fs"
+import { sha256 } from "@noble/hashes/sha2.js"
 import { describe, expect, it } from "vitest"
 import { decodeCoseMap, encodeCose, type CoseValue } from "../src/cose/cbor"
 import { messageEntryFields } from "../src/events"
 import { messageIdFor } from "../src/message-id"
 import { requestListingFields } from "../src/owner/endpoints"
+import { cidToString } from "../src/repo-proof"
 import type { MessageId, PairMailboxKey } from "../src/storage"
 
 const file = JSON.parse(
@@ -38,6 +40,14 @@ describe("request-mailbox wire vectors", () => {
         expect(hex(encodeCose(new Map<string, CoseValue>([["a", acks]])))).toBe(v.dropAck.cbor)
         const decoded = decodeCoseMap(Buffer.from(v.dropAck.cbor, "hex"))
         expect((decoded.get("a") as Map<string, CoseValue>[])[0]!.has("g")).toBe(false)
+    })
+
+    it("gives every dc as a CIDv1 dag-cbor sha2-256 in multibase base32", () => {
+        const dcs = Object.values(v).flatMap((x) => ((x as { dc?: string }).dc === undefined ? [] : [(x as { dc: string }).dc]))
+        expect(dcs.length).toBeGreaterThan(0)
+        for (const dc of dcs) expect(dc).toMatch(/^bafyrei[a-z2-7]{52}$/)
+        const digest = sha256(utf8(file.inputs.declarationBlockUtf8))
+        expect(v.fetchOneHit.dc).toBe(cidToString(new Uint8Array([0x01, 0x71, 0x12, 0x20, ...digest])))
     })
 
     it("encodes a fetched request entry in the catch-up entry shape", () => {
