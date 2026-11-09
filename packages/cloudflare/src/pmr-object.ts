@@ -63,6 +63,8 @@ import { webPushSender } from "./push-sender"
 
 const KEY_REGISTRATION = "reg"
 const KEY_POOL_BYTES = "poolBytes"
+/** Bytes held across every request mailbox: entries and, once accounted, their proofs. */
+const KEY_REQUEST_BYTES = "reqBytes"
 const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
 const KEY_PAIR_EVIDENCE_EXPIRY_MIN = "pairEvidenceExpiryMin"
 const PAIR_EVIDENCE_EXPIRY_BATCH_SIZE = 100
@@ -125,6 +127,8 @@ const MAX_KEY_BYTES = 2048
  * and its metadata under `grantrow:<address>`.
  */
 const POOL_PREFIX = "pool:"
+/** A sender's request mailbox: a non-empty `MessageRef[]`, deleted when it empties. */
+const REQUEST_PREFIX = "req:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
@@ -143,6 +147,7 @@ const BSKY_BLOCK_PREFIX = "bsky:"
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
 const discardKey = (k: MailboxKey) => `discard:${k}`
+const requestKey = (k: MailboxKey) => `${REQUEST_PREFIX}${k}`
 const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
 const poolVerdictKey = (k: MailboxKey) => `${POOL_VERDICT_PREFIX}${k}`
 const admittedKey = (k: MailboxKey) => `${ADMITTED_PREFIX}${k}`
@@ -1125,12 +1130,53 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     // MARK: - Request mailboxes
 
     async appendToRequest(
-        _key: PairMailboxKey,
-        _ref: MessageRef,
-        _nonce: Nonce,
-        _nowSeconds: number
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number
     ): Promise<RequestAppendResult> {
-        throw new Error("appendToRequest: not implemented")
+        return this.appendRequest(key, ref, nonce, nowSeconds, 0)
+    }
+
+    /**
+     * Depth is judged before the shared quota, so a full sender refuses
+     * whatever the quota's state. Every read happens before any decision,
+     * so a dropped put issues the same reads as a held one and skips only
+     * the writes.
+     *
+     * `extraBytes` is what the caller will newly account alongside the entry
+     * (a proof it holds for this sender), reserved in the same decision so
+     * the entry and its proof are kept together or not at all.
+     */
+    private async appendRequest(
+        key: MailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        extraBytes: number
+    ): Promise<RequestAppendResult> {
+        const seen = await this.loadNonces(key)
+        if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
+
+        const queue = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+        const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+
+        if (queue.length >= parseInt(this.env.REQUEST_DEPTH_PER_SENDER)) {
+            return {
+                outcome: "refused",
+                retryAfter: await this.retryInstant(key, nowSeconds),
+            }
+        }
+        const total = ref.byteLength + extraBytes
+        if (used + total > parseInt(this.env.REQUEST_SHARED_CAP_BYTES)) {
+            return { outcome: "dropped" }
+        }
+
+        queue.push(ref)
+        await this.db.put(requestKey(key), queue)
+        await this.db.put(KEY_REQUEST_BYTES, used + total)
+        await this.recordNonce(key, nonce, seen)
+        return { outcome: "held" }
     }
 
     async requestMailboxes(
