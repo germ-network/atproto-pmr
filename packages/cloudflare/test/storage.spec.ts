@@ -426,9 +426,10 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         })
     })
 
-    it("fills to capacity, then refuses with a future drain instant", async () => {
+    it("fills to the request depth, then refuses with a future drain instant", async () => {
         const stub = freshStub()
-        const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
+        // A blocked pair key refuses where an unblocked non-admitted sender would.
+        const capacity = parseInt(testEnv.REQUEST_DEPTH_PER_SENDER)
         await inPMR(stub, async (pmr) => {
             await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
@@ -444,7 +445,8 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
 
     it("drains once the stored instant passes, then accepts again", async () => {
         const stub = freshStub()
-        const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
+        // A blocked pair key refuses where an unblocked non-admitted sender would.
+        const capacity = parseInt(testEnv.REQUEST_DEPTH_PER_SENDER)
         await inPMR(stub, async (pmr) => {
             await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
@@ -462,7 +464,8 @@ describe("a blocked sender cannot distinguish blocking from silence", () => {
         // Anchoring on the fill would let a persistent sender push the drain
         // back indefinitely — both wrong and a tell.
         const stub = freshStub()
-        const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
+        // A blocked pair key refuses where an unblocked non-admitted sender would.
+        const capacity = parseInt(testEnv.REQUEST_DEPTH_PER_SENDER)
         await inPMR(stub, async (pmr) => {
             await pmr.block("did:plc:mallory", T0)
             for (let i = 0; i < capacity; i++) {
@@ -583,7 +586,8 @@ describe("anti-replay: nonce checked and recorded atomically with append", () =>
         // oracle for blocked-vs-real, since a real mailbox's replay (above)
         // never does that.
         const stub = freshStub()
-        const capacity = parseInt(testEnv.MAX_MESSAGES_PER_PAIR_SENDER)
+        // A blocked pair key refuses where an unblocked non-admitted sender would.
+        const capacity = parseInt(testEnv.REQUEST_DEPTH_PER_SENDER)
         await inPMR(stub, async (pmr) => {
             await pmr.block("did:plc:mallory", T0)
             const nonce = freshNonce()

@@ -223,6 +223,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return parseInt(this.env.MAX_MESSAGES_PER_PAIR_SENDER)
     }
 
+    private requestDepth(): number {
+        return parseInt(this.env.REQUEST_DEPTH_PER_SENDER)
+    }
+
     /**
      * What this deployment serves **for this registration**.
      *
@@ -822,7 +826,15 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         const result =
             blocked !== undefined
-                ? await this.advanceSynthetic(key, blocked, nowSeconds)
+                ? await this.advanceSynthetic(
+                      key,
+                      blocked,
+                      nowSeconds,
+                      // A pair key reaches `append` only without an admission
+                      // source, where an unblocked sender with no pair mailbox
+                      // meets the request depth.
+                      isPairMailboxKey(key) ? this.requestDepth() : this.capacity()
+                  )
                 : await this.appendReal(key, ref, nowSeconds)
 
         if (result.outcome === "appended") {
@@ -861,17 +873,31 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * No bytes, no queue rows, no delivery — and `persistBody: false`,
      * which is how the caller keeps "no bytes stored for a blocked sender"
      * true without ever learning it is talking to the synthetic path.
+     *
+     * `capacity` is the depth this put would meet unblocked: the pair
+     * mailbox's when admission would admit it, the request mailbox's
+     * otherwise. A blocked sender then refuses where an unblocked one does,
+     * so the point where a 429 starts does not say which it is.
      */
     private async advanceSynthetic(
         key: MailboxKey,
         stored: SyntheticState,
-        nowSeconds: number
+        nowSeconds: number,
+        capacity: number
     ): Promise<AppendResult> {
+        if (isPairMailboxKey(key)) {
+            // The request path reads these before it decides; reading them
+            // here keeps a blocked sender's put as much storage work as an
+            // unblocked one's.
+            await this.db.get(requestKey(key))
+            await this.db.get(KEY_REQUEST_BYTES)
+            await this.db.get(mailboxKey(key))
+        }
         const retryInstant = await this.retryInstant(key, nowSeconds)
         const { state, accepted } = this.synthetic.advance(
             stored,
             nowSeconds,
-            this.capacity(),
+            capacity,
             retryInstant
         )
         await this.db.put(syntheticKey(key), state)
@@ -1031,7 +1057,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         }
         if (blocked !== undefined) {
-            const result = await this.advanceSynthetic(key, blocked, nowSeconds)
+            const result = await this.advanceSynthetic(
+                key,
+                blocked,
+                nowSeconds,
+                admission.verdict === "yes" ? this.capacity() : this.requestDepth()
+            )
             if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
             return toReceiveResult(result)
         }
@@ -1202,7 +1233,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // A message id names one entry in exactly one tier.
         if (deep.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
 
-        if (queue.length >= parseInt(this.env.REQUEST_DEPTH_PER_SENDER)) {
+        if (queue.length >= this.requestDepth()) {
             return {
                 outcome: "refused",
                 retryAfter: await this.retryInstant(key, nowSeconds),
@@ -1455,7 +1486,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // `bs`; the marker is dropped before the early return.
         if (source === "device") await this.db.delete(bskyBlockKey(key))
         if (isPairMailboxKey(key)) await this.clearPairProof(key)
-        if ((await this.db.get(syntheticKey(key))) !== undefined) return
+        if ((await this.db.get(syntheticKey(key))) !== undefined) {
+            // An entry can land between a put's mailbox check and its hold.
+            await this.releaseRequest(key)
+            return
+        }
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
         // calling `advance` — that would count a fill at block time, so the
@@ -1470,11 +1505,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.delete(mailboxKey(key))
         await this.db.delete(admittedKey(key))
 
-        // And the pool, for the same reason. A sender who was pooled and
-        // then blocked would otherwise still surface in the owner's pool
-        // listing, and adjudication could provision them — creating a live
-        // mailbox holding a blocked sender's messages. Releasing through
-        // the shared helper also returns their bytes to the pool budget.
+        // And the request mailbox, for the same reason: a blocked sender
+        // would otherwise still surface in the owner's request listing. The
+        // quota gets its bytes back.
+        await this.releaseRequest(key)
+
         const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
         if (pooled.length > 0) await this.releasePool(key, pooled)
     }
@@ -1554,6 +1589,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const held = new Set<string>()
         for (const [prefix, family] of [
             [POOL_PREFIX, "pool"],
+            [REQUEST_PREFIX, "req"],
             [ADMITTED_PREFIX, "adm"],
             [MAILBOX_PREFIX, "mbox"],
         ] as const) {

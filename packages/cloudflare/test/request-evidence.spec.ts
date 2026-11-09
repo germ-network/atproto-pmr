@@ -186,13 +186,15 @@ describe("request-sender pair evidence", () => {
         })
     })
 
-    it("removing the last request entry of a blocked sender keeps its anti-rollback watermark row", async () => {
+    it("blocking a sender with request entries keeps its anti-rollback watermark row", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await heldBy(pmr, did("a"), "m1")
             await pmr.block(did("a"), T0)
-            await pmr.remove(did("a"), "m1")
             expect(await row(pmr, did("a"))).toMatchObject({ expiresAt: 0 })
             expect(await reqBytes(pmr)).toBe(0)
+            await pmr.unblock(did("a"))
+            const rolledBack = await pmr.appendPair(did("a"), ref("m2"), freshNonce(), T0, evidence(did("a"), 1000, { revision: "4444444444444" }))
+            expect(rolledBack.rejected).toBe("staleEvidence")
         })
     })
 
