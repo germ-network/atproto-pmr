@@ -1,12 +1,13 @@
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import type { PairMailboxEvidence } from "@germ-network/atproto-pmr-core"
+import type { Admission, PairMailboxEvidence } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
-import { inPMR } from "./helpers"
+import { inPMR, openPairMailbox } from "./helpers"
 
 const testEnv = env as unknown as PMREnv
 const NOW = Math.floor(Date.now() / 1000)
+const YES: Admission = { verdict: "yes" }
 const SENDER = "did:plc:edited-proof" as const
 const A: PairMailboxEvidence = { senderDID: SENDER, anchorKey: new Uint8Array(32).fill(1),
     declarationCID: "bafy-a", revision: "3333333333333", car: new Uint8Array([1]), expiresAt: NOW + 3_600 }
@@ -37,7 +38,7 @@ async function rejectConflicts(pmr: PMRObject, latest: PairMailboxEvidence) {
 describe("latest declaration watermark versus selected proof", () => {
     it("accepts repeats and replay after same-key edits, retaining one selected CAR and generation", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const firstNonce = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), firstNonce, NOW, A)
             const editedNonce = nonce()
@@ -64,7 +65,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it.each(["live", "cleared"] as const)("migrates consistent %s legacy rows lazily without replacing their generation", async state => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const first = await pmr.appendPair(SENDER, ref("a"), nonce(), NOW, A)
             const storage = storageOf(pmr)
             const { watermark: _, ...legacy } = (await rowOf(pmr))!
@@ -83,7 +84,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it("keeps an ambiguous legacy row fail-closed until a newer verified revision recovers it", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const replay = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), replay, NOW, A)
             const { watermark: _, ...legacy } = (await rowOf(pmr))!
@@ -104,14 +105,14 @@ describe("latest declaration watermark versus selected proof", () => {
         })
     })
 
-    it("keeps latest observation across pooling/provisioning and proof expiry, then renews one CAR", async () => {
+    it("keeps latest observation across holding, admission and proof expiry, then renews one CAR", async () => {
         await inPMR(stub(), async pmr => {
             const first = await pmr.appendPair(SENDER, ref("a"), nonce(), NOW, A)
-            expect(first.result?.outcome).toBe("pooled")
-            expect((await pmr.appendPair(SENDER, ref("b"), nonce(), NOW, B)).result?.outcome).toBe("pooled")
-            expect((await pmr.appendPair(SENDER, ref("b-repeat"), nonce(), NOW, B)).result?.outcome).toBe("pooled")
+            expect(first.result?.outcome).toBe("held")
+            expect((await pmr.appendPair(SENDER, ref("b"), nonce(), NOW, B)).result?.outcome).toBe("held")
+            expect((await pmr.appendPair(SENDER, ref("b-repeat"), nonce(), NOW, B)).result?.outcome).toBe("held")
             expect((await rowOf(pmr))?.watermark).toEqual(watermark(B))
-            await pmr.provisionFromPool(SENDER, NOW)
+            expect((await pmr.appendPair(SENDER, ref("opened"), nonce(), NOW, B, YES)).result?.outcome).toBe("queued")
             expect((await pmr.getPairEvidence(SENDER, A.declarationCID, NOW))?.car).toEqual(A.car)
             expect(await pmr.getPairEvidence(SENDER, A.declarationCID, A.expiresAt)).toBeNull()
             expect((await rowOf(pmr))?.watermark).toEqual(watermark(B))
@@ -127,13 +128,11 @@ describe("latest declaration watermark versus selected proof", () => {
         })
     })
 
-    it.each(["blocked", "discarded"] as const)("retains edited watermark across %s clearance", async action => {
+    it("retains edited watermark across blocked clearance", async () => {
         await inPMR(stub(), async pmr => {
-            if (action === "blocked") await pmr.provisionFromPool(SENDER, NOW)
-            await pmr.appendPair(SENDER, ref("a"), nonce(), NOW, A)
+            await pmr.appendPair(SENDER, ref("a"), nonce(), NOW, A, YES)
             await pmr.appendPair(SENDER, ref("b"), nonce(), NOW, B)
-            if (action === "blocked") await pmr.block(SENDER, NOW)
-            else await pmr.discardFromPool(SENDER, NOW + 100)
+            await pmr.block(SENDER, NOW)
             const after = await pmr.appendPair(SENDER, ref("absorbed"), nonce(), NOW, B)
             expect(after.rejected).toBeUndefined()
             expect((await rowOf(pmr))?.car.byteLength).toBe(0)
@@ -144,7 +143,7 @@ describe("latest declaration watermark versus selected proof", () => {
 
     it("rotates keys on a duplicate, keeps replay protection, and binds the new tuple independently", async () => {
         await inPMR(stub(), async pmr => {
-            await pmr.provisionFromPool(SENDER, NOW)
+            await openPairMailbox(pmr, SENDER)
             const replay = nonce()
             const first = await pmr.appendPair(SENDER, ref("a"), replay, NOW, A)
             await pmr.appendPair(SENDER, ref("b"), nonce(), NOW, B)

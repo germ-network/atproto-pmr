@@ -1,6 +1,6 @@
 /**
  * The relay applies a can-message verdict as an admission: blocks become relay
- * blocks, refusals and undecided verdicts keep their reasons for the pool, and
+ * blocks, refusals and undecided verdicts keep their reasons, and
  * a policy the relay does not yet honour admits nobody.
  */
 import { describe, expect, it } from "vitest"

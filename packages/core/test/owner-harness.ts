@@ -39,7 +39,6 @@ export async function ownerWorld(stub: Partial<PMRStore>, overrides: Partial<Own
         resolveLocator: async (did) => (did === OWNER ? "loc" : null),
         store: () => store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         ...overrides,
     } as OwnerDeps
 

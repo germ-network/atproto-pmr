@@ -11,7 +11,6 @@ import {
     encodeCapabilitiesFrame,
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
-    encodePoolFrame,
     encodeSummaryFrame,
     handleAckFrame,
     type EffectiveCapabilities,
@@ -23,7 +22,6 @@ import type {
     MessageRef,
     OpenMailboxesPage,
     PMRStore,
-    PoolSender,
 } from "../src/storage"
 
 const DC = "bafyreibnx7iqeihelssyae2kritsro2rylzgs5i6ul4ugtp6ycw5tyft7q"
@@ -82,8 +80,7 @@ describe("frame encode/decode", () => {
         })
     })
 
-    it("the pool and caughtUp frames carry empty bodies", () => {
-        expect(decodeFrame(encodePoolFrame())).toEqual({ type: "pool", body: new Map() })
+    it("the caughtUp frame carries an empty body", () => {
         expect(decodeFrame(encodeCaughtUpFrame())).toEqual({
             type: "caughtUp",
             body: new Map(),
@@ -112,18 +109,18 @@ describe("frame encode/decode", () => {
         // convention), not e.g. a single [header, body] array — decoded
         // generically with the sequence decoder rather than this module's
         // own `decodeFrame`, so the assertion is independent of it.
-        const frame = encodePoolFrame()
+        const frame = encodeCaughtUpFrame()
         const values = decodeCoseSequence(frame)
         expect(values).toHaveLength(2)
         const [header, body] = values as [Map<string, CoseValue>, Map<string, CoseValue>]
         expect(header.get("op")).toBe(1)
-        expect(header.get("t")).toBe("#pool")
+        expect(header.get("t")).toBe("#caughtUp")
         expect(body.size).toBe(0)
     })
 
     it("rejects a frame with a wrong op", () => {
         const bad = new Uint8Array([
-            ...encodeCose(new Map<string, CoseValue>([["op", -1], ["t", "#pool"]])),
+            ...encodeCose(new Map<string, CoseValue>([["op", -1], ["t", "#caughtUp"]])),
             ...encodeCose(new Map()),
         ])
         expect(() => decodeFrame(bad)).toThrow()
@@ -131,13 +128,13 @@ describe("frame encode/decode", () => {
 
     it("rejects a frame with only a header and no body", () => {
         const headerOnly = encodeCose(
-            new Map<string, CoseValue>([["op", 1], ["t", "#pool"]])
+            new Map<string, CoseValue>([["op", 1], ["t", "#caughtUp"]])
         )
         expect(() => decodeFrame(headerOnly)).toThrow()
     })
 
     it("rejects trailing garbage after a valid header+body pair", () => {
-        const withExtra = new Uint8Array([...encodePoolFrame(), 0x00])
+        const withExtra = new Uint8Array([...encodeCaughtUpFrame(), 0x00])
         expect(() => decodeFrame(withExtra)).toThrow()
     })
 
@@ -162,7 +159,7 @@ describe("ack frame", () => {
     })
 
     it("rejects a frame of the wrong type", () => {
-        expect(() => decodeAckFrame(encodePoolFrame())).toThrow()
+        expect(() => decodeAckFrame(encodeCaughtUpFrame())).toThrow()
     })
 })
 
@@ -170,7 +167,6 @@ describe("ack frame", () => {
 function world() {
     const mailboxes = new Map<string, MessageRef[]>()
     const bodies = new Map<string, Uint8Array>()
-    const pool: PoolSender[] = []
     const removed: { key: string; messageId: string }[] = []
 
     const store = {
@@ -185,9 +181,6 @@ function world() {
             const nextCursor =
                 startIndex + limit < keys.length ? page[page.length - 1] : null
             return { entries, nextCursor }
-        },
-        async poolSenders() {
-            return pool
         },
         async remove(key: string, messageId: string) {
             removed.push({ key, messageId })
@@ -212,7 +205,7 @@ function world() {
         },
     }
 
-    return { mailboxes, bodies, pool, removed, store, bodyStore }
+    return { mailboxes, bodies, removed, store, bodyStore }
 }
 
 const ALL_ACTIVE: EffectiveCapabilities = { grant: "active" }
@@ -229,7 +222,7 @@ function typesAfterCapabilities(frames: Uint8Array[]): string[] {
 }
 
 describe("drainBacklog", () => {
-    it("delivers everything queued, across mailboxes, then caughtUp — no pool", async () => {
+    it("delivers everything queued, across mailboxes, then caughtUp", async () => {
         const w = world()
         w.mailboxes.set("did:plc:alice", [ref("m1")])
         w.mailboxes.set("grant:addr", [ref("m2")])
@@ -241,27 +234,10 @@ describe("drainBacklog", () => {
 
         const decoded = frames.map(decodeFrame)
         expect(decoded.filter((d) => d.type === "delivery")).toHaveLength(2)
-        expect(decoded.filter((d) => d.type === "pool")).toHaveLength(0)
         expect(decoded[decoded.length - 1].type).toBe("caughtUp")
     })
 
-    it("sends the pool notice as the LAST frame before caughtUp, only when the pool is non-empty", async () => {
-        const w = world()
-        w.mailboxes.set("did:plc:alice", [ref("m1")])
-        w.bodies.set("m1", new Uint8Array([1]))
-        w.pool.push({ did: "did:plc:stranger", count: 1 })
-
-        const frames: Uint8Array[] = []
-        await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))
-
-        expect(typesAfterCapabilities(frames)).toEqual([
-            "delivery",
-            "pool",
-            "caughtUp",
-        ])
-    })
-
-    it("always sends caughtUp, even with nothing queued and no pool", async () => {
+    it("always sends caughtUp, even with nothing queued", async () => {
         const w = world()
         const frames: Uint8Array[] = []
         await drainBacklog(deps(w), ALL_ACTIVE, (f) => frames.push(f))

@@ -37,3 +37,12 @@ export function withSyntheticBehavior(
 ): void {
     ;(pmr as unknown as { synthetic: SyntheticBehavior }).synthetic = behavior
 }
+
+/**
+ * Writes an empty pair mailbox for `key` with no evidence row, the state of a
+ * mailbox opened before the sender's proof was recorded. For a mailbox that
+ * is empty because its entries were acked, queue a message and remove it.
+ */
+export async function openPairMailbox(pmr: PMRObject, key: string): Promise<void> {
+    await (pmr as unknown as { db: DurableObjectStorage }).db.put(`mbox:${key}`, [])
+}

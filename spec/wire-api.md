@@ -437,7 +437,7 @@ An implementation SHOULD monitor that declaration, and when the declared key
 disappears it SHOULD **pause** rather than tear down: stop acting on behalf
 of the DID and continue monitoring that one DID's declaration to see
 whether the key returns. A paused registration still **queues** all mail it
-is sent — pair, pool and grant alike — so nothing is lost while the key is
+is sent — pair, request and grant alike — so nothing is lost while the key is
 away, and unpausing changes nothing about what it holds.
 
 A registration is **retired** only on a verified observation: the
@@ -658,9 +658,9 @@ that follow.
 
 For a pair put, the permitted responses are exhaustive:
 
-- **`202 Accepted`** — for a provisioned sender with room, for an
-  unprovisioned sender (accepted into the [recovery pool](#the-recovery-pool)),
-  for a sender inside a discard window, for a
+- **`202 Accepted`** — for an admitted sender whose pair mailbox has room,
+  for any other sender whose [request mailbox](#request-mailboxes) has room
+  (including when the shared request quota keeps nothing), for a
   [blocked sender](#blocked-senders) whose synthetic state has room, and for
   a validly signed put whose recipient is unknown to this relay or is not
   the recipient the sender signed. A relay that implements the
@@ -672,14 +672,18 @@ For a pair put, the permitted responses are exhaustive:
   names, and, where the relay implements the sender hold, the hold does not
   verify it either. Nothing is stored.
 - **`429 Too Many Requests` with `Retry-After`** — when *the sender's own*
-  reservation is full, or the sender's own hold is.
+  reservation is full (its pair mailbox's or its request mailbox's), or the
+  sender's own hold is.
 - **`400`** or **`413`**, under the conditions below, for a request refused
   on its own bytes.
 
 Nothing else. A pair put MUST NOT disclose whether the recipient is active,
-whether the sender was blocked, whether the sender is provisioned, or
-whether the recipient exists in any state other than one that would produce
-these answers.
+whether the sender was blocked, or whether the recipient exists in any
+state other than one that would produce these answers. Where a `429` starts
+MAY show which reservation the sender holds — a pair mailbox's or a
+[request mailbox](#request-mailboxes)'s — and so whether admission admitted
+it; admission rests on the recipient's public policy and graph, as policy
+tiers do below.
 
 **The `409` is a fact about the sender, not the recipient.** It is decided
 after the sender's declaration is resolved and before any recipient lookup,
@@ -716,6 +720,8 @@ the read of the sender's PDS may learn, are in
   whose key verifies it. It is dropped when the monitor settles a declaration at
   least as new as the one it was held under whose key does not verify it,
   when it has waited ten minutes, or when the monitor stops tracking the DID.
+  A delivered put meets the reservation its admission routes it to, as any
+  put does; one that reservation refuses is dropped.
 
 A `202` for a held put is therefore a promise to try, not to deliver: the put
 may never be delivered (expiry, a further rotation, the monitor ceasing to track the DID, or a PDS that
@@ -791,14 +797,14 @@ accepting that claim unauthenticated is an impersonation and
 denial-of-service surface on the (sender, recipient) relationship. Closure
 does not depend on anonymous puts — it is preserved by uniform acceptance.
 
-**No open DMs.** A *provisioned* pair mailbox MUST come into being only
-from something the recipient controls — their follow graph, their declared
-messaging policy, or their device's own contact provisioning. An
-implementation MUST NOT provision a pair mailbox on a sender's request, and
-a sender's own declaration never opens one. Which recipient-side sources a
-deployment honors is implementation-defined; that provisioning is
-recipient-side is not. A sender with no provisioned mailbox is not
-refused: see [the recovery pool](#the-recovery-pool).
+**No open DMs.** A pair mailbox MUST come into being only from something
+the recipient controls — their follow graph or their declared messaging
+policy, applied by [receive-time admission](#receive-time-admission). An
+implementation MUST NOT open a pair mailbox on a sender's request, and a
+sender's own declaration never opens one. Which recipient-side sources a
+deployment honors is implementation-defined; that admission is
+recipient-side is not. A sender with no pair mailbox is not refused: see
+[request mailboxes](#request-mailboxes).
 
 A deployment MAY apply policy tiers to pair mailboxes — for example
 permitting attachments or larger limits from mutuals. Tiers being
@@ -814,32 +820,29 @@ A relay that can evaluate its recipient's messaging policy SHOULD judge each
 pair put when it arrives: does the recipient accept this sender? The verdict
 comes from the recipient's declared allow policies, social graph and blocks,
 as for the [can-message verdict](#can-message-verdict) with the put's signed
-sender as sender and the recipient as recipient. A sender the device
-provisioned is not judged by policy, only by blocks. Otherwise a put the
-policy admits is delivered as to a provisioned mailbox, and one it refuses or
-cannot yet decide goes to the [recovery pool](#the-recovery-pool) with the
-verdict's reasons, for the device to judge. A put from a sender the
-recipient blocks is handled as from a [blocked sender](#blocked-senders).
+sender as sender and the recipient as recipient. A put the policy admits is
+delivered to the sender's pair mailbox, opened if none is held, and one it
+refuses or cannot yet decide goes to the sender's
+[request mailbox](#request-mailboxes). A put from a sender the recipient
+blocks is handled as from a [blocked sender](#blocked-senders). A relay with
+no admission source opens no pair mailbox: a non-blocked put goes to a
+request mailbox unless the sender already holds a pair mailbox an earlier
+admission opened.
 
-Admission is per put: an admitted sender is judged again on its next put
-until the device provisions it, and mail already accepted is not re-judged
-when the recipient's graph later changes, except that a Bsky block clears it.
-On a yes, the sender's pooled entries move into the mailbox, oldest first, as
-far as capacity allows; the rest stay pooled. An admitted put is delivered even
-while the device's discard of that sender is live. The verdict never changes
+Admission is per put: every put is judged, whether or not the sender already
+holds a pair mailbox, and mail already accepted is not re-judged when the
+recipient's graph later changes, except that a Bsky block clears it. On a
+yes, the sender's request entries move into the pair mailbox as
+[request mailboxes](#request-mailboxes) describe. The verdict never changes
 the response vocabulary: every outcome is a `202` or the `429` of a full
-mailbox. A relay that cannot read a verdict in time treats it as undecided; it
-MUST NOT answer `5xx` for that. Grant puts name no sender and are never
-adjudicated.
+reservation. A relay that cannot read a verdict in time treats it as
+undecided; it MUST NOT answer `5xx` for that. Grant puts name no sender and
+are never adjudicated.
 
 A relay MUST NOT admit senders under a policy that admits strangers (such as
 `open`) until it bounds what an admitted sender can cost the recipient —
-mailbox depth and push wakes — as the recovery pool does. A put that only
-such a policy admits is pooled as `unknown`. A relay's own reasons for an
-undecided put include `admission-unavailable` (no verdict was readable in
-time), `recipient-not-held` (the relay holds no declaration for the
-recipient) and `policy-not-enabled` (the put is admitted only by a policy the
-relay does not yet honour).
+mailbox depth and push wakes — as a request mailbox does. A put that only
+such a policy admits goes to a request mailbox.
 
 ### The grant-put payload
 
@@ -1021,7 +1024,9 @@ The following are normative:
    `429` + `Retry-After`, on the same terms as
    [any pair put](#delivery--peer-facing). Any quota state a deployment
    discloses to real senders MUST also be produced, consistently, for
-   blocked ones.
+   blocked ones — including the depth of the reservation the sender would
+   reach unblocked: a pair mailbox's for a put admission admits, a
+   [request mailbox](#request-mailboxes)'s otherwise.
 
 The concrete synthetic behavior is implementation-defined and SHOULD NOT
 be published: a published simulation is a fingerprint an attacker can test
@@ -1040,7 +1045,11 @@ in disclosing fullness at all — and a blocked sender is exactly the party
 that feed must be cut off from. Mirroring the recipient's true behavior
 would conceal the block while continuing to leak their activity. The
 accepted residual is that a sender who was measuring cadence before the
-block may notice the transition from real to synthetic.
+block may notice the transition from real to synthetic. A second residual:
+while a recipient's shared [request quota](#request-mailboxes) is full, a
+non-admitted sender's puts keep nothing and so never reach a `429`, which a
+blocked sender's synthetic state would; a sender that sees `202` well past
+the request depth learns it is not blocked, never that it is.
 
 | method | path | notes |
 |---|---|---|
@@ -1065,15 +1074,15 @@ exist to prevent.
 
 **Bsky blocks.** A relay that indexes its recipient's Bsky blocks MUST treat
 a sender the recipient blocks on Bsky as blocked: it clears the sender's
-queued and pooled messages and handles later puts on the synthetic path. It
-applies a block it sees at accept immediately, and one made since no later
-than the next catch-up (socket drain, first page of the message catch-up,
-pool listing). A relay MUST NOT lift a block because it no longer sees the
+queued and request-mailbox messages and handles later puts on the synthetic
+path. It applies a block it sees at accept immediately, and one made since no
+later than the next catch-up (socket drain, first page of the message
+catch-up, first page of the request listing). A relay MUST NOT lift a block because it no longer sees the
 Bsky block, or because a verdict admits the sender: neither proves the recipient unblocked.
 Only a device unblock lifts a block, whoever set it. A device block takes a
 mirrored one over, and a device unblock holds only until the relay next sees
 the Bsky block, at the sender's next put or the catch-up after it (a put the
-verdict does not block leaves a pool entry or an admitted mailbox, which the
+verdict does not block leaves a request entry or a pair-mailbox entry, which the
 next sync re-blocks). `bs` can therefore hold senders the recipient has
 since unblocked on Bsky; the device compares `bs` with its own
 `app.bsky.graph.block` records (the summary's block list is a hint of the
@@ -1093,102 +1102,115 @@ that relay up to speed, and a new relay is not reachable until the client
 publishes it. Grants need nothing at all — a relay change leaves the old
 addresses behind entirely, so that half of a composite block fails closed.
 
-### The recovery pool
+### Request mailboxes
 
-**A sender with no provisioned mailbox MUST NOT be refused.** The
-unprovisioned case is typically session recovery, not a stranger knocking:
-a DID the client has permitted and knows about but has not told the
-server about, because the device was offline when the relationship
-formed, or restored from backup, or switched relays, or the relationship
-was formed on another device in the set. Refusing would break recovery in
-precisely the situation DID addressing exists for.
+**A sender with no pair mailbox MUST NOT be refused for that reason.** The
+case is often session recovery rather than a stranger knocking: a DID the
+device knows and permits but the relay's admission does not, because the
+relationship formed on another device, while offline, or before a restore.
+Refusing would break recovery in precisely the situation DID addressing
+exists for.
 
-Puts from unprovisioned senders land in a catch-all pool whose policy is
-the inverse of a provisioned mailbox's:
+A pair put from a sender that is not [blocked](#blocked-senders) and that
+[receive-time admission](#receive-time-admission) does not admit — the
+policy refuses the sender, cannot decide in time, or the relay has no
+admission source at all — is accepted into that sender's **request
+mailbox**. A request mailbox is keyed by the sender DID, like a pair
+mailbox, and differs from one in what it costs the recipient:
 
-| | provisioned pair mailbox | recovery pool |
+| | pair mailbox | request mailbox |
 |---|---|---|
-| depth | per-sender reservation | **shallow** — a recovery attempt, not a thread |
-| admission | recipient-provisioned only | **wide** — the server cannot know who is permitted |
-| under pressure | **refuses**, keeping oldest — first contact is the point | **newest wins** — the freshest attempt carries current state |
+| comes from | the recipient's admission | any non-blocked sender |
+| depth | the per-sender reservation | a smaller per-sender reservation |
+| storage | per sender | per sender, and one byte quota shared by all of a recipient's request mailboxes, counting retained proof bytes |
+| wakes the device | live `#delivery` and push | **never** |
+| catch-up | `GET /pmr/v1/messages`, reconnect-drain | `GET /pmr/v1/requests`, by DID |
+| attachments | as the deployment serves them | **none** |
 
-A provisioned mailbox keeps the oldest because first contact is what it is
-for; a recovery pool keeps the newest because the freshest attempt carries
-current state and stale attempts are worthless.
+**Full is answered as for any reservation.** A request mailbox at its depth
+refuses the put with `429` and `Retry-After`, drawn from the same
+distribution as a full pair mailbox's and a blocked sender's, and keeps its
+oldest entries; it MUST NOT accept and evict. When the shared quota cannot
+hold the entry — its bytes plus any proof bytes it would newly retain — the
+put is answered `202` and nothing is kept: no entry, no proof, no body. The
+shared quota is the recipient's state, not the sender's reservation, so no
+refusal may turn on it.
 
-Anti-abuse is deliberately not in the protocol beyond the requirement that
-a sender hold a real DID with a published declaration and produce a valid
-signature. Volume is handled operationally — WAF, rate limiting,
-reputation — where it adapts without a spec change.
+**A request mailbox MUST NOT wake the device.** Its puts produce no
+`#delivery` frame, no push and no events-socket notice, and its entries
+appear neither in `GET /pmr/v1/messages` (`ms` or `gs`) nor in
+reconnect-drain. Any notice per arrival would let anyone who can mint a DID
+ring a stranger's phone at will; the device reads request mailboxes when it
+chooses to.
 
-**The pool MUST NOT be pushed per arrival.** Per-arrival push would let
-anyone who can mint a DID ring a stranger's phone at will — a harassment
-surface arriving by a path blocking does not cover, since these senders
-were never provisioned and so were never blockable.
-
-Instead the pool is **adjudicated in batch** by the device:
+**The device judges by DID before it downloads.**
 
 | method | path | notes |
 |---|---|---|
-| `GET` | `/pmr/v1/pool` | list the DIDs holding pool entries — **DIDs only, never bodies** — each with `v` and `r` when the relay judged it |
-| `POST` | `/pmr/v1/pool/adjudication` | provision-or-discard per DID; bodies are delivered for the provisioned and dropped for the rest |
+| `GET` | `/pmr/v1/requests?cursor=` | list request mailboxes — **DIDs and entry ids, never bodies** |
+| `GET` | `/pmr/v1/messages/{k}/{id}` | fetch one request entry, as for any queued message ([Fetching one message by reference](#fetching-one-message-by-reference)) |
+| `POST` | `/pmr/v1/messages/acks` | remove request entries, as for any queued message |
 
-The server pooled these senders because it could not admit them — the
-recipient's policy refused them, or it could not decide yet — or, without
-receive-time admission, could not evaluate them. Each listing entry carries
-`v` (`no` | `unknown`) and `r` (reason codes) from the sender's latest pooled
-put when the relay judged it, so the device need not recompute the reason.
-The device's own contacts are not visible to the relay, so the device keeps
-the final say: it offers the only judgement that remains — provision these,
-discard those — and the server acts on the answer. "No open DMs" becomes a protocol
-step rather than an unstated client-side filter, and the pool becomes
-self-clearing, its size governed by the adjudication cycle rather than by
-an eviction policy.
+A listing page is the CBOR map `{rq, n}`. `rq` is an array of
+`{k, id}`, one per request mailbox: `k` the sender DID and `id` the array of
+its entry ids, oldest first; the mailbox's count is `id`'s length. `n` is the
+cursor for the next page, or `null` past the last; a page MAY hold fewer
+rows than the deployment's page size, or none, while `n` is non-null, and a
+client MUST keep paging on `n`. A listing carries no relay verdict or reason:
+admission is routing advice ([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)),
+and the device keeps the final say. The first page (no `cursor`) is a
+catch-up point for Bsky blocks ([Blocked senders](#blocked-senders)).
 
-**A round is triggered by threshold or by next connect, never by a
-schedule.** On connect, the pool notice rides out as the last frame after
-the queue drains — real mail first, then what is merely waiting to be
-judged, at no extra cost. On threshold, an absent device is woken — the
-only case that spends a notification, and it spends one per round, never
-one per arrival.
+The device fetches the bodies of the senders it chooses, one entry at a
+time, and drops a sender it does not want by acking that sender's entry ids
+without fetching them: `{a: [{k, id}…]}` with `k` the sender DID and no `g`. Acks of request entries follow the
+[generation rule](#the-events-socket) of any ack: an echoed current `g` or no
+`g` removes the entry, a stale `g` is a no-op; a drop from the listing omits
+`g`, since rows carry none. A device that wants no further mail from a sender
+[blocks](#blocked-senders) it. A fetched request entry has the same shape as any other
+(`{k, id, m}`, plus `sd`/`dc`/`g` when present), and its proof is served by
+`GET /pmr/v1/pair-evidence/{senderDID}` while the entry is held.
 
-**Wake and fetch, not push-the-list.** The notification MUST carry no
-list; the device fetches one. An inline list would be capped by the push
-platform's payload ceiling at a size an attacker could reach simply by
-minting DIDs, and a fetched list is unbounded. It also leaves the wake
-independently rate-limitable.
+**A request mailbox has no lifetime of its own.** It exists while it holds
+at least one entry and not otherwise; an empty request mailbox is not
+listed and leaves nothing behind. Entries leave by ack, by moving into a
+pair mailbox on admission, by a block, by a sender key change, or when the
+retention that governs their bodies expires. An entry's body can expire
+before the entry leaves, so a listed id MAY miss on fetch with the usual
+`404`; the device acks it to drop it. A sender whose last entry has left is
+judged afresh on its next put.
 
-**Discard is time-bounded** — neither one-shot nor standing. While a
-sender's discard window is live, arriving puts from that sender are
-dropped without pooling, unless
-[receive-time admission](#receive-time-admission) admits the put; once it
-lapses, the sender pools normally again.
-One-shot would make adjudication a treadmill (an attacker re-sends
-immediately and the same DIDs reappear next round); standing would be a
-block in all but name, drawing a permanent consequence from a judgement
-made on incomplete information — the pool exists precisely for the case
-where the device's own knowledge is behind, mid-restore or mid-resync.
+**Admission moves entries.** When admission admits a later put from a
+sender holding request entries, those entries move into the sender's pair
+mailbox ahead of the new put, oldest first, as far as the pair mailbox's
+capacity allows; the rest stay in the request mailbox. Moved entries are
+delivered as the admitted put is. A move keeps each entry's id, body and
+fields. One sender can hold a pair mailbox and a request mailbox at once,
+since admission is per put; a message id names one entry in exactly one of
+them, and the listing shows only the request entries.
 
-A put from a DID inside its discard window still answers `202`, identical
-to being pooled and later discarded, so the sender cannot distinguish
-suppression from ordinary pooling.
+**Request mailboxes take no attachments.** A put to a request mailbox
+carries the message alone.
 
 This is safe to drain because the device verifies senders itself: the
-relay's verdict is a hint, since it cannot see the device's own contacts, and
-an attacker flooding the pool cannot impersonate a permitted DID, so the
-client's filter rests on cryptography rather than a relay decision.
+relay's routing is a hint, since it cannot see the device's own contacts,
+and an attacker filling request mailboxes cannot impersonate a permitted
+DID, so the device's choice rests on cryptography rather than a relay
+decision.
 
-Pool sizing is [implementation-defined](#limits-are-implementation-defined).
+Request-mailbox depth and the shared quota are
+[implementation-defined](#limits-are-implementation-defined).
 
 ### Delivery — owner-facing
 
 | method | path | notes |
 |---|---|---|
 | `GET` | `/pmr/v1/messages?cursor=` | catch-up after being away |
-| `GET` | `/pmr/v1/messages/{k}/{id}` | fetch one queued message by reference; does not ack |
-| `POST` | `/pmr/v1/messages/acks` | batch ack; idempotent, up to the enabler document's limit |
-| `GET` | `/pmr/v1/pair-evidence/{senderDID}?cid=` | fetch the selected proof for a pair-mailbox generation |
-| `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery, acks, and the pool notice as the last frame before the queue is declared caught up |
+| `GET` | `/pmr/v1/messages/{k}/{id}` | fetch one queued message by reference, pair-mailbox, request-mailbox or grant; does not ack |
+| `POST` | `/pmr/v1/messages/acks` | batch ack of any queued message, request entries included; idempotent, up to the enabler document's limit |
+| `GET` | `/pmr/v1/requests?cursor=` | list [request mailboxes](#request-mailboxes) by DID and entry ids |
+| `GET` | `/pmr/v1/pair-evidence/{senderDID}?cid=` | fetch the selected proof for a pair-mailbox generation or a held request entry |
+| `GET` | `/pmr/v1/events` | `Upgrade: websocket` — capabilities, delivery and acks |
 
 Acks are idempotent: a repeated ack for an already-removed message MUST
 succeed rather than error, because the client's ack path retries.
@@ -1197,7 +1219,7 @@ succeed rather than error, because the client's ack path retries.
 
 `GET /pmr/v1/messages/{k}/{id}` returns the one queued message `id` in mailbox `k`. It is owner-authenticated like the rest of this surface, and is how a device resolves a reference push ([The sealed payload](#the-sealed-payload)) without draining every mailbox. `k` and `id` are each exactly one percent-encoded path segment, decoded once. A request with any other number of segments, an empty or undecodable segment, or a `k` matching neither mailbox-key form ([Delivery — peer-facing](#delivery--peer-facing)) MUST be refused `400` before any lookup.
 
-A hit returns `200` with a CBOR map that is exactly the message's entry in a `GET /pmr/v1/messages` page: `{k, id, m}`, plus `sd`/`dc`/`g` when present. Reading does not acknowledge; the message stays queued until acked through `POST /pmr/v1/messages/acks`. Like a full-form push, a fetch does not wait for the relay to see the owner's Bsky blocks; the next catch-up applies them.
+The message may sit in a pair mailbox, a [request mailbox](#request-mailboxes) or a grant mailbox; `k` is the same sender DID or grant address either way. A hit returns `200` with a CBOR map shaped exactly as a `GET /pmr/v1/messages` page entry: `{k, id, m}`, plus `sd`/`dc`/`g` when present. Reading does not acknowledge; the message stays queued until acked through `POST /pmr/v1/messages/acks`. Like a full-form push, a fetch does not wait for the relay to see the owner's Bsky blocks; the next catch-up applies them.
 
 Every miss MUST get the identical response — `404`, an empty body, and the same headers apart from `Germ-Next-Challenge` — whether the mailbox does not exist, the message never existed, was already acked, or is no longer retained. A client cannot, and need not, tell these apart. Neither a hit nor a miss may be cached.
 
@@ -1205,15 +1227,15 @@ A server MAY rate-limit this route per registration, answering `429` with `Retry
 
 Devices need not recompute admission; it is routing advice, not authority
 ([P8](trust-model.md#p8--the-relays-verdict-is-a-hint)). Mail on a pair
-mailbox is from a sender the device provisioned or one the relay admitted
-under the recipient's policy at that put or a later one; the pool lists only
-senders the relay refused or could not decide, with `v` and `r`. A Bsky-blocked
+mailbox is from a sender the relay admitted under the recipient's policy at
+that put or a later one; the request listing holds the senders it did not
+admit, with no reason given. A Bsky-blocked
 sender's mail stops appearing in catch-up once the relay has seen the block,
 and earlier deliveries are cleared on the device using the summary's block list.
 
 `GET /pmr/v1/messages` returns `gs`, an array of `{k, g}` entries for
-provisioned pair-mailbox generations, including mailboxes with no queued
-messages. Pool-only senders never appear in `gs`. Clients use these descriptors
+pair-mailbox generations, including mailboxes with no queued messages.
+Request-only senders never appear in `gs`. Clients use these descriptors
 to detect replacement generations during catch-up. A proof read returns CBOR
 `{sd, dc, g, car}` and is scoped to the authenticated owner; an expired or
 unknown CID returns 404.
@@ -1282,8 +1304,7 @@ body   = { ... type-specific fields ... }
 | `#capabilities` | server → client | `{gr, pg?}` | the grant lifecycle effective *for this registration* and optional pair-generation support |
 | `#delivery` | server → client | `{k, id, m, sd?, dc?, g?}` | one queued message. `k` is the mailbox key (a DID or a grant address — the socket does not distinguish them), `id` the messageId, `m` the message bytes. Pair-generation-aware deliveries carry `g`; pair proof fields `sd`/`dc` appear together |
 | `#ack` | client → server | `{k, id, g?}` | acknowledges one message. A client that received `g` SHOULD echo it; a supplied stale generation is a no-op. Missing `g` remains a legacy ack and removes the matching message ID |
-| `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
-| `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
+| `#caughtUp` | server → client | `{}` | unconditional "you are live now", so a client has a definite end to its connect-time backlog |
 | `#summary` | server → client | `{}` | a hint that this owner's social graph or [summary](#summary) inputs may have changed. Never a backlog frame; see [`#summary` (graph-change hint)](#summary-graph-change-hint) |
 
 **A client MUST ignore a frame whose `t` it does not recognize** and keep
@@ -1292,16 +1313,13 @@ a client that closed on, or failed over, an unknown type would break the
 first time a relay started sending one.
 
 **Ordering on connect, among the connect-time backlog frames: `#capabilities`
-first, then every queued message, oldest mailbox first, then `#pool` if and
-only if the pool is non-empty, then `#caughtUp`, always.** This is not an
-optimization — it costs no extra push, no extra round trip, and no extra
-wake, because the device is already attached and already draining — it is
-the property that lets a device treat "real mail" and "merely waiting to be
-judged" as answered in that priority order. `#capabilities` leads because it
-frames how to read everything after it.
+first, then every queued message, oldest mailbox first, then `#caughtUp`,
+always.** `#capabilities` leads because it frames how to read everything
+after it. [Request mailboxes](#request-mailboxes) contribute no frame: the
+device reads them by `GET /pmr/v1/requests` when it chooses to.
 
 **A live `#delivery` MAY interleave anywhere after `#capabilities`,
-including mid-backlog or between `#pool` and `#caughtUp`.** Only
+including mid-backlog.** Only
 `#capabilities`-first is an ordering guarantee against the *entire*
 connection; the backlog ordering above is a guarantee among the backlog
 frames themselves, not a promise that nothing else arrives between them. A
@@ -1374,7 +1392,7 @@ What a client should expect from each state:
 | `draining` | `#delivery` for grant addresses still; `POST /pmr/v1/grants` answers `409` |
 | `absent` | no new grants, and nothing further for grant addresses |
 
-`#delivery` for pair mailboxes, and `#pool`, are unconditional — a relay
+`#delivery` for pair mailboxes is unconditional — a relay
 operates pair mailboxes in every state above, so there is nothing to
 report and nothing for a client to switch on.
 
@@ -1427,6 +1445,8 @@ enabler entry (above) — advertised, so an over-size upload MAY be refused
 `413` rather than folded into the uniform `202`, exactly as
 `messageMaxBytes` governs a message put. Budget and retention are not
 peer-visible and are not published (see "Limits are implementation-defined").
+
+A [request mailbox](#request-mailboxes) takes no attachments.
 
 ### Records are CAR, wherever they are relayed
 
@@ -1932,7 +1952,7 @@ socket frames use:
 
 | field | meaning |
 |---|---|
-| `t` | what happened: `"m"` a message arrived, `"p"` the pool crossed its adjudication threshold, `"d"` a watched declaration changed (see below for its hints) |
+| `t` | what happened: `"m"` a message arrived, `"d"` a watched declaration changed (see below for its hints) |
 | `k` | present when `t` is `"m"`: the mailbox key the message landed in |
 | `id` | present when `t` is `"m"`: the message's id |
 | `m` | present when `t` is `"m"` **and** the sealed total still fits the push service's size ceiling with the message bytes included: the message itself, identical to `#delivery`'s `m` |
@@ -1956,17 +1976,10 @@ ciphertext is twenty bytes or two thousand.
 
 A device that receives the wake form (`{t, k, id}` without `m`) fetches that one message with [`GET /pmr/v1/messages/{k}/{id}`](#fetching-one-message-by-reference).
 
-**`t: "p"` is always exactly `{t}` and nothing else, permanently. `t: "d"`
-never carries content, permanently; it MAY carry the two hints below and
-nothing else.**
+**`t: "d"` never carries content, permanently; it MAY carry the two hints
+below and nothing else.** No push announces a
+[request mailbox](#request-mailboxes) entry.
 
-- `t: "p"` (the pool's adjudication threshold crossed) MUST NOT carry
-  content, and MUST NOT be sent on individual pool arrival. Per-arrival
-  notice to a stranger's message is exactly the harassment vector pool
-  adjudication's batching exists to prevent (see [The recovery
-  pool](#the-recovery-pool)) — "on threshold, an absent device is
-  woken... it spends one per round, never one per arrival" applies here
-  exactly as it does to the events socket's own `#pool` frame.
 - `t: "d"` (a watched DID's declaration changed) MUST NOT carry the
   changed content. A key-transparency monitor's whole purpose is
   catching a source — hostile or merely buggy — that lies by omission or
@@ -2042,7 +2055,7 @@ add a parallel array someone has to keep aligned with another one.
 | name | what it covers |
 |---|---|
 | `core` | registrations, challenges, the events socket — **always present** |
-| `didMailbox` | DID-addressed mail: `did:`-keyed puts, the recovery pool, `PUT`/`DELETE` on blocks |
+| `didMailbox` | DID-addressed mail: `did:`-keyed puts, request mailboxes, `PUT`/`DELETE` on blocks |
 | `grant` | grant issuance and grant-addressed mail: the grants endpoints and `grant:`-keyed puts |
 | `monitor` | the [key monitor](key-transparency.md), where the host also runs one |
 
@@ -2202,7 +2215,7 @@ The owner-facing error **body** format is
 ## Limits are implementation-defined
 
 Message and attachment size caps, attachment budgets, retention windows,
-recovery-pool sizing, discard-window length, challenge TTL, and dormancy
+request-mailbox depth and shared quota, challenge TTL, and dormancy
 policy are implementation-defined. The operator picks them and advertises
 the peer-visible ones in the enabler document. No constants appear in
 this specification; none of them is something a peer or another relay
@@ -2217,30 +2230,20 @@ a deployment that enforces a peer-visible cap it does not publish MUST NOT
 refuse on it distinguishably, because then the refusal is the only way a
 peer learns the limit exists.
 
-The recovery pool's sizing reasoning transfers even though its constants
-do not:
+Request-mailbox sizing reasoning transfers even though its constants do
+not:
 
-- **Bound the pool by bytes, not by sender count.** Width is the property
-  the pool exists to provide, and a sender-count cap rations exactly the
-  thing the design says not to pre-judge. Smaller messages simply fit more
+- **Request depth is smaller than a pair mailbox's.** A request is a
+  knock, not a thread; a few entries are enough for the device to judge
+  the sender by.
+- **Bound the shared quota by bytes, not by sender count**, counting the
+  proof bytes held for request senders. Smaller messages simply fit more
   senders.
-- **Degrade per-sender depth before turning any sender away.** Under
-  pressure, depth gives and width holds. A shallower pool doubles the
-  senders that fit for the same storage.
-- **Refuse only at true exhaustion** — byte cap reached with depth already
-  minimal — and refuse senders not already present, keeping earlier
-  arrivals rather than evicting them.
-- **A threshold on distinct senders, not a cap, governs ordinary
-  operation.** Crossing it triggers adjudication, which clears the pool.
-  The byte cap binds only in the unanswered-wake case, where a device is
-  offline, out of battery, or gone and nothing else regulates growth.
-  Message retention expiry is the backstop for a permanently absent
-  device.
-- Sizing the threshold in senders, not storage, reflects what it governs:
-  adjudication load — how many judgements the device is being asked for.
-
-Whatever a deployment picks for the pool, the put still answers `202`:
-pool sizing is recipient-side state, so no refusal may turn on it.
+- **The shared quota, once full, keeps nothing more and refuses nothing.**
+  It is recipient-side state, so the put still answers `202`; only the
+  sender's own request depth may answer `429`. The device frees it by
+  reading and acking, and retention expiry is the backstop for a device
+  that never does.
 
 ## Not yet specified
 
@@ -2280,8 +2283,7 @@ pool sizing is recipient-side state, so no refusal may turn on it.
 - **Concrete body schemas.** This document is an endpoint inventory and a
   set of rules about what may be disclosed, not an IDL. The field-level
   CBOR schemas for registration (beyond the ignore-unknown-keys rule),
-  grant issuance, ack batches, pool
-  adjudication, and the enabler document are not fixed here. The
+  grant issuance, ack batches and the enabler document are not fixed here. The
   encoding rules that govern them — deterministic CBOR, `COSE_Key`, tag-1
   integer timestamps — are.
 

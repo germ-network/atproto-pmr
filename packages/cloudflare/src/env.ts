@@ -22,7 +22,12 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
     pmrDirectory: KVNamespace
     /** Grant address → locator. Resolves before any relay is known. */
     addresses: KVNamespace
-    /** Message bodies, kept out of the queue. */
+    /**
+     * Message bodies, kept out of the queue. `PMRObject` also reads this to
+     * tell whether a request entry's body has expired, so it must be the
+     * store the deployment writes bodies to (or `PMRObject.bodyStored`
+     * overridden).
+     */
     messages: KVNamespace
     /**
      * Server-issued challenges. Global rather than per-relay: a challenge
@@ -41,13 +46,13 @@ export interface PMREnv<TPMR extends PMRObject = PMRObject> {
      */
     HOST_NAME: string
 
-    /** Per-sender capacity of a provisioned pair mailbox. */
+    /** Per-sender capacity of a pair mailbox. */
     MAX_MESSAGES_PER_PAIR_SENDER: string
 
-    /** Recovery pool: bounded by bytes, never by sender count. */
-    POOL_CAP_BYTES: string
-    POOL_DEPTH_PER_SENDER: string
-    POOL_DEPTH_UNDER_PRESSURE: string
+    /** Entries one sender's request mailbox holds before it refuses. Default 5 when unset or not a positive integer. */
+    REQUEST_DEPTH_PER_SENDER?: string
+    /** One byte quota across all request mailboxes, proof bytes included. Default 5000000 when unset or not a positive integer. */
+    REQUEST_SHARED_CAP_BYTES?: string
 
     /**
      * `active`, `draining`, or `absent` — deployment-wide policy for grant

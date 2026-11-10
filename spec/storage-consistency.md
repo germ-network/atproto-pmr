@@ -136,37 +136,60 @@ An adapter MUST NOT strip or add a prefix on the pair arm. Note the
 consequence for any internal key namespacing: a record family named
 `grant:` is now ambiguous with the mailbox-kind prefix, and wants a
 distinct name.
-- **The recovery pool** — for senders with no provisioned mailbox. Shallow
-  per sender, wide in sender count, and **newest-wins on overflow** rather
-  than refusing.
+- **Request mailboxes** — for senders that are not blocked and that
+  receive-time admission does not admit. Keyed by the sender DID like a pair
+  mailbox, but small per sender, refusing at its depth and keeping its
+  oldest entries, and bounded across senders by one byte quota. A request
+  mailbox exists only while it holds an entry
+  ([`wire-api.md` §Request mailboxes](wire-api.md#request-mailboxes)).
 
 | operation | notes |
 |---|---|
 | `append(mailboxKey, messageRef) -> Appended \| Refused(full)` | **refuses at capacity — never accept-and-evict**; the cap check and the write MUST be one atomic step, or two concurrent puts both see room |
-| `receive(senderKey, messageRef, admission) -> Queued \| Pooled \| Refused(full)` | one atomic step per adjudicated pair put: routes by the sender's standing (none, a device contact, an admitted sender, a blocked sender) and the recipient's verdict; the nonce and pause checks come first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit), then the writes |
-| `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; a pooled sender's selected proof is stored when it fits the shared pool budget and transfers on provisioning |
-| `appendToPool(senderKey, messageRef, verdict?)` | **never returns `Refused`** under ordinary pressure; it evicts; records the sender's latest verdict beside the entries |
+| `receive(senderKey, messageRef, admission) -> Queued \| Held \| Dropped \| Refused(full)` | one atomic step per judged pair put: a blocked sender is absorbed synthetically; otherwise the recipient's verdict alone routes the put, `yes` to the pair mailbox and anything else to the request mailbox; the nonce check comes first, then any block-marker change, then capacity (a `yes` is refused only when the new message does not fit; a `yes` whose message id a request mailbox already holds is a duplicate), then the writes. A `yes` moves the sender's request entries into the pair mailbox ahead of the new message, oldest first, as far as capacity allows |
+| `appendPair(senderDID, messageRef, nonce, verifiedEvidence, admission?)` | atomically checks the declaration revision, recycles on confirmed key change, then routes; a request sender's selected proof is held under the shared request quota together with its entry, or not at all |
+| `appendToRequest(senderKey, messageRef, nonce) -> Held \| Duplicate \| Refused(full) \| Dropped` | `Duplicate` for a repeated nonce or a message id the sender's pair mailbox already holds; **refuses at the sender's depth and keeps its oldest entries — never accept-and-evict**; `Dropped` when the shared quota cannot hold the entry with any proof bytes it would newly retain, keeping nothing and recording no nonce; the nonce check, the depth check, the quota check and the write MUST be one atomic step |
 | `list(mailboxKey, limit) -> [messageRef]` | drain for delivery |
-| `remove(mailboxKey, messageId)` | ack; **idempotent** |
-| `getMessage(mailboxKey, messageId) -> messageRef?` | fetch one by reference; read-only, never acks |
-| `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps |
-| `poolSenders() -> [senderKey, verdict?]` | adjudication; **DIDs only, never bodies** |
+| `remove(mailboxKey, messageId)` | ack; **idempotent**; reaches a sender's request entries as well as its pair entries, and removing the last request entry deletes the request mailbox |
+| `getMessage(mailboxKey, messageId) -> messageRef?` | fetch one by reference; read-only, never acks; reaches request entries under the sender's key, with the same answer on every miss |
+| `openMailboxes(limit, cursor)` | reconnect drain, retention sweeps; **pair and grant mailboxes only — never request entries** |
+| `requestMailboxes(cursor, limit) -> [senderKey, [messageId]]` | the owner's request listing; **DIDs and entry ids only, never bodies** |
 
 `appendPair(senderDID, messageRef, nonce, verifiedEvidence)` is the pair-put
 operation for generation-aware stores. Its key binding, generation selection,
 rotation disposal, nonce check, and append MUST be one serialized operation.
 The store retains one verified CAR and its declaration CID per sender-specific
-pair generation while that sender has queued or pooled messages. Pooled proof
-bytes count against the shared pool byte cap, and provisioning transfers the
-proof with the selected pooled refs. If a pool message fits but its proof CAR
-does not fit the remaining proof budget, the message is still accepted without
-`sd`, `dc`, or generation metadata; a later proof that fits may annotate the
-retained pool refs. Blocked, refused, discarded, duplicate, and exhausted
-outcomes MUST NOT retain proof bytes or expose a mailbox descriptor. The proof
-expires with the accepted message-body retention period.
-A small latest-observed revision/CID/key watermark may remain for a live
-provisioned mailbox to prevent a stale resolver result from rolling the key
-back. This tuple is independent of the selected proof's CID and revision:
+pair generation while that sender has queued or request-held messages. A
+request sender's proof counts against the shared request quota together with
+its first entry: both are held in one decision, or neither is kept — the put
+is dropped, with no entry, no proof and, for a first contact, no evidence row.
+A sender whose live proof is already held is charged only its entry bytes.
+A sender that holds a pair mailbox has the proof of a held entry stored, or its
+expiry extended, like any held entry, but charged to no quota, as a pair
+mailbox's proof is not.
+The proof leaves the quota when:
+
+- the sender's last request entry leaves;
+- it expires with the accepted message-body retention period, at which point
+  a sender with no pair mailbox also loses its request entries, whose bodies
+  expired with it;
+- admission moves every request entry into a pair mailbox, whose proof it
+  then becomes, charged to no quota; or
+- the sender's key changes.
+
+Every request entry also leaves, whatever its sender holds, once the
+retention that governs its body expires
+([`wire-api.md` §Request mailboxes](wire-api.md#request-mailboxes)): the store
+never lists it, and returns its bytes, and the proof's if it was the last, to
+the quota. A sender's own put need not purge, so a sender whose entries have
+expired may still be refused at its depth, or dropped at the quota, until the
+next listing or periodic sweep frees them. An adapter that reclaims nothing on
+its own MUST still do this when it meets an expired entry.
+
+Blocked, refused, duplicate and dropped outcomes MUST NOT retain proof bytes or
+expose a mailbox descriptor. A small latest-observed revision/CID/key
+watermark may remain for a live pair mailbox or a blocked sender to prevent a
+stale resolver result from rolling the key back. This tuple is independent of the selected proof's CID and revision:
 a same-anchor-key declaration edit advances the watermark while keeping that
 generation and selected evidence. Repeated puts under the edited declaration
 remain valid; equal-revision different CID/key evidence remains refused. This
@@ -180,7 +203,7 @@ stays refused until a strictly newer independently verified declaration
 establishes the watermark. Existing generation, selected proof and replay
 state are preserved during this recovery.
 A confirmed different anchor key allocates a new opaque generation and
-removes undelivered queue and pool refs for that sender. The nonce set MUST
+removes undelivered pair and request refs for that sender. The nonce set MUST
 survive key rotation so a key changed back cannot replay an old nonce. It MUST
 NOT affect another sender. Missing or unverifiable evidence cannot call this
 operation and never establishes a rotation. A verified rotation is applied
@@ -194,21 +217,18 @@ contract; grant mailbox acknowledgements remain unchanged. The relay
 advertises pair-generation support with `pg: true`, without requiring client
 opt-in or sending a separate generation frame.
 
-**Do not implement the pool by reusing `append` with a different cap.** The
-eviction direction is opposite, and conflating them is how a recovery
-attempt gets refused or a first-contact message silently dropped — the two
-failures each policy exists to prevent, swapped.
+**Do not implement a request mailbox by reusing `append` with a smaller cap.**
+It differs from a pair mailbox in what it never does: it never wakes the
+device — no live delivery and no push — never appears in the reconnect drain,
+and answers a full shared quota with a silent drop rather than a refusal. A
+full per-sender reservation is a refusal that keeps the oldest entries, with a
+`Retry-After` drawn from the same source as a full pair mailbox's and a
+blocked sender's.
 
-The pool is bounded two ways, and neither rations sender count directly: a
-*threshold* on distinct senders triggers an adjudication round, and a
-*byte cap* applies only when that round never comes. Bytes rather than
-senders is deliberate — width is the property the pool exists to provide —
-so under pressure `appendToPool` reduces per-sender depth before it turns
-any sender away. It refuses a new sender only when a put begins with the cap
-already reached; a put that begins below the cap may cross it, and an existing
-sender continues newest-wins treatment even if its replacement increases total
-bytes. Pooled proof CARs use the same budget but are skipped when they would
-not fit. Both values are
+The shared byte quota, proof bytes included, is the only bound across
+senders. A put whose entry and newly retained proof bytes do not fit is
+dropped; the sender's depth is checked first, so a full sender refuses
+whatever the quota's state. Both the depth and the quota are
 **implementation-defined**; the reasoning is what transfers, not any
 constant. See
 [`wire-api.md` §Limits](wire-api.md#limits-are-implementation-defined).
@@ -229,21 +249,18 @@ re-verifies it, so the hint is an index and a convenience, not evidence. An
 adapter that loses or corrupts hints degrades performance; one that lets a
 hint substitute for verification degrades security.
 
-#### Two suppression records, not interchangeable
+#### Blocked senders
 
-Both are per-sender suppression, and confusing them produces a wrong answer
-to a sender:
-
-| | blocked | discarded |
-|---|---|---|
-| applies to | a sender the recipient blocked, **provisioned or not**, whether the device blocked them or the relay mirrored a Bsky block | an **unprovisioned** sender the device declined |
-| put answers | `202` / `429` per the synthetic state | `202`, as any unprovisioned put does |
-| lifetime | until unblocked | **expires, deliberately** |
-| bodies stored | none | none |
-
-Neither is observable to the sender, and each matches the population it is
-drawn from — which is what keeps them indistinguishable from the ordinary
-behavior of that population.
+A **blocked** sender is a sender the recipient blocked, whether or not it holds
+a mailbox, and whether the device blocked it or the relay mirrored a Bsky
+block. Its puts answer `202` / `429` per the synthetic state until it is
+unblocked, and no bodies are stored. This is not observable to the sender, and
+it matches the population the sender is drawn from, which is what keeps it
+indistinguishable from the ordinary behavior of that population: the synthetic
+state refuses at the depth the same put would meet unblocked — the pair depth
+when admission would admit it, the request depth otherwise. Blocking MUST also
+remove the sender's request entries and return their bytes to the shared
+quota.
 
 For a **blocked** sender, storage MUST hold no message bytes and MUST write
 no queue rows. The append path for a blocked sender advances whatever
@@ -264,14 +281,11 @@ is indistinguishable. Three properties matter to an adapter:
 Blocking is reversible, so the record survives unblocking as ordinary reset
 state.
 
-A mailbox the relay opened for a sender the recipient's policy admitted
-carries an *admitted* mark, kept beside the queue. It marks a sender judged
-again on every put; provisioning the sender clears it and makes the sender a
-device contact, judged only by blocks. A block mirrored from Bsky carries its
-own mark. Neither a verdict nor the Bsky block's absence lifts it; only a
-device unblock does, and that holds only until the relay next sees the Bsky
-block (the sender's next put or the catch-up after it). A device block takes
-it over.
+No mark records that admission admitted a sender: every pair mailbox is judged
+by admission again on every put. A block mirrored from Bsky carries its own
+mark. Neither a verdict nor the Bsky block's absence lifts it; only a device
+unblock does, and that holds only until the relay next sees the Bsky block
+(the sender's next put or the catch-up after it). A device block takes it over.
 
 The concrete synthetic behavior is the implementer's, deliberately
 unpublished, and free to change. This document specifies the storage
@@ -330,7 +344,7 @@ becomes defense in depth against a lying PDS, added deliberately.
 **Reclamation is the storage layer's business, driven by a policy this
 interface hands it — never work this interface schedules.** Every record
 that expires carries its own expiry: `putBody(id, bytes, expiresAt)`, a
-grant's expiry, a discard window. An adapter reclaims on that however suits
+grant's expiry. An adapter reclaims on that however suits
 its backend — a native TTL, a periodic sweep, or nothing at all.
 
 What makes delegating it safe is
@@ -349,8 +363,8 @@ entirely
 ([`wire-api.md` §Monitoring](wire-api.md#monitoring--a-separate-component-not-a-relay-surface)).
 It is not something this interface schedules, per DID or otherwise.
 
-**Not expiry**, per the section above. **Nor** pool adjudication, which is
-triggered by threshold or by connect; **nor** the blocked-sender synthetic
+**Not expiry**, per the section above. **Nor** request mailboxes, which have no
+lifetime of their own; **nor** the blocked-sender synthetic
 state, which is evaluated when a put arrives and needs no sweep at all.
 
 What remains is work that must **enumerate** rather than wait on a timer —
@@ -485,8 +499,4 @@ any of it to satisfy the contract:
 - **Whether the observation cache belongs in this interface at all**, given
   an adapter may drop it entirely. The argument for keeping it is that
   adopters who *do* persist it should not each invent the shape.
-- **The recovery pool's cross-sender cap.** Per-sender depth (shallow) and
-  eviction within a sender (newest wins) are settled; whether the pool also
-  needs a cap *across* senders beyond the byte bound, and what it evicts
-  when it hits one, is open.
 - **Migration and versioning of the stored shapes**, once there is a v2.

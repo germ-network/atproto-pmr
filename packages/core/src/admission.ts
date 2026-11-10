@@ -7,9 +7,9 @@ export { admitsThroughBoundedPolicy, POLICY_NOT_ENABLED }
  * a sender, decided by the relay when the put arrives so devices never
  * recompute it. The recipient's declared allow policies and Bsky social
  * graph decide yes or no; a Bsky block by the recipient is its own verdict,
- * because it is applied as a relay block rather than a pool entry.
+ * because it is applied as a relay block rather than a held put.
  *
- * Grant-addressed puts are never adjudicated: a grant put names nobody, so
+ * Grant-addressed puts are never judged: a grant put names nobody, so
  * there is no sender to judge.
  */
 
@@ -19,9 +19,9 @@ export const ADMISSION_UNAVAILABLE = "admission-unavailable"
 export type Admission =
     /** The recipient's policy admits the sender: deliver this put. */
     | { verdict: "yes" }
-    /** The policy refuses the sender: pool the put with `why`, for the device to judge. */
+    /** The policy refuses the sender: hold the put in its request mailbox. `why` is kept for the relay's own use. */
     | { verdict: "no"; why: readonly string[] }
-    /** The relay cannot decide yet: pool the put with `why`. */
+    /** The relay cannot decide yet: hold the put in its request mailbox. */
     | { verdict: "unknown"; why: readonly string[] }
     /**
      * The recipient blocks the sender on Bsky: mirror into the relay block.
@@ -29,15 +29,9 @@ export type Admission =
      */
     | { verdict: "blocked" }
 
-/** The verdict a pooled sender's latest put carried, listed to the device. */
-export interface PoolVerdict {
-    verdict: "no" | "unknown"
-    why: readonly string[]
-}
-
 /**
  * Where a pair put's admission comes from. May throw; callers go through
- * `admissionOrUnavailable`, so a failed read pools rather than failing the put.
+ * `admissionOrUnavailable`, so a failed read holds the put rather than failing it.
  */
 export interface AdmissionSource {
     admission(sender: string, recipient: string): Promise<Admission>
@@ -45,7 +39,7 @@ export interface AdmissionSource {
 
 /**
  * How long a put waits for its verdict. Implementation-defined; past it the
- * put pools as unknown rather than stalling on a slow read.
+ * put is judged unknown rather than stalling on a slow read.
  */
 export const ADMISSION_DEADLINE_MS = 1_000
 

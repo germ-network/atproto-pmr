@@ -3,7 +3,7 @@
  * halves that live in this package:
  *
  *   - A paused registration QUEUES mail exactly as an active one does (pair,
- *     pool and grant alike); inactivity, not pause, is what stops admission.
+ *     request and grant alike); inactivity, not pause, is what stops admission.
  *   - `applyDeclarationOutcome`: the atomic read-modify-write of the paused
  *     flag a driver calls with a re-check's conclusion.
  *
@@ -52,13 +52,12 @@ describe("a paused registration queues mail", () => {
         })
     })
 
-    it("pools a DID-addressed pool put with its body", async () => {
+    it("holds a DID-addressed request put", async () => {
         await inPMR(freshStub(), async (pmr) => {
             await pmr.writeWatchState({ paused: true, lastCheckAt: T0 })
-            const r = await pmr.appendToPool("did:plc:sender", ref("p1"), freshNonce(), T0)
-            expect(r.outcome).toBe("pooled")
-            expect(r.outcome === "pooled" && r.persistBody).toBe(true)
-            expect(await pmr.poolSenders()).toHaveLength(1)
+            const r = await pmr.appendToRequest("did:plc:sender", ref("p1"), freshNonce(), T0)
+            expect(r.outcome).toBe("held")
+            expect((await pmr.requestMailboxes(null, 10)).entries).toHaveLength(1)
         })
     })
 

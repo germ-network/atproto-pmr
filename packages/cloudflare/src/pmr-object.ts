@@ -13,7 +13,6 @@ import {
     reconcileWatchState,
     type AppendResult,
     type Admission,
-    type PoolVerdict,
     type BlockSource,
     type ReceiveResult,
     type PairMailboxKey,
@@ -30,9 +29,10 @@ import {
     type Nonce,
     type OpenMailboxesPage,
     type PMRStore,
-    type PoolSender,
-    type PoolAppendResult,
     type RegistrationFields,
+    type RequestAppendResult,
+    type RequestMailbox,
+    type RequestMailboxesPage,
     SUMMARY_TOKENS_KEPT,
     type SummaryIndex,
     type SyntheticBehavior,
@@ -60,7 +60,23 @@ import { webPushSender } from "./push-sender"
  */
 
 const KEY_REGISTRATION = "reg"
-const KEY_POOL_BYTES = "poolBytes"
+/** Bytes held across every request mailbox: entries and, once accounted, their proofs. */
+const KEY_REQUEST_BYTES = "reqBytes"
+/** Used when `REQUEST_DEPTH_PER_SENDER` or `REQUEST_SHARED_CAP_BYTES` is unset or not a positive integer. */
+const DEFAULT_REQUEST_DEPTH_PER_SENDER = 5
+const DEFAULT_REQUEST_SHARED_CAP_BYTES = 5_000_000
+/** When the next sweep of request entries whose bodies have expired is due, in seconds. */
+const KEY_REQUEST_SWEEP_AT = "reqSweepAt"
+const KEY_REQUEST_SWEEP_CURSOR = "reqSweepCursor"
+const REQUEST_SWEEP_INTERVAL_SECONDS = 86_400
+const REQUEST_SWEEP_BATCH_SIZE = 50
+/**
+ * A request entry's body is written after its put is answered, and the body
+ * store is eventually consistent, so an entry is judged by its body only once
+ * it is older than this.
+ */
+const REQUEST_BODY_GRACE_SECONDS = 300
+const requestJudgementCutoff = () => Math.floor(Date.now() / 1000) - REQUEST_BODY_GRACE_SECONDS
 const KEY_PAIR_EVIDENCE_EXPIRY_CURSOR = "pairEvidenceExpiryCursor"
 const KEY_PAIR_EVIDENCE_EXPIRY_MIN = "pairEvidenceExpiryMin"
 const PAIR_EVIDENCE_EXPIRY_BATCH_SIZE = 100
@@ -106,14 +122,14 @@ interface SummaryOrder {
 /** Durable Object storage rejects a key longer than 2 KiB. */
 const MAX_KEY_BYTES = 2048
 
-/**
+/*
  * The key families — which *kind of record* this is, an axis orthogonal to
  * the `MailboxKey` it is about. A prefixed listing is therefore also the
  * key listing, with no side table to disagree with the family it describes.
  *
  * Keys contain `:` themselves — a DID always, and a grant key by its own
  * prefix — which is harmless: every read slices a fixed prefix length
- * rather than splitting, so `pool:did:plc:alice` recovers `did:plc:alice`
+ * rather than splitting, so `req:did:plc:alice` recovers `did:plc:alice`
  * and `mbox:grant:abc` recovers `grant:abc`, both exactly.
  *
  * `GRANT_ROW_PREFIX` is NOT the wire-level `grant:` mailbox-kind prefix,
@@ -122,28 +138,18 @@ const MAX_KEY_BYTES = 2048
  * out of an address. A grant's queue lives under `mbox:grant:<address>`
  * and its metadata under `grantrow:<address>`.
  */
-const POOL_PREFIX = "pool:"
+/** A sender's request mailbox: a non-empty `MessageRef[]`, deleted when it empties. */
+const REQUEST_PREFIX = "req:"
 const SYNTHETIC_PREFIX = "syn:"
 const GRANT_ROW_PREFIX = "grantrow:"
 const MAILBOX_PREFIX = "mbox:"
 const PAIR_EVIDENCE_PREFIX = "pairEvidence:"
-/** A pooled sender's latest receive-time verdict, kept as long as its `pool:` entries. */
-const POOL_VERDICT_PREFIX = "poolv:"
-/**
- * Marks a pair mailbox the relay opened for a sender the recipient's policy
- * admitted; absent for a device contact. A relay that stops adjudicating
- * treats every mailbox, marked or not, as a device contact's.
- */
-const ADMITTED_PREFIX = "adm:"
 /** Marks a relay block (`syn:`) that mirrors a Bsky block, so a device takeover or unblock can tell it from a device block. */
 const BSKY_BLOCK_PREFIX = "bsky:"
 
 const mailboxKey = (k: MailboxKey) => `${MAILBOX_PREFIX}${k}`
 const syntheticKey = (k: MailboxKey) => `${SYNTHETIC_PREFIX}${k}`
-const discardKey = (k: MailboxKey) => `discard:${k}`
-const poolKey = (k: MailboxKey) => `${POOL_PREFIX}${k}`
-const poolVerdictKey = (k: MailboxKey) => `${POOL_VERDICT_PREFIX}${k}`
-const admittedKey = (k: MailboxKey) => `${ADMITTED_PREFIX}${k}`
+const requestKey = (k: MailboxKey) => `${REQUEST_PREFIX}${k}`
 const bskyBlockKey = (k: MailboxKey) => `${BSKY_BLOCK_PREFIX}${k}`
 const nonceSetKey = (k: MailboxKey) => `nonces:${k}`
 const retryHintKey = (k: MailboxKey) => `retry:${k}`
@@ -179,6 +185,29 @@ type StoredPairEvidence = StoredPairMailboxEvidence & {
  */
 const NONCE_SEEN_SET_SIZE = 256
 const MAX_PAIR_EVIDENCE_BYTES = 1_000_000
+
+/** What `judgeRequestSweep` decided before the object was held. */
+interface RequestSweepPass {
+    /** Absent when no sweep is armed. */
+    dueAt: number | undefined
+    /** Present when the sweep is due now. */
+    senders?: Array<{ key: MailboxKey; dead: Set<MessageId> }>
+    full?: boolean
+}
+
+/** A request entry as stored: the ref plus when this object held it. */
+type HeldRef = MessageRef & { heldAt?: number }
+
+const unheld = (ref: HeldRef): MessageRef => {
+    const { heldAt: _heldAt, ...bare } = ref
+    return bare
+}
+
+/** A tunable that is missing or malformed must not unbound the tier it limits. */
+function positiveInteger(raw: string | undefined, fallback: number): number {
+    const n = Number(raw)
+    return Number.isSafeInteger(n) && n > 0 ? n : fallback
+}
 
 const nonceHex = (n: Nonce) =>
     [...n].map((b) => b.toString(16).padStart(2, "0")).join("")
@@ -216,6 +245,14 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
 
     private capacity(): number {
         return parseInt(this.env.MAX_MESSAGES_PER_PAIR_SENDER)
+    }
+
+    private requestDepth(): number {
+        return positiveInteger(this.env.REQUEST_DEPTH_PER_SENDER, DEFAULT_REQUEST_DEPTH_PER_SENDER)
+    }
+
+    private requestCapBytes(): number {
+        return positiveInteger(this.env.REQUEST_SHARED_CAP_BYTES, DEFAULT_REQUEST_SHARED_CAP_BYTES)
     }
 
     /**
@@ -664,13 +701,13 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
                 generationChanged = true
             } else if (!sameBytes(prior.anchorKey, evidence.anchorKey)) {
-                const [queue, pool] = await Promise.all([
+                const [queue, requests] = await Promise.all([
                     this.db.get<MessageRef[]>(mailboxKey(key)),
-                    this.db.get<MessageRef[]>(poolKey(key)),
+                    this.db.get<MessageRef[]>(requestKey(key)),
                 ])
-                recycledMessageIds = [...(queue ?? []), ...(pool ?? [])].map((r) => r.messageId)
+                recycledMessageIds = [...(queue ?? []), ...(requests ?? [])].map((r) => r.messageId)
                 if (queue !== undefined) await this.db.put(mailboxKey(key), [])
-                await this.releasePool(key, pool ?? [])
+                await this.releaseRequest(key)
                 await this.db.delete(retryHintKey(key))
                 selected = { ...evidence, car: new Uint8Array(), generation: crypto.randomUUID() }
                 generationChanged = true
@@ -680,8 +717,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 selected = { ...prior }
             }
             if (selected.car.byteLength > 0 && selected.expiresAt <= nowSeconds) {
-                await this.clearPairProof(key)
-                selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
+                await this.expireProof(key, mailboxExisted)
+                selected = { ...selected, car: new Uint8Array(), requestAccountedBytes: 0 }
             }
 
             selected.watermark = {
@@ -690,9 +727,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 anchorKey: evidence.anchorKey,
             }
 
-            // Pool-only first contact gets no revision row unless its proof
-            // fits inside the pool's existing byte budget. Existing floors,
-            // rotations and provisioned mailboxes remain durable.
+            // A request-only first contact gets a row only when its entry and
+            // proof are held together (below). Existing floors, rotations and
+            // pair mailboxes remain durable.
             if (prior !== undefined || mailboxExisted || admission?.verdict === "yes") {
                 await this.db.put(evidenceKey, selected)
             }
@@ -708,15 +745,20 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                     hint: { senderDID: key, declarationCID: selected.declarationCID },
                 }
                 : baseRef
+            // A request entry keeps its sender's proof with it. Its CAR is
+            // charged to the request quota in the same decision as the entry,
+            // unless a live proof is already held or the sender has a pair
+            // mailbox, whose proof is not budgeted.
+            const proofBytes = mailboxPresent || selected.car.byteLength > 0 ? 0 : evidence.car.byteLength
             const result = admission === undefined
                 ? (await this.hasMailbox(key))
                     ? await this.append(key, boundRef, nonce, nowSeconds)
-                    : await this.appendToPool(key, boundRef, nonce, nowSeconds)
-                : await this.receive(key, boundRef, nonce, nowSeconds, admission)
+                    : await this.appendRequest(key, boundRef, nonce, nowSeconds, proofBytes)
+                : await this.receiveWith(key, boundRef, nonce, nowSeconds, admission, proofBytes)
 
             const accepted = ("persistBody" in result) && result.persistBody &&
                 (result.outcome === "appended" || result.outcome === "queued")
-            const pooled = result.outcome === "pooled" && result.persistBody && !mailboxPresent
+            const held = result.outcome === "held"
             if (accepted) {
                 const latest = await this.db.get<StoredPairEvidence>(evidenceKey)
                 selected = generationChanged || latest?.car.byteLength === 0
@@ -724,7 +766,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         ...selected,
                         ...evidence,
                         generation: selected.generation,
-                        poolAccountedBytes: latest?.poolAccountedBytes ?? 0,
+                        requestAccountedBytes: latest?.requestAccountedBytes ?? 0,
                     }
                     : {
                         ...(latest ?? selected),
@@ -743,41 +785,20 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                         : entry)
                     await this.db.put(mailboxKey(key), updated)
                 }
-            } else if (pooled) {
-                const held = await this.db.get<StoredPairEvidence>(evidenceKey)
-                if (held !== undefined && held.car.byteLength > 0 && held.expiresAt <= nowSeconds) {
-                    await this.clearPairProof(key)
-                }
+            } else if (held) {
                 const current = await this.db.get<StoredPairEvidence>(evidenceKey)
-                const hasHeldProof = current !== undefined && current.car.byteLength > 0 &&
-                    current.expiresAt > nowSeconds
-                const proofBytes = hasHeldProof
-                    ? 0
-                    : evidence.car.byteLength
-                const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-                const cap = parseInt(this.env.POOL_CAP_BYTES)
-                if (hasHeldProof || used + proofBytes <= cap) {
-                    selected = hasHeldProof
-                        ? { ...current, expiresAt: Math.max(current.expiresAt, evidence.expiresAt) }
-                        : { ...selected, ...evidence, generation: selected.generation, poolAccountedBytes: proofBytes }
-                    await this.db.put(evidenceKey, selected)
-                    if (proofBytes > 0) await this.db.put(KEY_POOL_BYTES, used + proofBytes)
-                    const pooledRefs = await this.db.get<MessageRef[]>(poolKey(key))
-                    if (pooledRefs !== undefined) {
-                        await this.db.put(poolKey(key), pooledRefs.map((entry) => ({
-                            ...entry,
-                            pairGeneration: selected.generation,
-                            hint: { senderDID: key, declarationCID: selected.declarationCID },
-                        })))
-                    }
-                    await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
-                } else if (prior !== undefined || mailboxExisted) {
-                    // Keep the small anti-rollback watermark for an existing
-                    // mailbox generation, but never reserve unbudgeted CAR bytes.
-                    selected = { ...selected, car: new Uint8Array(), poolAccountedBytes: 0 }
-                    await this.db.put(evidenceKey, selected)
-                    await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
-                }
+                const hasHeldProof = current !== undefined && current.car.byteLength > 0
+                selected = hasHeldProof
+                    ? { ...current, expiresAt: Math.max(current.expiresAt, evidence.expiresAt) }
+                    : { ...selected, ...evidence, generation: selected.generation, requestAccountedBytes: proofBytes }
+                await this.db.put(evidenceKey, selected)
+                const heldRefs = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+                await this.db.put(requestKey(key), heldRefs.map((entry) => ({
+                    ...entry,
+                    pairGeneration: selected.generation,
+                    hint: { senderDID: key, declarationCID: selected.declarationCID },
+                })))
+                await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
             } else if ((prior !== undefined || mailboxExisted) && selected.car.byteLength === 0) {
                 await this.schedulePairEvidenceExpiry(key, selected.expiresAt)
             }
@@ -799,17 +820,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<StoredPairMailboxEvidence | null> {
         const evidence = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
         if (evidence === undefined || evidence.declarationCID !== evidenceCID ||
-            evidence.car.byteLength === 0 ||
-            (await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) return null
+            evidence.car.byteLength === 0) return null
+        const deep = (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
+        if (!deep && (await this.db.get<MessageRef[]>(requestKey(key))) === undefined) return null
         if (evidence.expiresAt <= nowSeconds) {
-            await this.clearPairProof(key)
+            await this.expireProof(key, deep)
             return null
         }
         return evidence
     }
 
     /**
-     * Appends to a provisioned pair mailbox, or advances the synthetic
+     * Appends to a pair mailbox, or advances the synthetic
      * mailbox if the sender is blocked. The caller cannot tell which
      * happened, and neither can the sender.
      *
@@ -849,7 +871,15 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         const blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         const result =
             blocked !== undefined
-                ? await this.advanceSynthetic(key, blocked, nowSeconds)
+                ? await this.advanceSynthetic(
+                      key,
+                      blocked,
+                      nowSeconds,
+                      // A pair key reaches `append` only without an admission
+                      // source, where an unblocked sender with no pair mailbox
+                      // meets the request depth.
+                      isPairMailboxKey(key) ? this.requestDepth() : this.capacity()
+                  )
                 : await this.appendReal(key, ref, nowSeconds)
 
         if (result.outcome === "appended") {
@@ -888,17 +918,32 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * No bytes, no queue rows, no delivery — and `persistBody: false`,
      * which is how the caller keeps "no bytes stored for a blocked sender"
      * true without ever learning it is talking to the synthetic path.
+     *
+     * `capacity` is the depth this put would meet unblocked: the pair
+     * mailbox's when admission would admit it, the request mailbox's
+     * otherwise. A blocked sender then refuses where an unblocked one does,
+     * so the point where a 429 starts does not say which it is.
      */
     private async advanceSynthetic(
         key: MailboxKey,
         stored: SyntheticState,
-        nowSeconds: number
+        nowSeconds: number,
+        capacity: number
     ): Promise<AppendResult> {
+        if (isPairMailboxKey(key)) {
+            // The request path reads these before it decides; reading them
+            // here keeps a blocked sender's put as much storage work as an
+            // unblocked one's.
+            await this.db.get(requestKey(key))
+            await this.db.get(KEY_REQUEST_BYTES)
+            await this.db.get(mailboxKey(key))
+            await this.db.get(KEY_REQUEST_SWEEP_AT)
+        }
         const retryInstant = await this.retryInstant(key, nowSeconds)
         const { state, accepted } = this.synthetic.advance(
             stored,
             nowSeconds,
-            this.capacity(),
+            capacity,
             retryInstant
         )
         await this.db.put(syntheticKey(key), state)
@@ -940,23 +985,90 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         return queue.slice(0, limit)
     }
 
-    /** Idempotent: the client's ack path retries (contract 6). */
+    /**
+     * Idempotent: the client's ack path retries (contract 6). A sender's
+     * pair and request entries share its key, so both tiers are searched.
+     */
     async remove(key: MailboxKey, messageId: MessageId, pairGeneration?: string): Promise<void> {
+        const removable = (existing: MessageRef) =>
+            !(isPairMailboxKey(key) && pairGeneration !== undefined && pairGeneration !== existing.pairGeneration)
+
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        if (queue === undefined) return
-        const existing = queue.find((r) => r.messageId === messageId)
-        if (existing === undefined) return
-        if (isPairMailboxKey(key) && pairGeneration !== undefined && pairGeneration !== existing.pairGeneration) return
-        const remaining = queue.filter((r) => r.messageId !== messageId)
-        if (remaining.length === queue.length) return
-        await this.db.put(mailboxKey(key), remaining)
+        const existing = queue?.find((r) => r.messageId === messageId)
+        if (queue !== undefined && existing !== undefined && removable(existing)) {
+            await this.db.put(mailboxKey(key), queue.filter((r) => r.messageId !== messageId))
+        }
+
+        const requests = await this.db.get<MessageRef[]>(requestKey(key))
+        const request = requests?.find((r) => r.messageId === messageId)
+        if (requests === undefined || request === undefined || !removable(request)) return
+        await this.writeRequest(
+            key,
+            requests,
+            requests.filter((r) => r.messageId !== messageId)
+        )
+    }
+
+    /** Persists a request mailbox's new contents: gone when empty, with the bytes it no longer holds refunded. */
+    private async writeRequest(key: MailboxKey, before: MessageRef[], after: MessageRef[]): Promise<void> {
+        if (after.length === 0) await this.db.delete(requestKey(key))
+        else await this.db.put(requestKey(key), after)
+        const freed = before.reduce((n, r) => n + r.byteLength, 0) - after.reduce((n, r) => n + r.byteLength, 0)
+        const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+        await this.db.put(KEY_REQUEST_BYTES, Math.max(0, used - freed))
+        if (after.length === 0) await this.releaseRequestProof(key)
+    }
+
+    /**
+     * A sender's proof leaves the shared quota with its last request entry.
+     * With no pair mailbox the proof has no other purpose and its row goes;
+     * with one, the row stays as that mailbox's proof, charged to no quota,
+     * and a blocked sender's row stays as its watermark.
+     */
+    private async releaseRequestProof(key: MailboxKey): Promise<void> {
+        if (!isPairMailboxKey(key)) return
+        const proof = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
+        if (proof === undefined) return
+        const charged = proof.requestAccountedBytes ?? 0
+        if (charged > 0) {
+            const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+            await this.db.put(KEY_REQUEST_BYTES, Math.max(0, used - charged))
+        }
+        // A blocked sender's row is its anti-rollback watermark: it stays.
+        const kept = (await this.db.get(mailboxKey(key))) !== undefined ||
+            (await this.db.get(syntheticKey(key))) !== undefined
+        if (!kept) {
+            await this.db.delete(pairEvidenceKey(key))
+        } else if (charged > 0) {
+            await this.db.put(pairEvidenceKey(key), { ...proof, requestAccountedBytes: 0 })
+        }
+    }
+
+    /** Drops a sender's request mailbox and proof, returning their bytes to the shared quota. */
+    private async releaseRequest(key: MailboxKey): Promise<void> {
+        const requests = (await this.db.get<MessageRef[]>(requestKey(key))) ?? []
+        await this.writeRequest(key, requests, [])
+    }
+
+    /**
+     * Retention for a proof that has expired. A sender with no pair mailbox
+     * has only request entries, whose bodies have expired with it: they go
+     * too. One with a pair mailbox keeps its entries and only loses the CAR.
+     */
+    private async expireProof(key: PairMailboxKey, hasPairMailbox: boolean): Promise<void> {
+        if (hasPairMailbox) await this.clearPairProof(key)
+        else await this.releaseRequest(key)
     }
 
     async getMessage(key: MailboxKey, messageId: MessageId): Promise<MessageRef | null> {
         // `db.get` throws on an over-long key; a miss must look like any other.
         if (new TextEncoder().encode(mailboxKey(key)).length > MAX_KEY_BYTES) return null
         const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        return queue?.find((r) => r.messageId === messageId) ?? null
+        const deep = queue?.find((r) => r.messageId === messageId)
+        if (deep !== undefined) return deep
+        const requests = await this.db.get<HeldRef[]>(requestKey(key))
+        const held = requests?.find((r) => r.messageId === messageId)
+        return held === undefined ? null : unheld(held)
     }
 
     async hasMailbox(key: MailboxKey): Promise<boolean> {
@@ -971,6 +1083,18 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         nowSeconds: number,
         admission: Admission
     ): Promise<ReceiveResult> {
+        return this.receiveWith(key, ref, nonce, nowSeconds, admission, 0)
+    }
+
+    /** `receive`, reserving `proofBytes` in the shared request quota when the put lands in a request mailbox. */
+    private async receiveWith(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number,
+        admission: Admission,
+        proofBytes: number
+    ): Promise<ReceiveResult> {
         const seen = await this.loadNonces(key)
         if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
 
@@ -980,38 +1104,30 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             blocked = await this.db.get<SyntheticState>(syntheticKey(key))
         }
         if (blocked !== undefined) {
-            const result = await this.advanceSynthetic(key, blocked, nowSeconds)
-            if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
-            return toReceiveResult(result)
-        }
-
-        const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
-        const admitted = (await this.db.get(admittedKey(key))) !== undefined
-        if (queue !== undefined && !admitted) {
-            const result = await this.appendReal(key, ref, nowSeconds)
+            const result = await this.advanceSynthetic(
+                key,
+                blocked,
+                nowSeconds,
+                admission.verdict === "yes" ? this.capacity() : this.requestDepth()
+            )
             if (result.outcome === "appended") await this.recordNonce(key, nonce, seen)
             return toReceiveResult(result)
         }
 
         if (admission.verdict === "yes") {
+            const queue = await this.db.get<MessageRef[]>(mailboxKey(key))
             return this.admit(key, ref, nonce, nowSeconds, queue ?? [], seen)
         }
         // A blocked verdict always ends on the synthetic path above.
         if (admission.verdict === "blocked") throw new Error("unreachable")
-        const pooled = await this.appendToPool(key, ref, nonce, nowSeconds, {
-            verdict: admission.verdict,
-            why: admission.why,
-        })
-        return pooled.outcome === "pooled"
-            ? { outcome: "pooled", persistBody: pooled.persistBody }
-            : pooled
+        return this.appendRequest(key, ref, nonce, nowSeconds, proofBytes, seen)
     }
 
     /**
-     * Queue a put the recipient's policy admitted, opening and marking the
-     * sender's mailbox if need be. Refused, writing nothing, only when the new
-     * ref itself does not fit; the oldest pooled entries that fit ahead of it
-     * move in and the rest stay pooled with their verdict.
+     * Queue a put the recipient's policy admitted, opening the sender's pair
+     * mailbox if need be. Refused, writing nothing, only when the new ref
+     * itself does not fit; the oldest request entries that fit ahead of it
+     * move in, with their ids and fields, and the rest stay held.
      */
     private async admit(
         key: MailboxKey,
@@ -1021,6 +1137,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         queue: MessageRef[],
         seen: string[]
     ): Promise<ReceiveResult> {
+        const requests = (await this.db.get<HeldRef[]>(requestKey(key))) ?? []
+        // A message id names one entry in exactly one tier.
+        if (requests.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
         const capacity = this.capacity()
         if (queue.length >= capacity) {
             return {
@@ -1028,21 +1147,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 retryAfter: await this.retryInstant(key, nowSeconds),
             }
         }
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        const moved = pooled.slice(0, capacity - queue.length - 1)
+        const moved = requests.slice(0, capacity - queue.length - 1).map(unheld)
         await this.db.put(mailboxKey(key), [...queue, ...moved, ref])
-        await this.db.put(admittedKey(key), true)
-        if (moved.length > 0) {
-            const rest = pooled.slice(moved.length)
-            if (rest.length === 0) {
-                await this.releasePool(key, pooled)
-            } else {
-                await this.db.put(poolKey(key), rest)
-                const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-                const freed = moved.reduce((n, r) => n + r.byteLength, 0)
-                await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
-            }
-        }
+        if (moved.length > 0) await this.writeRequest(key, requests, requests.slice(moved.length))
         await this.recordNonce(key, nonce, seen)
         return { outcome: "queued", persistBody: true, ...(moved.length > 0 ? { moved } : {}) }
     }
@@ -1109,15 +1216,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as MailboxKey
             const previous = combined.get(key)
             if (evidence.expiresAt > 0 && evidence.expiresAt <= Math.floor(Date.now() / 1000)) {
-                if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
-                    const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-                    await this.releasePool(key, pooled)
-                    await this.db.delete(rawKey)
-                } else {
-                    await this.clearPairProof(key as PairMailboxKey)
-                }
+                await this.expireProof(
+                    key as PairMailboxKey,
+                    (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined
+                )
             }
-            // Pool-only senders have no mailbox descriptor. Proof metadata
+            // Request-only senders have no mailbox descriptor. Proof metadata
             // alone must never reveal a sender to the owner.
             if (previous === undefined) continue
             combined.set(key, {
@@ -1138,218 +1242,161 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
     }
 
-    // MARK: - The recovery pool
+    // MARK: - Request mailboxes
+
+    async appendToRequest(
+        key: PairMailboxKey,
+        ref: MessageRef,
+        nonce: Nonce,
+        nowSeconds: number
+    ): Promise<RequestAppendResult> {
+        return this.appendRequest(key, ref, nonce, nowSeconds, 0)
+    }
 
     /**
-     * Shallow per sender, wide in sender count, newest-wins on overflow —
-     * the inverse of a provisioned mailbox, because a recovery attempt is
-     * not a thread and the freshest attempt carries current state.
+     * Depth is judged before the shared quota, so a full sender refuses
+     * whatever the quota's state. Every read happens before any decision,
+     * so a dropped put issues the same reads as a held one and skips only
+     * the writes. There is no I/O outside this object's storage between the
+     * reads and the writes, which keeps the whole put atomic.
      *
-     * Under pressure **depth gives and width holds**: the bound is bytes
-     * rather than sender count, since width is the property the pool exists
-     * to provide. Only at true exhaustion is a sender not already present
-     * turned away.
-     *
-     * **The discard check runs here, not in the caller.** A caller that
-     * checks discard status separately and skips this call for a discarded
-     * sender makes discard observable by round-trip count and timing even
-     * though the response bytes are identical. Folding it in means exactly
-     * one call either way, with the discarded branch doing the same reads
-     * before skipping only the write.
-     *
-     * **Anti-replay** shares its nonce set with `append` for the same key,
-     * deliberately: a nonce is a property of the (sender, envelope) pair,
-     * not of which tier absorbed it. Otherwise a sender provisioned
-     * mid-flight could replay a pooled envelope into their new mailbox.
+     * `extraBytes` is what the caller will newly account alongside the entry
+     * (a proof it holds for this sender), reserved in the same decision so
+     * the entry and its proof are kept together or not at all.
      */
-    async appendToPool(
+    private async appendRequest(
         key: MailboxKey,
         ref: MessageRef,
         nonce: Nonce,
         nowSeconds: number,
-        verdict?: PoolVerdict
-    ): Promise<PoolAppendResult> {
-        const seen = await this.loadNonces(key)
-        if (seen.includes(nonceHex(nonce))) {
-            return { outcome: "duplicate" }
-        }
+        extraBytes: number,
+        preloadedNonces?: string[]
+    ): Promise<RequestAppendResult> {
+        const seen = preloadedNonces ?? (await this.loadNonces(key))
+        if (seen.includes(nonceHex(nonce))) return { outcome: "duplicate" }
 
-        const discardedUntil = await this.db.get<number>(discardKey(key))
-        const discarded =
-            discardedUntil !== undefined && discardedUntil > nowSeconds
+        const queue = (await this.db.get<HeldRef[]>(requestKey(key))) ?? []
+        const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+        const deep = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
+        const sweepAt = await this.db.get<number>(KEY_REQUEST_SWEEP_AT)
+        // A message id names one entry in exactly one tier.
+        if (deep.some((r) => r.messageId === ref.messageId)) return { outcome: "duplicate" }
 
-        const capBytes = parseInt(this.env.POOL_CAP_BYTES)
-        const depth = parseInt(this.env.POOL_DEPTH_PER_SENDER)
-        const depthUnderPressure = parseInt(this.env.POOL_DEPTH_UNDER_PRESSURE)
-
-        const usedBytes = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-        const underPressure = usedBytes >= capBytes
-        const effectiveDepth = underPressure ? depthUnderPressure : depth
-
-        const existing = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        const wasEmpty = existing.length === 0
-
-        if (discarded) {
-            // Nothing kept and no nonce recorded, so a fresh attempt once
-            // the window lapses is evaluated on its own terms — the same
-            // reasoning `append`'s refusal relies on.
-            return { outcome: "pooled", persistBody: false }
-        }
-
-        existing.push(ref)
-        let reclaimed = 0
-        while (existing.length > effectiveDepth) {
-            const evicted = existing.shift()
-            if (evicted !== undefined) reclaimed += evicted.byteLength
-        }
-
-        if (wasEmpty && underPressure) {
-            return { outcome: "exhausted" }
-        }
-
-        await this.db.put(poolKey(key), existing)
-        if (verdict !== undefined) await this.db.put(poolVerdictKey(key), verdict)
-        await this.db.put(KEY_POOL_BYTES, usedBytes + ref.byteLength - reclaimed)
-        await this.recordNonce(key, nonce, seen)
-        return { outcome: "pooled", persistBody: true }
-    }
-
-    /**
-     * DIDs only, never bodies.
-     *
-     * A projection of the pool's own keys — not a join. Because the key is
-     * the DID, there is no entry whose DID can go missing and leave the
-     * sender unadjudicable until retention expiry.
-     */
-    async poolSenders(): Promise<PoolSender[]> {
-        const entries = await this.db.list<MessageRef[]>({ prefix: POOL_PREFIX })
-        const verdicts = await this.db.list<PoolVerdict>({
-            prefix: POOL_VERDICT_PREFIX,
-        })
-        return [...entries].map(([k, refs]) => {
-            const did = k.slice(POOL_PREFIX.length)
-            const verdict = verdicts.get(poolVerdictKey(did as MailboxKey))
+        if (queue.length >= this.requestDepth()) {
             return {
-                did,
-                count: refs.length,
-                ...(verdict !== undefined ? { verdict } : {}),
+                outcome: "refused",
+                retryAfter: await this.retryInstant(key, nowSeconds),
             }
-        })
+        }
+        const total = ref.byteLength + extraBytes
+        if (used + total > this.requestCapBytes()) {
+            return { outcome: "dropped" }
+        }
+
+        queue.push({ ...ref, heldAt: Math.floor(Date.now() / 1000) })
+        await this.db.put(requestKey(key), queue)
+        await this.db.put(KEY_REQUEST_BYTES, used + total)
+        await this.recordNonce(key, nonce, seen)
+        await this.armRequestSweep(sweepAt)
+        return { outcome: "held" }
     }
 
     /**
-     * Move a pooled sender's entries into a real pair mailbox.
-     *
-     * Capacity is applied on the way in, so provisioning a sender who
-     * flooded the pool cannot overfill their new mailbox — and the entries
-     * kept are the OLDEST, matching what a provisioned mailbox does under
-     * pressure. The pool's own newest-wins policy governed which attempts
-     * survived to be provisioned; it does not follow them across.
+     * The ids among `refs` whose bodies are no longer stored: the retention
+     * that governs a body is the entry's too. An entry too young for its body
+     * to be written, and propagated to wherever this reads, is not judged; nor
+     * is one whose body store cannot be read. This awaits the body store, so
+     * a caller must not hold a read of `req:` across it: judge first, then
+     * `dropExpired` against fresh storage.
      */
-    async provisionFromPool(
-        key: MailboxKey,
-        _nowSeconds: number
-    ): Promise<MessageRef[]> {
-        // A blocked sender is never provisionable. `block` already purges
-        // the pool, so this is belt-and-braces against a future caller that
-        // reaches here with a stale key — provisioning a blocked sender
-        // would undo the block by creating them a live mailbox.
-        if ((await this.db.get(syntheticKey(key))) !== undefined) return []
-
-        // A device contact is judged only by blocks from here on.
-        await this.db.delete(admittedKey(key))
-
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        if (pooled.length === 0) {
-            // Provisioning an empty sender still creates the mailbox, so
-            // their next put lands normally rather than pooling again.
-            const existing = await this.db.get<MessageRef[]>(mailboxKey(key))
-            if (existing === undefined) await this.db.put(mailboxKey(key), [])
-            return []
-        }
-
-        const queue = (await this.db.get<MessageRef[]>(mailboxKey(key))) ?? []
-        const room = Math.max(0, this.capacity() - queue.length)
-        const moved = pooled.slice(0, room)
-
-        await this.db.put(mailboxKey(key), [...queue, ...moved])
-        await this.releasePool(key, pooled)
-
-        // Live push and Web Push, both deferred past this RPC's own
-        // response. Unlike `deliverLive`/`deliverPush`'s pair/grant-put
-        // callers, there's no body-write race to avoid here: these bodies
-        // were persisted when each message was first pooled
-        // (`pair-put.ts`), well before this adjudication call, so a KV
-        // read-back is safe.
-        if (moved.length > 0) {
-            // Gated on socket attachment — correct here, since a live
-            // broadcast to zero sockets does nothing. Do NOT nest the Web
-            // Push call below inside this same gate: Web Push exists
-            // precisely for the case where no socket is attached, so
-            // gating it on socket presence would silently suppress it in
-            // exactly the case it's for.
-            if (this.ctx.getWebSockets().length > 0) {
-                this.ctx.waitUntil(this.pushProvisioned(key, moved))
-            }
-            // One push per adjudication batch, not one per moved ref —
-            // per-ref pushes burn germ-service's 200/day budget for no
-            // benefit, since `Topic` collapse at APNs does not conserve
-            // it. A single wake is enough: the device's own catch-up
-            // (REST or reconnect-drain) recovers every provisioned
-            // message regardless of how many this one mentions.
-            const bodies = kvBodyStore(this.env)
-            const [first] = moved
-            this.ctx.waitUntil(
-                (async () => {
-                    const body = await bodies.getBody(first.messageId)
-                    if (body !== null) await this.deliverPush(key, first, body)
-                })()
-            )
-        }
-
-        return moved
+    private async deadEntries(refs: HeldRef[]): Promise<Set<MessageId>> {
+        const old = refs.filter((r) => (r.heldAt ?? 0) <= requestJudgementCutoff())
+        const dead = new Set<MessageId>()
+        await Promise.all(
+            old.map(async (r) => {
+                if (!(await this.bodyStored(r.messageId))) dead.add(r.messageId)
+            })
+        )
+        return dead
     }
 
-    private async pushProvisioned(
-        key: MailboxKey,
-        moved: MessageRef[]
-    ): Promise<void> {
-        const bodies = kvBodyStore(this.env)
-        for (const ref of moved) {
-            const body = await bodies.getBody(ref.messageId)
-            if (body === null) continue
-            this.broadcast(encodeDeliveryFrame(key, ref, body))
+    /**
+     * Whether the body for `id` is still stored; a request entry whose body
+     * is gone has expired. This reads `env.messages`, the namespace
+     * `kvBodyStore` writes bodies to. A deployment that writes them anywhere
+     * else MUST override this to read that store, or every request entry is
+     * dropped once it is older than the grace window. A read that fails
+     * reports the body as stored.
+     */
+    protected async bodyStored(id: MessageId): Promise<boolean> {
+        try {
+            const body = await this.env.messages.get(id, "stream")
+            if (body === null) return false
+            await body.cancel()
+            return true
+        } catch {
+            // Unreadable, including past the platform's per-request read limit.
+            return true
         }
     }
 
-    /** Drop the pooled entries and suppress the sender until `until`. */
-    async discardFromPool(key: MailboxKey, until: number): Promise<void> {
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        await this.releasePool(key, pooled)
-        await this.db.put(discardKey(key), until)
-        if (isPairMailboxKey(key)) await this.clearPairProof(key)
+    /**
+     * Removes the entries of `key` that `deadEntries` found dead, re-reading
+     * storage so nothing that changed while the body store was consulted is
+     * overwritten, and returns their bytes, and the proof's with the last, to
+     * the quota. Storage operations only: atomic.
+     */
+    private async dropExpired(key: MailboxKey, dead: ReadonlySet<MessageId>): Promise<void> {
+        if (dead.size === 0) return
+        const refs = await this.db.get<HeldRef[]>(requestKey(key))
+        if (refs === undefined) return
+        const cutoff = requestJudgementCutoff()
+        const alive = refs.filter((r) => !(dead.has(r.messageId) && (r.heldAt ?? 0) <= cutoff))
+        if (alive.length !== refs.length) await this.writeRequest(key, refs, alive)
     }
 
-    /** Remove a sender's pool entries and return their bytes to the budget. */
-    private async releasePool(
-        key: MailboxKey,
-        pooled: MessageRef[]
-    ): Promise<void> {
-        const evidence = isPairMailboxKey(key)
-            ? await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
-            : undefined
-        const proofBytes = evidence?.poolAccountedBytes ?? 0
-        const freed = pooled.reduce((n, r) => n + r.byteLength, 0) + proofBytes
-        const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-        await this.db.delete(poolKey(key))
-        await this.db.delete(poolVerdictKey(key))
-        await this.db.put(KEY_POOL_BYTES, Math.max(0, used - freed))
-        if (proofBytes > 0 && evidence !== undefined) {
-            await this.db.put(pairEvidenceKey(key), { ...evidence, poolAccountedBytes: 0 })
+    /** Arms the sweep for a day out when none is due, and re-arms one whose alarm was lost. */
+    private async armRequestSweep(dueAt: number | undefined): Promise<void> {
+        const nowMs = Date.now()
+        if (dueAt === undefined) {
+            const next = Math.floor(nowMs / 1000) + REQUEST_SWEEP_INTERVAL_SECONDS
+            await this.db.put(KEY_REQUEST_SWEEP_AT, next)
+            const current = await this.db.getAlarm()
+            if (current === null || next * 1000 < current) await this.db.setAlarm(next * 1000)
+        } else if (dueAt * 1000 <= nowMs && (await this.db.getAlarm()) === null) {
+            await this.db.setAlarm(nowMs + 1_000)
         }
     }
 
-    // MARK: - Blocking and discard
+    async requestMailboxes(
+        cursor: string | null,
+        limit: number
+    ): Promise<RequestMailboxesPage> {
+        const rows = await this.db.list<HeldRef[]>({
+            prefix: REQUEST_PREFIX,
+            startAfter: cursor === null || cursor === "" ? undefined : cursor,
+            limit: limit + 1,
+        })
+        const all = [...rows]
+        const page = all.slice(0, limit)
+        // Judge every entry before changing any: the body store is awaited,
+        // and no read of this object's own storage may span it.
+        const judged = await Promise.all(page.map(async ([, refs]) => this.deadEntries(refs)))
+        const entries: RequestMailbox[] = []
+        for (const [i, [raw, refs]] of page.entries()) {
+            const key = raw.slice(REQUEST_PREFIX.length) as PairMailboxKey
+            const dead = judged[i]!
+            await this.dropExpired(key, dead)
+            const alive = refs.filter((r) => !dead.has(r.messageId))
+            if (alive.length > 0) entries.push({ key, messageIds: alive.map((r) => r.messageId) })
+        }
+        return {
+            entries,
+            nextCursor: all.length > limit && page.length > 0 ? page[page.length - 1]![0] : null,
+        }
+    }
+
+    // MARK: - Blocking
 
     async block(
         key: MailboxKey,
@@ -1360,7 +1407,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // `bs`; the marker is dropped before the early return.
         if (source === "device") await this.db.delete(bskyBlockKey(key))
         if (isPairMailboxKey(key)) await this.clearPairProof(key)
-        if ((await this.db.get(syntheticKey(key))) !== undefined) return
+        if ((await this.db.get(syntheticKey(key))) !== undefined) {
+            // An entry can land between a put's mailbox check and its hold.
+            await this.releaseRequest(key)
+            return
+        }
 
         // An empty state is the blocked marker. Deliberately NOT seeded by
         // calling `advance` — that would count a fill at block time, so the
@@ -1373,27 +1424,23 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // Dropping the queue is the point, not a side effect: no bytes are
         // kept for a blocked sender.
         await this.db.delete(mailboxKey(key))
-        await this.db.delete(admittedKey(key))
 
-        // And the pool, for the same reason. A sender who was pooled and
-        // then blocked would otherwise still surface in the owner's pool
-        // listing, and adjudication could provision them — creating a live
-        // mailbox holding a blocked sender's messages. Releasing through
-        // the shared helper also returns their bytes to the pool budget.
-        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-        if (pooled.length > 0) await this.releasePool(key, pooled)
+        // And the request mailbox, for the same reason: a blocked sender
+        // would otherwise still surface in the owner's request listing. The
+        // quota gets its bytes back.
+        await this.releaseRequest(key)
     }
 
     private async clearPairProof(key: PairMailboxKey): Promise<void> {
         const proof = await this.db.get<StoredPairEvidence>(pairEvidenceKey(key))
         if (proof !== undefined) {
-            const used = (await this.db.get<number>(KEY_POOL_BYTES)) ?? 0
-            await this.db.put(KEY_POOL_BYTES, Math.max(0, used - (proof.poolAccountedBytes ?? 0)))
+            const used = (await this.db.get<number>(KEY_REQUEST_BYTES)) ?? 0
+            await this.db.put(KEY_REQUEST_BYTES, Math.max(0, used - (proof.requestAccountedBytes ?? 0)))
             await this.db.put(pairEvidenceKey(key), {
                 ...proof,
                 car: new Uint8Array(),
                 expiresAt: 0,
-                poolAccountedBytes: 0,
+                requestAccountedBytes: 0,
             })
         }
     }
@@ -1414,46 +1461,99 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
     }
 
-    /** Reclaims selected declaration CARs at their message-retention deadline. */
+    /**
+     * Reclaims selected declaration CARs at their message-retention deadline,
+     * and, when its time comes, sweeps request entries whose bodies expired.
+     */
     async alarm(): Promise<void> {
+        const nowSeconds = Math.floor(Date.now() / 1000)
+        // The body store is consulted before the object is held.
+        const requestPass = await this.judgeRequestSweep(nowSeconds)
         await this.ctx.blockConcurrencyWhile(async () => {
-            const nowSeconds = Math.floor(Date.now() / 1000)
-            const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-            const proofs = await this.db.list<StoredPairEvidence>({
-                prefix: PAIR_EVIDENCE_PREFIX,
-                ...(cursor !== undefined ? { startAfter: cursor } : {}),
-                limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
-            })
-            let nextExpiry = Number.POSITIVE_INFINITY
-            for (const [rawKey, proof] of proofs) {
-                const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
-                if (proof.expiresAt === 0) continue
-                if (proof.expiresAt <= nowSeconds) {
-                    if ((await this.db.get<MessageRef[]>(mailboxKey(key))) === undefined) {
-                        const pooled = (await this.db.get<MessageRef[]>(poolKey(key))) ?? []
-                        await this.releasePool(key, pooled)
-                        await this.db.delete(rawKey)
-                    } else {
-                        await this.clearPairProof(key)
-                    }
-                } else {
-                    nextExpiry = Math.min(nextExpiry, proof.expiresAt)
-                }
-            }
-            const previousMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-            const passMin = Math.min(previousMin ?? Number.POSITIVE_INFINITY, nextExpiry)
-            if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
-                const lastKey = [...proofs.keys()].at(-1)
-                if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
-                if (Number.isFinite(passMin)) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, passMin)
-                else await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-                await this.db.setAlarm(Math.min(passMin * 1000, Date.now() + 1_000))
-            } else {
-                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
-                await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
-                if (Number.isFinite(passMin)) await this.db.setAlarm(passMin * 1000)
-            }
+            const proofAlarmMs = await this.sweepExpiredProofs(nowSeconds)
+            const sweepAlarmMs = await this.applyRequestSweep(requestPass, nowSeconds)
+            const next = Math.min(proofAlarmMs ?? Number.POSITIVE_INFINITY, sweepAlarmMs ?? Number.POSITIVE_INFINITY)
+            if (Number.isFinite(next)) await this.db.setAlarm(next)
         })
+    }
+
+    /** One bounded pass over the proof rows; the alarm time it wants next, if any. */
+    private async sweepExpiredProofs(nowSeconds: number): Promise<number | null> {
+        const cursor = await this.db.get<string>(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        const proofs = await this.db.list<StoredPairEvidence>({
+            prefix: PAIR_EVIDENCE_PREFIX,
+            ...(cursor !== undefined ? { startAfter: cursor } : {}),
+            limit: PAIR_EVIDENCE_EXPIRY_BATCH_SIZE,
+        })
+        let nextExpiry = Number.POSITIVE_INFINITY
+        for (const [rawKey, proof] of proofs) {
+            const key = rawKey.slice(PAIR_EVIDENCE_PREFIX.length) as PairMailboxKey
+            if (proof.expiresAt === 0) continue
+            if (proof.expiresAt <= nowSeconds) {
+                await this.expireProof(key, (await this.db.get<MessageRef[]>(mailboxKey(key))) !== undefined)
+            } else {
+                nextExpiry = Math.min(nextExpiry, proof.expiresAt)
+            }
+        }
+        const previousMin = await this.db.get<number>(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+        const passMin = Math.min(previousMin ?? Number.POSITIVE_INFINITY, nextExpiry)
+        if (proofs.size === PAIR_EVIDENCE_EXPIRY_BATCH_SIZE) {
+            const lastKey = [...proofs.keys()].at(-1)
+            if (lastKey !== undefined) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR, lastKey)
+            if (Number.isFinite(passMin)) await this.db.put(KEY_PAIR_EVIDENCE_EXPIRY_MIN, passMin)
+            else await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+            return Math.min(passMin * 1000, Date.now() + 1_000)
+        }
+        await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_CURSOR)
+        await this.db.delete(KEY_PAIR_EVIDENCE_EXPIRY_MIN)
+        return Number.isFinite(passMin) ? passMin * 1000 : null
+    }
+
+    /** When the next request sweep is due, and if it is due now, the senders it covers and their dead entries. */
+    private async judgeRequestSweep(nowSeconds: number): Promise<RequestSweepPass> {
+        const dueAt = await this.db.get<number>(KEY_REQUEST_SWEEP_AT)
+        if (dueAt === undefined || dueAt > nowSeconds) return { dueAt }
+
+        const cursor = await this.db.get<string>(KEY_REQUEST_SWEEP_CURSOR)
+        const rows = await this.db.list<HeldRef[]>({
+            prefix: REQUEST_PREFIX,
+            ...(cursor !== undefined ? { startAfter: cursor } : {}),
+            limit: REQUEST_SWEEP_BATCH_SIZE,
+        })
+        const senders = [...rows]
+        const dead = await Promise.all(senders.map(async ([, refs]) => this.deadEntries(refs)))
+        return {
+            dueAt,
+            senders: senders.map(([raw], i) => ({
+                key: raw.slice(REQUEST_PREFIX.length) as MailboxKey,
+                dead: dead[i]!,
+            })),
+            full: rows.size === REQUEST_SWEEP_BATCH_SIZE,
+        }
+    }
+
+    /**
+     * Applies a request sweep pass; the alarm time it wants next, if any.
+     * Not due, it only reports when it will be; with no request entry left
+     * it disarms.
+     */
+    private async applyRequestSweep(pass: RequestSweepPass, nowSeconds: number): Promise<number | null> {
+        if (pass.dueAt === undefined) return null
+        if (pass.senders === undefined) return pass.dueAt * 1000
+
+        for (const { key, dead } of pass.senders) await this.dropExpired(key, dead)
+        if (pass.full) {
+            await this.db.put(KEY_REQUEST_SWEEP_CURSOR, requestKey(pass.senders.at(-1)!.key))
+            return Date.now() + 1_000
+        }
+        await this.db.delete(KEY_REQUEST_SWEEP_CURSOR)
+        if ((await this.db.list({ prefix: REQUEST_PREFIX, limit: 1 })).size === 0) {
+            await this.db.delete(KEY_REQUEST_SWEEP_AT)
+            return null
+        }
+        const next = nowSeconds + REQUEST_SWEEP_INTERVAL_SECONDS
+        await this.db.put(KEY_REQUEST_SWEEP_AT, next)
+        return next * 1000
     }
 
     async unblock(key: MailboxKey): Promise<void> {
@@ -1464,8 +1564,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     async syncBskyBlocks(blocked: ReadonlySet<string>): Promise<void> {
         const held = new Set<string>()
         for (const [prefix, family] of [
-            [POOL_PREFIX, "pool"],
-            [ADMITTED_PREFIX, "adm"],
+            [REQUEST_PREFIX, "req"],
             [MAILBOX_PREFIX, "mbox"],
         ] as const) {
             const keys = await this.db.list({ prefix })
@@ -1493,26 +1592,6 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
             prefix: SYNTHETIC_PREFIX,
         })
         return [...entries.keys()].map((k) => k.slice(SYNTHETIC_PREFIX.length))
-    }
-
-    async setDiscarded(key: MailboxKey, until: number): Promise<void> {
-        await this.db.put(discardKey(key), until)
-    }
-
-    /**
-     * For owner-facing queries only — never the put path.
-     *
-     * A put must NOT branch on this: `appendToPool` checks discard status
-     * internally so that a discarded sender costs the same round trip a
-     * pooled one does. Calling this first and skipping the append would
-     * reintroduce exactly the timing oracle that folding it in removed.
-     *
-     * Expiry is an observability rule, so a lapsed window reads as absent
-     * even before anything reclaims it.
-     */
-    async isDiscarded(key: MailboxKey, nowSeconds: number): Promise<boolean> {
-        const until = await this.db.get<number>(discardKey(key))
-        return until !== undefined && until > nowSeconds
     }
 
     // MARK: - Grants

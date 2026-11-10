@@ -30,7 +30,7 @@ const ATTACKER = "did:plc:attacker000000000000000" as Sender
 interface Mailbox {
     revision: number
     queue: MessageRef[]
-    pool: MessageRef[]
+    request: MessageRef[]
 }
 
 /**
@@ -46,7 +46,7 @@ function world(opts: { open?: (locator: string, key: string) => boolean } = {}) 
         const slot = `${locator}\0${key}`
         let found = mailboxes.get(slot)
         if (found === undefined) {
-            found = { revision: 0, queue: [], pool: [] }
+            found = { revision: 0, queue: [], request: [] }
             mailboxes.set(slot, found)
         }
         return found
@@ -60,19 +60,19 @@ function world(opts: { open?: (locator: string, key: string) => boolean } = {}) 
                 const box = mailbox(locator, key)
                 const revision = Number(evidence.revision)
                 const recycledMessageIds = revision > box.revision
-                    ? [...box.queue, ...box.pool].map((r) => r.messageId)
+                    ? [...box.queue, ...box.request].map((r) => r.messageId)
                     : []
                 if (revision > box.revision) {
                     box.revision = revision
                     box.queue = []
-                    box.pool = []
+                    box.request = []
                 }
                 const open = opts.open?.(locator, key) ?? true
-                ;(open ? box.queue : box.pool).push(ref)
+                ;(open ? box.queue : box.request).push(ref)
                 return {
                     result: open
                         ? { outcome: "appended", persistBody: true }
-                        : { outcome: "pooled", persistBody: true },
+                        : { outcome: "held" },
                     generation: `generation-${revision}`,
                     evidenceCID: evidence.declarationCID,
                     generationChanged: recycledMessageIds.length > 0,
@@ -146,7 +146,7 @@ describe("body storage stays within its mailbox", () => {
         expect(w.bodies.has(idAt(`loc:${attackerHost}`, ATTACKER, SECRET))).toBe(false)
     })
 
-    it("a stranger's rotation in the victim's pool does not delete the victim's queued body holding the same bytes", async () => {
+    it("a stranger's rotation in the victim's request mailbox does not delete the victim's queued body holding the same bytes", async () => {
         const w = world({ open: (_locator, key) => key === VICTIM_SENDER })
         const R = "did:plc:recipientv0000000000000"
         await put(w, R, VICTIM_SENDER, SECRET, 1)

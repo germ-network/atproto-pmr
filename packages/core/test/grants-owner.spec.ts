@@ -147,7 +147,6 @@ function deps(w: ReturnType<typeof world>): OwnerDeps & GrantConfig {
         resolveLocator: (did) => w.directory.resolve(did),
         store: w.store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         hostName: HOST,
         grantExpirySeconds: 3600,
         maxGrantsPerRequest: 5,

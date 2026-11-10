@@ -49,9 +49,9 @@ export type AuthenticatedPutDeps = Pick<
 
 export type AuthenticatedPutOutcome =
     /**
-     * Queued, pooled, a repeat, absorbed for a blocked sender, or dropped by
-     * the store (pool exhausted, discard window); deliberately
-     * indistinguishable, as for a pair-put sender.
+     * Queued, held in a request mailbox, a repeat, absorbed for a blocked
+     * sender, or dropped by the store (shared request quota full);
+     * deliberately indistinguishable, as for a pair-put sender.
      */
     | { outcome: "accepted" }
     /** The sender's reservation is full. `retryAfter` is absolute, in seconds. */
@@ -122,13 +122,16 @@ export async function ingestAuthenticatedPut(
         ref.pairGeneration = pair.generation
         ref.hint = { senderDID: mailboxKey, declarationCID: pair.evidenceCID }
         const result = pair.result
+        const persistsBody = result.outcome === "held" || ("persistBody" in result && result.persistBody)
         deps.defer(Promise.allSettled(pair.recycledMessageIds
-            .filter((id) => !("persistBody" in result && result.persistBody && id === messageId))
+            .filter((id) => !(persistsBody && id === messageId))
             .map((id) => deps.bodies.deleteBody(id))))
         if (result.outcome === "refused") {
             return { outcome: "refused", retryAfter: result.retryAfter }
         }
-        if (("persistBody" in result) && result.persistBody) {
+        if (result.outcome === "held") {
+            deps.defer(storeBody())
+        } else if (("persistBody" in result) && result.persistBody) {
             if (result.outcome === "appended" || result.outcome === "queued") {
                 deps.defer(deliverQueued(
                     store,
@@ -141,8 +144,6 @@ export async function ingestAuthenticatedPut(
                         body: () => deps.bodies.getBody(moved.messageId),
                     })) : []
                 ))
-            } else if (result.outcome === "pooled") {
-                deps.defer(storeBody())
             }
         }
         return { outcome: "accepted" }
@@ -174,12 +175,12 @@ export async function ingestAuthenticatedPut(
                     storeBody,
                     received.moved?.map((moved) => ({
                         ref: moved,
-                        // Stored when the entry was pooled.
+                        // Stored when the entry was held.
                         body: () => deps.bodies.getBody(moved.messageId),
                     }))
                 )
             )
-        } else if (received.outcome === "pooled" && received.persistBody) {
+        } else if (received.outcome === "held") {
             deps.defer(storeBody())
         }
         return { outcome: "accepted" }
@@ -200,12 +201,11 @@ export async function ingestAuthenticatedPut(
         return { outcome: "accepted" }
     }
 
-    // Unprovisioned: the recovery pool. Discard status is checked INSIDE
-    // `appendToPool`, not by a separate call this code branches on — a
-    // discarded sender's put must cost the same round trip a pooled one
-    // does, or the count itself becomes an oracle.
-    const pooled = await store.appendToPool(mailboxKey, ref, put.replayKey, nowSeconds)
-    if (pooled.outcome === "pooled" && pooled.persistBody) {
+    const request = await store.appendToRequest(mailboxKey, ref, put.replayKey, nowSeconds)
+    if (request.outcome === "refused") {
+        return { outcome: "refused", retryAfter: request.retryAfter }
+    }
+    if (request.outcome === "held") {
         deps.defer(storeBody())
     }
     return { outcome: "accepted" }
@@ -213,7 +213,7 @@ export async function ingestAuthenticatedPut(
 
 /**
  * Store the body, then deliver a queued message live and by push. `moved`
- * (pooled entries a yes moved into the mailbox) goes live first, in order,
+ * (request entries a yes moved into the mailbox) goes live first, in order,
  * so the device sees the mailbox in queue order; the one push covers them all.
  *
  * Best effort and sequenced after the body write: a failed delivery costs the

@@ -1,12 +1,13 @@
 import { env } from "cloudflare:test"
 import { describe, expect, it } from "vitest"
-import type { PairMailboxEvidence, PairMailboxKey } from "@germ-network/atproto-pmr-core"
+import type { Admission, PairMailboxEvidence, PairMailboxKey } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "../src/env"
 import type { PMRObject } from "../src/pmr-object"
-import { inPMR } from "./helpers"
+import { inPMR, openPairMailbox } from "./helpers"
 
 const testEnv = env as unknown as PMREnv
 const NOW = Math.floor(Date.now() / 1000)
+const YES: Admission = { verdict: "yes" }
 let counter = 0
 const freshStub = () => testEnv.pmrs.get(testEnv.pmrs.idFromName(`proof-expiry-${++counter}`))
 const nonce = () => { const n = new Uint8Array(16); new DataView(n.buffer).setUint32(0, ++counter); return n }
@@ -26,16 +27,14 @@ interface ProofRow {
 
 // Exercise actual Worker storage and its invalid-alarm/input-gate behavior.
 describe("cleared pair-proof watermarks", () => {
-    it.each(["blocked", "discarded"] as const)("keeps a %s sender's watermark without scheduling expiry and permits later recovery", async action => {
+    it("keeps a blocked sender's watermark without scheduling expiry and permits later recovery", async () => {
         const stub = freshStub()
-        const sender = `did:plc:watermark-${action}` as const
+        const sender = "did:plc:watermark-blocked" as const
         const proof = evidence(sender)
         await inPMR(stub, async pmr => {
-            if (action === "blocked") await pmr.provisionFromPool(sender, NOW)
-            const first = await pmr.appendPair(sender, ref("first"), nonce(), NOW, proof)
-            expect(first.result?.outcome).toBe(action === "blocked" ? "appended" : "pooled")
-            if (action === "blocked") await pmr.block(sender, NOW)
-            else await pmr.discardFromPool(sender, NOW + 100)
+            const first = await pmr.appendPair(sender, ref("first"), nonce(), NOW, proof, YES)
+            expect(first.result?.outcome).toBe("queued")
+            await pmr.block(sender, NOW)
             const storage = storageOf(pmr)
             await storage.deleteAlarm() // Consume the earlier live-proof alarm.
             const cleared = await storage.get<ProofRow>(`pairEvidence:${sender}`)
@@ -45,7 +44,6 @@ describe("cleared pair-proof watermarks", () => {
             expect(refused.rejected).toBeUndefined()
             expect(refused.result).not.toMatchObject({ persistBody: true })
             expect(await pmr.list(sender, 10)).toEqual([])
-            expect(await pmr.poolSenders()).toEqual([])
             expect(await storage.getAlarm()).toBeNull()
             expect(await storage.get(`pairEvidence:${sender}`)).toEqual(cleared)
             const stale = await pmr.appendPair(sender, ref("stale"), nonce(), NOW,
@@ -53,11 +51,10 @@ describe("cleared pair-proof watermarks", () => {
             expect(stale.rejected).toBe("staleEvidence")
             expect(await storage.get(`pairEvidence:${sender}`)).toEqual(cleared)
 
-            if (action === "blocked") await pmr.unblock(sender)
-            await pmr.provisionFromPool(sender, NOW + 101)
+            await pmr.unblock(sender)
             const recovered = await pmr.appendPair(sender, ref("recovered"), nonce(), NOW + 101,
-                { ...proof, revision: "6666666666666" })
-            expect(recovered.result?.outcome).toBe("appended")
+                { ...proof, revision: "6666666666666" }, YES)
+            expect(recovered.result?.outcome).toBe("queued")
             expect(recovered.generation).toBe(first.generation)
             expect((await pmr.getPairEvidence(sender, proof.declarationCID, NOW + 101))?.car).toEqual(proof.car)
             expect(await storage.getAlarm()).toBe(proof.expiresAt * 1000)
@@ -73,7 +70,7 @@ describe("cleared pair-proof watermarks", () => {
         const proof = evidence(sender)
         const replay = nonce()
         await inPMR(stub, async pmr => {
-            await pmr.provisionFromPool(sender, NOW)
+            await openPairMailbox(pmr, sender)
             const first = await pmr.appendPair(sender, ref("same-id"), replay, NOW, proof)
             const storage = storageOf(pmr)
             await storage.deleteAlarm()
@@ -109,7 +106,7 @@ describe("cleared pair-proof watermarks", () => {
         const clearedSender = "did:plc:watermark-cleared" as const
         const liveSender = "did:plc:watermark-live" as const
         await inPMR(stub, async pmr => {
-            await pmr.provisionFromPool(clearedSender, NOW)
+            await openPairMailbox(pmr, clearedSender)
             const clearedProof = evidence(clearedSender)
             await pmr.appendPair(clearedSender, ref("clear-me"), nonce(), NOW, clearedProof)
             await pmr.block(clearedSender, NOW)
@@ -126,8 +123,7 @@ describe("cleared pair-proof watermarks", () => {
         const cleared = "did:plc:a-cleared" as const
         const live = "did:plc:b-live" as const
         await inPMR(stub, async pmr => {
-            await pmr.provisionFromPool(cleared, NOW)
-            await pmr.appendPair(cleared, ref("clear"), nonce(), NOW, evidence(cleared))
+            await pmr.appendPair(cleared, ref("clear"), nonce(), NOW, evidence(cleared), YES)
             await pmr.block(cleared, NOW)
             const liveProof = evidence(live)
             await pmr.appendPair(live, ref("live"), nonce(), NOW, liveProof)
@@ -150,7 +146,7 @@ describe("cleared pair-proof watermarks", () => {
             await pmr.alarm()
             expect(await storage.get("pairEvidenceExpiryCursor")).toBeUndefined()
             expect(await storage.getAlarm()).toBe(liveProof.expiresAt * 1000)
-            expect((await pmr.poolSenders()).map(row => row.did)).toEqual([live])
+            expect((await pmr.requestMailboxes(null, 200)).entries.map(entry => entry.key)).toContain(live)
             expect((await storage.get<ProofRow>(`pairEvidence:${cleared}`))?.expiresAt).toBe(0)
         })
     })

@@ -3,7 +3,6 @@ import { decodeCoseMap } from "../src/cose/cbor"
 import {
     buildDeclarationPushPayload,
     buildMessagePushPayload,
-    buildPoolPushPayload,
 } from "../src/push/payload"
 import { SEAL_OVERHEAD_BYTES } from "../src/push/seal"
 import type { MessageRef } from "../src/storage"
@@ -104,13 +103,6 @@ describe("buildMessagePushPayload — falls back to pointer-only when it doesn't
     })
 })
 
-describe("buildPoolPushPayload / buildDeclarationPushPayload", () => {
-    it("pool payload is exactly {t: 'p'}", () => {
-        const map = decodeCoseMap(buildPoolPushPayload())
-        expect([...map.entries()]).toEqual([["t", "p"]])
-    })
-})
-
 describe("declaration push hints", () => {
     const CID = "bafyreidjhhf3zynnv3qugihpmh757j7uhexdk62kmt4bgjqwsacji75d4e"
 
@@ -133,9 +125,5 @@ describe("declaration push hints", () => {
     it("the largest hinted payload seals well under a 2880-byte ceiling", () => {
         const bytes = buildDeclarationPushPayload({ c: "rotate", dc: CID.padEnd(100, "a") })
         expect(bytes.byteLength + SEAL_OVERHEAD_BYTES).toBeLessThan(2880 / 2)
-    })
-
-    it("the pool payload is still exactly {t:'p'}", () => {
-        expect([...decodeCoseMap(buildPoolPushPayload()).entries()]).toEqual([["t", "p"]])
     })
 })

@@ -145,7 +145,6 @@ function deps(
         resolveLocator: (did) => w.directory.resolve(did),
         store: w.store,
         nowSeconds: T0,
-        discardWindowSeconds: 3600,
         bodies: w.bodyStore,
         catchUpPageMailboxes: 2,
         maxAcksPerRequest: 3,
@@ -271,7 +270,7 @@ describe("GET /pmr/v1/messages — catch-up", () => {
         const locator = (await w.directory.resolve(did))!
         const mailboxes = w.mailboxesFor(locator)
 
-        // Two provisioned-but-empty mailboxes sort before the one with a
+        // Two empty pair mailboxes sort before the one with a
         // real message; page size 2 puts both empties on page 1 alone.
         mailboxes.set("did:plc:empty-a", [])
         mailboxes.set("did:plc:empty-b", [])

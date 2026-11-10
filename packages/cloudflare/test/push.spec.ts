@@ -419,63 +419,6 @@ describe("deliverPush — enabled, subscription present", () => {
     })
 })
 
-describe("deliverPush via pool provisioning", () => {
-    it("fires even with NO socket attached — the property the socket-gate fix protects", async () => {
-        // A live-socket broadcast is correctly skipped with nothing
-        // attached (see events.spec.ts's pool-provisioning tests) — but
-        // Web Push exists precisely for the disconnected case, so it must
-        // NOT be gated on the same socket-attachment check. This test
-        // deliberately attaches no socket at all.
-        const stub = freshStub()
-        await withPushEnabled(stub)
-        await withSubscription(stub, {
-            endpoint: "https://push.example/sub/1",
-            contentKey: new Uint8Array(32).fill(1),
-            keyId: 1,
-        })
-        await inPMR(stub, (pmr) =>
-            pmr.appendToPool(
-                "did:plc:recovering",
-                { messageId: "m1", byteLength: 5 },
-                new Uint8Array([9]),
-                0
-            )
-        )
-        await testEnv.messages.put("m1", new TextEncoder().encode("hello"))
-
-        let fetchCalled = false
-        vi.stubGlobal("fetch", async () => {
-            fetchCalled = true
-            return new Response(null, { status: 201 })
-        })
-
-        const moved = await inPMR(stub, (pmr) =>
-            pmr.provisionFromPool("did:plc:recovering", 0)
-        )
-        expect(moved).toHaveLength(1)
-        await expect.poll(() => fetchCalled).toBe(true)
-    })
-
-    it("provisioning an empty sender pushes nothing", async () => {
-        const stub = freshStub()
-        await withPushEnabled(stub)
-        await withSubscription(stub, {
-            endpoint: "https://push.example/sub/1",
-            contentKey: new Uint8Array(32).fill(1),
-            keyId: 1,
-        })
-        let fetchCalled = false
-        vi.stubGlobal("fetch", async () => {
-            fetchCalled = true
-            return new Response(null, { status: 201 })
-        })
-
-        await inPMR(stub, (pmr) => pmr.provisionFromPool("did:plc:nobody", 0))
-        await new Promise((r) => setTimeout(r, 10))
-        expect(fetchCalled).toBe(false)
-    })
-})
-
 describe("push while paused", () => {
     it("a registration paused by the declaration watch is still pushed to", async () => {
         const stub = freshStub()
