@@ -1,5 +1,11 @@
 # @germ-network/atproto-pmr-core
 
+## 0.8.0
+
+### Minor Changes
+
+- [#110](https://github.com/germ-network/atproto-pmr/pull/110) [`16b2329`](https://github.com/germ-network/atproto-pmr/commit/16b2329aaec25f7d29f51850c3df745eb09b56e8) Thanks [@germ-mark](https://github.com/germ-mark)! - Add a payload-free `#summary` frame on the events socket: a hint that an owner's social graph or summary inputs may have changed, sent only to attached sockets and never as backlog. Clients MUST ignore frames whose type they do not recognize. `PMRObject.nudgeSummary()` sends it, coalescing bursts into a leading and a trailing frame per `summaryNudgeIntervalMs`. `MonitorIngest.onSummaryInputsChanged` reports each committed declaration change and graph write, and `summaryOwnersAffected` resolves a report to the graph owners whose summary it may have altered.
+
 ## 0.7.0
 
 ### Minor Changes
