@@ -7,6 +7,7 @@ import {
     drainBacklog,
     encodeCapabilitiesFrame,
     encodeDeliveryFrame,
+    encodeSummaryFrame,
     handleAckFrame,
     isPairMailboxKey,
     parseGrantLifecycle,
@@ -235,6 +236,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * so; a production relay passes its own and does not publish it.
      */
     protected synthetic: SyntheticBehavior = DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR
+    /** The shortest gap between two `#summary` frames; see `nudgeSummary`. */
+    protected summaryNudgeIntervalMs = 1000
+    private lastSummaryNudgeAtMs = 0
+    private summaryTrailingPending = false
 
     constructor(ctx: DurableObjectState, env: PMREnv) {
         super(ctx, env)
@@ -337,6 +342,52 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<void> {
         if (this.ctx.getWebSockets().length === 0) return
         this.broadcast(encodeDeliveryFrame(key, ref, message))
+    }
+
+    /**
+     * Tell this owner's attached devices that their graph or summary inputs
+     * may have changed (`#summary`). With nothing attached it returns at
+     * once and sends nothing. Never throws: a nudge is a hint, and its
+     * caller has nothing to do about a socket that is already gone.
+     *
+     * Nudges closer together than `summaryNudgeIntervalMs` coalesce: the
+     * first goes out at once and the rest become one frame at the end of
+     * the interval, so a burst costs a device at most two reads and the
+     * last change in it is announced too. The interval and the pending
+     * frame live in memory: hibernation resetting the interval costs at
+     * most one extra frame, and an eviction inside the interval drops the
+     * pending one.
+     */
+    async nudgeSummary(): Promise<void> {
+        try {
+            if (this.ctx.getWebSockets().length === 0) return
+            const waitMs =
+                this.lastSummaryNudgeAtMs + this.summaryNudgeIntervalMs - Date.now()
+            if (waitMs <= 0) {
+                this.sendSummary()
+                return
+            }
+            if (this.summaryTrailingPending) return
+            this.summaryTrailingPending = true
+            // `fetch()` holds `#capabilities` first by keeping the input
+            // gate closed across its storage await; that gate also holds
+            // this callback, so it cannot reach a socket still being set up.
+            setTimeout(() => {
+                this.summaryTrailingPending = false
+                try {
+                    this.sendSummary()
+                } catch (error) {
+                    console.error("nudgeSummary trailing send failed", error)
+                }
+            }, waitMs)
+        } catch (error) {
+            console.error("nudgeSummary failed", error)
+        }
+    }
+
+    private sendSummary(): void {
+        this.lastSummaryNudgeAtMs = Date.now()
+        this.broadcast(encodeSummaryFrame())
     }
 
     /**

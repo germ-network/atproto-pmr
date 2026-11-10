@@ -96,6 +96,7 @@ export { kvDidDocuments, kvPlcCoverage, kvPlcLogs, kvReadSigningKeys } from "./d
 export { kvSigningKeyCache } from "./signing-key-store"
 export { kvFirehoseCoverage } from "./firehose-coverage-store"
 export { d1FollowEdgeStore } from "./follow-edge-store"
+export { summaryOwnersAffected, type SummaryInputsChange } from "./summary-inputs"
 export { d1BlockEdgeStore } from "./block-edge-store"
 export { d1SenderGraphReader } from "./sender-graph-reader"
 export { d1AdmissionSource } from "./admission-source"

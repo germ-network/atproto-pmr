@@ -179,6 +179,7 @@ import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
+import { summaryInputTracking, type SummaryInputsChange } from "./summary-inputs"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
@@ -4024,7 +4025,9 @@ export class MonitorIngest
      */
     private async runGraphSteps(): Promise<void> {
         const budget = statementBudget(this.envInt(this.env.GRAPH_STATEMENT_BUDGET, 1000))
-        const edges = d1FollowEdgeWriter(this.env.graph!, budget)
+        const edges = summaryInputTracking(d1FollowEdgeWriter(this.env.graph!, budget), (change) =>
+            this.reportSummaryInputs(change)
+        )
         const blocks = d1BlockEdgeWriter(this.env.graph!, budget)
         const deps = { index: this, listings: this, edges, nowMs: () => Date.now(), budget }
         const owners = { edges, interest: this, nowMs: deps.nowMs }
@@ -4737,6 +4740,27 @@ export class MonitorIngest
     }
 
     /**
+     * Some owners' summaries may have changed: called once per committed
+     * declaration change (`onChange`, `onDelete`, leaving interest) and
+     * graph write, after the commit, never with both lists empty. A quiet
+     * re-verify that changed nothing a summary carries does not call it. `summaryOwnersAffected` turns `change` into the owners to
+     * nudge. It only reports: a deployment does the per-owner fan-out away
+     * from this object, typically by enqueueing `change`. A throw is logged
+     * and does not undo or stop the write that raised it. No-op by default.
+     */
+    protected onSummaryInputsChanged(_change: SummaryInputsChange): Promise<void> {
+        return Promise.resolve()
+    }
+
+    private async reportSummaryInputs(change: SummaryInputsChange): Promise<void> {
+        try {
+            await this.onSummaryInputsChanged(change)
+        } catch (error) {
+            console.error("monitor: summary inputs report failed", error)
+        }
+    }
+
+    /**
      * A rev that moved backwards. Never silent in a real deployment — and,
      * like `onChange`, pushes to a registered device: a regression is
      * exactly the kind of change `spec/key-transparency.md`'s "own-DID
@@ -4855,10 +4879,22 @@ export class MonitorIngest
                         : { reason: failure.reason }),
                     notBefore: new Date(notBeforeMs).toISOString(),
                 }),
-            onChange: (did, rev, hint) => this.onChange(did, rev, hint),
+            onChange: async (did, rev, hint) => {
+                try {
+                    await this.onChange(did, rev, hint)
+                } finally {
+                    await this.reportSummaryInputs({ dids: [did], owners: [] })
+                }
+            },
             onSettled: (did, settled) => this.onSettled(did, settled),
             onRegression: (did, i, o) => this.onRegression(did, i, o),
-            onDelete: (did) => this.onDelete(did),
+            onDelete: async (did) => {
+                try {
+                    await this.onDelete(did)
+                } finally {
+                    await this.reportSummaryInputs({ dids: [did], owners: [] })
+                }
+            },
             // The export stream is authoritative for did:plc, and a PDS's
             // identity event follows the directory's op, so once the stream
             // is consumed its hint would only clobber the fresh key.
@@ -5507,7 +5543,13 @@ export class MonitorIngest
                                 secondaries: monitorCollections(this.env),
                                 didDocuments: this,
                                 nowMs: () => Date.now(),
-                                onSettled: (did, settled) => this.onSettled(did, settled),
+                                onSettled: async (did, settled) => {
+                                    try {
+                                        await this.onSettled(did, settled)
+                                    } finally {
+                                        await this.reportSummaryInputs({ dids: [did], owners: [] })
+                                    }
+                                },
                             },
                             this.envInt(this.env.INTEREST_BATCH, 64)
                         ),

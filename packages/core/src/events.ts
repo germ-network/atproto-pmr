@@ -191,6 +191,15 @@ export function encodeCaughtUpFrame(): Uint8Array {
     return encodeFrame("caughtUp", new Map())
 }
 
+/**
+ * The graph-change hint: something this owner's social graph or summary
+ * reads from may have changed. Payload-free, so it identifies no contact,
+ * and a hint only: `spec/wire-api.md`, "`#summary` (graph-change hint)".
+ */
+export function encodeSummaryFrame(): Uint8Array {
+    return encodeFrame("summary", new Map())
+}
+
 export interface AckPayload {
     key: string
     messageId: MessageId
