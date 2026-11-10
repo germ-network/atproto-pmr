@@ -87,7 +87,11 @@ describe("frame encode/decode", () => {
         })
     })
 
-    it.todo("encodes #summary as the pinned header-then-empty-body bytes the spec describes")
+    it("encodes #summary as the pinned header-then-empty-body bytes the spec describes", () => {
+        const frame = encodeSummaryFrame()
+        expect(bytesToHex(frame)).toBe("a26174682373756d6d617279626f7001a0")
+        expect(decodeFrame(frame)).toEqual({ type: "summary", body: new Map() })
+    })
 
     it("a capabilities frame round-trips each grant state", () => {
         for (const grant of ["active", "draining", "absent"] as const) {

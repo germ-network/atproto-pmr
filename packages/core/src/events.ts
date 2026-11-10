@@ -197,7 +197,7 @@ export function encodeCaughtUpFrame(): Uint8Array {
  * and a hint only: `spec/wire-api.md`, "`#summary` (graph-change hint)".
  */
 export function encodeSummaryFrame(): Uint8Array {
-    throw new Error("unimplemented")
+    return encodeFrame("summary", new Map())
 }
 
 export interface AckPayload {
