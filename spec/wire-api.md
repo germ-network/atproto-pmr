@@ -1284,6 +1284,12 @@ body   = { ... type-specific fields ... }
 | `#ack` | client → server | `{k, id, g?}` | acknowledges one message. A client that received `g` SHOULD echo it; a supplied stale generation is a no-op. Missing `g` remains a legacy ack and removes the matching message ID |
 | `#pool` | server → client | `{}` | the wake with **no list**: naming pooled senders here would be exactly the per-arrival identification pool adjudication's batching exists to prevent. The device already has `GET /pmr/v1/pool` |
 | `#caughtUp` | server → client | `{}` | unconditional "you are live now" — sent whether or not `#pool` was, so a client has a definite end to its connect-time backlog regardless of pool state |
+| `#summary` | server → client | `{}` | a hint that this owner's social graph or [summary](#summary) inputs may have changed. Never a backlog frame; see [`#summary` (graph-change hint)](#summary-graph-change-hint) |
+
+**A client MUST ignore a frame whose `t` it does not recognize** and keep
+the connection open. New frame types are added without a version change, so
+a client that closed on, or failed over, an unknown type would break the
+first time a relay started sending one.
 
 **Ordering on connect, among the connect-time backlog frames: `#capabilities`
 first, then every queued message, oldest mailbox first, then `#pool` if and
@@ -1302,6 +1308,34 @@ frames themselves, not a promise that nothing else arrives between them. A
 message newly delivered while a connect-time drain is still in flight is not
 required to wait for `#caughtUp` — see the redelivery note below for why an
 early or duplicate arrival is still safe to act on.
+
+#### `#summary` (graph-change hint)
+
+```
+{}
+```
+
+Server → client, with an empty body. It says that something this owner's
+social graph or [summary](#summary) reads from may have changed. For
+example, an account they follow or that follows them may have started or
+stopped holding a declaration, published a new one, or followed or
+unfollowed them. The examples are illustrative, not the set of changes a
+relay watches, and a relay need not send a frame for every change. The frame
+names neither the account nor the change. A device answers by refreshing its view
+of the owner's graph and reading the summary again, naming its token, so a
+change it already holds costs it one empty delta.
+
+It is a hint, not a stream:
+
+- A relay **MAY** send it when nothing the device can see has changed, and
+  **MAY** coalesce several changes into one frame or delay it briefly.
+- It is **never part of the connect-time backlog**. Like a live
+  `#delivery`, it **MAY** arrive anywhere after `#capabilities`.
+- **A client MUST NOT rely on it for completeness.** It reaches only
+  sockets that are open when the change is noticed, and a relay may drop
+  it. A client that needs a current graph reads it on connect or on
+  foreground regardless, and treats `#summary` only as a prompt to read
+  again sooner.
 
 #### `#capabilities`
 

@@ -206,6 +206,8 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * so; a production relay passes its own and does not publish it.
      */
     protected synthetic: SyntheticBehavior = DEVELOPMENT_ONLY_SYNTHETIC_BEHAVIOR
+    /** The shortest gap between two `#summary` frames; see `nudgeSummary`. */
+    protected summaryNudgeIntervalMs = 1000
 
     constructor(ctx: DurableObjectState, env: PMREnv) {
         super(ctx, env)
@@ -300,6 +302,22 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     ): Promise<void> {
         if (this.ctx.getWebSockets().length === 0) return
         this.broadcast(encodeDeliveryFrame(key, ref, message))
+    }
+
+    /**
+     * Tell this owner's attached devices that their graph or summary inputs
+     * may have changed (`#summary`). With nothing attached it returns at
+     * once and sends nothing. Never throws: a nudge is a hint, and its
+     * caller has nothing to do about a socket that is already gone.
+     *
+     * Nudges closer together than `summaryNudgeIntervalMs` coalesce: the
+     * first goes out at once and the rest become one frame at the end of
+     * the interval, so a burst costs a device at most two reads and the
+     * last change in it is never left unannounced. The interval lives in
+     * memory; hibernation resetting it costs at most one extra frame.
+     */
+    async nudgeSummary(): Promise<void> {
+        throw new Error("unimplemented")
     }
 
     /**

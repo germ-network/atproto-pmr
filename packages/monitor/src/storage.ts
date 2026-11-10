@@ -984,6 +984,14 @@ export interface EdgeRef {
  */
 export interface EdgeWriteResult {
     subjects: string[]
+    /**
+     * From `putEdges` and `deleteEdges`: the followers and subjects, old
+     * subjects included, of the edges the write inserted, re-pointed or
+     * removed, leaving out puts that rewrote an edge unchanged and deletes
+     * that found no row. Absent when the writer doesn't track it; every
+     * named edge then counts as changed.
+     */
+    changedEndpoints?: string[]
 }
 
 /** One block, identified the way the stream identifies it. */

@@ -179,6 +179,7 @@ import { FIREHOSE_COVERAGE_KEY } from "./firehose-coverage-store"
 import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
+import type { SummaryInputsChange } from "./summary-inputs"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
@@ -4733,6 +4734,19 @@ export class MonitorIngest
      * `IngestDeps.onSettled`. No-op by default.
      */
     protected onSettled(_did: string, _settled: SettledDeclaration | null): Promise<void> {
+        return Promise.resolve()
+    }
+
+    /**
+     * Some owners' summaries may have changed: called once per committed
+     * declaration change (`onChange`, `onDelete`, leaving interest) and
+     * graph write, after the commit, never with both lists empty. A quiet
+     * re-verify that changed nothing a summary carries does not call it. `summaryOwnersAffected` turns `change` into the owners to
+     * nudge. It only reports: a deployment does the per-owner fan-out away
+     * from this object, typically by enqueueing `change`. A throw is logged
+     * and does not undo or stop the write that raised it. No-op by default.
+     */
+    protected onSummaryInputsChanged(_change: SummaryInputsChange): Promise<void> {
         return Promise.resolve()
     }
 

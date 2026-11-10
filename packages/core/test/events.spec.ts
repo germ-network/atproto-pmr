@@ -12,6 +12,7 @@ import {
     encodeCaughtUpFrame,
     encodeDeliveryFrame,
     encodePoolFrame,
+    encodeSummaryFrame,
     handleAckFrame,
     type EffectiveCapabilities,
     type EventsDeps,
@@ -88,6 +89,8 @@ describe("frame encode/decode", () => {
             body: new Map(),
         })
     })
+
+    it.todo("encodes #summary as the pinned header-then-empty-body bytes the spec describes")
 
     it("a capabilities frame round-trips each grant state", () => {
         for (const grant of ["active", "draining", "absent"] as const) {

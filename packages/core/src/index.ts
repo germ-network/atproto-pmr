@@ -249,6 +249,7 @@ export {
     messageEntryFields,
     RESERVED_ENTRY_KEYS,
     encodePoolFrame,
+    encodeSummaryFrame,
     handleAckFrame,
     type AckPayload,
     type DecodedFrame,
