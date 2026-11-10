@@ -121,7 +121,7 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                 statements.push(
                     db
                         .prepare(
-                            "SELECT DISTINCT subject FROM follows WHERE (follower, rkey) IN " +
+                            "SELECT follower, rkey, subject FROM follows WHERE (follower, rkey) IN " +
                                 `(VALUES ${refList(chunk.length, 1)})`
                         )
                         .bind(...binds)
@@ -142,8 +142,22 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
             }
             const subjects = [...new Set(edges.map((e) => e.subject))]
             const results = await send(statements)
-            const old = replaced.flatMap((i) => subjectsOf(results[i]))
-            return { subjects: [...new Set([...subjects, ...old])] }
+            const existing = replaced.flatMap(
+                (i) => (results[i]?.results ?? []) as { follower: string; rkey: string; subject: string }[]
+            )
+            const before = new Map(existing.map((r) => [`${r.follower}\0${r.rkey}`, r.subject]))
+            const changed = new Set<string>()
+            for (const e of edges) {
+                const prior = before.get(`${e.follower}\0${e.rkey}`)
+                if (prior === e.subject) continue
+                changed.add(e.follower).add(e.subject)
+                if (prior !== undefined) changed.add(prior)
+            }
+            const old = existing.map((r) => r.subject)
+            return {
+                subjects: [...new Set([...subjects, ...old])],
+                changedEndpoints: [...changed],
+            }
         },
 
         async deleteEdges(refs: readonly EdgeRef[]): Promise<EdgeWriteResult> {
@@ -151,12 +165,18 @@ export function d1FollowEdgeWriter(db: D1Database, budget: StatementBudget): Fol
                 db
                     .prepare(
                         "DELETE FROM follows WHERE (follower, rkey) IN " +
-                            `(VALUES ${refList(chunk.length, 1)}) RETURNING subject`
+                            `(VALUES ${refList(chunk.length, 1)}) RETURNING follower, subject`
                     )
                     .bind(...chunk.flatMap((r) => [r.follower, r.rkey]))
             )
             const results = await send(statements)
-            return { subjects: [...new Set(results.flatMap((r) => subjectsOf(r)))] }
+            const removed = results.flatMap(
+                (r) => (r?.results ?? []) as { follower: string; subject: string }[]
+            )
+            return {
+                subjects: [...new Set(removed.map((r) => r.subject))],
+                changedEndpoints: [...new Set(removed.flatMap((r) => [r.follower, r.subject]))],
+            }
         },
 
         async sweep(follower, gen) {
