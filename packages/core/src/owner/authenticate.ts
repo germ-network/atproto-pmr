@@ -3,6 +3,7 @@ import { parseSignatureInput } from "../http-sig/structured-fields.js"
 import { DEFAULT_LABEL, verifyRequestSignature } from "../http-sig/verify.js"
 import { parseOkpEd25519Key } from "../cose/key.js"
 import type { ChallengeStore, Locator, PMRStore } from "../storage.js"
+import { utcDay } from "../utc-day.js"
 
 /**
  * Authenticating an owner-facing request.
@@ -126,6 +127,15 @@ export async function authenticateOwner(
     })
     if (!verified.valid) {
         return { authenticated: false, reason: verified.reason }
+    }
+
+    // Owner activity: the first authenticated call of each UTC day. Recorded
+    // before any handler runs, so a handler that then fails still counts. A
+    // failed touch never changes the authentication result.
+    if (utcDay(deps.nowSeconds) > utcDay(registration.lastActive)) {
+        try {
+            await store.touchActive?.(deps.nowSeconds, registration.anchorKey)
+        } catch {}
     }
 
     return { authenticated: true, did, locator, store }

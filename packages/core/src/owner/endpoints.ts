@@ -39,6 +39,7 @@ import {
 } from "../summary.js"
 import { summaryCoverageAtMs, type SummaryCoverageDeps } from "../firehose-coverage.js"
 import { withNextChallenge } from "../challenge-endpoint.js"
+import { utcDay } from "../utc-day.js"
 import {
     authenticateOwner,
     type OwnerAuthDeps,
@@ -305,6 +306,23 @@ export async function handleRegistrationCreate(
         return new Response(null, { status: 409 })
     }
 
+    // A registration POST under the key already stored is an authenticated
+    // owner call, recorded on that exact incarnation before anything below can
+    // fail. A different key proved nothing about the stored registration, and
+    // `create` never touches the locator it returns: it may be a successor.
+    const priorLocator = await deps.directory.resolve(did)
+    const prior = priorLocator === null ? null : await deps.store(priorLocator).load()
+    if (
+        priorLocator !== null &&
+        prior !== null &&
+        sameStoredKey(prior.anchorKey, anchorKey) &&
+        utcDay(deps.nowSeconds) > utcDay(prior.lastActive)
+    ) {
+        try {
+            await deps.store(priorLocator).touchActive?.(deps.nowSeconds, prior.anchorKey)
+        } catch {}
+    }
+
     const fields: RegistrationFields = {
         did,
         // Self-describing on the way in, so nothing downstream has to know
@@ -420,12 +438,8 @@ export async function handleRegistrationCreate(
     // request 401s transiently and a crash leaves it deregistered until the client
     // retries — both benign and self-healing, and forced by create's idempotency
     // (a fresh DO cannot be allocated while the old routing row exists).
-    const priorLocator = await deps.directory.resolve(did)
-    if (priorLocator !== null) {
-        const prior = await deps.store(priorLocator).load()
-        if (prior !== null && !sameStoredKey(prior.anchorKey, anchorKey)) {
-            await deps.directory.delete(did)
-        }
+    if (prior !== null && !sameStoredKey(prior.anchorKey, anchorKey)) {
+        await deps.directory.delete(did)
     }
 
     const locator = await deps.directory.create(did, fields)
@@ -442,7 +456,6 @@ export async function handleRegistrationCreate(
     // update — no separate PATCH exists or is needed for it.
     await deps.store(locator).update({
         anchorKey: fields.anchorKey,
-        lastActive: fields.lastActive,
         ...(fields.pushSubscription !== undefined
             ? { pushSubscription: fields.pushSubscription }
             : {}),

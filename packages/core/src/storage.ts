@@ -291,6 +291,11 @@ export interface RegistrationFields {
         /** Device-assigned, 0..255, device-global across deliverers. */
         keyId: number
     }
+    /**
+     * Seconds. Set when a registration is created; afterwards advanced by
+     * `PMRStore.touchActive` to the first authenticated owner interaction of
+     * each UTC day. A registration refresh does not write it.
+     */
     lastActive: number
     /**
      * Set only through `RegistrationExtension`. Every create replaces it
@@ -673,6 +678,21 @@ export interface PMRStore {
      * succeeds, or on the recipient's push service being reachable at all.
      */
     deliverPush?(key: MailboxKey, ref: MessageRef, message: Uint8Array): Promise<void>
+
+    /**
+     * Records owner activity on THIS registration: sets `lastActive` to
+     * `nowSeconds` only when the stored registration exists, carries a `did`,
+     * matches `anchorKey` byte-for-byte (the stored
+     * `COSE_Key` blob), and `nowSeconds` falls on a later UTC day than
+     * `lastActive` (a non-finite stored value is never advanced). Otherwise a
+     * no-op. The check and write are one atomic step,
+     * so it never creates, resurrects or rewinds a registration.
+     *
+     * Call only for authenticated owner interactions, never for peer traffic,
+     * server sends, push, background work or census reads. OPTIONAL like
+     * `deliverLive`: an adapter that omits it records no activity.
+     */
+    touchActive?(nowSeconds: number, anchorKey: Uint8Array): Promise<void>
 
     /** True for a pair mailbox *or* a blocked sender. */
     hasMailbox(key: MailboxKey): Promise<boolean>

@@ -1,5 +1,6 @@
 import { admissionOrUnavailable } from "./admission.js"
 import { RESERVED_ENTRY_KEYS } from "./events.js"
+import { notifyIntakeStored } from "./intake-hook.js"
 import { messageIdFor } from "./message-id.js"
 import type { PairPutDeps } from "./pair-put.js"
 import type {
@@ -44,7 +45,7 @@ export interface AuthenticatedPut {
 
 export type AuthenticatedPutDeps = Pick<
     PairPutDeps,
-    "config" | "directory" | "store" | "bodies" | "admission" | "defer"
+    "config" | "directory" | "store" | "bodies" | "admission" | "defer" | "onIntakeStored"
 >
 
 export type AuthenticatedPutOutcome =
@@ -97,12 +98,14 @@ export async function ingestAuthenticatedPut(
         hint: { senderDID: put.senderDID, declarationCID: put.declarationCID },
         ...(put.ext !== undefined ? { ext: put.ext } : {}),
     }
-    const storeBody = () =>
-        deps.bodies.putBody(
+    const storeBody = async () => {
+        await deps.bodies.putBody(
             messageId,
             put.payload,
             nowSeconds + config.limits.messageExpirySeconds
         )
+        notifyIntakeStored(deps.onIntakeStored, deps.defer, nowSeconds)
+    }
 
     if (put.evidence !== undefined) {
         const admission = deps.admission === undefined

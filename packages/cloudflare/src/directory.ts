@@ -247,7 +247,60 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
     async isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean> {
         return (await this.env.pmrDirectory.get(tombstoneKey(did, anchorThumbprint))) !== null
     }
+
+    /**
+     * Census read, deployment-only: one page (one KV list call) of DIDs that
+     * have a route. Candidates only — `probeRegistration` decides liveness.
+     */
+    async listRouteCandidates(cursor: string | null): Promise<RouteCandidatePage> {
+        const page = await this.env.pmrDirectory.list({
+            prefix: "did:",
+            limit: 1000,
+            cursor: cursor ?? undefined,
+        })
+        return {
+            dids: page.keys.map((key) => key.name),
+            cursor: page.list_complete ? null : page.cursor,
+        }
+    }
+
+    /**
+     * Census read, deployment-only, side-effect free: at most three calls
+     * (route, record, tombstone). Live only when the route resolves to a
+     * well-formed locator, the record exists with this `did` and a parsable
+     * anchor, and that anchor is not tombstoned. Other errors propagate;
+     * nothing is logged.
+     */
+    async probeRegistration(did: string): Promise<RegistrationProbe> {
+        const locator = await this.resolve(did)
+        if (locator === null) return null
+        let id: DurableObjectId
+        try {
+            id = this.env.pmrs.idFromString(locator)
+        } catch {
+            return null
+        }
+        const record = await this.env.pmrs.get(id).load()
+        if (record === null || record.did !== did) return null
+        let thumbprint: Uint8Array
+        try {
+            thumbprint = thumbprintOkpEd25519(parseOkpEd25519Key(record.anchorKey))
+        } catch {
+            return null
+        }
+        if (await this.isTombstoned(did, thumbprint)) return null
+        return { lastActive: record.lastActive }
+    }
 }
+
+export interface RouteCandidatePage {
+    dids: string[]
+    /** Opaque; `null` past the last page. */
+    cursor: string | null
+}
+
+/** `null`: not a live registration. */
+export type RegistrationProbe = { lastActive: number } | null
 
 /**
  * Reach one relay's store from its locator.

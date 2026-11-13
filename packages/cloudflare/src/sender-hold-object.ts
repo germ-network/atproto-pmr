@@ -47,7 +47,7 @@ export abstract class SenderHoldObject extends DurableObject<PMREnv> {
     /** The sender's declaration from its PDS, typically `directDeclarationResolver`. */
     protected abstract readDirect(senderDID: string): Promise<SenderDeclarationResolution>
 
-    /** Where a release stores, as the deployment's pair-put path does. `releaseHeld` awaits whatever it defers. */
+    /** Where a release stores, as the deployment's pair-put path does. `releaseHeld` awaits whatever it defers, except `onIntakeStored`, which goes to `defer` un-awaited: pass a real `waitUntil` or the release-time count is dropped. */
     protected abstract releaseDeps(): AuthenticatedPutDeps
 
     /** Held-put cap for one sender; `MAX_MESSAGES_PER_PAIR_SENDER` by default. */

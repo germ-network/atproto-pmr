@@ -144,6 +144,8 @@ export {
     type ChallengeEndpointDeps,
 } from "./challenge-endpoint.js"
 
+export { utcDay } from "./utc-day.js"
+
 // The owner-facing surface.
 export {
     authenticateOwner,

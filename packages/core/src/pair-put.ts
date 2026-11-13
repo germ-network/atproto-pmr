@@ -67,6 +67,15 @@ export interface PairPutDeps {
      * does relative to a synthetic one is off the response path entirely.
      */
     defer: (work: Promise<unknown>) => void
+    /**
+     * Deployment-side intake observer, not protocol surface. Called once per
+     * real stored intake, right after its body is written (the entry is
+     * already committed), with the put's `nowSeconds`. Never for synthetic,
+     * duplicate, dropped or moved messages, nor when the body write fails.
+     * Its result is deferred and any failure ignored, so it cannot change a
+     * response or delay delivery.
+     */
+    onIntakeStored?: (acceptedAtS: number) => Promise<unknown> | void
 }
 
 /**
