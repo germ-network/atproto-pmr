@@ -44,7 +44,7 @@ export interface AuthenticatedPut {
 
 export type AuthenticatedPutDeps = Pick<
     PairPutDeps,
-    "config" | "directory" | "store" | "bodies" | "admission" | "defer"
+    "config" | "directory" | "store" | "bodies" | "admission" | "defer" | "onIntakeStored"
 >
 
 export type AuthenticatedPutOutcome =

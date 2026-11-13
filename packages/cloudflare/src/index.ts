@@ -35,6 +35,7 @@
 
 export { PMRObject } from "./pmr-object"
 export { KVDirectory, pmrStore, kvBodyStore } from "./directory"
+export type { RouteCandidatePage, RegistrationProbe } from "./directory"
 export { monitorRecheck } from "./monitor-recheck"
 export { monitorVerifiedAnchor } from "./monitor-verified-anchor"
 export { monitorOwnBlocks } from "./monitor-own-blocks"

@@ -247,7 +247,35 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
     async isTombstoned(did: string, anchorThumbprint: Uint8Array): Promise<boolean> {
         return (await this.env.pmrDirectory.get(tombstoneKey(did, anchorThumbprint))) !== null
     }
+
+    /**
+     * Census read, deployment-only: one page (one KV list call) of DIDs that
+     * have a route. Candidates only — `probeRegistration` decides liveness.
+     */
+    async listRouteCandidates(_cursor: string | null): Promise<RouteCandidatePage> {
+        throw new Error("not implemented")
+    }
+
+    /**
+     * Census read, deployment-only, side-effect free: at most three calls
+     * (route, record, tombstone). Live only when the route resolves to a
+     * well-formed locator, the record exists with this `did` and a parsable
+     * anchor, and that anchor is not tombstoned. Other errors propagate;
+     * nothing is logged.
+     */
+    async probeRegistration(_did: string): Promise<RegistrationProbe> {
+        throw new Error("not implemented")
+    }
 }
+
+export interface RouteCandidatePage {
+    dids: string[]
+    /** Opaque; `null` past the last page. */
+    cursor: string | null
+}
+
+/** `null`: not a live registration. */
+export type RegistrationProbe = { lastActive: number } | null
 
 /**
  * Reach one relay's store from its locator.

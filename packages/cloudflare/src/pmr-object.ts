@@ -542,6 +542,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
+    async touchActive(_nowSeconds: number, _anchorKey: Uint8Array): Promise<void> {
+        throw new Error("not implemented")
+    }
+
     async isMonitorConfirmed(): Promise<boolean> {
         return (await this.db.get<boolean>(KEY_MONITOR_CONFIRMED)) === true
     }

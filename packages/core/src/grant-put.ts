@@ -20,6 +20,8 @@ export interface GrantPutDeps {
     challenges: ChallengeStore
     /** Run work after the response has been produced — see below. */
     defer: (work: Promise<unknown>) => void
+    /** As `PairPutDeps.onIntakeStored`. */
+    onIntakeStored?: (acceptedAtS: number) => Promise<unknown> | void
 }
 
 /**

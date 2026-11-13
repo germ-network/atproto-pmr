@@ -277,3 +277,15 @@ describe("registration read reports the pause", () => {
         }
     })
 })
+
+describe("registration owner-activity touch (D-24)", () => {
+    it.todo("same-key refresh on a new UTC day touches; the same day does not")
+    it.todo("refresh never moves lastActive backwards")
+    it.todo("same-key POST that 400s on push validation, or whose onCommitted throws, has still touched")
+    it.todo("tombstoned anchor (409) and a bad signature never touch")
+    it.todo("different-key replace refused before the delete leaves the predecessor's lastActive untouched")
+    it.todo("successful different-key replace sets lastActive only on the new incarnation")
+    it.todo("a stale same-key refresh landing after a different-key replace touches nothing")
+    it.todo("a delayed request authenticated against the old incarnation neither touches the new one nor resurrects the old")
+    it.todo("a new incarnation keeps create's initial lastActive")
+})
