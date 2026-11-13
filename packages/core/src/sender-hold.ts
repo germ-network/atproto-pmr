@@ -11,6 +11,7 @@ import { readRecordFromCar } from "./repo-proof.js"
 import { compareRev } from "./rev.js"
 import type { PairMailboxKey } from "./storage.js"
 import { errorKind } from "./log-safe"
+import { notifyIntakeStored } from "./intake-hook.js"
 
 /**
  * The hold for a sender whose put fails under the monitor's snapshot but
@@ -384,7 +385,15 @@ export async function releaseHeld(
     }
 
     const tasks: Promise<unknown>[] = []
-    const ingestDeps: AuthenticatedPutDeps = { ...deps, defer: (work) => void tasks.push(work) }
+    // The observer goes to the caller's own `defer`, not `tasks`: it is never
+    // awaited here, so a slow one cannot hold up the release.
+    const { onIntakeStored } = deps
+    const ingestDeps: AuthenticatedPutDeps = {
+        ...deps,
+        defer: (work) => void tasks.push(work),
+        onIntakeStored:
+            onIntakeStored && ((at) => notifyIntakeStored(onIntakeStored, deps.defer, at)),
+    }
     const processed: string[] = []
     for (const put of await storage.held()) {
         if (put.expiresAtSeconds <= nowSeconds) {

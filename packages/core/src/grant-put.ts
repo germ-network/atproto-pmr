@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { consumeChallenge } from "./challenge.js"
 import { decodeCoseMap } from "./cose/cbor.js"
 import { verifyGrantPutTag } from "./grant.js"
+import { notifyIntakeStored } from "./intake-hook.js"
 import { grantMailboxKey } from "./mailbox-key.js"
 import { messageIdFor } from "./message-id.js"
 import { PMRConfig } from "./config.js"
@@ -147,6 +148,7 @@ async function deliver(
             message,
             nowSeconds + deps.config.limits.messageExpirySeconds
         )
+        notifyIntakeStored(deps.onIntakeStored, deps.defer, nowSeconds)
         // Best effort: a failed push costs a reconnect-drain, never a
         // message — the entry stays queued until acked either way.
         try {
