@@ -7,6 +7,7 @@ import type {
     SettledSenderDeclaration,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
+import { errorKind } from "./log-safe"
 
 /** The RPC surface of `SenderHoldObject`. */
 interface SenderHoldStub {
@@ -53,6 +54,6 @@ export async function releaseSenderHold(
     try {
         await holdFor(namespace, senderDID).settle(senderDID, settled, nowSeconds)
     } catch (err) {
-        console.warn(`releaseSenderHold: settle failed for ${senderDID}:`, err)
+        console.warn("releaseSenderHold: settle failed", errorKind(err))
     }
 }

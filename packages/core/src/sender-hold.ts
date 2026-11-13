@@ -10,6 +10,7 @@ import { FIREHOSE_COVERAGE_MAX_LAG_MS } from "./firehose-coverage.js"
 import { readRecordFromCar } from "./repo-proof.js"
 import { compareRev } from "./rev.js"
 import type { PairMailboxKey } from "./storage.js"
+import { errorKind } from "./log-safe"
 
 /**
  * The hold for a sender whose put fails under the monitor's snapshot but
@@ -426,7 +427,7 @@ export async function releaseHeld(
                 if (result.outcome === "accepted") summary.released += 1
                 else summary.dropped += 1
             } catch (error) {
-                console.error("sender hold: release of a held put failed", error)
+                console.error("sender hold: release of a held put failed", errorKind(error))
                 summary.kept += 1
             }
         } else if (verdict === "undecodable" || compareRev(put.heldUnderRevision, settled.rev) !== "regressed") {
@@ -438,7 +439,7 @@ export async function releaseHeld(
     }
     for (const outcome of await Promise.allSettled(tasks)) {
         if (outcome.status === "rejected") {
-            console.error("sender hold: deferred work for a released put failed", outcome.reason)
+            console.error("sender hold: deferred work for a released put failed", errorKind(outcome.reason))
         }
     }
     await storage.remove(processed)

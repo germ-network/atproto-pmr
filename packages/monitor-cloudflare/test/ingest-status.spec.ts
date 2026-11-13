@@ -228,55 +228,50 @@ describe("settle failure log line", () => {
         signingKey,
     })
 
-    it("a settle that throws writes one 'monitor: settle deferred' line naming the DID, attempts, error and next not-before", async () => {
+    it("a settle that throws writes one 'monitor: settle deferred' line with attempts, error name and next not-before, never the DID", async () => {
         const before = Date.now()
         const lines = await settleLogged(
             {
                 fetchRecord: async () => {
-                    throw new TypeError("fetch failed")
+                    throw new TypeError(`fetch failed for ${DID}`)
                 },
             },
             2
         )
         expect(lines).toHaveLength(1)
-        expect(lines[0]).toMatchObject({
-            did: DID,
-            attempts: 3,
-            kind: "threw",
-            error: "TypeError: fetch failed",
-        })
+        expect(lines[0]).toMatchObject({ attempts: 3, kind: "threw", error: "TypeError" })
+        expect(JSON.stringify(lines)).not.toContain(DID)
         const notBefore = Date.parse(String(lines[0]?.notBefore))
         expect(notBefore).toBeGreaterThanOrEqual(before + 4000)
         expect(notBefore).toBeLessThan(before + 60_000)
     })
 
-    it("a never-held unverifiable DID writes one line of kind unverifiable with its reason", async () => {
+    it("a never-held unverifiable DID writes one line of kind unverifiable, without the DID or the verifier's reason", async () => {
         const lines = await settleLogged({
             fetchRecord: record("did:key:zQ3sh"),
-            verifyRecord: async () => ({ kind: "unverifiable", reason: "bad commit signature" }),
+            verifyRecord: async () => ({ kind: "unverifiable", reason: `bad commit signature from ${DID}` }),
         })
         expect(lines).toHaveLength(1)
-        expect(lines[0]).toMatchObject({
-            did: DID,
-            attempts: 1,
-            kind: "unverifiable",
-            reason: "bad commit signature",
-        })
+        expect(lines[0]).toMatchObject({ attempts: 1, kind: "unverifiable" })
+        expect(lines[0]).not.toHaveProperty("reason")
+        expect(JSON.stringify(lines)).not.toContain(DID)
     })
 
-    it("a DID with no #atproto signing key is unverifiable with that reason (real verifier, not stubVerify)", async () => {
+    it("a DID with no #atproto signing key is logged unverifiable (real verifier, not stubVerify)", async () => {
         const lines = await settleLogged({ fetchRecord: record(null) })
         expect(lines).toHaveLength(1)
-        expect(lines[0]).toMatchObject({ kind: "unverifiable", reason: "no #atproto signing key" })
+        expect(lines[0]).toMatchObject({ kind: "unverifiable" })
+        expect(JSON.stringify(lines)).not.toContain(DID)
     })
 
-    it("a non-terminal XRPC error is logged with its XRPC error name, e.g. 400 InvalidRequest", async () => {
+    it("a non-terminal XRPC error logs its error name only, not its message", async () => {
         const lines = await settleLogged({
             fetchRecord: async () => {
                 throw new Error("endpoint answered 400 InvalidRequest")
             },
         })
-        expect(String(lines[0]?.error)).toContain("endpoint answered 400 InvalidRequest")
+        expect(lines[0]?.error).toBe("Error")
+        expect(JSON.stringify(lines)).not.toContain("InvalidRequest")
     })
 
     it("a RecordNotFound settle writes no settle-deferred line", async () => {
@@ -585,7 +580,7 @@ describe("secondary pending bookkeeping", () => {
         return settleSecondaryDue(secondaryDepsOf(obj))
     }
 
-    it("a throwing secondary settle leaves last_failure on the row and logs 'monitor: secondary settle deferred' with did, collection, rkey, attempts, error, notBefore", async () => {
+    it("a throwing secondary settle leaves last_failure on the row and logs 'monitor: secondary settle deferred' with collection, attempts, error name, notBefore, never the DID", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
         try {
             const before = Date.now()
@@ -603,13 +598,12 @@ describe("secondary pending bookkeeping", () => {
                 )
                 expect(lines).toHaveLength(1)
                 expect(lines[0]?.[1]).toMatchObject({
-                    did: DID,
                     collection: COLLECTION,
-                    rkey: "self",
                     attempts: 3,
                     kind: "threw",
-                    error: "TypeError: fetch failed",
+                    error: "TypeError",
                 })
+                expect(JSON.stringify(lines)).not.toContain(DID)
                 const notBefore = Date.parse(String((lines[0]?.[1] as { notBefore: string }).notBefore))
                 expect(notBefore).toBeGreaterThanOrEqual(before + 4000)
                 expect(notBefore).toBe(row?.not_before)

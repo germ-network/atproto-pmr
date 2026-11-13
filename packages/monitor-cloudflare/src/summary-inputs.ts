@@ -1,4 +1,5 @@
 import type { FollowEdgeWriter } from "@germ-network/atproto-pmr-monitor"
+import { errorKind } from "./log-safe"
 
 /**
  * What one committed write changed, as far as owner summaries go.
@@ -80,7 +81,7 @@ export function summaryInputTracking(
         try {
             await report(change)
         } catch (error) {
-            console.error("monitor: summary inputs report failed", error)
+            console.error("monitor: summary inputs report failed", errorKind(error))
         }
     }
     return {

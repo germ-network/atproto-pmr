@@ -278,19 +278,21 @@ describe("sender hold adapters", () => {
 
     it("releaseSenderHold swallows a hold fault and does nothing when SENDER_HOLDS is not bound", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const sender = freshSender()
         const faulty = {
             ...testEnv,
             SENDER_HOLDS: {
                 idFromName: () => ({}),
                 get: () => ({
                     settle: async () => {
-                        throw new Error("hold down")
+                        throw new Error(`hold down for ${sender}`)
                     },
                 }),
             } as unknown as DurableObjectNamespace,
         }
-        await expect(releaseSenderHold(faulty, freshSender(), null, nowSeconds())).resolves.toBeUndefined()
-        expect(warn).toHaveBeenCalled()
+        await expect(releaseSenderHold(faulty, sender, null, nowSeconds())).resolves.toBeUndefined()
+        expect(warn).toHaveBeenCalledWith("releaseSenderHold: settle failed", "Error")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(sender)
         await expect(
             releaseSenderHold({ SENDER_HOLDS: undefined }, freshSender(), null, nowSeconds())
         ).resolves.toBeUndefined()

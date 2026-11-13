@@ -32,6 +32,8 @@ import {
     storedSettled,
 } from "./fixtures/sender-hold"
 
+const SEEDED_DID = "did:plc:seededlogcapture000000000"
+
 const NOW = 10_000
 const CONFIG = {
     limits: { messageMaxBytes: 10_000, framingAllowanceBytes: 1024, messageExpirySeconds: 1000 },
@@ -384,25 +386,27 @@ describe("releasing held puts on a monitor settle", () => {
         const t = setup({
             held: [{}, {}],
             putBody: async () => {
-                throw new Error("body store down")
+                throw new Error(`body store down for ${SEEDED_DID}`)
             },
         })
         const summary = await t.release(settledDeclaration(t.key.publicKey, REV.new))
         expect(summary.released).toBe(2)
         expect(t.storage.state.held).toEqual([])
-        expect(logged).toHaveBeenCalled()
+        expect(logged).toHaveBeenCalledWith(expect.any(String), "Error")
+        expect(JSON.stringify(logged.mock.calls)).not.toContain(SEEDED_DID)
     })
 
     it("a held put whose ingest throws stays held for the next settle", async () => {
         const logged = vi.spyOn(console, "error").mockImplementation(() => {})
         const t = setup({ held: [{}] })
         t.deps.directory.resolve = async () => {
-            throw new Error("directory down")
+            throw new Error(`directory down for ${SEEDED_DID}`)
         }
         const summary = await t.release(settledDeclaration(t.key.publicKey, REV.new))
         expect(summary).toEqual({ released: 0, dropped: 0, kept: 1 })
         expect(t.storage.state.held).toHaveLength(1)
-        expect(logged).toHaveBeenCalled()
+        expect(logged).toHaveBeenCalledWith(expect.any(String), "Error")
+        expect(JSON.stringify(logged.mock.calls)).not.toContain(SEEDED_DID)
     })
 })
 

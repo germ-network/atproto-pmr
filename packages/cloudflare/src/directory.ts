@@ -13,6 +13,7 @@ import {
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
 import type { PMRObject } from "./pmr-object"
+import { errorKind } from "./log-safe"
 
 /** Minimum TTL Cloudflare KV accepts, seconds. Below this it errors. */
 const MIN_KV_TTL_SECONDS = 60
@@ -132,7 +133,7 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
             ) as unknown as MonitorRegistrationNotify
             await monitor[call](did)
         } catch (err) {
-            console.warn(`KVDirectory.${call}: monitor notify failed for ${did}:`, err)
+            console.warn(`KVDirectory.${call}: monitor notify failed`, errorKind(err))
         }
     }
 
@@ -189,12 +190,12 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
         } catch (err) {
             // Best-effort reclamation: a failed teardown just leaves the orphan, it
             // must not fail the deregistration/replace.
-            console.warn(`KVDirectory: DO teardown failed for ${did}:`, err)
+            console.warn("KVDirectory: DO teardown failed", errorKind(err))
         }
         try {
             await this.onRemoved(did, locator)
         } catch (err) {
-            console.warn(`KVDirectory: onRemoved failed for ${did}:`, err)
+            console.warn("KVDirectory: onRemoved failed", errorKind(err))
         }
         await this.notifyMonitor("unregister", did)
     }
@@ -213,11 +214,11 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
                 try {
                     await this.deleteGrantAddress(grant.address)
                 } catch (err) {
-                    console.warn(`KVDirectory: grant row delete failed for ${did}:`, err)
+                    console.warn("KVDirectory: grant row delete failed", errorKind(err))
                 }
             }
         } catch (err) {
-            console.warn(`KVDirectory: grant listing failed for ${did}:`, err)
+            console.warn("KVDirectory: grant listing failed", errorKind(err))
         }
     }
 

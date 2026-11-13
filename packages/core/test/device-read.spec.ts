@@ -313,11 +313,13 @@ describe("record read past the 24-hour rule", () => {
     it("a rejected recheck does not fail or change the read", async () => {
         const { deps, waited } = withRecheck({ declaration: true, freshAtMs: lapsed })
         deps.requestRecheck = async () => {
-            throw new Error("monitor down")
+            throw new Error(`monitor down for ${DID}`)
         }
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
         const res = await handleRecordRead(get(DECL_PATH), deps)
         await Promise.all(waited)
+        expect(warn).toHaveBeenCalledWith("re-check request failed", "Error")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(DID)
         warn.mockRestore()
         expect(res.status).toBe(200)
         expect(decodeRecordReadResponse(new Uint8Array(await res.arrayBuffer())).found).toBe(true)
@@ -405,6 +407,7 @@ describe("dedupedRecheck", () => {
         advance(WINDOW)
         await fn("did:plc:a")
         expect(warn).toHaveBeenCalledTimes(2)
+        expect(JSON.stringify(warn.mock.calls)).not.toContain("did:plc:a")
         warn.mockRestore()
     })
 })

@@ -9,6 +9,7 @@ import {
     type PlcLog,
     type PlcLogEntry,
 } from "@germ-network/atproto-pmr-core"
+import { errorKind } from "./log-safe"
 
 export interface PlcLogIndex {
     /**
@@ -54,7 +55,7 @@ export async function drainPlcLogs(deps: DrainPlcLogsDeps, limit: number): Promi
             await deps.index.putPlcLog({ did, entries, asOfMs: fetchedAtMs })
             stored += 1
         } catch (error) {
-            console.warn(`plc log: fetch for ${did} failed`, error)
+            console.warn("plc log: fetch failed", errorKind(error))
             await deps.index.markPlcLogAttempted(did, fetchedAtMs)
         }
     }

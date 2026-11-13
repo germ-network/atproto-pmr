@@ -149,12 +149,13 @@ describe("summary input tracking writer", () => {
         const logged = vi.spyOn(console, "error").mockImplementation(() => {})
         try {
             const writer = summaryInputTracking(d1FollowEdgeWriter(db, statementBudget(1000)), async () => {
-                throw new Error("queue down")
+                throw new Error("queue down for did:plc:seeded")
             })
             const result = await writer.putEdges([edge("did:f", "r1", "did:s")], 1)
             expect(result.subjects).toEqual(["did:s"])
             expect(await count("follows")).toBe(1)
-            expect(logged).toHaveBeenCalled()
+            expect(logged).toHaveBeenCalledWith("monitor: summary inputs report failed", "Error")
+            expect(JSON.stringify(logged.mock.calls)).not.toContain("did:plc:seeded")
         } finally {
             logged.mockRestore()
         }

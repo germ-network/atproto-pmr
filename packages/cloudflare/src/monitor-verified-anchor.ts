@@ -3,6 +3,7 @@ import type {
     VerifiedAnchorObservation,
 } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
+import { errorKind } from "./log-safe"
 
 /**
  * The bound monitor's verified view of a DID's anchor, for deciding whether
@@ -23,7 +24,7 @@ export function monitorVerifiedAnchor(
             ) as unknown as MonitorVerifiedAnchorRequest
             return await monitor.verifiedAnchorOf(did)
         } catch (err) {
-            console.warn(`monitorVerifiedAnchor: read failed for ${did}:`, err)
+            console.warn("monitorVerifiedAnchor: read failed", errorKind(err))
             return { state: "unknown" }
         }
     }

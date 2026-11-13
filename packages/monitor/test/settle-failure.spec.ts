@@ -411,28 +411,30 @@ describe("settle failure reporting", () => {
             }
         }
 
-        it("a throwing deferPending for A still settles B and C, and is logged once with A", async () => {
+        it("a throwing deferPending for A still settles B and C, and is logged once without A", async () => {
             const h = harness({ fetchRecord: throwingForA })
             h.deps.index.deferPending = async () => {
-                throw new Error("SQLITE_BUSY")
+                throw new Error(`SQLITE_BUSY for ${A}`)
             }
             const calls = await drain(h)
             expect([...h.pending.keys()]).toEqual([A])
             expect(h.revs.get(B)).toBe("3m2")
             expect(h.revs.get(C)).toBe("3m2")
-            expect(calls).toEqual([["monitor: settle defer failed", { did: A, err: expect.any(Error) }]])
+            expect(calls).toEqual([["monitor: settle defer failed", "Error"]])
+            expect(JSON.stringify(calls)).not.toContain(A)
         })
 
-        it("a throwing retryCapMs for A still settles B and C, and is logged once with A", async () => {
+        it("a throwing retryCapMs for A still settles B and C, and is logged once without A", async () => {
             const h = harness({
                 fetchRecord: throwingForA,
                 retryCapMs: async () => {
-                    throw new Error("SQLITE_BUSY")
+                    throw new Error(`SQLITE_BUSY for ${A}`)
                 },
             })
             const calls = await drain(h)
             expect([...h.pending.keys()]).toEqual([A])
-            expect(calls).toEqual([["monitor: settle defer failed", { did: A, err: expect.any(Error) }]])
+            expect(calls).toEqual([["monitor: settle defer failed", "Error"]])
+            expect(JSON.stringify(calls)).not.toContain(A)
         })
     })
 })

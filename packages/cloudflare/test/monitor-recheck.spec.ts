@@ -47,20 +47,22 @@ describe("monitorRecheck", () => {
         }
     })
 
-    it("resolves, with a warning, when the monitor call throws", async () => {
+    it("resolves, with a warning naming neither the DID nor the error message, when the monitor call throws", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const did = freshDID()
         const failing = {
             ...testEnv,
             MONITOR_INGEST: {
                 idFromName: () => ({}),
                 get: () => ({
-                    requestRefresh: () => Promise.reject(new Error("monitor down")),
+                    requestRefresh: () => Promise.reject(new Error(`monitor down for ${did}`)),
                 }),
             } as unknown as DurableObjectNamespace,
         }
         try {
-            await expect(monitorRecheck(failing)(freshDID())).resolves.toBeUndefined()
+            await expect(monitorRecheck(failing)(did)).resolves.toBeUndefined()
             expect(warn).toHaveBeenCalledTimes(1)
+            expect(warn).toHaveBeenCalledWith("monitorRecheck: refresh request failed", "Error")
         } finally {
             warn.mockRestore()
         }

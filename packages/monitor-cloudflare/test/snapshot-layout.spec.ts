@@ -236,7 +236,8 @@ describe("snapshot entry layout", () => {
         expect(await kvDeclarationSnapshots(testEnv)(did)).toBeNull()
         expect(await kvSummaryIndexReader(testEnv).entries([ref(did)])).toEqual([null])
         expect((await kvMessagingKeyFirstSeenMany(testEnv, [did])).get(did)).toBeNull()
-        expect(warn).toHaveBeenCalledWith("monitor: snapshot entry not v2", { key: `rec:${did}` })
+        expect(warn).toHaveBeenCalledWith("monitor: snapshot entry not v2")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         expect(warn).toHaveBeenCalledWith("monitor: snapshot entries not v2", { count: 1 })
     })
 

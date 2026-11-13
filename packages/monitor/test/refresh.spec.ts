@@ -451,21 +451,19 @@ describe("refreshDue", () => {
         expect(half.checks.size).toBe(0)
     })
 
-    it("a DID that fails logs its DID and the error", async () => {
+    it("a DID that fails logs the error name only, never the DID or message", async () => {
         const warned = vi.spyOn(console, "warn").mockImplementation(() => {})
         try {
             const down = harness({
                 indexed: { [DID]: "3mbaaaaaaaaaa" },
                 stored: { [DID]: fetched("3mbaaaaaaaaaa", decl(1)) },
                 head: async () => {
-                    throw new Error("pds down")
+                    throw new Error(`pds down for ${DID}`)
                 },
             })
             expect((await run(down)).outcomes.failed).toBe(1)
-            expect(warned).toHaveBeenCalledWith("monitor: refresh did failed", {
-                did: DID,
-                error: "Error: pds down",
-            })
+            expect(warned).toHaveBeenCalledWith("monitor: refresh did failed", "Error")
+            expect(JSON.stringify(warned.mock.calls)).not.toContain(DID)
         } finally {
             warned.mockRestore()
         }

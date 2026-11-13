@@ -44,6 +44,7 @@ import {
     type SnapshotEvidence,
     type SnapshotWriter,
 } from "./storage"
+import { errorKind } from "./log-safe"
 
 /** The authoritative record, as fetched from the DID's own PDS. */
 export interface FetchedRecord {
@@ -896,7 +897,7 @@ export async function settleDue(
             } catch (deferErr) {
                 // The row keeps its `not_before`, so it is due again next
                 // drain; letting this escape would skip the rest of the batch.
-                console.error("monitor: settle defer failed", { did: p.did, err: deferErr })
+                console.error("monitor: settle defer failed", errorKind(deferErr))
             }
         }
     }

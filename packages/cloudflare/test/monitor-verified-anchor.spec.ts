@@ -44,6 +44,7 @@ describe("monitorVerifiedAnchor", () => {
         try {
             expect(await monitorVerifiedAnchor(testEnv)(did)).toEqual({ state: "unknown" })
             expect(warn).toHaveBeenCalledTimes(1)
+            expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         } finally {
             warn.mockRestore()
         }

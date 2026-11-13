@@ -86,7 +86,7 @@ function decodeEntry(
     const meta = readIndexMeta(metadata)
     const decoded = meta === null ? null : decodeSnapshotValue(new Uint8Array(value))
     if (meta === null || decoded === null) {
-        console.warn("monitor: snapshot entry not v2", { key: describe })
+        console.warn("monitor: snapshot entry not v2")
         return null
     }
     return { meta, ...decoded }

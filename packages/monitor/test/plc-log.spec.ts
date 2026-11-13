@@ -74,15 +74,17 @@ describe("drainPlcLogs", () => {
         ])
     })
 
-    it("a fetch that throws is a failed attempt", async () => {
-        vi.spyOn(console, "warn").mockImplementation(() => {})
-        const w = world({ [modern.did]: new Error("directory down"), [legacy.did]: legacy.audit }, [
+    it("a fetch that throws is a failed attempt, logged without the DID or message", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const w = world({ [modern.did]: new Error(`directory down for ${modern.did}`), [legacy.did]: legacy.audit }, [
             { did: modern.did, attemptedAtMs: 0 },
             { did: legacy.did, attemptedAtMs: 0 },
         ])
         expect(await drainPlcLogs(w.deps, 10)).toBe(1)
         expect(w.attempted).toEqual([{ did: modern.did, atMs: NOW }])
         expect(w.stored.map((l) => l.did)).toEqual([legacy.did])
+        expect(warn).toHaveBeenCalledWith("plc log: fetch failed", "Error")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(modern.did)
     })
 
     it("drains at most limit owed DIDs, skipping those attempted within PLC_LOG_RETRY_MS", async () => {
