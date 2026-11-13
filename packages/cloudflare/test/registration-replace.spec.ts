@@ -14,8 +14,11 @@
  */
 import { ed25519 } from "@noble/curves/ed25519.js"
 import { env } from "cloudflare:test"
-import { describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
+    binaryToBase64URL,
+    encodeCose,
+    type RegistrationExtension,
     asPairMailboxKey,
     encodeBinding,
     handleRegistrationCreate,
@@ -279,13 +282,179 @@ describe("registration read reports the pause", () => {
 })
 
 describe("registration owner-activity touch (D-24)", () => {
-    it.todo("same-key refresh on a new UTC day touches; the same day does not")
-    it.todo("refresh never moves lastActive backwards")
-    it.todo("same-key POST that 400s on push validation, or whose onCommitted throws, has still touched")
-    it.todo("tombstoned anchor (409) and a bad signature never touch")
-    it.todo("different-key replace refused before the delete leaves the predecessor's lastActive untouched")
-    it.todo("successful different-key replace sets lastActive only on the new incarnation")
-    it.todo("a stale same-key refresh landing after a different-key replace touches nothing")
-    it.todo("a delayed request authenticated against the old incarnation neither touches the new one nor resurrects the old")
-    it.todo("a new incarnation keeps create's initial lastActive")
+    const DAY = 86_400
+    let consoleSpies: ReturnType<typeof vi.spyOn>[]
+    beforeEach(() => {
+        consoleSpies = (["log", "info", "warn", "error", "debug"] as const).map((m) =>
+            vi.spyOn(console, m).mockImplementation(() => {})
+        )
+    })
+    afterEach(() => {
+        const output = consoleSpies.flatMap((spy) => spy.mock.calls)
+        vi.restoreAllMocks()
+        expect(output).toEqual([])
+    })
+
+    async function post(
+        did: string,
+        secretKey: Uint8Array,
+        challenges: ChallengeStore,
+        opts: {
+            now: number
+            body?: Uint8Array
+            signer?: Uint8Array
+            directory?: KVDirectory
+            extension?: RegistrationExtension
+        }
+    ): Promise<Response> {
+        const nonce = await challengeFor(challenges, did)
+        const parts = signRequest({
+            method: "POST",
+            url: CREATE_URL,
+            nonce,
+            keyid: "t",
+            secretKey: opts.signer ?? secretKey,
+            ...(opts.body !== undefined ? { body: opts.body } : {}),
+        })
+        const base = deps(challenges, async () => ed25519.getPublicKey(secretKey))
+        return handleRegistrationCreate(
+            new Request(CREATE_URL, { method: "POST", headers: parts.headers, body: opts.body }),
+            {
+                ...base,
+                nowSeconds: opts.now,
+                ...(opts.directory !== undefined ? { directory: opts.directory } : {}),
+                ...(opts.extension !== undefined ? { registrationExtension: opts.extension } : {}),
+            }
+        )
+    }
+
+    async function registeredAt(now: number, key = ed25519.utils.randomSecretKey()) {
+        const did = freshDID()
+        const directory = new KVDirectory(testEnv)
+        const challenges = memoryChallenges()
+        const response = await post(did, key, challenges, { now })
+        expect(response.status).toBe(201)
+        const locator = (await directory.resolve(did))!
+        const store = pmrStore(locator, testEnv)
+        return { did, key, directory, challenges, locator, store, last: async () => (await store.load())?.lastActive }
+    }
+
+    const tombstone = (did: string, key: Uint8Array) =>
+        testEnv.pmrDirectory.put(
+            `tomb:${did}:${binaryToBase64URL(thumbprintOkpEd25519({ x: ed25519.getPublicKey(key) }))}`,
+            "1"
+        )
+
+    it("same-key refresh on a new UTC day touches; the same day does not", async () => {
+        const r = await registeredAt(T0)
+        await post(r.did, r.key, r.challenges, { now: T0 + DAY })
+        expect(await r.last()).toBe(T0 + DAY)
+        await post(r.did, r.key, r.challenges, { now: T0 + DAY + 100 })
+        expect(await r.last()).toBe(T0 + DAY)
+    })
+
+    it("refresh never moves lastActive backwards", async () => {
+        const r = await registeredAt(T0)
+        await post(r.did, r.key, r.challenges, { now: T0 - 5 * DAY })
+        expect(await r.last()).toBe(T0)
+    })
+
+    it("same-key POST that 400s on push validation, or whose onCommitted throws, has still touched", async () => {
+        const r = await registeredAt(T0)
+        const malformed = encodeCose(new Map([["pse", "https://push.example/x"]]))
+        const bad = await post(r.did, r.key, r.challenges, { now: T0 + DAY, body: malformed })
+        expect(bad.status).toBe(400)
+        expect(await r.last()).toBe(T0 + DAY)
+
+        const r2 = await registeredAt(T0)
+        const extension: RegistrationExtension = {
+            parseCreateFields: () => ({}),
+            onCommitted: async () => {
+                throw new Error("commit failed")
+            },
+        }
+        await expect(
+            post(r2.did, r2.key, r2.challenges, { now: T0 + DAY, extension })
+        ).rejects.toThrow("commit failed")
+        expect(await r2.last()).toBe(T0 + DAY)
+    })
+
+    it("tombstoned anchor (409) and a bad signature never touch", async () => {
+        const r = await registeredAt(T0)
+        const stranger = ed25519.utils.randomSecretKey()
+        const forged = await post(r.did, r.key, r.challenges, { now: T0 + DAY, signer: stranger })
+        expect(forged.status).toBe(401)
+        expect(await r.last()).toBe(T0)
+
+        await tombstone(r.did, r.key)
+        const refused = await post(r.did, r.key, r.challenges, { now: T0 + DAY })
+        expect(refused.status).toBe(409)
+        expect(await r.last()).toBe(T0)
+    })
+
+    it("different-key replace refused before the delete leaves the predecessor's lastActive untouched", async () => {
+        const r = await registeredAt(T0)
+        const keyB = ed25519.utils.randomSecretKey()
+        await tombstone(r.did, keyB)
+        const refused = await post(r.did, keyB, r.challenges, { now: T0 + DAY })
+        expect(refused.status).toBe(409)
+        expect(await r.directory.resolve(r.did)).toBe(r.locator)
+        expect(await r.last()).toBe(T0)
+    })
+
+    it("a different-key POST refused after the touch point leaves the predecessor's lastActive untouched", async () => {
+        const r = await registeredAt(T0)
+        const keyB = ed25519.utils.randomSecretKey()
+        const malformed = encodeCose(new Map([["pse", "https://push.example/x"]]))
+        const refused = await post(r.did, keyB, r.challenges, { now: T0 + DAY, body: malformed })
+        expect(refused.status).toBe(400)
+        expect(await r.directory.resolve(r.did)).toBe(r.locator)
+        expect(await r.last()).toBe(T0)
+    })
+
+    it("successful different-key replace sets lastActive only on the new incarnation", async () => {
+        const r = await registeredAt(T0)
+        const keyB = ed25519.utils.randomSecretKey()
+        expect((await post(r.did, keyB, r.challenges, { now: T0 + DAY })).status).toBe(201)
+        const fresh = (await r.directory.resolve(r.did))!
+        expect(fresh).not.toBe(r.locator)
+        expect((await pmrStore(fresh, testEnv).load())!.lastActive).toBe(T0 + DAY)
+        expect(await r.store.load()).toBeNull()
+    })
+
+    it("a stale same-key refresh landing after a different-key replace touches nothing", async () => {
+        const r = await registeredAt(T0)
+        const keyB = ed25519.utils.randomSecretKey()
+        await post(r.did, keyB, r.challenges, { now: T0 + 100 })
+        const fresh = (await r.directory.resolve(r.did))!
+
+        // The refresh resolved the DID before the replace landed.
+        const stale = Object.create(r.directory) as KVDirectory
+        const resolveNow = r.directory.resolve.bind(r.directory)
+        let resolves = 0
+        stale.resolve = async (did) => ((resolves += 1) === 1 ? r.locator : resolveNow(did))
+        await post(r.did, r.key, r.challenges, { now: T0 + 2 * DAY, directory: stale })
+
+        expect(await r.store.load()).toBeNull()
+        expect((await pmrStore(fresh, testEnv).load())!.lastActive).toBe(T0 + 100)
+    })
+
+    it("a delayed request authenticated against the old incarnation neither touches the new one nor resurrects the old", async () => {
+        const r = await registeredAt(T0)
+        const oldBlob = (await r.store.load())!.anchorKey
+        const keyB = ed25519.utils.randomSecretKey()
+        await post(r.did, keyB, r.challenges, { now: T0 + 100 })
+        const fresh = pmrStore((await r.directory.resolve(r.did))!, testEnv)
+
+        await r.store.touchActive!(T0 + 3 * DAY, oldBlob)
+        await fresh.touchActive!(T0 + 3 * DAY, oldBlob)
+
+        expect(await r.store.load()).toBeNull()
+        expect((await fresh.load())!.lastActive).toBe(T0 + 100)
+    })
+
+    it("a new incarnation keeps create's initial lastActive", async () => {
+        const r = await registeredAt(T0 + 1_234)
+        expect(await r.last()).toBe(T0 + 1_234)
+    })
 })
