@@ -296,7 +296,12 @@ export interface StoredSettledDeclaration {
     settledAtSeconds: number
 }
 
-/** `releaseHeld` awaits every task it hands to `defer` before it returns. */
+/**
+ * `releaseHeld` awaits every task it hands to `defer` before it returns,
+ * except the `onIntakeStored` observer: that goes to the caller's own `defer`
+ * un-awaited, so a deployment must pass a real `waitUntil` there or the
+ * release-time count is dropped.
+ */
 export interface ReleaseDeps extends AuthenticatedPutDeps {
     senderDID: PairMailboxKey
     storage: SenderHoldStorage

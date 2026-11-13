@@ -304,6 +304,7 @@ describe("registration owner-activity touch (D-24)", () => {
             body?: Uint8Array
             signer?: Uint8Array
             directory?: KVDirectory
+            store?: (locator: Locator) => ReturnType<typeof pmrStore>
             extension?: RegistrationExtension
         }
     ): Promise<Response> {
@@ -323,6 +324,7 @@ describe("registration owner-activity touch (D-24)", () => {
                 ...base,
                 nowSeconds: opts.now,
                 ...(opts.directory !== undefined ? { directory: opts.directory } : {}),
+                ...(opts.store !== undefined ? { store: opts.store } : {}),
                 ...(opts.extension !== undefined ? { registrationExtension: opts.extension } : {}),
             }
         )
@@ -377,6 +379,22 @@ describe("registration owner-activity touch (D-24)", () => {
             post(r2.did, r2.key, r2.challenges, { now: T0 + DAY, extension })
         ).rejects.toThrow("commit failed")
         expect(await r2.last()).toBe(T0 + DAY)
+    })
+
+    it("a same-key POST whose touchActive rejects still registers, silently", async () => {
+        const r = await registeredAt(T0)
+        const store = (locator: Locator) =>
+            new Proxy(pmrStore(locator, testEnv), {
+                get: (target, prop) =>
+                    prop === "touchActive"
+                        ? async () => {
+                              throw new Error(r.did)
+                          }
+                        : (target as never as Record<string | symbol, unknown>)[prop],
+            })
+        const response = await post(r.did, r.key, r.challenges, { now: T0 + DAY, store })
+        expect(response.status).toBe(201)
+        expect(await r.last()).toBe(T0)
     })
 
     it("tombstoned anchor (409) and a bad signature never touch", async () => {

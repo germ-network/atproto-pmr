@@ -63,6 +63,17 @@ the device verifies rather than trusts: the pair-put verification
 algorithm, CAR-verified declarations, and re-derivation of grant addresses.
 A client that skips them removes the guarantee rather than degrading it.
 
+## Deployment hooks
+
+Beyond the protocol, the packages expose read-only and observer seams for a
+deployment's own use; none is wire protocol. `KVDirectory.listRouteCandidates`
+and `probeRegistration` (Cloudflare package) enumerate routed DIDs and classify
+each as live, with its `lastActive`, or excluded, without writing anything.
+`onIntakeStored` (on the pair and grant put deps in core) is called once per
+real stored intake after its body is written; its failures never change a
+response. `lastActive` is the first authenticated owner interaction of each
+UTC day, recorded through the optional `PMRStore.touchActive`.
+
 ## Status
 
 **First public draft.** Unsettled edges are listed in each document's "Not
