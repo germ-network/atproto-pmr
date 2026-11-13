@@ -100,7 +100,7 @@ export class MonitorIngestStub extends DurableObject {
 
     async verifiedAnchorOf(did: string): Promise<unknown> {
         const answer = await this.ctx.storage.get(`verifiedAnchor:${did}`)
-        if (answer === "throw") throw new Error("monitor down")
+        if (answer === "throw") throw new Error(`monitor down for ${did}`)
         return answer ?? { state: "unknown" }
     }
 

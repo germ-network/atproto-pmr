@@ -120,6 +120,8 @@ describe("KVDirectory monitor notify", () => {
             await directory.delete(did)
             expect(await directory.resolve(did)).toBeNull()
             expect(warn).toHaveBeenCalledTimes(2)
+            expect(warn).toHaveBeenCalledWith("KVDirectory.register: monitor notify failed", "Error")
+            expect(warn).toHaveBeenCalledWith("KVDirectory.unregister: monitor notify failed", "Error")
             expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         } finally {
             warn.mockRestore()

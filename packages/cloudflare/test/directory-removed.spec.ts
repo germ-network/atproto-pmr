@@ -122,7 +122,7 @@ describe("KVDirectory.onRemoved", () => {
         await expect(directory.deregister(did, thumb(key))).resolves.toBeUndefined()
         expect(await directory.resolve(did)).toBeNull()
         expect(directory.removed).toHaveLength(1)
-        expect(warn.mock.calls.some((c) => String(c[0]).includes("onRemoved"))).toBe(true)
+        expect(warn).toHaveBeenCalledWith("KVDirectory: onRemoved failed", "Error")
         expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         warn.mockRestore()
     })
@@ -193,7 +193,7 @@ describe("grant-address rows on teardown", () => {
         }
         expect(await directory.resolve(did)).toBeNull()
         expect(await directory.resolveAddress(address)).not.toBeNull()
-        expect(warn.mock.calls.some((c) => String(c[0]).includes("grant listing"))).toBe(true)
+        expect(warn).toHaveBeenCalledWith("KVDirectory: grant listing failed", "Error")
         expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         warn.mockRestore()
     })

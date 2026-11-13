@@ -3289,6 +3289,16 @@ describe("verifying a fetched record", () => {
     })
 })
 
+/** Every evidence-unavailable line carries exactly `{ reason }`: no DID, no error object. */
+function expectOnlyReasons(calls: unknown[][], did: string) {
+    for (const call of calls.filter((c) => c[0] === "monitor: declaration evidence unavailable")) {
+        expect(call).toHaveLength(2)
+        expect(Object.keys(call[1] as object)).toEqual(["reason"])
+        expect(typeof (call[1] as { reason: unknown }).reason).toBe("string")
+    }
+    expect(JSON.stringify(calls)).not.toContain(did)
+}
+
 describe("declaration evidence", () => {
     const COLLECTION = testEnv.MONITOR_COLLECTION
     const HOSTNAME = "monitor.example.org"
@@ -3477,7 +3487,7 @@ describe("declaration evidence", () => {
         expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
             reason: "PLC current-key operation unverified",
         })
-        expect(JSON.stringify(warn.mock.calls)).not.toContain(w.did)
+        expectOnlyReasons(warn.mock.calls, w.did)
     })
 
     it("a verified chain whose head renders no document is custody-chain evidence, with no AppView read", async () => {
@@ -3524,7 +3534,7 @@ describe("declaration evidence", () => {
             return message === "monitor: declaration evidence unavailable" ? [warning?.reason] : []
         })
         expect(reasons).toEqual(["AppView unreachable", "AppView unreachable", "AppView did not confirm"])
-        expect(JSON.stringify(warn.mock.calls)).not.toContain(w.did)
+        expectOnlyReasons(warn.mock.calls, w.did)
     })
 
     it("an unreachable PLC directory leaves the declaration verified without evidence", async () => {
@@ -3539,7 +3549,7 @@ describe("declaration evidence", () => {
         expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
             reason: expect.any(String),
         })
-        expect(JSON.stringify(warn.mock.calls)).not.toContain(w.did)
+        expectOnlyReasons(warn.mock.calls, w.did)
     })
 
     it("a stale fetched document or a fetch with no attempt start is no evidence", async () => {
@@ -3638,7 +3648,7 @@ describe("declaration evidence", () => {
             expect(warn).toHaveBeenCalledWith("monitor: declaration evidence unavailable", {
                 reason: "no fetched DID document",
             })
-            expect(JSON.stringify(warn.mock.calls)).not.toContain(w.did)
+            expectOnlyReasons(warn.mock.calls, w.did)
         })
 
         it("anchors kept before rows were keyed by DID migrate in place and survive an unchanged settle", async () => {
