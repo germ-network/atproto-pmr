@@ -40,6 +40,7 @@ import {
     type SyntheticState,
     type WatchOutcome,
     type WatchState,
+    utcDay,
 } from "@germ-network/atproto-pmr-core"
 import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
@@ -542,8 +543,20 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         await this.db.put(KEY_REGISTRATION, { ...current, ...fields })
     }
 
-    async touchActive(_nowSeconds: number, _anchorKey: Uint8Array): Promise<void> {
-        throw new Error("not implemented")
+    async touchActive(nowSeconds: number, anchorKey: Uint8Array): Promise<void> {
+        // One input-gated read-then-write: never `update`, which would
+        // recreate a registration `destroy` removed.
+        const reg = await this.db.get<RegistrationFields>(KEY_REGISTRATION)
+        if (
+            reg === undefined ||
+            typeof reg.did !== "string" ||
+            !(reg.anchorKey instanceof Uint8Array) ||
+            !sameBytes(reg.anchorKey, anchorKey) ||
+            !(utcDay(nowSeconds) > utcDay(reg.lastActive))
+        ) {
+            return
+        }
+        await this.db.put(KEY_REGISTRATION, { ...reg, lastActive: nowSeconds })
     }
 
     async isMonitorConfirmed(): Promise<boolean> {
