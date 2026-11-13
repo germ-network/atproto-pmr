@@ -269,11 +269,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * deployment can therefore be `draining` while a client that holds no
      * live grants is correctly told `absent`.
      *
-     * `fetch()` relies on this method's only await (`listGrants`, below)
-     * being a DO *storage* read: that keeps the input gate closed for the
-     * duration, so a concurrent `deliverLive` RPC cannot land on the new
-     * socket before `#capabilities` does. Adding a non-storage await here
-     * (a `fetch()` call, a timer) would reopen that race — don't.
+     * `fetch()` relies on every await before its `101` (the key bind's read,
+     * and `listGrants` below) being a DO *storage* read: that keeps the input
+     * gate closed for the duration, so a concurrent `deliverLive` RPC cannot
+     * land on the new socket before `#capabilities` does. Adding a
+     * non-storage await here (a `fetch()` call, a timer) would reopen that
+     * race — don't.
      */
     private async effectiveCapabilities(): Promise<EffectiveCapabilities> {
         // Parsed rather than read loosely: an unrecognized value is a
@@ -467,10 +468,10 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
      * idle on mobile — exactly hibernation's case — and a non-hibernating
      * DO stays resident and billed for the whole connection regardless.
      * The cost is that per-connection state cannot live in an in-memory
-     * array; it has to survive eviction. Nothing here needs any: draining
-     * reads straight from durable storage, and an ack names its own
-     * mailbox key and messageId, so there is nothing to carry in a
-     * `serializeAttachment` payload either.
+     * array; it has to survive eviction. Draining reads straight from durable
+     * storage and an ack names its own mailbox key and messageId, so the only
+     * thing a socket carries, in its attachment, is the anchor key it was
+     * opened under.
      */
     async fetch(request: Request): Promise<Response> {
         if (request.headers.get("Upgrade") !== "websocket") {
@@ -480,6 +481,17 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         }
         const [client, server] = Object.values(new WebSocketPair())
         this.ctx.acceptWebSocket(server)
+
+        // Frames count as owner activity only against the key this socket was
+        // opened under, so a registration rebound in place later is not
+        // credited. A bind that fails leaves the socket unbound: its frames
+        // record nothing, and the upgrade still completes.
+        try {
+            const reg = await this.db.get<RegistrationFields>(KEY_REGISTRATION)
+            if (reg !== undefined && typeof reg.did === "string") {
+                server.serializeAttachment({ anchorKey: reg.anchorKey })
+            }
+        } catch {}
 
         const capabilities = await this.effectiveCapabilities()
 
@@ -506,9 +518,9 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     /**
      * A hibernation-woken instance reaches this with no surviving
      * in-memory context from `fetch` — everything it needs is in the
-     * frame itself, which is exactly why an ack names its own mailbox key
-     * and messageId rather than relying on anything remembered per
-     * connection.
+     * frame itself — apart from the anchor key in the socket's attachment —
+     * which is exactly why an ack names its own mailbox key and messageId
+     * rather than relying on anything remembered per connection.
      *
      * `webSocketClose`/`webSocketError` are deliberately not implemented:
      * there is no in-memory session state to release, so there is nothing
@@ -518,6 +530,12 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         ws: WebSocket,
         message: string | ArrayBuffer
     ): Promise<void> {
+        try {
+            const bound = (ws.deserializeAttachment() as { anchorKey?: unknown } | null)?.anchorKey
+            if (bound instanceof Uint8Array) {
+                await this.touchActive(Math.floor(Date.now() / 1000), bound)
+            }
+        } catch {}
         if (typeof message === "string") return // frames are binary only
         try {
             await handleAckFrame(
