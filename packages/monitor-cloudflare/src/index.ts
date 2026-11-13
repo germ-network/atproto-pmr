@@ -55,15 +55,16 @@
  *     const status = await env.ingest.get(env.ingest.idFromName(MONITOR_NAME)).ingestStatus()
  *
  * Every failed settle also logs one `monitor: settle deferred` line carrying
- * the DID, attempts, error or reason, and next try; a failed secondary settle
- * logs `monitor: secondary settle deferred` with the collection and rkey too.
- * A DID the refresh pass fails on logs `monitor: refresh did failed` with the
- * DID and error, and a snapshot whose metadata had to be trimmed under KV's
+ * the attempts, failure kind, error name and next try; a failed secondary
+ * settle logs `monitor: secondary settle deferred` with the collection too.
+ * Package logs never carry a DID, an error message or a body. A DID the
+ * refresh pass fails on logs `monitor: refresh did failed` with the error
+ * name, and a snapshot whose metadata had to be trimmed under KV's
  * cap logs `monitor: snapshot metadata trimmed`, or `monitor: snapshot metadata
  * over cap after trim` when even that leaves it too large to store.
  * With `MONITOR_HOSTNAME` set, a declaration stored without summary evidence
- * logs `monitor: declaration evidence unavailable` with the DID and reason
- * (for a deployment `fetchRecord`, most often a missing `didDocument`).
+ * logs `monitor: declaration evidence unavailable` (for a deployment
+ * `fetchRecord`, most often a missing `didDocument`).
  *
  * The public read paths — the record fetch and the change digest — are
  * deliberately *not* here: they are KV reads that belong in a plain

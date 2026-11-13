@@ -1,3 +1,4 @@
+import { errorKind } from "./log-safe"
 /**
  * Wraps a handler so a thrown error becomes a 500 rather than an unhandled
  * rejection.
@@ -18,7 +19,7 @@ export async function runWithErrorHandling(
     try {
         return await handler()
     } catch (e) {
-        console.log("request failed", e)
+        console.log("request failed", errorKind(e))
         return new Response("Internal error", { status: 500 })
     }
 }

@@ -1,5 +1,6 @@
 import type { MonitorRecheckRequest } from "@germ-network/atproto-pmr-core"
 import type { PMREnv } from "./env"
+import { errorKind } from "./log-safe"
 
 /**
  * `RecordReadDeps.requestRecheck` for a relay bound to a monitor: forwards
@@ -20,7 +21,7 @@ export function monitorRecheck(
             ) as unknown as MonitorRecheckRequest
             await monitor.requestRefresh(did, nowMs())
         } catch (err) {
-            console.warn(`monitorRecheck: refresh request failed for ${did}:`, err)
+            console.warn("monitorRecheck: refresh request failed", errorKind(err))
         }
     }
 }

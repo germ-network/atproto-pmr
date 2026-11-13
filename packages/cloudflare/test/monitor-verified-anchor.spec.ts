@@ -43,7 +43,8 @@ describe("monitorVerifiedAnchor", () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
         try {
             expect(await monitorVerifiedAnchor(testEnv)(did)).toEqual({ state: "unknown" })
-            expect(warn).toHaveBeenCalledTimes(1)
+            expect(warn).toHaveBeenCalledWith("monitorVerifiedAnchor: read failed", "Error")
+            expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         } finally {
             warn.mockRestore()
         }

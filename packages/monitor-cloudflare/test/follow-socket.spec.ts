@@ -506,11 +506,8 @@ describe("a follow frame that throws", () => {
                 (obj as unknown as { onFollowFrame(raw: string): Promise<void> }).onFollowFrame(raw)
             ).resolves.toBeUndefined()
         })
-        expect(error).toHaveBeenCalledWith("monitor: follow frame relist failed", {
-            did: owner,
-            name: "Error",
-            message: "queueListing broke",
-        })
+        expect(error).toHaveBeenCalledWith("monitor: follow frame relist failed", "Error")
+        expect(JSON.stringify(error.mock.calls)).not.toContain(owner)
     })
 
     it("a #sync after a failed frame still raises the follow cursor", async () => {
@@ -524,51 +521,51 @@ describe("a follow frame that throws", () => {
         )
         await vi.waitFor(async () => expect(await meta(stub, "follow_cursor")).toBe("7000"))
     })
-    it("a failed frame is logged with its error and event fields", async () => {
+    it("a failed frame is logged with its error name and event shape, never its DID, rkey or message", async () => {
         const { stub, owner, ws, error } = await ownerOnStream()
         await breakMethod(stub, "logEdgeOp")
         await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
         await vi.waitFor(() => expect(error).toHaveBeenCalled())
         const [message, fields] = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")!
         expect(message).toBe("monitor: follow frame failed")
-        expect(fields).toMatchObject({
+        expect(fields).toEqual({
             name: "Error",
-            message: "logEdgeOp broke",
             kind: "commit",
-            did: owner,
             cursor: "6000",
             collection: BLOCK,
             operation: "create",
-            rkey: "b1",
         })
-        expect(typeof fields.stack).toBe("string")
+        expect(JSON.stringify(error.mock.calls)).not.toContain(owner)
     })
 
-    it("the logged stack is truncated to FOLLOW_FRAME_FAILURE_STACK_CHARS", async () => {
+    it("an error carrying the DID in its name, message or stack logs none of it", async () => {
         const { stub, owner, ws, error } = await ownerOnStream()
         await inObj(stub, async (obj) => {
             ;(obj as unknown as Record<string, unknown>).logEdgeOp = async () => {
-                const err = new Error("deep")
-                err.stack = "x".repeat(5_000)
+                const err = new Error(`write failed for ${owner}`)
+                err.name = `Error(${owner})`
+                err.stack = `at ${owner}`
                 throw err
             }
         })
         await push(stub, ws, commit(owner, BLOCK, "create", "b1", 6000, { subject: "did:plc:x" }))
         await vi.waitFor(() => expect(error).toHaveBeenCalled())
         const fields = error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]
-        expect(fields.stack).toBe("x".repeat(2_000))
+        expect(fields.name).toBe("Error")
+        expect(JSON.stringify(error.mock.calls)).not.toContain(owner)
     })
 
-    it("a failed frame by a DID outside interest is logged too", async () => {
+    it("a failed frame by a DID outside interest is logged too, without the DID", async () => {
         const { stub, ws, error } = await ownerOnStream()
         await breakMethod(stub, "isGraphOwner")
         const stranger = uniqDid()
         await push(stub, ws, commit(stranger, FOLLOW, "create", "r1", 6000, { subject: "did:plc:x" }))
         await vi.waitFor(() => expect(error).toHaveBeenCalled())
         expect(error.mock.calls.find((c) => c[0] === "monitor: follow frame failed")![1]).toMatchObject({
-            did: stranger,
-            message: "isGraphOwner broke",
+            name: "Error",
+            kind: "commit",
         })
+        expect(JSON.stringify(error.mock.calls)).not.toContain(stranger)
     })
 
     it("each failed frame is counted in ingestStatus().followFrameFailures", async () => {

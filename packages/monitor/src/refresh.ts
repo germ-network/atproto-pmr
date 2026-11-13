@@ -27,6 +27,7 @@ import {
 import type { HeadRev } from "./fetch-record"
 import { settleSecondary, type SecondaryDeps } from "./secondary"
 import { compareRev, type GoneCause, type VerifiedDeclarationWrite } from "./storage"
+import { errorKind } from "./log-safe"
 
 /** When a stored snapshot was last confirmed current, for the rev it was confirmed at. */
 export interface SnapshotCheck {
@@ -163,7 +164,7 @@ export async function refreshDue(
             outcome = await refreshOne(deps, did, opts.nowMs)
         } catch (err) {
             outcome = "failed"
-            console.warn("monitor: refresh did failed", { did, error: String(err) })
+            console.warn("monitor: refresh did failed", errorKind(err))
             await deps.refreshIndex.markAttempted(did, opts.nowMs).catch(() => {})
         }
         outcomes[outcome] += 1

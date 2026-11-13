@@ -45,6 +45,7 @@ import { kvBodyStore } from "./directory"
 import type { PMREnv } from "./env"
 import { monitorOwnBlocks } from "./monitor-own-blocks"
 import { webPushSender } from "./push-sender"
+import { errorKind } from "./log-safe"
 
 /**
  * One Durable Object per relay — the per-PMR store from
@@ -377,11 +378,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 try {
                     this.sendSummary()
                 } catch (error) {
-                    console.error("nudgeSummary trailing send failed", error)
+                    console.error("nudgeSummary trailing send failed", errorKind(error))
                 }
             }, waitMs)
         } catch (error) {
-            console.error("nudgeSummary failed", error)
+            console.error("nudgeSummary failed", errorKind(error))
         }
     }
 
@@ -446,7 +447,7 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
                 )
             }
         } catch (err) {
-            console.error(`deliverPush: failed for ${endpointOrigin}:`, err)
+            console.error(`deliverPush: failed for ${endpointOrigin}`, errorKind(err))
         }
     }
 

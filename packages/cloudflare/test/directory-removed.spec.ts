@@ -115,14 +115,15 @@ describe("KVDirectory.onRemoved", () => {
     it("a throwing onRemoved does not fail the removal", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
         const directory = new RecordingDirectory(testEnv)
-        directory.failWith = new Error("index down")
         const did = freshDID()
+        directory.failWith = new Error(`index down for ${did}`)
         const key = ed25519.utils.randomSecretKey()
         await register(did, key, directory)
         await expect(directory.deregister(did, thumb(key))).resolves.toBeUndefined()
         expect(await directory.resolve(did)).toBeNull()
         expect(directory.removed).toHaveLength(1)
-        expect(warn.mock.calls.some((c) => String(c[0]).includes("onRemoved"))).toBe(true)
+        expect(warn).toHaveBeenCalledWith("KVDirectory: onRemoved failed", "Error")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         warn.mockRestore()
     })
 })
@@ -180,7 +181,7 @@ describe("grant-address rows on teardown", () => {
                 get: (t, p) =>
                     p === "listGrants"
                         ? async () => {
-                              throw new Error("list down")
+                              throw new Error(`list down for ${did}`)
                           }
                         : (t as any)[p],
             })
@@ -192,7 +193,8 @@ describe("grant-address rows on teardown", () => {
         }
         expect(await directory.resolve(did)).toBeNull()
         expect(await directory.resolveAddress(address)).not.toBeNull()
-        expect(warn.mock.calls.some((c) => String(c[0]).includes("grant listing"))).toBe(true)
+        expect(warn).toHaveBeenCalledWith("KVDirectory: grant listing failed", "Error")
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(did)
         warn.mockRestore()
     })
 })

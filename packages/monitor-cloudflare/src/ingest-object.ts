@@ -180,6 +180,7 @@ import { kvMonitorRegistrationStore } from "./registration-store"
 import { kvSigningKeyCache } from "./signing-key-store"
 import { kvSnapshotStore } from "./snapshot-store"
 import { summaryInputTracking, type SummaryInputsChange } from "./summary-inputs"
+import { boundedErrorName, errorKind } from "./log-safe"
 
 /** A re-check request not selected within this much wall-clock time is dropped. */
 const REFRESH_REQUEST_MAX_AGE_MS = 86_400_000
@@ -258,8 +259,6 @@ const STALE_RELIST_PER_ALARM = 200
 const FOLLOW_TIMEOUTS_BEFORE_PAGED = 3
 /** Consecutive permanent-class failures after which a listing is unlistable. */
 const FOLLOW_UNLISTABLE_AFTER = 5
-/** Characters of a failed follow frame's stack that are logged. */
-const FOLLOW_FRAME_FAILURE_STACK_CHARS = 2_000
 const LISTING_RETRY_BASE_MS = 60_000
 const LISTING_RETRY_MAX_MS = 86_400_000
 
@@ -2830,7 +2829,7 @@ export class MonitorIngest
                 if (row.log === null) await writer.delete(row.did)
                 else await writer.put(JSON.parse(row.log) as PlcLog)
             } catch (err) {
-                console.warn(`monitor: plc log publish failed for ${row.did}`, err)
+                console.warn("monitor: plc log publish failed", errorKind(err))
                 continue
             }
             const marked = this.db.sql.exec(
@@ -4077,7 +4076,7 @@ export class MonitorIngest
             try {
                 await step()
             } catch (err) {
-                console.error(`monitor: ${name} failed`, err)
+                console.error(`monitor: ${name} failed`, errorKind(err))
             }
         }
     }
@@ -4171,7 +4170,7 @@ export class MonitorIngest
             if (this.alarmReconcileAgain) {
                 this.alarmReconcileAgain = false
                 void this.reconcileAlarm().catch((err) => {
-                    console.error("monitor: alarm reconciliation retry failed", err)
+                    console.error("monitor: alarm reconciliation retry failed", errorKind(err))
                 })
             }
         })
@@ -4301,7 +4300,7 @@ export class MonitorIngest
         } catch (err) {
             // The durable pending/key row and prompt intent are already committed.
             // The watchdog or a later start repairs this scheduling gap.
-            console.error("monitor: prompt alarm scheduling failed", err)
+            console.error("monitor: prompt alarm scheduling failed", errorKind(err))
         }
     }
 
@@ -4342,7 +4341,7 @@ export class MonitorIngest
                     .join("|")
             })
         } catch (err) {
-            console.error("monitor: settle failed", err)
+            console.error("monitor: settle failed", errorKind(err))
         }
         const afterRows = selectedDids.length === 0
             ? []
@@ -4553,10 +4552,10 @@ export class MonitorIngest
         try {
             evidence = await this.declarationEvidence(ref.did, record, record.signingKey, outcome.commitCid)
         } catch (err) {
-            evidence = { kind: "unavailable", reason: err instanceof Error ? `${err.name}: ${err.message}` : String(err) }
+            evidence = unavailable(errorKind(err))
         }
         if (evidence.kind === "unavailable") {
-            console.warn("monitor: declaration evidence unavailable", { did: ref.did, reason: evidence.reason })
+            console.warn("monitor: declaration evidence unavailable", { reason: reasonKind(evidence.reason) })
             return base
         }
         return { ...base, assurance: evidence.assurance, authority: evidence.authority, monitor }
@@ -4756,7 +4755,7 @@ export class MonitorIngest
         try {
             await this.onSummaryInputsChanged(change)
         } catch (error) {
-            console.error("monitor: summary inputs report failed", error)
+            console.error("monitor: summary inputs report failed", errorKind(error))
         }
     }
 
@@ -4768,7 +4767,7 @@ export class MonitorIngest
      * ordinary advance.
      */
     protected onRegression(did: string, indexed: string, observed: string): Promise<void> {
-        console.log("monitor: rev regression", { did, indexed, observed })
+        console.log("monitor: rev regression")
         this.notifyRegistration(did, { c: "rev" })
         return Promise.resolve()
     }
@@ -4780,7 +4779,7 @@ export class MonitorIngest
      * object says what kind of change it was, never its content.
      */
     protected onDelete(did: string): Promise<void> {
-        console.log("monitor: declaration deleted", { did })
+        console.log("monitor: declaration deleted")
         this.notifyRegistration(did, { c: "gone" })
         return Promise.resolve()
     }
@@ -4831,11 +4830,11 @@ export class MonitorIngest
             const result = await pushDeclarationChange(did, { registrations, sender }, hint)
             if (result?.outcome === "failed") {
                 console.error(
-                    `monitor onChange: push service answered ${result.status} for ${did}`
+                    `monitor onChange: push service answered ${result.status}`
                 )
             }
         } catch (err) {
-            console.error(`monitor onChange: push failed for ${did}:`, err)
+            console.error("monitor onChange: push failed", errorKind(err))
         }
     }
 
@@ -4871,12 +4870,9 @@ export class MonitorIngest
             retryCapMs: (did) => this.retryCapMs(did),
             onSettleFailure: ({ did, attempts, failure, notBeforeMs }) =>
                 console.warn("monitor: settle deferred", {
-                    did,
                     attempts,
                     kind: failure.kind,
-                    ...(failure.kind === "threw"
-                        ? { error: `${failure.errorName}: ${failure.message}` }
-                        : { reason: failure.reason }),
+                    ...(failure.kind === "threw" ? { error: boundedErrorName(failure.errorName) } : {}),
                     notBefore: new Date(notBeforeMs).toISOString(),
                 }),
             onChange: async (did, rev, hint) => {
@@ -4956,14 +4952,10 @@ export class MonitorIngest
             retryCapMs: (did) => this.retryCapMs(did),
             onSettleFailure: ({ did, collection, rkey, attempts, failure, notBeforeMs }) =>
                 console.warn("monitor: secondary settle deferred", {
-                    did,
                     collection,
-                    rkey,
                     attempts,
                     kind: failure.kind,
-                    ...(failure.kind === "threw"
-                        ? { error: `${failure.errorName}: ${failure.message}` }
-                        : { reason: failure.reason }),
+                    ...(failure.kind === "threw" ? { error: boundedErrorName(failure.errorName) } : {}),
                     notBefore: new Date(notBeforeMs).toISOString(),
                 }),
             nowMs: () => Date.now(),
@@ -4985,12 +4977,12 @@ export class MonitorIngest
         try {
             await this.connectFollow()
         } catch (err) {
-            console.error("monitor: follow connect failed", err)
+            console.error("monitor: follow connect failed", errorKind(err))
         }
         try {
             await this.connectPlc()
         } catch (err) {
-            console.error("monitor: plc connect failed", err)
+            console.error("monitor: plc connect failed", errorKind(err))
         }
     }
 
@@ -5216,7 +5208,7 @@ export class MonitorIngest
             }
         })
         this.plcChain = next.catch((err) => {
-            console.error("monitor: plc frame failed", err)
+            console.error("monitor: plc frame failed", errorKind(err))
             this.endPlcRun()
         })
         return this.plcChain
@@ -5242,7 +5234,7 @@ export class MonitorIngest
                 if (plcCursorAfterClose(reason) === "reset") await this.resetPlcCursor()
             })
             .catch((err) => {
-                console.error("monitor: plc close failed", err)
+                console.error("monitor: plc close failed", errorKind(err))
             })
         return this.plcChain
     }
@@ -5272,14 +5264,14 @@ export class MonitorIngest
                             await cache.delete(did)
                         }
                     } catch (err) {
-                        console.error("monitor: key drain failed", err)
+                        console.error("monitor: key drain failed", errorKind(err))
                         return true
                     }
                     await this.clearKeyUpdate(did, version)
                 }
                 return false
             } catch (err) {
-                console.error("monitor: key drain failed", err)
+                console.error("monitor: key drain failed", errorKind(err))
                 return true
             } finally {
                 this.draining = null
@@ -5356,15 +5348,11 @@ export class MonitorIngest
     ): Promise<void> {
         try {
             console.error("monitor: follow frame failed", {
-                name: err instanceof Error ? err.name : typeof err,
-                message: err instanceof Error ? err.message : String(err),
-                stack:
-                    err instanceof Error ? err.stack?.slice(0, FOLLOW_FRAME_FAILURE_STACK_CHARS) : undefined,
+                name: errorKind(err),
                 kind: event?.kind ?? null,
-                did: event?.did ?? null,
                 cursor,
                 ...(event?.kind === "commit"
-                    ? { collection: event.collection, operation: event.operation, rkey: event.rkey }
+                    ? { collection: event.collection, operation: event.operation }
                     : {}),
             })
         } catch {
@@ -5377,7 +5365,7 @@ export class MonitorIngest
             )
         } catch (countErr) {
             try {
-                console.error("monitor: follow frame failure count failed", countErr)
+                console.error("monitor: follow frame failure count failed", errorKind(countErr))
             } catch {
                 // Counting must not stop the relisting.
             }
@@ -5389,11 +5377,7 @@ export class MonitorIngest
             if (await this.inInterest(did)) await this.queueListing(did, Date.now(), "lost-frame")
         } catch (relistErr) {
             try {
-                console.error("monitor: follow frame relist failed", {
-                    did,
-                    name: relistErr instanceof Error ? relistErr.name : typeof relistErr,
-                    message: relistErr instanceof Error ? relistErr.message : String(relistErr),
-                })
+                console.error("monitor: follow frame relist failed", errorKind(relistErr))
             } catch {
                 // Nothing the recovery does may escape into the read loop.
             }
@@ -5475,12 +5459,12 @@ export class MonitorIngest
             try {
                 await this.connectPlc()
             } catch (err) {
-                console.error("monitor: plc connect failed", err)
+                console.error("monitor: plc connect failed", errorKind(err))
             }
             try {
                 await this.connectFollow()
             } catch (err) {
-                console.error("monitor: follow connect failed", err)
+                console.error("monitor: follow connect failed", errorKind(err))
             }
             // Ahead of the sweep, which throws when its relay is down and
             // would otherwise strand owed key updates behind it.
@@ -5491,7 +5475,7 @@ export class MonitorIngest
             try {
                 this.persistPlcCursor()
             } catch (err) {
-                console.error("monitor: plc cursor persist failed", err)
+                console.error("monitor: plc cursor persist failed", errorKind(err))
             }
             // Before the documents are published, so a document a fetched log
             // confirms goes out in the same alarm.
@@ -5509,7 +5493,7 @@ export class MonitorIngest
                     console.log("monitor: plc logs", published)
                 }
             } catch (err) {
-                console.error("monitor: plc log drain failed", err)
+                console.error("monitor: plc log drain failed", errorKind(err))
             }
             // Ahead of the sweep, which throws when its relay is down: stored
             // documents and the coverage marker must not wait behind it.
@@ -5519,12 +5503,12 @@ export class MonitorIngest
                 coveredThroughMs = published.coveredThroughMs
                 console.log("monitor: did documents", published)
             } catch (err) {
-                console.error("monitor: did document publish failed", err)
+                console.error("monitor: did document publish failed", errorKind(err))
             }
             try {
                 await this.publishPlcCoverage(coveredThroughMs)
             } catch (err) {
-                console.error("monitor: plc coverage publish failed", err)
+                console.error("monitor: plc coverage publish failed", errorKind(err))
             }
             // Joins and leaves are applied ahead of the settles; each step
             // fails alone so a directory outage cannot strand them.
@@ -5558,7 +5542,7 @@ export class MonitorIngest
                 try {
                     await step()
                 } catch (err) {
-                    console.error(`monitor: ${name} failed`, err)
+                    console.error(`monitor: ${name} failed`, errorKind(err))
                 }
             }
             // Before settling, so a DID this sweep just discovered is
@@ -5579,7 +5563,7 @@ export class MonitorIngest
                             }),
                     })
                 } catch (err) {
-                    console.error("monitor: backfill sweep failed", err)
+                    console.error("monitor: backfill sweep failed", errorKind(err))
                 }
             }
             try {
@@ -5591,17 +5575,17 @@ export class MonitorIngest
                     this.snapshotLayoutDone = done
                 }
             } catch (err) {
-                console.error("monitor: snapshot layout sweep failed", err)
+                console.error("monitor: snapshot layout sweep failed", errorKind(err))
             }
             try {
                 await this.sweepEvidenceRefreshIfConfigured()
             } catch (err) {
-                console.error("monitor: evidence refresh sweep failed", err)
+                console.error("monitor: evidence refresh sweep failed", errorKind(err))
             }
             try {
                 await this.settleDeclarationBatch()
             } catch (err) {
-                console.error("monitor: settle failed", err)
+                console.error("monitor: settle failed", errorKind(err))
             }
             const batch = this.settleBatch()
             try {
@@ -5610,7 +5594,7 @@ export class MonitorIngest
                     Number.isFinite(batch) ? batch : 32
                 )
             } catch (err) {
-                console.error("monitor: secondary settle failed", err)
+                console.error("monitor: secondary settle failed", errorKind(err))
             }
             try {
                 await settleSecondaryDue(
@@ -5620,7 +5604,7 @@ export class MonitorIngest
                     "own-blocks"
                 )
             } catch (err) {
-                console.error("monitor: own-block settle failed", err)
+                console.error("monitor: own-block settle failed", errorKind(err))
             }
             try {
                 await disposeStrayOwnBlockProofs(
@@ -5628,12 +5612,12 @@ export class MonitorIngest
                     Number.isFinite(batch) ? batch : 32
                 )
             } catch (err) {
-                console.error("monitor: own-block disposal failed", err)
+                console.error("monitor: own-block disposal failed", errorKind(err))
             }
             try {
                 await this.publishFirehoseCoverage()
             } catch (err) {
-                console.error("monitor: firehose coverage publish failed", err)
+                console.error("monitor: firehose coverage publish failed", errorKind(err))
             }
             // After settling (a just-stored snapshot is not yet due) and
             // before sealing (a change it finds lands in a window that has
@@ -5665,7 +5649,7 @@ export class MonitorIngest
                 console.log("monitor: refresh", refreshed)
             } catch (err) {
                 // The alarm must still seal and re-arm itself.
-                console.error("monitor: refresh failed", err)
+                console.error("monitor: refresh failed", errorKind(err))
             }
             // Sealed after settling, so anything confirmed on this wake
             // lands in a window before that window is closed out.
@@ -5680,7 +5664,7 @@ export class MonitorIngest
             try {
                 await this.runGraphSteps()
             } catch (err) {
-                console.error("monitor: graph steps failed", err)
+                console.error("monitor: graph steps failed", errorKind(err))
             }
           } finally {
             const interval = Number.parseInt(this.env.WATCHDOG_INTERVAL_MS, 10)
@@ -5699,6 +5683,8 @@ type DeclarationEvidence =
     | { kind: "unavailable"; reason: string }
 
 const unavailable = (reason: string): DeclarationEvidence => ({ kind: "unavailable", reason })
+/** A reason's fixed prefix: whatever follows `: ` may be a raw error message. */
+const reasonKind = (reason: string): string => reason.split(": ", 1)[0]!
 
 /** The longest DNS name; bounds the monitor name every stored evidence carries. */
 const MONITOR_HOSTNAME_MAX_CHARS = 253

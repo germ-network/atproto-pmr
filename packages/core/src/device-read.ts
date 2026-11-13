@@ -18,6 +18,7 @@ import { readRecordFromCar } from "./repo-proof.js"
 import { SNAPSHOT_MAX_AGE_MS, type RecordSnapshotStore } from "./snapshot-read.js"
 import { toResponseBody } from "./util.js"
 import type { WatchedRecord } from "./watched.js"
+import { errorKind } from "./log-safe"
 
 export interface RecordReadDeps {
     records: RecordSnapshotStore
@@ -75,7 +76,7 @@ export function dedupedRecheck(
             requestedAt.delete(requestedAt.keys().next().value!)
         }
         requestedAt.set(did, now)
-        console.warn(`declaration snapshot past ${SNAPSHOT_MAX_AGE_MS} ms; requesting re-check`, did)
+        console.warn(`declaration snapshot past ${SNAPSHOT_MAX_AGE_MS} ms; requesting re-check`)
         await requestRecheck(did)
     }
 }
@@ -156,7 +157,7 @@ export async function handleRecordRead(
         deps.waitUntil(
             Promise.resolve()
                 .then(() => deps.requestRecheck(did))
-                .catch((error) => console.warn("re-check request failed", did, error))
+                .catch((error) => console.warn("re-check request failed", errorKind(error)))
         )
     }
     return recordResponse({

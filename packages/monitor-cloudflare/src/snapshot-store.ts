@@ -79,14 +79,13 @@ export function snapshotKeys(
 /** A held entry's parts, decoded from a v2 value and metadata; `null` for anything else. */
 function decodeEntry(
     value: ArrayBuffer | null,
-    metadata: unknown,
-    describe: string
+    metadata: unknown
 ): { meta: SnapshotIndexMeta; detail: SnapshotDetail; car: Uint8Array } | null {
     if (value === null || metadata === null) return null
     const meta = readIndexMeta(metadata)
     const decoded = meta === null ? null : decodeSnapshotValue(new Uint8Array(value))
     if (meta === null || decoded === null) {
-        console.warn("monitor: snapshot entry not v2", { key: describe })
+        console.warn("monitor: snapshot entry not v2")
         return null
     }
     return { meta, ...decoded }
@@ -98,7 +97,7 @@ async function readEntry(
 ): Promise<SnapshotEntry | null> {
     const key = snapshotKeys(ref.did, ref.collection, ref.rkey).record
     const { value, metadata } = await env.records.getWithMetadata<unknown>(key, "arrayBuffer")
-    const entry = decodeEntry(value, metadata, key)
+    const entry = decodeEntry(value, metadata)
     if (entry === null) return null
     const { meta, detail, car } = entry
     return {
@@ -267,7 +266,7 @@ export function kvDeclarationSnapshots<TIngest extends MonitorIngest = MonitorIn
             env.records.getWithMetadata<unknown>(RECORD_PREFIX + did, "arrayBuffer"),
             env.records.get<SnapshotCheck>(CHECK_PREFIX + did, "json"),
         ])
-        const entry = decodeEntry(value, metadata, RECORD_PREFIX + did)
+        const entry = decodeEntry(value, metadata)
         if (entry === null) return null
         const confirmedAtMs =
             check !== null && check.rev === entry.meta.rev ? check.checkedAtMs : 0
@@ -295,7 +294,7 @@ export function kvRecordSnapshots<TIngest extends MonitorIngest = MonitorIngest>
                 env.records.getWithMetadata<unknown>(keys.record, "arrayBuffer"),
                 env.records.get<SnapshotCheck>(keys.check, "json"),
             ])
-            const entry = decodeEntry(value, metadata, keys.record)
+            const entry = decodeEntry(value, metadata)
             if (entry === null) return null
             const { meta } = entry
             const verifiedWith = meta.verifiedWith
