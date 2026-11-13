@@ -1,5 +1,11 @@
 # @germ-network/atproto-pmr-cloudflare
 
+## 0.8.1
+
+### Patch Changes
+
+- [#112](https://github.com/germ-network/atproto-pmr/pull/112) [`db485f5`](https://github.com/germ-network/atproto-pmr/commit/db485f532dedad2b0d8a6cdc107c55def207cb86) Thanks [@germ-mark](https://github.com/germ-mark)! - Package logs no longer carry a DID, an error message, a stack or a response body: failure lines log the error's class name only (`errorKind`), and DID-keyed lines drop the DID. Settle failures keep their full detail in `last_failure`, as before.
+
 ## 0.8.0
 
 ### Minor Changes
