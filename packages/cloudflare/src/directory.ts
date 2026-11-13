@@ -252,8 +252,16 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
      * Census read, deployment-only: one page (one KV list call) of DIDs that
      * have a route. Candidates only — `probeRegistration` decides liveness.
      */
-    async listRouteCandidates(_cursor: string | null): Promise<RouteCandidatePage> {
-        throw new Error("not implemented")
+    async listRouteCandidates(cursor: string | null): Promise<RouteCandidatePage> {
+        const page = await this.env.pmrDirectory.list({
+            prefix: "did:",
+            limit: 1000,
+            cursor: cursor ?? undefined,
+        })
+        return {
+            dids: page.keys.map((key) => key.name),
+            cursor: page.list_complete ? null : page.cursor,
+        }
     }
 
     /**
@@ -263,8 +271,25 @@ export class KVDirectory<TPMR extends PMRObject = PMRObject>
      * anchor, and that anchor is not tombstoned. Other errors propagate;
      * nothing is logged.
      */
-    async probeRegistration(_did: string): Promise<RegistrationProbe> {
-        throw new Error("not implemented")
+    async probeRegistration(did: string): Promise<RegistrationProbe> {
+        const locator = await this.resolve(did)
+        if (locator === null) return null
+        let id: DurableObjectId
+        try {
+            id = this.env.pmrs.idFromString(locator)
+        } catch {
+            return null
+        }
+        const record = await this.env.pmrs.get(id).load()
+        if (record === null || record.did !== did) return null
+        let thumbprint: Uint8Array
+        try {
+            thumbprint = thumbprintOkpEd25519(parseOkpEd25519Key(record.anchorKey))
+        } catch {
+            return null
+        }
+        if (await this.isTombstoned(did, thumbprint)) return null
+        return { lastActive: record.lastActive }
     }
 }
 
