@@ -28,10 +28,10 @@ const DECLARATION_CHANGE_TOPIC = "d"
 
 /**
  * Composes the core Web Push primitives against this Worker's env and
- * `fetch` global — the monitor-side counterpart to
- * `@germ-network/atproto-pmr-cloudflare`'s `webPushSender`, re-derived
- * rather than imported (that package is not a dependency here; a
- * standalone monitor deployment has no `PMRObject`).
+ * `fetchImpl` (the caller's `MonitorIngest.pushFetch`) — the monitor-side
+ * counterpart to `@germ-network/atproto-pmr-cloudflare`'s `webPushSender`,
+ * re-derived rather than imported (that package is not a dependency here;
+ * a standalone monitor deployment has no `PMRObject`).
  *
  * Returns `null` when the deployment has not configured push, matching the
  * PMR side's "not configured → no-op" contract.
@@ -43,7 +43,8 @@ const DECLARATION_CHANGE_TOPIC = "d"
  * and satisfies both interfaces from the same env.
  */
 export function monitorWebPushSender<TIngest extends MonitorIngest = MonitorIngest>(
-    env: MonitorEnv<TIngest>
+    env: MonitorEnv<TIngest>,
+    fetchImpl: typeof fetch
 ): DeclarationPushSender | null {
     if (
         env.VAPID_PUBLIC_KEY === undefined ||
@@ -90,7 +91,7 @@ export function monitorWebPushSender<TIngest extends MonitorIngest = MonitorInge
             })
 
             return deliverPush(subscription.endpoint, sealed, {
-                fetchImpl: fetch,
+                fetchImpl,
                 authorizationHeader: vapidAuthorizationHeader(jwt, publicKey),
                 ttlSeconds,
                 topic: DECLARATION_CHANGE_TOPIC,

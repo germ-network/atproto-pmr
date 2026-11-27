@@ -33,10 +33,10 @@ export interface PushSender {
 
 /**
  * Composes the core Web Push primitives against this Worker's env and
- * `fetch` global. Returns `null` when the deployment has not configured
- * push — the caller (`PMRObject.deliverPush`) treats a `null` sender as a
- * no-op, matching `deliverLive`'s "an adapter with no concept omits it"
- * contract.
+ * `fetchImpl` (the caller's `PMRObject.pushFetch`). Returns `null` when
+ * the deployment has not configured push — the caller
+ * (`PMRObject.deliverPush`) treats a `null` sender as a no-op, matching
+ * `deliverLive`'s "an adapter with no concept omits it" contract.
  *
  * All of `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`,
  * `PUSH_MAX_SEALED_BYTES`, and `PUSH_TTL_SECONDS` are required together —
@@ -45,7 +45,8 @@ export interface PushSender {
  * differently per missing field.
  */
 export function webPushSender<TPMR extends PMRObject>(
-    env: PMREnv<TPMR>
+    env: PMREnv<TPMR>,
+    fetchImpl: typeof fetch
 ): PushSender | null {
     if (
         env.VAPID_PUBLIC_KEY === undefined ||
@@ -94,7 +95,7 @@ export function webPushSender<TPMR extends PMRObject>(
             })
 
             return deliverPush(subscription.endpoint, sealed, {
-                fetchImpl: fetch,
+                fetchImpl,
                 authorizationHeader: vapidAuthorizationHeader(jwt, publicKey),
                 ttlSeconds,
             })

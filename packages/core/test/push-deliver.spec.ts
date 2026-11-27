@@ -212,3 +212,24 @@ describe("deliverPush — request shape", () => {
         ).rejects.toThrow(/Topic/)
     })
 })
+
+describe("deliverPush — calling the injected fetch", () => {
+    // workerd's global `fetch` throws "Illegal invocation" when called
+    // with a foreign `this`, so passing it straight in as `fetchImpl` must
+    // work: it is called as a plain function, never as a method of the
+    // options object.
+    it("fetchImpl is called as a plain function, with no `this`", async () => {
+        const seenThis: unknown[] = []
+        const fetchImpl = async function (this: unknown) {
+            seenThis.push(this)
+            return new Response(null, { status: 201 })
+        } as typeof fetch
+        await deliverPush(ENDPOINT, new Uint8Array([1]), {
+            fetchImpl,
+            authorizationHeader: "vapid t=x, k=y",
+            ttlSeconds: 86400,
+        })
+        expect(seenThis).toHaveLength(1)
+        expect(seenThis[0]).toBeUndefined()
+    })
+})

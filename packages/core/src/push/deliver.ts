@@ -83,8 +83,11 @@ export async function deliverPush(
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+    // Called as a plain function: workerd's global `fetch` throws "Illegal
+    // invocation" when called as a method of another object.
+    const { fetchImpl } = opts
     try {
-        const response = await opts.fetchImpl(endpoint, {
+        const response = await fetchImpl(endpoint, {
             method: "POST",
             headers,
             // `lib.dom.d.ts`'s `BodyInit` wants `ArrayBufferView<ArrayBuffer>`

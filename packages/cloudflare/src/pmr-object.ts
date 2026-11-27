@@ -243,6 +243,24 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
     private lastSummaryNudgeAtMs = 0
     private summaryTrailingPending = false
 
+    /**
+     * The `fetch` every Web Push delivery from this object goes out
+     * through: endpoint, method, headers and body exactly as core
+     * `deliverPush` built them. The default is the global `fetch`. A
+     * deployment overrides it when a push service is not reachable by a
+     * public fetch from this Worker (Cloudflare does not deliver a
+     * Worker's fetch to a route on the same zone), and sends that origin
+     * through a service binding instead, calling it as a method on the
+     * binding (`env.X.fetch(input, init)`), never extracted: an extracted
+     * binding `fetch` throws "Illegal invocation". The hook is always
+     * called with `this` as this object, so an override can read
+     * `this.env`. A throw is caught and logged by `deliverPush` like any
+     * failed fetch.
+     */
+    protected pushFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+        return fetch(input, init)
+    }
+
     constructor(ctx: DurableObjectState, env: PMREnv) {
         super(ctx, env)
         this.db = ctx.storage
@@ -431,7 +449,11 @@ export class PMRObject extends DurableObject<PMREnv> implements PMRStore {
         // same base-wide-misconfiguration class this logging exists to
         // catch, so it has to be inside the guard too.
         try {
-            const sender = webPushSender(this.env)
+            // An arrow, so every push goes through `pushFetch`, called with
+            // `this` as this object (an override reads `this.env`).
+            const sender = webPushSender(this.env, (input, init) =>
+                this.pushFetch(input, init)
+            )
             if (sender === null) return
 
             const plaintext = buildMessagePushPayload({
