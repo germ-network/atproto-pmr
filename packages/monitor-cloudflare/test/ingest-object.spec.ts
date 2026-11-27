@@ -1107,9 +1107,50 @@ describe("own-DID push", () => {
     // A deployment overrides `pushFetch` to send some push origins another
     // way (a service binding). The push it receives must be the one
     // `deliverPush` built, and the global `fetch` must not also be used.
-    it.todo(
-        "the overriding pushFetch is called once, on this object, with the endpoint, method, headers (Topic included) and body unchanged, and the global fetch is not called"
-    )
+    it("the overriding pushFetch is called once, on this object, with the endpoint, method, headers (Topic included) and body unchanged, and the global fetch is not called", async () => {
+        const did = "did:plc:push-own-fetch"
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await putRegistration(did, { endpoint: "https://ger.mx/push/v1/abc", keyId: 42 })
+
+        // Both stubs only record: `deliverDeclarationPush` swallows anything
+        // thrown under it, so an assertion inside either one could not fail
+        // the test.
+        let globalCalls = 0
+        vi.stubGlobal("fetch", async () => {
+            globalCalls += 1
+            return new Response(null, { status: 201 })
+        })
+        const calls: { self: unknown; input: RequestInfo | URL; init?: RequestInit }[] = []
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            const held = obj as unknown as { pushFetch: typeof fetch }
+            held.pushFetch = async function (this: unknown, input, init) {
+                calls.push({ self: this, input, init })
+                return new Response(null, { status: 201 })
+            }
+        })
+
+        await callDeliverDeclarationPush(stub, did)
+
+        expect(calls).toHaveLength(1)
+        const [{ self, input, init }] = calls
+        await runInDurableObject(stub, (obj: MonitorIngest) => {
+            expect(self === obj).toBe(true)
+        })
+        expect(input).toBe("https://ger.mx/push/v1/abc")
+        expect(init?.method).toBe("POST")
+        expect(init?.redirect).toBe("manual")
+        const headers = new Headers(init?.headers)
+        expect(headers.get("Authorization")).toMatch(/^vapid t=.+, k=.+$/)
+        expect(headers.get("TTL")).toBe("86400")
+        expect(headers.get("Content-Type")).toBe("application/webpush-message")
+        expect(headers.get("Topic")).toBe("d")
+        expect(init?.body).toBeInstanceOf(Uint8Array)
+        const body = init?.body as Uint8Array
+        expect(body.byteLength).toBeGreaterThan(0)
+        expect(body[0]).toBe(42)
+        expect(globalCalls).toBe(0)
+    })
 
     it("a discard response (404/410) deletes the registration", async () => {
         const did = "did:plc:push-discard"
