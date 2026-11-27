@@ -212,3 +212,11 @@ describe("deliverPush — request shape", () => {
         ).rejects.toThrow(/Topic/)
     })
 })
+
+describe("deliverPush — calling the injected fetch", () => {
+    // workerd's global `fetch` throws "Illegal invocation" when called
+    // with a foreign `this`, so passing it straight in as `fetchImpl` must
+    // work: it is called as a plain function, never as a method of the
+    // options object.
+    it.todo("fetchImpl is called as a plain function, with no `this`")
+})

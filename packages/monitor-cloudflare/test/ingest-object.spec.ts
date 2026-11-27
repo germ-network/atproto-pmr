@@ -1104,6 +1104,13 @@ describe("own-DID push", () => {
         expect(seenTopic).toBe("d")
     })
 
+    // A deployment overrides `pushFetch` to send some push origins another
+    // way (a service binding). The push it receives must be the one
+    // `deliverPush` built, and the global `fetch` must not also be used.
+    it.todo(
+        "the overriding pushFetch is called once, on this object, with the endpoint, method, headers (Topic included) and body unchanged, and the global fetch is not called"
+    )
+
     it("a discard response (404/410) deletes the registration", async () => {
         const did = "did:plc:push-discard"
         const stub = freshStub()

@@ -419,6 +419,15 @@ describe("deliverPush — enabled, subscription present", () => {
     })
 })
 
+describe("deliverPush — a deployment's pushFetch", () => {
+    // A deployment overrides `pushFetch` to send some push origins another
+    // way (a service binding). The delivery it receives must be the one
+    // `deliverPush` built, and the global `fetch` must not also be used.
+    it.todo(
+        "the overriding pushFetch is called once, on this object, with the endpoint, method, headers and body unchanged, and the global fetch is not called"
+    )
+})
+
 describe("push while paused", () => {
     it("a registration paused by the declaration watch is still pushed to", async () => {
         const stub = freshStub()
