@@ -423,9 +423,54 @@ describe("deliverPush — a deployment's pushFetch", () => {
     // A deployment overrides `pushFetch` to send some push origins another
     // way (a service binding). The delivery it receives must be the one
     // `deliverPush` built, and the global `fetch` must not also be used.
-    it.todo(
-        "the overriding pushFetch is called once, on this object, with the endpoint, method, headers and body unchanged, and the global fetch is not called"
-    )
+    it("the overriding pushFetch is called once, on this object, with the endpoint, method, headers and body unchanged, and the global fetch is not called", async () => {
+        const stub = freshStub()
+        await withPushEnabled(stub)
+        await withSubscription(stub, {
+            endpoint: "https://ger.mx/push/v1/abc",
+            contentKey: new Uint8Array(32).fill(1),
+            keyId: 42,
+        })
+
+        // Both stubs only record: `deliverPush` swallows anything thrown
+        // under it, so an assertion inside either one could not fail the test.
+        let globalCalls = 0
+        vi.stubGlobal("fetch", async () => {
+            globalCalls += 1
+            return new Response(null, { status: 201 })
+        })
+
+        await inPMR(stub, async (pmr) => {
+            const calls: { self: unknown; input: RequestInfo | URL; init?: RequestInit }[] = []
+            const held = pmr as unknown as { pushFetch: typeof fetch }
+            held.pushFetch = async function (this: unknown, input, init) {
+                calls.push({ self: this, input, init })
+                return new Response(null, { status: 201 })
+            }
+
+            await pmr.deliverPush(
+                "did:plc:sender",
+                { messageId: "m1", byteLength: 5 },
+                new TextEncoder().encode("hello")
+            )
+
+            expect(calls).toHaveLength(1)
+            const [{ self, input, init }] = calls
+            expect(self === pmr).toBe(true)
+            expect(input).toBe("https://ger.mx/push/v1/abc")
+            expect(init?.method).toBe("POST")
+            expect(init?.redirect).toBe("manual")
+            const headers = new Headers(init?.headers)
+            expect(headers.get("Authorization")).toMatch(/^vapid t=.+, k=.+$/)
+            expect(headers.get("TTL")).toBe("86400")
+            expect(headers.get("Content-Type")).toBe("application/webpush-message")
+            expect(init?.body).toBeInstanceOf(Uint8Array)
+            const body = init?.body as Uint8Array
+            expect(body.byteLength).toBeGreaterThan(0)
+            expect(body[0]).toBe(42)
+        })
+        expect(globalCalls).toBe(0)
+    })
 })
 
 describe("push while paused", () => {
