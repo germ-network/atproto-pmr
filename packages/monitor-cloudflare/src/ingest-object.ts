@@ -4753,14 +4753,17 @@ export class MonitorIngest
 
     /**
      * The `fetch` every own-DID declaration push goes out through:
-     * endpoint, method, headers (`Topic` included) and body exactly as core
-     * `deliverPush` built them. The default is the global `fetch`. A
+     * endpoint, method, headers (`Topic` included) and body exactly as
+     * core `deliverPush` built them. The default is the global `fetch`. A
      * deployment overrides it when a push service is not reachable by a
      * public fetch from this Worker (Cloudflare does not deliver a
      * Worker's fetch to a route on the same zone), and sends that origin
-     * through a service binding instead. It is always called with `this`
-     * as this object, so an override can read `this.env`. A throw is
-     * caught and logged by `deliverDeclarationPush` like any failed fetch.
+     * through a service binding instead, calling it as a method on the
+     * binding (`env.X.fetch(input, init)`), never extracted: an extracted
+     * binding `fetch` throws "Illegal invocation". The hook is always
+     * called with `this` as this object, so an override can read
+     * `this.env`. A throw is caught and logged by
+     * `deliverDeclarationPush` like any failed fetch.
      */
     protected pushFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
         return fetch(input, init)
@@ -4839,10 +4842,8 @@ export class MonitorIngest
     private async deliverDeclarationPush(did: string, hint?: DeclarationPushHint): Promise<void> {
         try {
             const registrations = kvMonitorRegistrationStore(this.env)
-            // An arrow, not `this.pushFetch` or the global `fetch` itself:
-            // workerd's `fetch` and a service binding's `fetch` throw
-            // "Illegal invocation" when called with a foreign `this`, and
-            // an override needs `this` to be this object.
+            // An arrow, so every push goes through `pushFetch`, called with
+            // `this` as this object (an override reads `this.env`).
             const sender = monitorWebPushSender(this.env, (input, init) =>
                 this.pushFetch(input, init)
             )

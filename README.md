@@ -66,16 +66,16 @@ A client that skips them removes the guarantee rather than degrading it.
 ## Deployment hooks
 
 Beyond the protocol, the packages expose seams for a deployment's own use;
-none is wire protocol. `KVDirectory.listRouteCandidates`
-and `probeRegistration` (Cloudflare package) enumerate routed DIDs and classify
+none is wire protocol. `KVDirectory.listRouteCandidates` and
+`probeRegistration` (Cloudflare package) enumerate routed DIDs and classify
 each as live, with its `lastActive`, or excluded, without writing anything.
 `onIntakeStored` (on the pair and grant put deps in core) is called once per
 real stored intake after its body is written; its failures never change a
 response. `lastActive` is the first authenticated owner interaction of each
-UTC day, recorded through the optional `PMRStore.touchActive`.
-`PMRObject` and `MonitorIngest` send every Web Push through their protected
-`pushFetch`, which a deployment can override to reach a push origin another way,
-such as a service binding; the default is the global `fetch`.
+UTC day, recorded through the optional `PMRStore.touchActive`. `PMRObject`
+and `MonitorIngest` send every Web Push through their protected `pushFetch`,
+which a deployment can override to reach a push origin another way, such as
+a service binding; the default is the global `fetch`.
 
 ## Status
 
